@@ -227,6 +227,120 @@ def _combine_topk_swa_indices_kernel(
         tl.store(combined_lens_ptr + token_idx, combined_len)
 
 
+@triton.jit
+def _combine_full_swa_indices_kernel(
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    M,
+    N,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    PADDED_MAX_TOPK: tl.constexpr,
+):
+    """C128 (HCA) variant of combine_topk_swa: no topk selection; every
+    compressed token in [0, (pos+1)//COMPRESS_RATIO) is attended to. We
+    synthesize the sequential indices instead of loading from a topk_indices
+    tensor."""
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    start_pos = seq_len - query_len
+    gather_start = seq_len - gather_len
+
+    for token_idx in range(query_start + worker_id, query_end, num_workers):
+        token_idx_in_query = token_idx - query_start
+        pos = start_pos + token_idx_in_query
+        # Full enumeration: every causally-visible compressed token.
+        topk_len = (pos + 1) // COMPRESS_RATIO
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+
+        # Sequential compressed indices: M*batch + [0, topk_len)
+        offset = tl.arange(0, PADDED_MAX_TOPK)
+        mask = offset < topk_len
+        tl.store(
+            combined_indices_ptr + token_idx * combined_indices_stride + offset,
+            M * batch_idx + offset,
+            mask=mask,
+        )
+        # SWA window indices (identical layout to combine_topk_swa).
+        offset = tl.arange(0, WINDOW_SIZE)
+        tl.store(
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + topk_len
+            + offset,
+            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+            mask=offset < swa_len,
+        )
+
+        combined_len = topk_len + swa_len
+        tl.store(combined_lens_ptr + token_idx, combined_len)
+
+
+def combine_full_swa_indices(
+    num_q_tokens: int,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    max_topk_len: int,
+    M: int,
+    N: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate full-enumeration compressed indices and SWA window indices
+    for C128 (HCA) prefill.
+
+    `max_topk_len` is the per-request upper bound on `(pos+1) // compress_ratio`,
+    typically `ceil(max_model_len / compress_ratio)` (= N).
+    """
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (max_topk_len + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.full(
+        (num_q_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=device,
+    )
+    combined_lens = torch.empty(
+        num_q_tokens,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    NUM_WORKERS = 128
+    _combine_full_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        PADDED_MAX_TOPK=triton.next_power_of_2(max(max_topk_len, 1)),
+    )
+    return combined_indices, combined_lens
+
+
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -281,57 +395,85 @@ def combine_topk_swa_indices(
     return combined_indices, combined_lens
 
 
-def forward_prefill_c4_sparse(
+def forward_prefill_sparse(
     *,
     q: torch.Tensor,
     attn_sink: torch.Tensor,
     sm_scale: float,
     output: torch.Tensor,
     swa_k_cache: torch.Tensor,
-    c4_k_cache: torch.Tensor,
-    c4_local_topk_indices: torch.Tensor,
+    compressed_k_cache: torch.Tensor,
+    local_topk_indices: Optional[torch.Tensor],
     prefill_seq_lens: torch.Tensor,
     prefill_gather_lens: torch.Tensor,
     prefill_query_start_loc: torch.Tensor,
     prefill_query_start_loc_cpu: list[int],
-    c4_block_table: torch.Tensor,
+    compressed_block_table: torch.Tensor,
     swa_block_table: torch.Tensor,
-    c4_block_size: int,
+    compressed_block_size: int,
     swa_block_size: int,
     compress_ratio: int,
     window_size: int,
-    c4_topk: int,
+    sparse_topk: Optional[int],
     max_model_len: int,
     attn_tp_rank: int = 0,
     attn_tp_size: int = 1,
     chunk_size: int = PREFILL_CHUNK_SIZE,
 ) -> None:
-    """C4 prefill attention via FlashMLA sparse forward.
+    """DSv4 CSA / HCA prefill attention via FlashMLA sparse forward.
 
-    Mirrors `vllm/.../deepseek_v4_attention.py:_forward_prefill` for compress_ratio=4.
-    Writes attention output in-place into `output` (shape (T, H, head_dim_v=512) bf16).
+    Mirrors `vllm/.../deepseek_v4_attention.py:_forward_prefill`. Writes the
+    attention output in-place into `output` (shape (T, H, head_dim_v=512) bf16).
+
+    Two compression modes supported:
+      - C4 (CSA, compress_ratio=4): pass `local_topk_indices` (LOGICAL c4
+        positions emitted by the indexer via `out_raw_indices`) and
+        `sparse_topk` (e.g. 512 or 1024). Each query token attends to the
+        topk-selected compressed tokens + SWA window.
+      - C128 (HCA, compress_ratio=128): pass `local_topk_indices=None` and
+        `sparse_topk=None`. Each query token attends to the full prefix of
+        compressed tokens [0, (pos+1)//128) + SWA window — no topk selection.
 
     Args:
-        q: (T, H, D=576) bf16.
-        attn_sink: (H,) float32 (per-head sink logits).
+        q: (T, H, D=512) bf16.
+        attn_sink: (n_heads_global,) float32 — full global sink, will be
+            sliced to the local TP rank's heads.
         output: (T, H, 512) bf16, pre-allocated.
-        swa_k_cache: raw SWA pool FP8 buffer, (num_swa_blocks, swa_page_bytes) uint8.
-        c4_k_cache: raw C4 pool FP8 buffer, (num_c4_blocks, c4_page_bytes) uint8.
-        c4_local_topk_indices: (T, c4_topk) int32 of LOGICAL c4-compressed
-            positions emitted by the indexer (passed via `out_raw_indices`).
-        prefill_seq_lens: (num_prefill_reqs,) int32, full seq lens.
+        swa_k_cache: raw SWA pool FP8 buffer (num_swa_blocks, swa_page_bytes) uint8.
+        compressed_k_cache: raw C4 / C128 pool FP8 buffer.
+        local_topk_indices: (T, sparse_topk) int32 of LOGICAL compressed
+            positions for C4; None for C128 full enumeration.
+        prefill_seq_lens: (num_prefill_reqs,) int32 full seq lens.
         prefill_gather_lens: (num_prefill_reqs,) int32 = min(seq_len, qo_len+window-1).
-        prefill_query_start_loc: (num_prefill_reqs+1,) int32 cumulative qo_lens.
-        c4_block_table: (num_prefill_reqs, max_c4_blocks) int32, C4 pool page ids.
-        swa_block_table: (num_prefill_reqs, max_swa_blocks) int32, SWA pool page ids.
-        compress_ratio: 4.
+        prefill_query_start_loc: (num_prefill_reqs+1,) int32 cumulative qo lens.
+        compressed_block_table: (num_prefill_reqs, max_blocks) int32 — pool
+            page ids; for both C4 and C128 this is reusable from
+            core_attn_metadata.page_table directly because every main pool
+            256-token page corresponds to one C4 page (64 token) or one C128
+            page (2 token), sharing the same page id.
+        swa_block_table: (num_prefill_reqs, max_swa_blocks) int32.
+        compressed_block_size: tokens per page in the compressed pool
+            (page_size // compress_ratio = 64 for C4, 2 for C128).
+        swa_block_size: tokens per SWA page (= 128).
+        compress_ratio: 4 (C4 / CSA) or 128 (C128 / HCA).
         window_size: SWA window (128).
-        c4_topk: 512 or 1024.
-        max_model_len: upper bound used to size the workspace.
+        sparse_topk: cap on topk_len for C4; ignored for C128.
+        max_model_len: upper bound on max_seq_len, used to size the workspace.
     """
     import flash_mla
 
-    assert compress_ratio == 4, f"only c4 supported, got {compress_ratio=}"
+    assert compress_ratio in (
+        4,
+        128,
+    ), f"only C4 (4) or C128 (128) supported, got {compress_ratio=}"
+    if compress_ratio == 4:
+        assert (
+            local_topk_indices is not None and sparse_topk is not None
+        ), "C4 prefill requires local_topk_indices + sparse_topk"
+    else:
+        assert (
+            local_topk_indices is None
+        ), "C128 (HCA) prefill must not pass local_topk_indices"
 
     num_prefill_reqs = prefill_seq_lens.shape[0]
     if num_prefill_reqs == 0:
@@ -422,14 +564,14 @@ def forward_prefill_c4_sparse(
         c_end = min(c_start + chunk_size, num_prefill_reqs)
         cs = c_end - c_start
 
-        # Gather compressed C4 KV → kv[:cs, 0:N) of workspace
+        # Gather compressed (C4 / C128) KV → kv[:cs, 0:N) of workspace
         dequantize_and_gather_k_cache(
             out=kv[:cs],
-            k_cache=c4_k_cache,
+            k_cache=compressed_k_cache,
             seq_lens=prefill_seq_lens[c_start:c_end] // compress_ratio,
             gather_lens=None,
-            block_table=c4_block_table[c_start:c_end],
-            block_size=c4_block_size,
+            block_table=compressed_block_table[c_start:c_end],
+            block_size=compressed_block_size,
             offset=0,
         )
 
@@ -444,21 +586,37 @@ def forward_prefill_c4_sparse(
             offset=N,
         )
 
-        # Combine local topk + SWA indices per query token, rebased to workspace
+        # Combine compressed + SWA indices per query token, rebased to workspace.
         q_start = prefill_query_start_loc_cpu[c_start]
         q_end = prefill_query_start_loc_cpu[c_end]
 
-        combined_indices, combined_lens = combine_topk_swa_indices(
-            c4_local_topk_indices[q_start:q_end],
-            prefill_query_start_loc[c_start : c_end + 1],
-            prefill_seq_lens[c_start:c_end],
-            prefill_gather_lens[c_start:c_end],
-            window_size,
-            compress_ratio,
-            c4_topk,
-            M,
-            N,
-        )
+        if local_topk_indices is not None:
+            # C4 (CSA) — read topk indices from the indexer.
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                local_topk_indices[q_start:q_end],
+                prefill_query_start_loc[c_start : c_end + 1],
+                prefill_seq_lens[c_start:c_end],
+                prefill_gather_lens[c_start:c_end],
+                window_size,
+                compress_ratio,
+                sparse_topk,
+                M,
+                N,
+            )
+        else:
+            # C128 (HCA) — synthesize sequential [0, (pos+1)//128) indices.
+            combined_indices, combined_lens = combine_full_swa_indices(
+                num_q_tokens=q_end - q_start,
+                query_start_loc=prefill_query_start_loc[c_start : c_end + 1],
+                seq_lens=prefill_seq_lens[c_start:c_end],
+                gather_lens=prefill_gather_lens[c_start:c_end],
+                window_size=window_size,
+                compress_ratio=compress_ratio,
+                max_topk_len=N,
+                M=M,
+                N=N,
+                device=device,
+            )
 
         q_chunk = q[q_start:q_end]
         # q_chunk: (q_end - q_start, h_q_kernel = n_local, head_dim) bf16

@@ -57,7 +57,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align
+from sglang.srt.utils import ceil_align, logger
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -98,7 +98,11 @@ class _PrefillPerReqMeta(NamedTuple):
     gather_lens: torch.Tensor  # (num_prefill_reqs,) int32
     query_start_loc: torch.Tensor  # (num_prefill_reqs+1,) int32
     query_start_loc_cpu: List[int]  # cumulative qo lens, len=num_prefill_reqs+1
-    c4_block_table: torch.Tensor  # (num_prefill_reqs, max_c4_blocks) int32
+    # Same page-id table works for both C4 and C128 compressed pools — every
+    # main 256-token page maps 1:1 to a C4 page (64 token) or a C128 page
+    # (2 token), so the value is the same; only the block_size differs at the
+    # gather kernel call site.
+    compressed_block_table: torch.Tensor  # (num_prefill_reqs, max_blocks) int32
     swa_block_table: torch.Tensor  # (num_prefill_reqs, max_swa_blocks) int32
 
 
@@ -1007,24 +1011,33 @@ class DeepseekV4AttnBackend(
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
-            # Prefill-only sparse_fwd dispatch: compress_ratio=4 layers run
-            # bf16 dequantize + combined-indices + flash_mla_sparse_fwd, mirroring
-            # vLLM's DeepseekV4MLAAttention._forward_prefill. Decode /
-            # target_verify / draft_extend / c128 / swa-only keep using
+            # Prefill-only sparse_fwd dispatch: compress_ratio=4 (CSA) and
+            # compress_ratio=128 (HCA) layers run bf16 dequantize + combined-
+            # indices + flash_mla_sparse_fwd, mirroring vLLM's
+            # DeepseekV4MLAAttention._forward_prefill. Decode / target_verify /
+            # draft_extend / SWA-only (compress_ratio=0) keep using
             # flash_mla_with_kvcache below.
             if self._should_use_prefill_sparse_fwd(
                 forward_batch, compress_ratio, core_attn_metadata
             ):
+                logger.info_once(
+                    f"\033[32m DSV4 Prefill CSA/HCA Use API: flash_mla_sparse_fwd. \033[0m"
+                )
                 assert attn_sink is not None
-                return self._forward_prefill_c4_sparse(
+                return self._forward_prefill_sparse(
                     q=q,
                     attn_sink=attn_sink,
                     forward_batch=forward_batch,
                     core_attn_metadata=core_attn_metadata,
                     swa_k_cache=swa_k_cache,
-                    c4_k_cache=token_to_kv_pool.get_extra_key_buffer(layer_id),
+                    compressed_k_cache=token_to_kv_pool.get_extra_key_buffer(layer_id),
+                    compress_ratio=compress_ratio,
                 )
 
+            if forward_batch.forward_mode.is_extend() and compress_ratio in (4, 128):
+                logger.info_once(
+                    f"\033[32m DSV4 Prefill CSA/HCA Use API: flash_mla_with_kvcache. \033[0m"
+                )
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -1118,7 +1131,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: int,
         core_attn_metadata: DSV4AttnMetadata,
     ) -> bool:
-        if compress_ratio != 4:
+        if compress_ratio not in (4, 128):
             return False
         if not envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get():
             return False
@@ -1129,8 +1142,12 @@ class DeepseekV4AttnBackend(
             return False
         if fm.is_draft_extend(include_v2=True):
             return False
-        # Indexer must have populated LOCAL c4 topk indices for this path.
-        return core_attn_metadata.c4_local_topk_indices is not None
+        if compress_ratio == 4:
+            # * C4 (CSA) requires the indexer to have published LOCAL topk indices.
+            return core_attn_metadata.c4_local_topk_indices is not None
+        # * C128 (HCA) attends to every compressed token in [0, S/128) — no
+        # indexer involvement, no per-layer topk metadata required.
+        return True
 
     def _get_prefill_per_request_metadata(
         self,
@@ -1185,24 +1202,28 @@ class DeepseekV4AttnBackend(
             torch.int32
         )
 
-        # C4 block table: page_table[r] is already C4 pool page ids — each
-        # main-pool 256-token page == one C4 pool 64-token page, sharing the
-        # same page id (see metadata_kernel.py line 75 derivation).
-        # core.page_table is (num_qo_tokens, max_main_blocks), per-token
-        # repeated; take the first query-token row of each prefill request.
+        # Compressed (C4 / C128) block table: page_table[r] holds main-pool
+        # page ids that are also valid in the C4 pool (256/4 = 64 token per
+        # C4 page, one C4 page per main page) and the C128 pool (256/128 = 2
+        # token per C128 page, also one per main page).
+        # See metadata_kernel.py:75 derivation. core.page_table is
+        # (num_qo_tokens, max_main_blocks) per-token repeated; take the first
+        # query-token row of each prefill request.
         first_token_per_req = query_start_loc[:-1].to(torch.long)
-        c4_block_table = core_attn_metadata.page_table[first_token_per_req].contiguous()
+        compressed_block_table = core_attn_metadata.page_table[
+            first_token_per_req
+        ].contiguous()
 
         return _PrefillPerReqMeta(
             seq_lens=seq_lens,
             gather_lens=gather_lens,
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
-            c4_block_table=c4_block_table,
+            compressed_block_table=compressed_block_table,
             swa_block_table=swa_block_table,
         )
 
-    def _forward_prefill_c4_sparse(
+    def _forward_prefill_sparse(
         self,
         *,
         q: torch.Tensor,
@@ -1210,10 +1231,18 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         core_attn_metadata: DSV4AttnMetadata,
         swa_k_cache: torch.Tensor,
-        c4_k_cache: torch.Tensor,
+        compressed_k_cache: torch.Tensor,
+        compress_ratio: Literal[4, 128],
     ) -> torch.Tensor:
+        """Common prefill driver for CSA (C4) and HCA (C128).
+
+        Differences between the two paths are confined to:
+          - which compressed pool's k cache + page_size is used
+          - whether `local_topk_indices` is populated (C4) or None (C128)
+          - which sparse_topk cap is applied (only C4)
+        """
         from sglang.srt.layers.attention.dsv4.sparse_prefill import (
-            forward_prefill_c4_sparse,
+            forward_prefill_sparse,
         )
 
         if q.ndim == 4:
@@ -1226,33 +1255,42 @@ class DeepseekV4AttnBackend(
         prep = self._get_prefill_per_request_metadata(forward_batch, core_attn_metadata)
 
         num_q_tokens = q.shape[0]
-        # c4_local_topk_indices may be padded (num_qo_tokens) to alignment;
-        # restrict to the actual q token range.
-        c4_local_topk_indices = core_attn_metadata.c4_local_topk_indices
-        assert c4_local_topk_indices is not None
-        c4_local_topk_indices = c4_local_topk_indices[:num_q_tokens]
+        if compress_ratio == 4:
+            local_topk_indices = core_attn_metadata.c4_local_topk_indices
+            assert local_topk_indices is not None
+            # c4_local_topk_indices may be padded (num_qo_tokens) to alignment;
+            # restrict to the actual q token range.
+            local_topk_indices = local_topk_indices[:num_q_tokens]
+            sparse_topk = self.c4_topk
+            compressed_pool_page_size = self.token_to_kv_pool.c4_kv_pool.page_size
+        else:
+            # C128 (HCA): no topk selection — every compressed token is
+            # attended to. The combine kernel synthesizes the indices.
+            local_topk_indices = None
+            sparse_topk = None
+            compressed_pool_page_size = self.token_to_kv_pool.c128_kv_pool.page_size
 
         out = q.new_empty(q.shape[0], q.shape[1], self.head_dim_v)
 
-        forward_prefill_c4_sparse(
+        forward_prefill_sparse(
             q=q,
             attn_sink=attn_sink,
             sm_scale=self.softmax_scale,
             output=out,
             swa_k_cache=swa_k_cache,
-            c4_k_cache=c4_k_cache,
-            c4_local_topk_indices=c4_local_topk_indices,
+            compressed_k_cache=compressed_k_cache,
+            local_topk_indices=local_topk_indices,
             prefill_seq_lens=prep.seq_lens,
             prefill_gather_lens=prep.gather_lens,
             prefill_query_start_loc=prep.query_start_loc,
             prefill_query_start_loc_cpu=prep.query_start_loc_cpu,
-            c4_block_table=prep.c4_block_table,
+            compressed_block_table=prep.compressed_block_table,
             swa_block_table=prep.swa_block_table,
-            c4_block_size=self.token_to_kv_pool.c4_kv_pool.page_size,
+            compressed_block_size=compressed_pool_page_size,
             swa_block_size=self.token_to_kv_pool.swa_page_size,
-            compress_ratio=4,
+            compress_ratio=compress_ratio,
             window_size=SWA_WINDOW,
-            c4_topk=self.c4_topk,
+            sparse_topk=sparse_topk,
             max_model_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             attn_tp_rank=get_attention_tp_rank(),
             attn_tp_size=get_attention_tp_size(),
