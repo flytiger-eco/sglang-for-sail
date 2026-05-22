@@ -23,6 +23,7 @@ def get_config_file_name(
     block_shape: Optional[int] = None,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    version: int = 1,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
@@ -31,7 +32,8 @@ def get_config_file_name(
     )
     per_channel_quant_selector = ",per_channel_quant=True" if per_channel_quant else ""
     down_moe_selector = "_down" if down_moe else ""
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
+    version_str = f",version={version}" if version > 1 else ""
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}{version_str}.json"
 
 
 @functools.lru_cache
@@ -43,6 +45,7 @@ def get_moe_configs(
     block_k: Optional[int] = 0,
     per_channel_quant: bool = False,
     down_moe: bool = False,
+    version: int = 1,
 ) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the fused MoE kernel.
@@ -71,6 +74,7 @@ def get_moe_configs(
         [block_n, block_k],
         per_channel_quant,
         down_moe=down_moe,
+        version=version,
     )
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
@@ -222,6 +226,7 @@ def try_get_optimal_moe_config(
     block_shape: Optional[List[int]] = None,
     per_channel_quant: bool = False,
     return_down_config: bool = False,
+    version: int = 1,
 ):
     from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
 
@@ -243,6 +248,7 @@ def try_get_optimal_moe_config(
             block_k,
             per_channel_quant=per_channel_quant,
             down_moe=False,
+            version=version,
         )
 
         if configs:
@@ -263,6 +269,7 @@ def try_get_optimal_moe_config(
                 block_k,
                 per_channel_quant=per_channel_quant,
                 down_moe=True,
+                version=version,
             )
             if down_configs:
                 down_config = down_configs[
