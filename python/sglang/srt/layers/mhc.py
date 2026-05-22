@@ -10,6 +10,7 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import is_ppu
 
 tilelang.set_log_level("WARNING")
 
@@ -674,7 +675,12 @@ def mhc_pre(
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         import deep_gemm
 
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        if is_ppu():
+            assert (
+                n_splits == 1
+            ), "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+        else:
+            n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
