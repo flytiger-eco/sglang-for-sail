@@ -664,6 +664,9 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # Memory Pool
+    SGLANG_SORT_PAGE = EnvBool(False)  # enable page sorting when not in PD mode
+
     # SAIL
     SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)

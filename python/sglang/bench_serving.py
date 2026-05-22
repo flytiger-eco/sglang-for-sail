@@ -910,6 +910,7 @@ class BenchmarkMetrics:
     median_ttft_ms: float
     std_ttft_ms: float
     p99_ttft_ms: float
+    p90_tpot_ms: float
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
@@ -1126,6 +1127,7 @@ def calculate_metrics(
         median_tpot_ms=np.median(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
+        p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
         mean_itl_ms=np.mean(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
@@ -1589,6 +1591,7 @@ async def benchmark(
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
         print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P90 TPOT (ms):", metrics.p90_tpot_ms))
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
