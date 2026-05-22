@@ -254,7 +254,11 @@ def _init_jit_cuda_arch_once():
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
-    _CUDA_ARCH = ArchInfo(major, minor, "")
+    suffix = ""
+    # Convey 80a to archinfo on 810e / 810, otherwise SGL_CUDA_ARCH will be set to 890 and raise assert error later.
+    if "810" in torch.cuda.get_device_name():
+        suffix = "a"
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
 @contextmanager

@@ -92,8 +92,8 @@ struct ActivationKernel {
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
   template <bool kFilterExpert>
-  static auto select_kernel(const std::string& type)
-      -> decltype(activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+  // can be removed in next release
+  static auto select_kernel(const std::string& type) -> void (*const)(ActivationParams) {
     using namespace host;
     if (type == "silu") {
       return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
