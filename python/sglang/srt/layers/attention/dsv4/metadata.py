@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     pass
@@ -99,11 +99,16 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    q_fp8_shape: torch.Size
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if (
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or not self.build_paged_mqa_logits_metadata
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -116,10 +121,29 @@ class PagedIndexerMetadata:
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
+
+            metadata_extra = None
+            if (
+                self.q_fp8_shape is not None
+                and not envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            ):
+                metadata_extra = (
+                    1,  # next_n
+                    self.q_fp8_shape[2],  # num_heads
+                    self.q_fp8_shape[3],  # head_dim
+                    1,  # element size
+                )
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                 _c4,
                 self.c4_page_size,
                 deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if is_ppu() and metadata_extra is not None
+                    else {}
+                ),
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
@@ -154,7 +178,7 @@ class PagedIndexerMetadata:
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=["page_size", "build_paged_mqa_logits_metadata"],
             copy_fields=copy_fields,
         )
 

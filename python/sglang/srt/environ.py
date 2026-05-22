@@ -595,6 +595,7 @@ class Envs:
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
@@ -674,6 +675,7 @@ class Envs:
     SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
+    SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
 
 
 envs = Envs()

@@ -83,6 +83,19 @@ def _jit_topk1024_module() -> Module:
 
 
 @cache_once
+def _jit_topk_prefill_module(topk: int) -> Module:
+    return load_jit(
+        make_name("topk_prefill"),
+        str(topk),
+        cuda_files=["deepseek_v4/topk_prefill.cuh"],
+        cuda_wrappers=[
+            ("top_k_per_row_prefill", "TopKPrefillKernel::transform"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
+@cache_once
 def _jit_topk_v2_module(topk: int) -> Module:
     return load_jit(
         make_name("topk_v2"),
@@ -242,6 +255,20 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module
 
 
 @cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_int8_module(dtype: torch.dtype) -> Module:
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + int8 act-quant (no norm)."""
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant_int8"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardInt8Kernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_metadata_module():
     return load_jit(
         make_name("metadata"),
@@ -365,6 +392,27 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
+
+
+def top_k_per_row_prefill(
+    scores: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    module = _jit_topk_prefill_module(out_page_indices.shape[1])
+    module.top_k_per_row_prefill(
+        scores,
+        row_starts,
+        row_ends,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+    )
 
 
 def topk_transform_512_v2(
@@ -684,6 +732,25 @@ def fused_q_indexer_rope_hadamard_quant(
         q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
     )
     return q_fp8, weights_out
+
+
+def fused_q_indexer_rope_hadamard_quant_int8(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    q_int8 = torch.empty(q_input.shape, dtype=torch.int8, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_int8_module(q_input.dtype)
+    module.forward(
+        q_input, q_int8, weight, weights_out, float(weight_scale), freqs_real, positions
+    )
+    return q_int8, weights_out
 
 
 def fused_k_norm_rope_flashmla(
