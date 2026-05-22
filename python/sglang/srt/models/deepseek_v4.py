@@ -75,7 +75,14 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    _is_ppu,
+)
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -1019,6 +1026,34 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        packed_modules_mapping["wqkv_a"] = ["wq_a", "wkv"]
+
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+        orig_to_new_prefix={
+            "mtp.0.self_attn": "model.decoder.self_attn",
+            "mtp.0.mlp": "model.decoder.mlp",
+            "mtp.0.e_proj": "model.e_proj",
+            "mtp.0.h_proj": "model.h_proj",
+        },
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1180,7 +1215,10 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -1236,6 +1274,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name:
             name = name.replace(".scale", ".weight_scale_inv")
+
+        if _is_ppu:
+            if quant_config and quant_config.get_name() == "fp8":
+                if quant_config.is_fp4_experts and "mlp.experts" in name:
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+            else:
+                name = name.replace(".weight_scale_inv", ".weight_scale")
 
         return name
 
@@ -1320,6 +1365,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        quant_config=self.quant_config,
                     )
 
                     layer_id = get_layer_id(name)
@@ -1480,8 +1526,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     cache_compressor_weight.pop(key)
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
+                                or name.endswith(".wq_a.weight_scale")
                                 or name.endswith(".wq_a.weight_scale_inv")
                                 or name.endswith(".wkv.weight")
+                                or name.endswith(".wkv.weight_scale")
                                 or name.endswith(".wkv.weight_scale_inv")
                             ):
                                 is_q = ".wq_a." in name
