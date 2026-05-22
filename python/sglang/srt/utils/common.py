@@ -197,6 +197,11 @@ def is_mps() -> bool:
     return torch.backends.mps.is_available()
 
 
+@lru_cache(maxsize=1)
+def is_ppu() -> bool:
+    return "PPU_SDK" in os.environ
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -1611,6 +1616,16 @@ def get_device_sm():
     return 0
 
 
+def get_device_tensorcore(device: torch.device | int | str):
+    sms = 0
+    if torch.cuda.is_available():
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        device_name = torch.cuda.get_device_name(device)
+        if "810E" in device_name:
+            sms = 20
+    return sms
+
+
 def _cuda_mem_fallback(reason: str) -> int:
     """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
 
@@ -1994,7 +2009,15 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "mps"
         return "mps:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
+    # NOTE: PPU torch still has attr cuda, this function will return "cuda" on ppu actually for now.
+    if is_ppu():
+        if device_id is None:
+            return "ppu"
+        return "ppu:{}".format(device_id)
+
+    raise RuntimeError(
+        "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, PPU) is available."
+    )
 
 
 @lru_cache(maxsize=1)
