@@ -349,6 +349,11 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
+
+            from sglang.srt.layers.attention.nsa.triton_kernel import (
+                is_fp4_indexer_cache_enabled,
+            )
+
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
@@ -370,6 +375,7 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 enable_hisparse=self.enable_hisparse,
+                use_fp4_indexer_cache=is_fp4_indexer_cache_enabled(),
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:

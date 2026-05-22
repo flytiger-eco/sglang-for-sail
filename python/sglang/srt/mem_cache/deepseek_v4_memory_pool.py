@@ -242,6 +242,8 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    # MXFP4 quant block — must match the act_quant_mxfp4 / fused store kernel.
+    mxfp4_block_size = 32
 
     def __init__(
         self,
@@ -254,6 +256,7 @@ class DeepSeekV4IndexerPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        use_fp4_cache: bool = False,
     ):
         super().__init__(
             size,
@@ -266,13 +269,27 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
+        self.use_fp4_cache = use_fp4_cache
 
         self._create_buffer()
 
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_cache:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
+    @property
+    def scale_bytes_per_token(self) -> int:
+        """Per-token scale bytes. FP8: 4 bytes (one fp32). MXFP4: head_dim/32 ue8m0 bytes."""
+        if self.use_fp4_cache:
+            return self.index_head_dim // self.mxfp4_block_size
+        return (self.index_head_dim // self.quant_block_size) * 4
+
     def _create_buffer(self):
-        num_scales_per_token = self.index_head_dim // self.quant_block_size
-        page_bytes = self.page_size * self.index_head_dim
-        page_bytes += self.page_size * num_scales_per_token * 4
+        page_bytes = self.page_size * self.packed_bytes_per_token
+        page_bytes += self.page_size * self.scale_bytes_per_token
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -307,19 +324,47 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len: int,
-        page_indices: torch.Tensor,
-        seq_len_sum: int,
-        max_seq_len: int,
+        seq_len: int = None,
+        page_indices: Optional[torch.Tensor] = None,
+        seq_len_sum: Optional[int] = None,
+        max_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert page_indices is not None
         buf = self.index_k_with_scale_buffer[layer_id]
+        if self.use_fp4_cache:
+            # FP4 layout: per-token = 64 packed bytes + 4 ue8m0 bytes. The
+            # accessor is byte-stride agnostic; pass the FP4 K-byte width as
+            # `index_head_dim`. NOTE: this path requires the
+            # (seq_len_sum, max_seq_len) calling convention — the legacy
+            # single-sequence form is unused on the FP4 path.
+            assert seq_len_sum is not None and max_seq_len is not None, (
+                "FP4 indexer cache requires the (seq_len_sum, max_seq_len) "
+                "gather form"
+            )
+            from sglang.srt.layers.attention.nsa.index_buf_accessor import (
+                _get_k_and_s_triton,
+            )
+
+            return _get_k_and_s_triton(
+                buf=buf,
+                page_indices=page_indices,
+                seq_lens=seq_len,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+                page_size=self.page_size,
+                index_head_dim=self.packed_bytes_per_token,
+            )
+        if seq_len_sum is not None and max_seq_len is not None:
+            return index_buf_accessor.GetKAndS.execute(
+                self,
+                buf,
+                page_indices=page_indices,
+                seq_len_tensor=seq_len,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+            )
         return index_buf_accessor.GetKAndS.execute(
-            self,
-            buf,
-            seq_len_tensor=seq_len,
-            page_indices=page_indices,
-            seq_len_sum=seq_len_sum,
-            max_seq_len=max_seq_len,
+            self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
     def set_index_k_scale_buffer(
@@ -329,6 +374,10 @@ class DeepSeekV4IndexerPool(KVCache):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        assert not self.use_fp4_cache, (
+            "Unfused FP4 cache insert is not supported. Enable "
+            "SGLANG_OPT_USE_FUSED_STORE_CACHE=1 when SGLANG_OPT_USE_FP4_INDEXER_CACHE is on."
+        )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
@@ -345,7 +394,7 @@ class DeepSeekV4IndexerPool(KVCache):
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
             indices=loc,
             page_size=self.page_size,
-            type="indexer",
+            type="indexer_mxfp4" if self.use_fp4_cache else "indexer",
         )
 
 
@@ -379,6 +428,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
+        use_fp4_indexer_cache: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -472,6 +522,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver,
         )
 
+        self.use_fp4_indexer_cache = use_fp4_indexer_cache
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
             self.c4_logical_size,
             c4_page_size,
@@ -480,6 +531,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_layer_num,
             device,
             enable_memory_saver,
+            use_fp4_cache=use_fp4_indexer_cache,
         )
 
         self._init_compressed_layer_mapping()

@@ -598,6 +598,8 @@ class Envs:
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
     # Use flash_mla_sparse_fwd in CSA prefill phase
     SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD = EnvBool(True)
+    # TODO: due to 2v1 deepgemm bug and not compatible with compressor_v2, disable fp4 indexer by default for now
+    SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(False)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
