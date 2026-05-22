@@ -1867,6 +1867,16 @@ class ServerArgs:
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                         self.attn_cp_size = self.tp_size // self.dp_size
 
+                        # assume that non-810e machine has 8 cards
+                        if not "810E" in get_device_name():
+                            assert (
+                                self.tp_size == 8
+                            ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        else:
+                            assert (
+                                self.tp_size <= 16
+                            ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8 or 16 on 810E)"
+
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                         )

@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.nsa.utils import (
+    NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
     is_nsa_enable_prefill_cp,
@@ -36,7 +37,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_ppu, print_info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
@@ -312,7 +314,9 @@ class NativeSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1
+            if (model_runner.server_args.enable_deterministic_inference and not _is_ppu)
+            else 0
         )
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
         assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
@@ -328,6 +332,7 @@ class NativeSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.indexer_head_dim = model_runner.model_config.index_head_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -367,6 +372,7 @@ class NativeSparseAttnBackend(
                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
 
+        self.flashmla_padding = 64
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -661,8 +667,28 @@ class NativeSparseAttnBackend(
                 seqlens_32_2d = _to_2d_context_lens(
                     seqlens_32, forward_batch.batch_size
                 )
+
+                metadata_extra = (
+                    1,  # next_n
+                    self.num_q_heads,  # num_heads
+                    self.indexer_head_dim,  # head_dim
+                    (
+                        1
+                        if not (envs.SGLANG_SAIL_BF16_INDEXER.get() and _is_ppu)
+                        else 2
+                    ),  # element size
+                )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    **(
+                        dict(
+                            metadata_extra=metadata_extra,
+                        )
+                        if _is_ppu
+                        else {}
+                    ),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -947,8 +973,28 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+
+                metadata_extra = (
+                    1,  # next_n
+                    self.num_q_heads,  # num_heads
+                    self.indexer_head_dim,  # head_dim
+                    (
+                        1
+                        if not (envs.SGLANG_SAIL_BF16_INDEXER.get() and _is_ppu)
+                        else 2
+                    ),  # element size
+                )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    **(
+                        dict(
+                            metadata_extra=metadata_extra,
+                        )
+                        if _is_ppu
+                        else {}
+                    ),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1098,8 +1144,28 @@ class NativeSparseAttnBackend(
                     else metadata.cache_seqlens_int32
                 )
                 seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+
+                metadata_extra = (
+                    1,  # next_n
+                    self.num_q_heads,  # num_heads
+                    self.indexer_head_dim,  # head_dim
+                    (
+                        1
+                        if not (envs.SGLANG_SAIL_BF16_INDEXER.get() and _is_ppu)
+                        else 2
+                    ),  # element size
+                )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    **(
+                        dict(
+                            metadata_extra=metadata_extra,
+                        )
+                        if _is_ppu
+                        else {}
+                    ),
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     object.__setattr__(
@@ -1472,6 +1538,20 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
+            # PPU and dpsk opensource mla need head_num padding here
+            # sglang community uses https://github.com/sgl-project/FlashMLA/, not needing
+            if _is_ppu:
+                if layer.tp_q_head_num % self.flashmla_padding != 0:
+                    assert self.flashmla_padding % layer.tp_q_head_num == 0
+                    print_info_once(
+                        f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
+                    )
+                    q_padded = q_all.new_empty(
+                        (q_all.shape[0], self.flashmla_padding, q_all.shape[2])
+                    )
+                    q_padded[:, : layer.tp_q_head_num, :] = q_all
+                    q_all = q_padded
+
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
@@ -1484,6 +1564,15 @@ class NativeSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
+
+            if _is_ppu:
+                return self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )[:, : layer.tp_q_head_num, :]
 
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -1810,7 +1899,7 @@ class NativeSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
+        if NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and not self.nsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -1832,7 +1921,7 @@ class NativeSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
 
         if target_q_heads != num_q_heads:
@@ -2296,7 +2385,7 @@ class NativeSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
             topk=self.nsa_index_topk,
         )
 

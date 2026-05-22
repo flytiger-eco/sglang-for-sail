@@ -6,7 +6,7 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, get_compiler_backend, is_hip
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -53,6 +53,7 @@ class GetK:
         return index_k_fp8[:seq_len]
 
     @classmethod
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def torch_fast(
         cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
@@ -125,6 +126,7 @@ class GetS:
         return index_k_scale_fp8[:seq_len]
 
     @classmethod
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def torch_fast(
         cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
     ):
@@ -275,6 +277,7 @@ class SetK:
             ] = index_k[i].view(torch.uint8)
 
     @classmethod
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def torch_fast(
         cls,
         pool: "NSATokenToKVPool",
@@ -325,6 +328,7 @@ class SetS:
             )
 
     @classmethod
+    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def torch_fast(
         cls,
         pool: "NSATokenToKVPool",
@@ -386,13 +390,21 @@ class SetKAndS:
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
         loc = loc.to(torch.int64)
 
-        _set_k_and_s_triton(
-            buf=buf,
-            loc=loc,
-            index_k=index_k,
-            index_k_scale=index_k_scale,
-            page_size=pool.page_size,
-        )
+        if buf.dtype == torch.uint8:
+            _set_k_and_s_triton(
+                buf=buf,
+                loc=loc,
+                index_k=index_k,
+                index_k_scale=index_k_scale,
+                page_size=pool.page_size,
+            )
+        else:
+            _set_k_triton_bf16(
+                buf=buf,
+                loc=loc,
+                index_k=index_k,
+                page_size=pool.page_size,
+            )
 
 
 def _set_k_and_s_triton(
@@ -444,7 +456,7 @@ def _set_k_and_s_triton(
     if _is_fp8_fnuz:
         assert index_k.dtype == torch.float8_e4m3fnuz
     else:
-        assert index_k.dtype == torch.float8_e4m3fn
+        assert index_k.dtype in [torch.float8_e4m3fn, torch.int8]
     assert index_k_scale.dtype == torch.float32
 
     assert buf.is_contiguous()
@@ -455,7 +467,7 @@ def _set_k_and_s_triton(
     if _is_fp8_fnuz:
         buf_fp8 = buf.view(torch.float8_e4m3fnuz)
     else:
-        buf_fp8 = buf.view(torch.float8_e4m3fn)
+        buf_fp8 = buf.view(index_k.dtype)
     buf_fp32 = buf.view(torch.float32)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
@@ -464,6 +476,47 @@ def _set_k_and_s_triton(
         loc,
         index_k,
         index_k_scale,
+        index_k.stride(0),
+        PAGE_SIZE=page_size,
+        BUF_NUMEL_PER_PAGE=buf_numel_per_page,
+        NUM_K_ELEMS_PER_TOKEN=index_head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=page_size * index_head_dim,
+    )
+
+
+def _set_k_triton_bf16(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    index_k: torch.Tensor,
+    page_size: int,
+):
+    """
+    :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
+    :param loc: (num_tokens_to_write,), int, element := the token index to write to
+    :param index_k: (num_tokens_to_write, 128 elem), fp8
+    :param index_k_scale: (num_tokens_to_write, 1 elem), fp32
+    :return:
+    """
+    num_pages, buf_numel_per_page = buf.shape
+    (num_tokens_to_write,) = loc.shape
+    num_tokens_to_write_, index_head_dim = index_k.shape
+    assert buf_numel_per_page == 64 * 128
+    assert num_tokens_to_write == num_tokens_to_write_
+    assert index_head_dim == 128
+    assert page_size == 64
+
+    assert buf.dtype == torch.bfloat16
+    assert loc.dtype == torch.int64, f"{loc.dtype=}"  # can be int32
+    assert index_k.dtype == torch.bfloat16
+
+    assert buf.is_contiguous()
+    assert loc.is_contiguous()
+    assert index_k.is_contiguous()
+
+    _set_k_triton_kernel_bf16[(num_tokens_to_write,)](
+        buf,
+        loc,
+        index_k,
         index_k.stride(0),
         PAGE_SIZE=page_size,
         BUF_NUMEL_PER_PAGE=buf_numel_per_page,
@@ -515,6 +568,38 @@ def _set_k_and_s_triton_kernel(
     tl.store(buf_fp32_ptr + out_s_offset, k_scale)
 
 
+@triton.jit
+def _set_k_triton_kernel_bf16(
+    buf_ptr,
+    loc_ptr,
+    index_k_ptr,
+    index_k_ptr_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    NUM_K_ELEMS_PER_TOKEN: tl.constexpr,
+    S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+
+    loc = tl.load(loc_ptr + token_id)
+
+    in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+
+    # no need for `mask`, since we read 128B for k and 4B for scale, both pow of 2
+    k = tl.load(index_k_ptr + in_k_offsets)
+
+    loc_page_index = loc // PAGE_SIZE
+    loc_token_offset_in_page = loc % PAGE_SIZE
+
+    out_k_offsets = (
+        loc_page_index * BUF_NUMEL_PER_PAGE
+        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
+        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
+    )
+
+    tl.store(buf_ptr + out_k_offsets, k)
+
+
 def _get_k_triton(
     buf: torch.Tensor,
     page_indices: torch.Tensor,
@@ -535,7 +620,7 @@ def _get_k_triton(
     num_pages, buf_numel_per_page = buf.shape
 
     # Allocate output
-    out = torch.empty((seq_len, index_head_dim), dtype=torch.uint8, device=buf.device)
+    out = torch.empty((seq_len, index_head_dim), dtype=buf.dtype, device=buf.device)
 
     # Launch kernel with one thread per token
     grid = (seq_len,)
@@ -543,7 +628,6 @@ def _get_k_triton(
         buf,
         page_indices,
         out,
-        seq_len,
         page_size,
         buf_numel_per_page,
         index_head_dim,
@@ -558,7 +642,6 @@ def _get_k_triton_kernel(
     buf_ptr,
     page_indices_ptr,
     out_ptr,
-    seq_len: tl.constexpr,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
@@ -622,7 +705,6 @@ def _get_s_triton(
         buf,
         page_indices,
         out,
-        seq_len,
         page_size,
         buf_numel_per_page,
         s_offset_in_page,
@@ -636,7 +718,6 @@ def _get_s_triton_kernel(
     buf_ptr,
     page_indices_ptr,
     out_ptr,
-    seq_len: tl.constexpr,
     page_size: tl.constexpr,
     buf_numel_per_page: tl.constexpr,
     s_offset_in_page: tl.constexpr,
@@ -696,7 +777,7 @@ def _get_k_and_s_triton(
     """
     # Allocate outputs
     k_out = torch.empty(
-        (seq_len_sum, index_head_dim), dtype=torch.uint8, device=buf.device
+        (seq_len_sum, index_head_dim), dtype=buf.dtype, device=buf.device
     )
     s_out = torch.empty((seq_len_sum, 4), dtype=torch.uint8, device=buf.device)
 

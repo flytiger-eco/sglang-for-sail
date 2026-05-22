@@ -57,6 +57,10 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var(
+    "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8", "true"
+)
+
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
     return original_seq_lens.clamp(max=nsa_index_topk)

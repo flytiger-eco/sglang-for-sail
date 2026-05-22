@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_ppu,
     next_power_of_2,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -1980,7 +1981,10 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    use_bf16_indexer = envs.SGLANG_SAIL_BF16_INDEXER.get() and is_ppu()
+    index_k_with_scale_buffer_dtype = (
+        torch.uint8 if not use_bf16_indexer else torch.bfloat16
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -2054,8 +2058,13 @@ class NSATokenToKVPool(MLATokenToKVPool):
                         (index_buf_size + page_size + 1) // self.page_size,
                         self.page_size
                         * (
-                            index_head_dim + index_head_dim // self.quant_block_size * 4
-                        ),
+                            (
+                                index_head_dim
+                                + index_head_dim // self.quant_block_size * 4
+                            )
+                            if not self.use_bf16_indexer
+                            else index_head_dim
+                        ),  # bf16 kcache does not need scale
                     ),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
