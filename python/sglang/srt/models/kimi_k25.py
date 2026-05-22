@@ -28,6 +28,7 @@ except ImportError:
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization import (
+    MixedPrecisionW4Config,
     Mxfp4Config,
     W8A8Int8Config,
 )
@@ -635,6 +636,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         }
     )
 
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: KimiK25Config,
@@ -662,7 +671,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Also applied in PR #20131.
         self.language_model = None
         if not config.encoder_only:
-            prefix_config = (ModelSlimConfig, Mxfp4Config, W8A8Int8Config)
+            prefix_config = (
+                MixedPrecisionW4Config,
+                ModelSlimConfig,
+                Mxfp4Config,
+                W8A8Int8Config,
+            )
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
