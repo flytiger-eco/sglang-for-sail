@@ -6,17 +6,23 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_musa,
+    is_ppu,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 
 def _compute_enable_deep_gemm():
     sm_version = get_device_sm()
-    if (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31):
+    if not _is_ppu and (
+        (_is_cuda and sm_version < 90) or (_is_musa and sm_version < 31)
+    ):
+        return False
+    elif _is_ppu and sm_version < 80:
         return False
     if not (_is_cuda or _is_musa):
         return False
@@ -33,4 +39,4 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
-DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_ppu)

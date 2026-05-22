@@ -27,8 +27,11 @@ except ImportError:
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization import (
+    Mxfp4Config,
+    W8A8Int8Config,
+)
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -655,14 +658,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
+        # In unofficial weights, "language_model" prefix must be added to be compatible with ignore lists.
+        # Also applied in PR #20131.
         self.language_model = None
         if not config.encoder_only:
+            prefix_config = (ModelSlimConfig, Mxfp4Config, W8A8Int8Config)
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
                 prefix=(
-                    "language_model"
-                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
+                    add_prefix("language_model", prefix)
+                    if isinstance(quant_config, prefix_config)
                     else ""
                 ),
             )

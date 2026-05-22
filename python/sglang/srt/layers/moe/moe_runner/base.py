@@ -50,6 +50,11 @@ class MoeRunnerConfig:
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
 
+    # <NOTE>
+    # PPU specialize params
+    # </NOTE>
+    dispatch_dtype: Optional[torch.dtype] = None
+
 
 @dataclass
 class RunnerInput(ABC):

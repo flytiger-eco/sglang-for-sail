@@ -31,16 +31,26 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
     CompressedTensorsFusedMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+)
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -107,9 +117,16 @@ class DeepEPMoE(FusedMoE):
         )
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
-            quant_config, Fp8Config
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+            isinstance(quant_config, Fp8Config)
+            or isinstance(quant_config, W8A8Int8Config)
+            or isinstance(quant_config, Mxfp4Config)
+            or isinstance(quant_config, CompressedTensorsConfig)
+            or quant_config is None
         ):
+            # <NOTE>
+            # TODO: move bf16 deepgemm into python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+            # </NOTE>
             self.deprecate_flag = True
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM

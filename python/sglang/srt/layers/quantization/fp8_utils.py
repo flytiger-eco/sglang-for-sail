@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_sm,
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
@@ -43,6 +44,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_musa,
+    is_ppu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -59,6 +61,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -124,6 +127,27 @@ use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
+
+
+def gemm_nt_f8f8bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_f8f8bf16_fake)
+def gemm_nt_f8f8bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
 def use_rowwise_torch_scaled_mm():
@@ -674,7 +698,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    if not _is_musa and not _is_ppu:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],
@@ -1539,6 +1563,26 @@ def apply_fp8_linear(
                     qinput, x_scale = per_token_group_quant_fp8(
                         input_2d, group_size=input_2d.shape[1]
                     )
+    # PPU: use deepgemm for channelwise fp8 (no bias support)
+    if (
+        _is_ppu
+        and get_device_sm() >= 89
+        and weight_scale.numel() == weight.shape[1]
+        and bias is None
+    ):
+        out = torch.empty(
+            output_shape,
+            dtype=torch.bfloat16,
+            device=qinput.device,
+        )
+        gemm_nt_f8f8bf16(
+            qinput,
+            x_scale,
+            weight.t(),
+            weight_scale,
+            out,
+        )
+        return out.view(*output_shape).to(input.dtype)
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
