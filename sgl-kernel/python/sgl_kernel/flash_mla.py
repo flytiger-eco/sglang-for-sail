@@ -20,6 +20,7 @@ from sglang.srt.utils import is_ppu
 if is_ppu():
     try:
         import flash_mla as flashmla
+        from flash_mla import FlashMLASchedMeta
 
         _flashmla_import_error = None
         _ppu_flashmla_imported = True
@@ -142,7 +143,7 @@ def flash_mla_with_kvcache(
     ), "descale_q and descale_k should be both None or both not None"
 
     if SGLANG_PROFILE_NVTX:
-        batch_size = len(num_splits) - 1
+        batch_size = q.shape[0]
         if len(q) == 4:
             max_seqlen_q = q.shape[-3]
         else:
@@ -189,8 +190,10 @@ def flash_mla_with_kvcache(
                 block_table,
                 cache_seqlens,
                 head_dim_v,
-                tile_scheduler_metadata,
-                num_splits,
+                tile_scheduler_metadata=FlashMLASchedMeta(
+                    tile_scheduler_metadata=tile_scheduler_metadata,
+                    num_splits=num_splits,
+                ),
                 softmax_scale=softmax_scale,
                 causal=causal,
                 is_fp8_kvcache=is_fp8_kvcache,

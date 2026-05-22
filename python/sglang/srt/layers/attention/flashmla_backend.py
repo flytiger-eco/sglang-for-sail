@@ -5,11 +5,15 @@ Support attention backend for FlashMLA.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import triton
-from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from sgl_kernel.flash_mla import (
+    FlashMLASchedMeta,
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
@@ -29,18 +33,15 @@ PAGE_SIZE = 64
 
 @dataclass
 class FlashMLADecodeMetadata:
-    flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    num_splits: Optional[torch.Tensor] = None
+    flashmla_metadata: Optional[FlashMLASchedMeta] = None
     block_kv_indices: Optional[torch.Tensor] = None
 
     def __init__(
         self,
-        flashmla_metadata: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        num_splits: Optional[torch.Tensor] = None,
+        flashmla_metadata: Optional[FlashMLASchedMeta] = None,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         self.flashmla_metadata = flashmla_metadata
-        self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
 
 
@@ -106,7 +107,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, _ = get_mla_metadata(
                 forward_batch.seq_lens.to(torch.int32),
                 self.num_q_heads,
                 1,
@@ -114,7 +115,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
-                num_splits,
                 block_kv_indices,
             )
         elif forward_batch.forward_mode.is_target_verify():
@@ -137,7 +137,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.req_to_token.stride(0),
                 max_seqlen_pad,
             )
-            mla_metadata, num_splits = get_mla_metadata(
+            mla_metadata, _ = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
@@ -145,7 +145,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             self.forward_metadata = FlashMLADecodeMetadata(
                 mla_metadata,
-                num_splits,
                 block_kv_indices,
             )
         else:
@@ -209,30 +208,41 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             num_q_heads = self.num_q_heads
 
-            mla_metadata, num_splits = get_mla_metadata(
+            scheduler_metadata, _ = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
+            if self.is_fp8_kvcache:
+                if is_ppu():
+                    raise
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    num_q_heads,
+                    1,
+                    is_fp8_kvcache=self.is_fp8_kvcache,
+                )
+                actual_num_sm_parts = mla_metadata.shape[0]
+                assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
+                    f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
+                    f"{self.cuda_graph_mla_metadata.shape[0]}"
+                )
 
-            actual_num_sm_parts = mla_metadata.shape[0]
-            assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
-                f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
-                f"{self.cuda_graph_mla_metadata.shape[0]}"
-            )
+                self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
 
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-
-            self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                :actual_num_sm_parts
-            ]
-            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                    :actual_num_sm_parts
+                ]
+                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+                scheduler_metadata.tile_scheduler_metadata = (
+                    self.cuda_graph_mla_metadata_view
+                )
+                scheduler_metadata.num_splits = self.cuda_graph_num_splits_view
 
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata_view,
-                self.cuda_graph_num_splits_view,
+                scheduler_metadata,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
 
@@ -250,27 +260,36 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices.stride(0),
             )
 
-            mla_metadata, num_splits = get_mla_metadata(
+            scheduler_metadata, _ = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
+            if self.is_fp8_kvcache:
+                if is_ppu():
+                    raise
 
-            actual_num_sm_parts = mla_metadata.shape[0]
-            assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0]
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_draft_tokens * self.num_q_heads,
+                    1,
+                    is_fp8_kvcache=self.is_fp8_kvcache,
+                )
 
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+                actual_num_sm_parts = mla_metadata.shape[0]
+                assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0]
 
-            self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                :actual_num_sm_parts
-            ]
-            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+                self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+
+                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                    :actual_num_sm_parts
+                ]
+                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
 
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata_view,
-                self.cuda_graph_num_splits_view,
+                scheduler_metadata,
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         else:
@@ -312,35 +331,49 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
             num_q_heads = self.num_q_heads
 
-            mla_metadata, num_splits = get_mla_metadata(
+            scheduler_metadata, _ = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
+            if self.is_fp8_kvcache:
+                if is_ppu():
+                    raise
 
-            actual_num_sm_parts = mla_metadata.shape[0]
-
-            if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
-                import logging
-
-                logger = logging.getLogger(__name__)
-                logger.warning(
-                    f"num_sm_parts mismatch in CUDA Graph replay: "
-                    f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
-                    f"replay={actual_num_sm_parts}. "
-                    f"This may indicate batch size changed between capture and replay."
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    num_q_heads,
+                    1,
+                    is_fp8_kvcache=self.is_fp8_kvcache,
                 )
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
 
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+                actual_num_sm_parts = mla_metadata.shape[0]
 
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
+                if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
+                    import logging
+
+                    logger = logging.getLogger(__name__)
+                    logger.warning(
+                        f"num_sm_parts mismatch in CUDA Graph replay: "
+                        f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
+                        f"replay={actual_num_sm_parts}. "
+                        f"This may indicate batch size changed between capture and replay."
+                    )
+                    self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                        :actual_num_sm_parts
+                    ]
+                    self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[
+                        : bs + 1
+                    ]
+
+                self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+
+                self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
+                self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
+
+            self.forward_metadata.flashmla_metadata = scheduler_metadata
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -360,26 +393,39 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices.stride(0),
             )
 
-            mla_metadata, num_splits = get_mla_metadata(
+            scheduler_metadata, _ = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
                 1,
                 is_fp8_kvcache=self.is_fp8_kvcache,
             )
+            if self.is_fp8_kvcache:
+                if is_ppu():
+                    raise
 
-            actual_num_sm_parts = mla_metadata.shape[0]
+                mla_metadata, num_splits = get_mla_metadata(
+                    seq_lens.to(torch.int32),
+                    self.num_draft_tokens * self.num_q_heads,
+                    1,
+                    is_fp8_kvcache=self.is_fp8_kvcache,
+                )
 
-            if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+                actual_num_sm_parts = mla_metadata.shape[0]
 
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+                if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
+                    self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
+                        :actual_num_sm_parts
+                    ]
+                    self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[
+                        : bs + 1
+                    ]
 
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
+                self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
+                self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+
+                self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
+                self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
+            self.forward_metadata.flashmla_metadata = scheduler_metadata
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -423,6 +469,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
+            # NOTE (kai): PPU do not support flashmla dense fp8, this path raise error.
             if layer.k_scale is not None:
                 q_scale = layer.k_scale
                 descale_q = layer.k_scale.reshape(1)
@@ -462,8 +509,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_table=self.forward_metadata.block_kv_indices[:bs],
                 cache_seqlens=forward_batch.seq_lens.to(torch.int32),
                 head_dim_v=self.kv_lora_rank,
-                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-                num_splits=self.forward_metadata.num_splits,
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata.tile_scheduler_metadata,
+                num_splits=self.forward_metadata.flashmla_metadata.num_splits,
                 softmax_scale=layer.scaling,
                 causal=True,
             )
@@ -497,6 +544,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             if self.is_fp8_kvcache:
+                # NOTE (kai): PPU do not support flashmla dense fp8, this path raise error.
                 if layer.k_scale is not None:
                     q_scale = layer.k_scale
                     descale_q = layer.k_scale.reshape(1)
@@ -538,8 +586,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     cache_seqlens=forward_batch.seq_lens.to(torch.int32)
                     + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
-                    tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
-                    num_splits=self.forward_metadata.num_splits,
+                    tile_scheduler_metadata=self.forward_metadata.flashmla_metadata.tile_scheduler_metadata,
+                    num_splits=self.forward_metadata.flashmla_metadata.num_splits,
                     softmax_scale=layer.scaling,
                     causal=True,
                 )

@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_ppu = is_ppu()
 
+if is_ppu:
+    pass
+
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
 
@@ -98,10 +101,12 @@ class NSAFlashMLAMetadata:
     def slice(self, sli):
         return NSAFlashMLAMetadata(
             flashmla_metadata=self.flashmla_metadata,
-            num_splits=self.num_splits[sli],
+            num_splits=self.num_splits,
         )
 
     def copy_(self, other: "NSAFlashMLAMetadata"):
+        if is_ppu():
+            return
         self.flashmla_metadata.copy_(other.flashmla_metadata)
         self.num_splits.copy_(other.num_splits)
 
@@ -2378,7 +2383,7 @@ class NativeSparseAttnBackend(
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        flashmla_metadata, num_splits = get_mla_metadata(
+        flashmla_metadata, _ = get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?
@@ -2390,8 +2395,8 @@ class NativeSparseAttnBackend(
         )
 
         return NSAFlashMLAMetadata(
-            flashmla_metadata=flashmla_metadata,
-            num_splits=num_splits,
+            flashmla_metadata=flashmla_metadata.tile_scheduler_metadata,
+            num_splits=flashmla_metadata.num_splits,
         )
 
 
