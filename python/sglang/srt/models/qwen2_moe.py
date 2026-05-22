@@ -745,6 +745,16 @@ class Qwen2MoeModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        def _quant_config_new(idx, prefix):
+            _layer_idx = int(prefix.split(".")[-1])
+            _mix_layer = (
+                quant_config.mix_layer
+                if quant_config and hasattr(quant_config, "mix_layer")
+                else None
+            )
+            _mix_layer = _mix_layer or []
+            return None if _layer_idx in _mix_layer else quant_config
+
         # Use the provided decoder layer type or default to Qwen2MoeDecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2MoeDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -752,7 +762,7 @@ class Qwen2MoeModel(nn.Module):
             lambda idx, prefix: decoder_layer_type(
                 layer_id=idx,
                 config=config,
-                quant_config=quant_config,
+                quant_config=_quant_config_new(idx, prefix),
                 prefix=prefix,
                 alt_stream=alt_stream,
             ),

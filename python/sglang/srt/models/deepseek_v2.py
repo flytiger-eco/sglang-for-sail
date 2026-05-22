@@ -157,6 +157,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_ppu,
     _is_xpu,
     _use_aiter,
     _use_aiter_gfx95,
@@ -640,6 +641,10 @@ class DeepseekV2MoE(nn.Module):
                     == "compressed-tensors"
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                elif _is_ppu:
+                    # The following code is specific to intel_amx_backend.
+                    # Can be safely skipped when running on PPU.
                     pass
                 else:
                     assert (

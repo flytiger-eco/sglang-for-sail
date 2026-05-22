@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
+    is_ppu,
     is_xpu,
 )
 
@@ -43,6 +44,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_ppu = is_ppu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
