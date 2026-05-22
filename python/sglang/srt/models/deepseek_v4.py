@@ -548,11 +548,14 @@ class MQALayer(nn.Module):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
-            rank = self.tp_rank
-            tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
+        if not _is_ppu:
+            if self.tp_size > 1:
+                q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
+                rank = self.tp_rank
+                tp_slice = slice(
+                    rank * self.n_local_heads, (rank + 1) * self.n_local_heads
+                )
+                q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
