@@ -658,6 +658,10 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # SAIL
+    SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
+    SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

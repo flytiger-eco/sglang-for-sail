@@ -37,6 +37,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    check_acext_version_compatibility,
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
@@ -67,6 +68,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    set_acext_token_limit,
     torch_release,
     xpu_has_xmx_support,
 )
@@ -200,6 +202,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "acext",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -905,6 +908,7 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+        self._handle_ppu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
         from sglang.srt.platforms import current_platform
@@ -1299,6 +1303,14 @@ class ServerArgs:
                 )
             self.disable_piecewise_cuda_graph = True
 
+    def _handle_ppu_backends(self):
+        if is_ppu():
+            # acext init
+            if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
+                envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
+            if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+                check_acext_version_compatibility()
+
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
         if self.enforce_piecewise_cuda_graph:
@@ -1487,6 +1499,13 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
+
+        # Set acext config for PPU
+        if is_ppu():
+            if self.chunked_prefill_size is not None:
+                set_acext_token_limit(
+                    acext_num_tokens=int(self.chunked_prefill_size * 0.5),
+                )
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
