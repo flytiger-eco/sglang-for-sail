@@ -57,6 +57,7 @@ else:
         dsv3_router_gemm,
         fp8_blockwise_scaled_mm,
         fp8_scaled_mm,
+        gptq_dequantize,
         gptq_gemm,
         gptq_shuffle,
         int8_scaled_mm,
