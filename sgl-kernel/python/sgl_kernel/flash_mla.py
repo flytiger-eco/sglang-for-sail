@@ -2,6 +2,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+
 try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
@@ -24,6 +26,17 @@ if is_ppu():
     except Exception as _e:
         _flashmla_import_error = _e
         _ppu_flashmla_imported = False
+
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
 
 
 def get_mla_metadata(
@@ -128,6 +141,27 @@ def flash_mla_with_kvcache(
         descale_k is None
     ), "descale_q and descale_k should be both None or both not None"
 
+    if SGLANG_PROFILE_NVTX:
+        batch_size = len(num_splits) - 1
+        if len(q) == 4:
+            max_seqlen_q = q.shape[-3]
+        else:
+            max_seqlen_q = 1
+
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        else:
+            if SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+                cu_seqlens_k_list = (
+                    cache_seqlens.flatten().cpu().tolist()
+                    if cache_seqlens is not None
+                    else "[]"
+                )
+                nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal},num_blocks:{k_cache.shape[-4]},page_block_size:{k_cache.shape[-3]},cu_seqlens_k:{cu_seqlens_k_list}"
+            else:
+                nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        th_nvtx_range_push(nvtx_message)
+
     if indices is None and q.element_size() == 1:
         if _ppu_flashmla_imported:
             raise NotImplementedError(
@@ -149,7 +183,7 @@ def flash_mla_with_kvcache(
         )
     else:
         if _ppu_flashmla_imported:
-            return flashmla.flash_mla_with_kvcache(
+            out, softmax_lse = flashmla.flash_mla_with_kvcache(
                 q,
                 k_cache,
                 block_table,
@@ -162,6 +196,9 @@ def flash_mla_with_kvcache(
                 is_fp8_kvcache=is_fp8_kvcache,
                 indices=indices,
             )
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
+            return out, softmax_lse
 
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
             q,
@@ -176,6 +213,8 @@ def flash_mla_with_kvcache(
             is_fp8_kvcache,
             indices,
         )
+    if SGLANG_PROFILE_NVTX:
+        th_nvtx_range_pop()
     return out, softmax_lse
 
 

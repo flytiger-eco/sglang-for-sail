@@ -1,9 +1,51 @@
 import contextlib
+import functools
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
 import torch
+
+# ==== NVTX profiling for MTP stages ====
+# Dedicated lightweight NVTX helpers used to annotate MTP pipeline stages
+# (draft decode / target verify / draft extend). Mirrors the import-guarded
+# pattern in model_runner.py so builds without NVTX still work.
+try:
+    from torch.cuda.nvtx import range_pop as _th_nvtx_range_pop  # type: ignore
+    from torch.cuda.nvtx import range_push as _th_nvtx_range_push  # type: ignore
+except ImportError:
+
+    def _th_nvtx_range_push(label):  # type: ignore
+        pass
+
+    def _th_nvtx_range_pop():  # type: ignore
+        pass
+
+
+_SGLANG_PROFILE_NVTX = os.getenv("SGLANG_PROFILE_NVTX", False)
+
+
+def _mtp_nvtx(name: str):
+    """Decorator: wrap an MTP stage method so its entire execution is bracketed
+    by an NVTX range labeled ``name``. Active only when SGLANG_PROFILE_NVTX is set.
+    """
+
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if _SGLANG_PROFILE_NVTX:
+                _th_nvtx_range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if _SGLANG_PROFILE_NVTX:
+                    _th_nvtx_range_pop()
+
+        return _wrapped
+
+    return _deco
+
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -336,6 +378,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
+    @_mtp_nvtx("mtp_draft_decode")
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -511,6 +554,7 @@ class EagleDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
+    @_mtp_nvtx("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
@@ -564,6 +608,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
+    @_mtp_nvtx("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -968,6 +1013,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 sa.speculative_num_draft_tokens,
             ) = backup
 
+    @_mtp_nvtx("mtp_target_verify")
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory

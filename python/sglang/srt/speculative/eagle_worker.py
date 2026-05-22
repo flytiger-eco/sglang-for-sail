@@ -1,9 +1,51 @@
+import functools
 import logging
+import os
 import time
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import torch
+
+# ==== NVTX profiling for MTP stages ====
+# Dedicated lightweight NVTX helpers used to annotate MTP pipeline stages
+# (draft decode / target verify / draft extend). Mirrors the import-guarded
+# pattern in model_runner.py so builds without NVTX still work.
+try:
+    from torch.cuda.nvtx import range_pop as _th_nvtx_range_pop  # type: ignore
+    from torch.cuda.nvtx import range_push as _th_nvtx_range_push  # type: ignore
+except ImportError:
+
+    def _th_nvtx_range_push(label):  # type: ignore
+        pass
+
+    def _th_nvtx_range_pop():  # type: ignore
+        pass
+
+
+_SGLANG_PROFILE_NVTX = os.getenv("SGLANG_PROFILE_NVTX", False)
+
+
+def _mtp_nvtx(name: str):
+    """Decorator: wrap an MTP stage method so its entire execution is bracketed
+    by an NVTX range labeled ``name``. Active only when SGLANG_PROFILE_NVTX is set.
+    """
+
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if _SGLANG_PROFILE_NVTX:
+                _th_nvtx_range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if _SGLANG_PROFILE_NVTX:
+                    _th_nvtx_range_pop()
+
+        return _wrapped
+
+    return _deco
+
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
@@ -755,6 +797,7 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=capture_mode,
         )
 
+    @_mtp_nvtx("mtp_draft_decode")
     def draft(self, batch: ScheduleBatch):
         # Parse args
         if batch.forward_mode.is_idle():
@@ -932,6 +975,7 @@ class EAGLEWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
+    @_mtp_nvtx("mtp_target_verify")
     def verify(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
@@ -1107,6 +1151,7 @@ class EAGLEWorker(TpModelWorker):
             model=self.target_worker.model_runner.model,
         )
 
+    @_mtp_nvtx("mtp_draft_extend_prefill")
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
@@ -1151,6 +1196,7 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
+    @_mtp_nvtx("mtp_draft_extend_decode")
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
     ) -> EagleDraftInput:

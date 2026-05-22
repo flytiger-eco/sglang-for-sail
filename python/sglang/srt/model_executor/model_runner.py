@@ -284,6 +284,24 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         )
 
 
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter
+
+        use_model_prof = True
+
+    except ImportError as e:
+        use_model_prof = False
+
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
+
 # Detect stragger ranks in model loading
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
@@ -486,6 +504,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+        if SGLANG_PROFILE_NVTX:
+            self.iteration = 0
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -3333,6 +3353,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if SGLANG_PROFILE_NVTX:
+                if forward_batch.extend_seq_lens_cpu is None:
+                    th_nvtx_range_push(
+                        f"total bs={forward_batch.batch_size}, forward_pass_id={self.forward_pass_id}"
+                    )
+                else:
+                    th_nvtx_range_push(
+                        f"total bs={forward_batch.batch_size}, P bs={len(forward_batch.extend_seq_lens_cpu)}, forward_pass_id={self.forward_pass_id}"
+                    )
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3349,6 +3378,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend,
                     split_forward_count,
                 )
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
@@ -3413,12 +3444,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         # Replay cuda graph if applicable
+
+        if SGLANG_PROFILE_NVTX:
+            if use_model_prof:
+                prof_iter(self.iteration)
+            self.iteration += 1
+
         if can_run_graph:
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_push("decode_cudagraph")
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -3449,24 +3490,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Forward without cuda graph
         if forward_batch.forward_mode.is_decode():
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_push("forward_decode")
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_split_prefill():
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_push("forward_split_prefill")
             ret = self.forward_split_prefill(
                 forward_batch,
                 reinit_attn_backend=reinit_attn_backend,
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_push("forward_extend")
             ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_idle():
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_push("forward_idle")
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
@@ -3476,7 +3525,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.pp_group.is_last_rank
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
-
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
@@ -3510,6 +3560,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+
+        if SGLANG_PROFILE_NVTX:
+            logits_output_shape = getattr(
+                logits_output.next_token_logits, "shape", None
+            )
+            th_nvtx_range_push(
+                f"[FW_NATIVE] op:sample,logits_output:{logits_output_shape}"
+            )
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -3527,6 +3585,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ),
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
         return next_token_ids
 
     def compute_logprobs_only(

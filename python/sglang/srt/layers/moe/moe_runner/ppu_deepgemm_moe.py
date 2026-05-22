@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import silu_and_mul
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.ep_moe.kernels import ep_gather, ep_scatter_sail
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -31,6 +32,20 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatchOutput,
 )
+
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_TOPID = envs.SGLANG_PROFILE_NVTX_PRINT_TOPID.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        from sglang.srt.utils import logger
+
+        logger.warning(f"Import NVTX Error! {e}")
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_TOPID = False
 
 
 @torch.compile
@@ -410,6 +425,30 @@ def deep_moe_impl_fused(
     N = w1.shape[1]
     K = a.shape[-1]
 
+    # print topid only if SGLANG_PROFILE_NVTX_PRINT_TOPID_TOPID set to avoid impact perf compare
+    nvtx_pushed = False
+    if SGLANG_PROFILE_NVTX and SGLANG_PROFILE_NVTX_PRINT_TOPID:
+        if not torch.cuda.is_current_stream_capturing():
+            num_activated_experts = (num_recv_tokens_per_expert > 0).sum().item()
+            token_counts_list = num_recv_tokens_per_expert.flatten().cpu().tolist()
+            # shape param
+            M = hidden_states.shape[0]
+            E = w1.shape[0]
+            H = w1.shape[2]
+            In = w1.shape[1]
+            K = topk_ids.shape[1]
+            U = num_activated_experts
+
+            nvtx_tag = (
+                f"MoE,"
+                f"M_{M}_E_{E}_H_{H}_In_{In}_"
+                f"topk_{K}_"
+                f"topkids{token_counts_list}_"
+                f"unique_{U}"
+            )
+            nvtx_pushed = True
+            th_nvtx_range_push(nvtx_tag)
+
     if use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(
             a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
@@ -489,6 +528,9 @@ def deep_moe_impl_fused(
         grouped_gemm_nt_bf16bf16bf16_nopad(
             a, w2, out3, expert_ids, num_recv_tokens_per_expert
         )
+
+    if nvtx_pushed:
+        th_nvtx_range_pop()
 
     ep_gather(
         input_tensor=out3,
