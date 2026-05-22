@@ -9,6 +9,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    NamedTuple,
     Optional,
     Tuple,
     TypeVar,
@@ -50,6 +51,8 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_rank,
+    get_attention_tp_size,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -90,6 +93,15 @@ def _create_dummy_paged_compress_data(compress_ratio: int):
     return None
 
 
+class _PrefillPerReqMeta(NamedTuple):
+    seq_lens: torch.Tensor  # (num_prefill_reqs,) int32
+    gather_lens: torch.Tensor  # (num_prefill_reqs,) int32
+    query_start_loc: torch.Tensor  # (num_prefill_reqs+1,) int32
+    query_start_loc_cpu: List[int]  # cumulative qo lens, len=num_prefill_reqs+1
+    c4_block_table: torch.Tensor  # (num_prefill_reqs, max_c4_blocks) int32
+    swa_block_table: torch.Tensor  # (num_prefill_reqs, max_swa_blocks) int32
+
+
 @dataclass
 class DSV4AttnMetadata:
     page_size: int
@@ -109,6 +121,11 @@ class DSV4AttnMetadata:
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
     c4_sparse_page_indices: torch.Tensor = field(init=False)
+
+    # LOCAL (logical) topk positions for the C4 compressed dimension. Populated
+    # by the indexer when the sparse-fwd prefill path is active; consumed by
+    # forward_prefill_c4_sparse. Shape matches c4_sparse_page_indices.
+    c4_local_topk_indices: Optional[torch.Tensor] = None
 
     c128_out_loc: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
@@ -990,6 +1007,24 @@ class DeepseekV4AttnBackend(
                 self.store_cache(layer_id, swa_k, forward_batch)
             swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
 
+            # Prefill-only sparse_fwd dispatch: compress_ratio=4 layers run
+            # bf16 dequantize + combined-indices + flash_mla_sparse_fwd, mirroring
+            # vLLM's DeepseekV4MLAAttention._forward_prefill. Decode /
+            # target_verify / draft_extend / c128 / swa-only keep using
+            # flash_mla_with_kvcache below.
+            if self._should_use_prefill_sparse_fwd(
+                forward_batch, compress_ratio, core_attn_metadata
+            ):
+                assert attn_sink is not None
+                return self._forward_prefill_c4_sparse(
+                    q=q,
+                    attn_sink=attn_sink,
+                    forward_batch=forward_batch,
+                    core_attn_metadata=core_attn_metadata,
+                    swa_k_cache=swa_k_cache,
+                    c4_k_cache=token_to_kv_pool.get_extra_key_buffer(layer_id),
+                )
+
             extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
             if compress_ratio == 4:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -1076,6 +1111,153 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _should_use_prefill_sparse_fwd(
+        self,
+        forward_batch: ForwardBatch,
+        compress_ratio: int,
+        core_attn_metadata: DSV4AttnMetadata,
+    ) -> bool:
+        if compress_ratio != 4:
+            return False
+        if not envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get():
+            return False
+        fm = forward_batch.forward_mode
+        if not fm.is_extend():
+            return False
+        if fm.is_target_verify():
+            return False
+        if fm.is_draft_extend(include_v2=True):
+            return False
+        # Indexer must have populated LOCAL c4 topk indices for this path.
+        return core_attn_metadata.c4_local_topk_indices is not None
+
+    def _get_prefill_per_request_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        core_attn_metadata: DSV4AttnMetadata,
+    ) -> _PrefillPerReqMeta:
+        device = forward_batch.seq_lens.device
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        qo_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        assert qo_lens.shape == seq_lens.shape, (
+            f"{qo_lens.shape=} vs {seq_lens.shape=}; sparse_fwd prefill "
+            "requires per-request extend_seq_lens"
+        )
+        # SWA gather covers every query token's window: positions
+        # [pos - swa_len + 1, pos] for pos in [seq_len - qo_len, seq_len).
+        # The earliest needed position is seq_len - qo_len - WINDOW + 1, so
+        # gather_len = min(seq_len, qo_len + WINDOW - 1).
+        gather_lens = torch.minimum(seq_lens, qo_lens + (SWA_WINDOW - 1))
+
+        bs = seq_lens.shape[0]
+        query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        torch.cumsum(qo_lens, dim=0, dtype=torch.int32, out=query_start_loc[1:])
+        # CPU mirror to avoid GPU->CPU sync in the per-layer driver loop.
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None:
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens.tolist()
+        query_start_loc_cpu: List[int] = [0]
+        acc = 0
+        for x in extend_seq_lens_cpu:
+            acc += int(x)
+            query_start_loc_cpu.append(acc)
+
+        # SWA pool block table. We sample one slot per swa_page_size-aligned
+        # window and divide by swa_page_size to get the physical SWA page id.
+        # Relies on the allocator keeping each main-pool 256-token page
+        # contiguous in the SWA pool (2x128 SWA pages), which the
+        # `assert page_size % swa_page_size == 0` invariant at pool init
+        # guarantees.
+        pool = forward_batch.token_to_kv_pool
+        assert isinstance(pool, DeepSeekV4TokenToKVPool)
+        full_to_swa = pool.full_to_swa_index_mapping
+        assert full_to_swa is not None, "full_to_swa_index_mapping not registered"
+
+        swa_page_size = pool.swa_page_size
+        # req_to_token is (max_num_reqs, MAX_SEQ_LEN_FOR_CAPTURE)
+        # Take every swa_page_size-th slot id per request, then translate.
+        max_seq_len = self.req_to_token.shape[1]
+        raw_first_in_block = self.req_to_token[
+            forward_batch.req_pool_indices, :max_seq_len:swa_page_size
+        ]
+        swa_block_table = (full_to_swa[raw_first_in_block] // swa_page_size).to(
+            torch.int32
+        )
+
+        # C4 block table: page_table[r] is already C4 pool page ids — each
+        # main-pool 256-token page == one C4 pool 64-token page, sharing the
+        # same page id (see metadata_kernel.py line 75 derivation).
+        # core.page_table is (num_qo_tokens, max_main_blocks), per-token
+        # repeated; take the first query-token row of each prefill request.
+        first_token_per_req = query_start_loc[:-1].to(torch.long)
+        c4_block_table = core_attn_metadata.page_table[first_token_per_req].contiguous()
+
+        return _PrefillPerReqMeta(
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            c4_block_table=c4_block_table,
+            swa_block_table=swa_block_table,
+        )
+
+    def _forward_prefill_c4_sparse(
+        self,
+        *,
+        q: torch.Tensor,
+        attn_sink: torch.Tensor,
+        forward_batch: ForwardBatch,
+        core_attn_metadata: DSV4AttnMetadata,
+        swa_k_cache: torch.Tensor,
+        c4_k_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsv4.sparse_prefill import (
+            forward_prefill_c4_sparse,
+        )
+
+        if q.ndim == 4:
+            # Some call sites pre-unsqueeze q to (T, 1, H, D); collapse for
+            # sparse_fwd which expects (T, H, D).
+            assert q.shape[1] == 1, f"unexpected q layout {q.shape=}"
+            q = q.squeeze(1)
+        assert q.ndim == 3, f"expected q (T, H, D), got {q.shape=}"
+
+        prep = self._get_prefill_per_request_metadata(forward_batch, core_attn_metadata)
+
+        num_q_tokens = q.shape[0]
+        # c4_local_topk_indices may be padded (num_qo_tokens) to alignment;
+        # restrict to the actual q token range.
+        c4_local_topk_indices = core_attn_metadata.c4_local_topk_indices
+        assert c4_local_topk_indices is not None
+        c4_local_topk_indices = c4_local_topk_indices[:num_q_tokens]
+
+        out = q.new_empty(q.shape[0], q.shape[1], self.head_dim_v)
+
+        forward_prefill_c4_sparse(
+            q=q,
+            attn_sink=attn_sink,
+            sm_scale=self.softmax_scale,
+            output=out,
+            swa_k_cache=swa_k_cache,
+            c4_k_cache=c4_k_cache,
+            c4_local_topk_indices=c4_local_topk_indices,
+            prefill_seq_lens=prep.seq_lens,
+            prefill_gather_lens=prep.gather_lens,
+            prefill_query_start_loc=prep.query_start_loc,
+            prefill_query_start_loc_cpu=prep.query_start_loc_cpu,
+            c4_block_table=prep.c4_block_table,
+            swa_block_table=prep.swa_block_table,
+            c4_block_size=self.token_to_kv_pool.c4_kv_pool.page_size,
+            swa_block_size=self.token_to_kv_pool.swa_page_size,
+            compress_ratio=4,
+            window_size=SWA_WINDOW,
+            c4_topk=self.c4_topk,
+            max_model_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            attn_tp_rank=get_attention_tp_rank(),
+            attn_tp_size=get_attention_tp_size(),
+        )
+        return out
 
     def expand_prefill_casually(
         self,

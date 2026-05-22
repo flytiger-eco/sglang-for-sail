@@ -1,0 +1,482 @@
+"""DeepseekV4 CSA prefill via FlashMLA sparse forward.
+
+Ported from vLLM's `vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py` and
+`vllm/model_executor/layers/deepseek_v4_attention.py:_forward_prefill`.
+
+The SGLang DSv4 paged FP8 K cache uses the same per-token byte layout as vLLM
+(448 fp8 nope + 128 bf16 rope + 8 ue8m0 scales with a 1-byte pad), and the same
+intra-page layout (page_size*576 token bytes followed by page_size*8 scale
+bytes, padded to 576-byte multiples) — see
+`python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py` writer and the
+assertion at `python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py:104-117`.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+import triton
+import triton.language as tl
+
+# FlashMLA sparse prefill kernel asserts `params.topk % B_TOPK == 0`. B_TOPK is
+# 64 for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
+# Extra slots stay as -1 sentinels and combined_lens caps the valid range via
+# `topk_length`, so padding is a no-op at kernel level.
+_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
+
+# Bound the bf16 KV gather workspace by chunking prefill requests.
+PREFILL_CHUNK_SIZE = 4
+
+
+@triton.jit
+def _dequantize_and_gather_k_kernel(
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    k_cache_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    offset,
+    gather_lens_ptr,
+    max_blocks_per_seq: tl.constexpr,
+    fp8_dim: tl.constexpr,  # 448
+    bf16_dim: tl.constexpr,  # 64
+    scale_dim: tl.constexpr,  # 8 (incl. 1 pad)
+    quant_block: tl.constexpr,  # 64
+    cache_block_size: tl.constexpr,  # swa=128 / c4=64
+    token_data_size: tl.constexpr,  # 576
+    block_stride: tl.constexpr,  # bytes per cache page
+    output_dim: tl.constexpr,  # 512
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,  # 7
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if gather_lens_ptr is not None:  # noqa: SIM108
+        gather_len = tl.load(gather_lens_ptr + batch_idx)
+    else:
+        gather_len = seq_len
+    start_pos = seq_len - gather_len
+
+    for i in range(worker_id, gather_len, num_workers):
+        pos = start_pos + i
+
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+
+        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)
+
+        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
+
+        token_fp8_ptr = token_data_ptr
+        token_bf16_ptr = token_data_ptr + fp8_dim
+
+        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
+
+            if qblock_start < fp8_dim:
+                offsets = qblock_start + tl.arange(0, quant_block)
+                mask = offsets < fp8_dim
+
+                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                x_float = x_fp8.to(tl.float32)
+
+                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                exponent = encoded_scale.to(tl.float32) - 127.0
+                scale = tl.exp2(exponent)
+
+                x_dequant = x_float * scale
+
+                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+
+        bf16_output_offset = fp8_dim
+        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+
+        for j in tl.static_range(bf16_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+
+
+def dequantize_and_gather_k_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: Optional[torch.Tensor],
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """Gather + dequantize per-request slices of a DSv4 paged FP8 K cache.
+
+    Args:
+        out: [num_reqs, max_num_tokens, 576] bf16.
+        k_cache: [num_blocks, block_bytes] uint8 (raw pool buffer).
+        seq_lens: [num_reqs] int32, total seq len in cache pool units.
+        gather_lens: [num_reqs] int32 or None. If None, gather full seq_lens.
+        block_table: [num_reqs, max_blocks_per_seq] int32, physical page ids.
+        block_size: tokens per cache page (swa=128, c4=64).
+        offset: starting column in `out` for the gathered tokens.
+    """
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+
+    num_reqs = seq_lens.shape[0]
+    NUM_WORKERS = 128
+    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+        out,
+        out.stride(0),
+        out.stride(1),
+        k_cache,
+        seq_lens,
+        block_table,
+        offset,
+        gather_lens,
+        max_blocks_per_seq=block_table.shape[-1],
+        fp8_dim=TOKEN_FP8_DIM,
+        bf16_dim=TOKEN_BF16_DIM,
+        scale_dim=TOKEN_SCALE_DIM,
+        quant_block=QUANT_BLOCK_SIZE,
+        cache_block_size=block_size,
+        token_data_size=TOKEN_DATA_SIZE,
+        block_stride=k_cache.stride(0),
+        output_dim=512,
+        fp8_max=FP8_MAX,
+        n_quant_blocks=7,
+    )
+
+
+@triton.jit
+def _combine_topk_swa_indices_kernel(
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    M,
+    N,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    start_pos = seq_len - query_len
+    gather_start = seq_len - gather_len
+
+    for token_idx in range(query_start + worker_id, query_end, num_workers):
+        token_idx_in_query = token_idx - query_start
+        pos = start_pos + token_idx_in_query
+        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+
+        offset = tl.arange(0, PADDED_TOP_K)
+        mask = offset < topk_len
+        topk_indices = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=mask,
+        )
+        tl.store(
+            combined_indices_ptr + token_idx * combined_indices_stride + offset,
+            topk_indices + M * batch_idx,
+            mask=mask,
+        )
+        offset = tl.arange(0, WINDOW_SIZE)
+        tl.store(
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + topk_len
+            + offset,
+            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+            mask=offset < swa_len,
+        )
+
+        combined_len = topk_len + swa_len
+        tl.store(combined_lens_ptr + token_idx, combined_len)
+
+
+def combine_topk_swa_indices(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate per-token topk compressed indices and SWA window indices.
+
+    Returns (combined_indices, combined_lens) where combined_indices points
+    into the chunk's bf16 KV workspace (shape `[chunk, M, 576]` viewed flat as
+    `[chunk*M, 1, 576]`).
+    """
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+
+    NUM_WORKERS = 128
+    _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        TOP_K=topk,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+    )
+    return combined_indices, combined_lens
+
+
+def forward_prefill_c4_sparse(
+    *,
+    q: torch.Tensor,
+    attn_sink: torch.Tensor,
+    sm_scale: float,
+    output: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    c4_k_cache: torch.Tensor,
+    c4_local_topk_indices: torch.Tensor,
+    prefill_seq_lens: torch.Tensor,
+    prefill_gather_lens: torch.Tensor,
+    prefill_query_start_loc: torch.Tensor,
+    prefill_query_start_loc_cpu: list[int],
+    c4_block_table: torch.Tensor,
+    swa_block_table: torch.Tensor,
+    c4_block_size: int,
+    swa_block_size: int,
+    compress_ratio: int,
+    window_size: int,
+    c4_topk: int,
+    max_model_len: int,
+    attn_tp_rank: int = 0,
+    attn_tp_size: int = 1,
+    chunk_size: int = PREFILL_CHUNK_SIZE,
+) -> None:
+    """C4 prefill attention via FlashMLA sparse forward.
+
+    Mirrors `vllm/.../deepseek_v4_attention.py:_forward_prefill` for compress_ratio=4.
+    Writes attention output in-place into `output` (shape (T, H, head_dim_v=512) bf16).
+
+    Args:
+        q: (T, H, D=576) bf16.
+        attn_sink: (H,) float32 (per-head sink logits).
+        output: (T, H, 512) bf16, pre-allocated.
+        swa_k_cache: raw SWA pool FP8 buffer, (num_swa_blocks, swa_page_bytes) uint8.
+        c4_k_cache: raw C4 pool FP8 buffer, (num_c4_blocks, c4_page_bytes) uint8.
+        c4_local_topk_indices: (T, c4_topk) int32 of LOGICAL c4-compressed
+            positions emitted by the indexer (passed via `out_raw_indices`).
+        prefill_seq_lens: (num_prefill_reqs,) int32, full seq lens.
+        prefill_gather_lens: (num_prefill_reqs,) int32 = min(seq_len, qo_len+window-1).
+        prefill_query_start_loc: (num_prefill_reqs+1,) int32 cumulative qo_lens.
+        c4_block_table: (num_prefill_reqs, max_c4_blocks) int32, C4 pool page ids.
+        swa_block_table: (num_prefill_reqs, max_swa_blocks) int32, SWA pool page ids.
+        compress_ratio: 4.
+        window_size: SWA window (128).
+        c4_topk: 512 or 1024.
+        max_model_len: upper bound used to size the workspace.
+    """
+    import flash_mla
+
+    assert compress_ratio == 4, f"only c4 supported, got {compress_ratio=}"
+
+    num_prefill_reqs = prefill_seq_lens.shape[0]
+    if num_prefill_reqs == 0:
+        return
+
+    # head_dim is the BF16 element count (= qk_nope_head_dim 448 + qk_rope_head_dim 64
+    # = 512 for DSv4). Don't confuse this with the FP8 cache's 576-byte per-token
+    # layout (448B FP8 nope + 128B BF16 rope + 8B UE8M0 scales) — after dequant
+    # we end up with 512 BF16 elements per token.
+    head_dim = q.shape[-1]
+    assert (
+        head_dim == 512
+    ), f"expected DSv4 MQA head_dim=512 (nope 448 + rope 64), got {head_dim=}"
+    in_h_q = q.shape[1]
+    sink_global = attn_sink.shape[0]
+    v_head_dim = output.shape[-1]
+    device = q.device
+
+    # Slice-down strategy (requires a FlashMLA build that does NOT enforce
+    # h_q ∈ {64, 128}): each rank sends only its local n_local_heads to the
+    # kernel — no zero-padded heads, no wasted compute. attn_sink is sliced
+    # to match. Each query head is independent in softmax, so this is bit-
+    # for-bit equivalent to running with full n_heads_global and discarding
+    # the other ranks' heads after.
+    #
+    # Two input-q layouts both work:
+    # (a) MQALayer built q_padded so q.shape[1] == n_heads_global. Slice
+    #     both q and attn_sink to the local-rank head range; the output
+    #     buffer is the global shape and the local result is placed at the
+    #     rank slice (other positions left as their pre-allocated values —
+    #     they are dropped by MQALayer's o[:, tp_slice, :] cut).
+    # (b) MQALayer skipped q_padded so q.shape[1] == n_local_heads already.
+    #     Only attn_sink is sliced; output is local-shape.
+    n_local = sink_global // attn_tp_size
+    assert (
+        n_local * attn_tp_size == sink_global
+    ), f"sink_global={sink_global} not divisible by attn_tp_size={attn_tp_size}"
+
+    sink_start = attn_tp_rank * n_local
+    sink_end = sink_start + n_local
+    local_sink = attn_sink[sink_start:sink_end].contiguous()
+    if local_sink.dtype != torch.float32:
+        local_sink = local_sink.to(torch.float32)
+
+    if in_h_q == n_local:
+        # Case (b): q is already local-rank-only.
+        q_local = q
+        return_global = False
+        local_slice = slice(None)
+    elif in_h_q == sink_global:
+        # Case (a): q is the full-global tensor with garbage in non-local
+        # head slots. Slice to local; output stays global-shape so the
+        # caller's tp_slice cut works.
+        local_slice = slice(sink_start, sink_end)
+        q_local = q[:, local_slice, :]
+        return_global = True
+    else:
+        raise AssertionError(
+            f"unexpected q.shape[1]={in_h_q}, expected either n_local="
+            f"{n_local} or n_heads_global={sink_global}"
+        )
+
+    # Bind: kernel sees only n_local heads.
+    h_q_kernel = n_local
+    attn_sink = local_sink
+    q = q_local
+
+    # Compressed-region pool size per request — must hold every compressed
+    # token of the longest request (max_model_len // compress_ratio).
+    N = (max_model_len + compress_ratio - 1) // compress_ratio
+
+    # M bounds the concatenated workspace per request: compressed region (N) +
+    # window (SWA) + the longest qo extent. We bound by max_model_len to be safe.
+    M = N + window_size + max_model_len
+
+    # Workspace: chunk of bf16 KV. Allocated once per call; the allocator will
+    # reuse this hot path's memory across layers.
+    kv = torch.empty(
+        (chunk_size, M, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    num_chunks = (num_prefill_reqs + chunk_size - 1) // chunk_size
+
+    for chunk_idx in range(num_chunks):
+        c_start = chunk_idx * chunk_size
+        c_end = min(c_start + chunk_size, num_prefill_reqs)
+        cs = c_end - c_start
+
+        # Gather compressed C4 KV → kv[:cs, 0:N) of workspace
+        dequantize_and_gather_k_cache(
+            out=kv[:cs],
+            k_cache=c4_k_cache,
+            seq_lens=prefill_seq_lens[c_start:c_end] // compress_ratio,
+            gather_lens=None,
+            block_table=c4_block_table[c_start:c_end],
+            block_size=c4_block_size,
+            offset=0,
+        )
+
+        # Gather SWA KV → kv[:cs, N:N+gather_len)
+        dequantize_and_gather_k_cache(
+            out=kv[:cs],
+            k_cache=swa_k_cache,
+            seq_lens=prefill_seq_lens[c_start:c_end],
+            gather_lens=prefill_gather_lens[c_start:c_end],
+            block_table=swa_block_table[c_start:c_end],
+            block_size=swa_block_size,
+            offset=N,
+        )
+
+        # Combine local topk + SWA indices per query token, rebased to workspace
+        q_start = prefill_query_start_loc_cpu[c_start]
+        q_end = prefill_query_start_loc_cpu[c_end]
+
+        combined_indices, combined_lens = combine_topk_swa_indices(
+            c4_local_topk_indices[q_start:q_end],
+            prefill_query_start_loc[c_start : c_end + 1],
+            prefill_seq_lens[c_start:c_end],
+            prefill_gather_lens[c_start:c_end],
+            window_size,
+            compress_ratio,
+            c4_topk,
+            M,
+            N,
+        )
+
+        q_chunk = q[q_start:q_end]
+        # q_chunk: (q_end - q_start, h_q_kernel = n_local, head_dim) bf16
+        # attn_sink: (n_local,) float32 — already sliced to local-rank heads
+
+        out_chunk, _, _ = flash_mla.flash_mla_sparse_fwd(
+            q=q_chunk,
+            kv=kv.view(-1, 1, head_dim),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=sm_scale,
+            attn_sink=attn_sink,
+            topk_length=combined_lens,
+        )
+        # out_chunk: (q_end - q_start, n_local, v_head_dim) bf16.
+        # Write the local-rank result into the caller's pre-allocated output
+        # buffer. If output was pre-allocated to global shape (return_global),
+        # write into the local-rank slice; otherwise write directly.
+        if return_global:
+            output[q_start:q_end, local_slice, :].copy_(out_chunk[..., :v_head_dim])
+        else:
+            output[q_start:q_end].copy_(out_chunk[..., :v_head_dim])

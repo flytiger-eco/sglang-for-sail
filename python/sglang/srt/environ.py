@@ -596,6 +596,8 @@ class Envs:
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
+    # Use flash_mla_sparse_fwd in CSA prefill phase
+    SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD = EnvBool(True)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)

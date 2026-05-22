@@ -799,6 +799,16 @@ class C4IndexerBackendMixin:
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
 
+        # Sparse-fwd prefill consumes LOCAL c4 positions: when active, allocate
+        # raw_indices and publish on the shared core_metadata so the attention
+        # backend (DeepseekV4AttnBackend.forward) can pick them up. Skip if
+        # another path (capture/hisparse_decode) already owns raw_indices.
+        use_sparse_fwd_prefill = (
+            use_prefill_logits and envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get()
+        )
+        # Reset stale pointer from a prior forward in the same metadata object.
+        core_metadata.c4_local_topk_indices = None
+
         raw_indices = None
         if capture_enabled:
             raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
@@ -806,6 +816,11 @@ class C4IndexerBackendMixin:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : core_metadata.c4_sparse_page_indices.size(0)
             ]
+        elif use_sparse_fwd_prefill:
+            raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
+
+        if use_sparse_fwd_prefill and raw_indices is not None:
+            core_metadata.c4_local_topk_indices = raw_indices
 
         if use_prefill_logits:
             self._forward_prefill_c4_topk_chunked(
