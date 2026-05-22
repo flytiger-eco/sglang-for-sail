@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_sm100_supported, retry
+from sglang.srt.utils import is_hip, is_ppu, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -1564,6 +1564,18 @@ piecewise_cuda_graph_disabled_model_archs = [
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
+
+if is_ppu():
+    #!<Note>: MLA seems not support piecewise graph on PPU.
+    from sglang.srt.utils import logger
+
+    logger.info_once(
+        "On PPU, for the DeepSeek architecture, we should disable piecewise-cuda-graph.\n"
+        "Because if it is enabled, the `qv` received by the PPU FA3 interface will not be `None`. "
+        "However, the PPU FA3 interface does not support this case."
+    )
+
+    piecewise_cuda_graph_disabled_model_archs.append("DeepseekV3ForCausalLM")
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
     multimodal_model_archs.append(external_mm_model_arch)

@@ -196,6 +196,7 @@ from sglang.srt.utils import (
     is_hip,
     is_host_cpu_arm64,
     is_npu,
+    is_ppu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -1134,11 +1135,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
-
-        if (
-            not self.use_mla_backend
-            or server_args.attention_backend
+        # <NOTE>
+        #
+        # --- Platform-Specific Configuration ---
+        #
+        # PPU FA3 does not support MLA currently. Instead of setting [--attention-backend fa3],
+        # we set [--prefill-attention-backend fa3 --decode-attention-backend flashmla]
+        # for MLA models, so we should check whether prefill_attention_backend is in
+        # CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS or not.
+        # </NOTE>
+        if not self.use_mla_backend or (
+            server_args.attention_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+            and (
+                not is_ppu()
+                or server_args.prefill_attention_backend
+                not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+            )
         ):
             server_args.disable_chunked_prefix_cache = True
 

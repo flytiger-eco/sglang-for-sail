@@ -5,9 +5,10 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.utils import get_device_capability, is_musa
+from sglang.srt.utils import get_device_capability, is_musa, is_ppu
 
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ def create_flashattention_v3_backend(runner):
 
     major, minor = get_device_capability()
     if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
+        assert (major == 8 and (_is_ppu or not runner.use_mla_backend)) or major == 9, (
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
