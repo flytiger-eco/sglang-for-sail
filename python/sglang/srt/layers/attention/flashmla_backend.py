@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -167,7 +168,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.cuda_graph_kv_indices = block_kv_indices
 
         device_props = torch.cuda.get_device_properties(self.req_to_token.device)
-        max_num_sm_parts = device_props.multi_processor_count
+        # ppu mla metadata can return num_sm_parts greater than the num of sms
+        max_num_sm_parts = device_props.multi_processor_count if not is_ppu() else 320
 
         self.cuda_graph_mla_metadata = torch.empty(
             (max_num_sm_parts, 8),

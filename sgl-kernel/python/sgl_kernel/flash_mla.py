@@ -13,6 +13,18 @@ _IMPORT_ERROR = ImportError(
     "Failed to load sgl_kernel.flashmla_ops extension. Ensure CUDA Driver >= 12.4"
 )
 
+from sglang.srt.utils import is_ppu
+
+if is_ppu():
+    try:
+        import flash_mla as flashmla
+
+        _flashmla_import_error = None
+        _ppu_flashmla_imported = True
+    except Exception as _e:
+        _flashmla_import_error = _e
+        _ppu_flashmla_imported = False
+
 
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
@@ -39,11 +51,27 @@ def get_mla_metadata(
         raise _IMPORT_ERROR from _flashmla_import_error
 
     if is_fp8_kvcache and topk is None:
+        if _ppu_flashmla_imported:
+            raise NotImplementedError(
+                "FlashMLA dense FP8 get_mla_metadata is not supported."
+            )
+
         return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
             cache_seqlens,
             num_q_tokens_per_head_k,
             num_heads_k,
         )
+
+    if _ppu_flashmla_imported:
+        return flashmla.get_mla_metadata(
+            cache_seqlens,
+            num_q_tokens_per_head_k,
+            num_heads_k,
+            num_heads_q=num_heads_q,
+            is_fp8_kvcache=is_fp8_kvcache,
+            topk=topk,
+        )
+
     return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -101,6 +129,11 @@ def flash_mla_with_kvcache(
     ), "descale_q and descale_k should be both None or both not None"
 
     if indices is None and q.element_size() == 1:
+        if _ppu_flashmla_imported:
+            raise NotImplementedError(
+                "FlashMLA dense FP8 with kvcache is not supported."
+            )
+
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
             q,
             k_cache,
@@ -115,6 +148,21 @@ def flash_mla_with_kvcache(
             descale_k,
         )
     else:
+        if _ppu_flashmla_imported:
+            return flashmla.flash_mla_with_kvcache(
+                q,
+                k_cache,
+                block_table,
+                cache_seqlens,
+                head_dim_v,
+                tile_scheduler_metadata,
+                num_splits,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                is_fp8_kvcache=is_fp8_kvcache,
+                indices=indices,
+            )
+
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
             q,
             k_cache,
@@ -157,6 +205,15 @@ def flash_mla_sparse_fwd(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    if _ppu_flashmla_imported:
+        return flashmla.flash_mla_sparse_fwd(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v=d_v,
+        )
 
     results = torch.ops.sgl_kernel.sparse_prefill_fwd.default(
         q, kv, indices, sm_scale, d_v
