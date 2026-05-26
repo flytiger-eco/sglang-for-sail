@@ -104,6 +104,10 @@ class _PrefillPerReqMeta(NamedTuple):
     # gather kernel call site.
     compressed_block_table: torch.Tensor  # (num_prefill_reqs, max_blocks) int32
     swa_block_table: torch.Tensor  # (num_prefill_reqs, max_swa_blocks) int32
+    # Batch-level maxima (CPU ints) used to size the sparse-prefill workspace
+    # without a GPU->CPU sync. Both are derived from already-CPU metadata.
+    max_seq_len_cpu: int  # max kv seq len across requests in this batch
+    max_qo_len_cpu: int  # max extend (qo) len across requests in this batch
 
 
 @dataclass
@@ -1174,11 +1178,31 @@ class DeepseekV4AttnBackend(
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         if extend_seq_lens_cpu is None:
             extend_seq_lens_cpu = forward_batch.extend_seq_lens.tolist()
+        elif isinstance(extend_seq_lens_cpu, torch.Tensor):
+            extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
         query_start_loc_cpu: List[int] = [0]
         acc = 0
+        max_qo_len_cpu = 0
         for x in extend_seq_lens_cpu:
-            acc += int(x)
+            xi = int(x)
+            acc += xi
             query_start_loc_cpu.append(acc)
+            if xi > max_qo_len_cpu:
+                max_qo_len_cpu = xi
+
+        # seq_lens_cpu lets us size workspaces without a GPU->CPU sync. The
+        # scheduler normally populates forward_batch.seq_lens_cpu; only fall
+        # back to .tolist() (which syncs) if it is absent.
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu_list = forward_batch.seq_lens.tolist()
+        elif isinstance(seq_lens_cpu, torch.Tensor):
+            seq_lens_cpu_list = seq_lens_cpu.tolist()
+        else:
+            seq_lens_cpu_list = list(seq_lens_cpu)
+        max_seq_len_cpu = (
+            max(int(s) for s in seq_lens_cpu_list) if seq_lens_cpu_list else 0
+        )
 
         # SWA pool block table. We sample one slot per swa_page_size-aligned
         # window and divide by swa_page_size to get the physical SWA page id.
@@ -1221,6 +1245,8 @@ class DeepseekV4AttnBackend(
             query_start_loc_cpu=query_start_loc_cpu,
             compressed_block_table=compressed_block_table,
             swa_block_table=swa_block_table,
+            max_seq_len_cpu=max_seq_len_cpu,
+            max_qo_len_cpu=max_qo_len_cpu,
         )
 
     def _forward_prefill_sparse(
@@ -1292,6 +1318,8 @@ class DeepseekV4AttnBackend(
             window_size=SWA_WINDOW,
             sparse_topk=sparse_topk,
             max_model_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len_in_batch=prep.max_seq_len_cpu,
+            max_qo_len_in_batch=prep.max_qo_len_cpu,
             attn_tp_rank=get_attention_tp_rank(),
             attn_tp_size=get_attention_tp_size(),
         )

@@ -416,6 +416,8 @@ def forward_prefill_sparse(
     window_size: int,
     sparse_topk: Optional[int],
     max_model_len: int,
+    max_seq_len_in_batch: Optional[int] = None,
+    max_qo_len_in_batch: Optional[int] = None,
     attn_tp_rank: int = 0,
     attn_tp_size: int = 1,
     chunk_size: int = PREFILL_CHUNK_SIZE,
@@ -541,13 +543,29 @@ def forward_prefill_sparse(
     attn_sink = local_sink
     q = q_local
 
+    # Size workspace by the actual batch maxima when available, falling back
+    # to max_model_len. With long-context models this cuts the workspace by
+    # >10x for short-input workloads (e.g. 8K input vs 128K model context),
+    # which is the difference between fitting and OOMing under tight
+    # mem-fraction-static budgets.
+    seq_len_for_ws = (
+        min(max_seq_len_in_batch, max_model_len)
+        if max_seq_len_in_batch is not None
+        else max_model_len
+    )
+    qo_len_for_ws = (
+        min(max_qo_len_in_batch, max_model_len)
+        if max_qo_len_in_batch is not None
+        else max_model_len
+    )
+
     # Compressed-region pool size per request — must hold every compressed
-    # token of the longest request (max_model_len // compress_ratio).
-    N = (max_model_len + compress_ratio - 1) // compress_ratio
+    # token of the longest request (seq_len_for_ws // compress_ratio).
+    N = (seq_len_for_ws + compress_ratio - 1) // compress_ratio
 
     # M bounds the concatenated workspace per request: compressed region (N) +
-    # window (SWA) + the longest qo extent. We bound by max_model_len to be safe.
-    M = N + window_size + max_model_len
+    # window (SWA) + the longest qo extent in this batch.
+    M = N + window_size + qo_len_for_ws
 
     # Workspace: chunk of bf16 KV. Allocated once per call; the allocator will
     # reuse this hot path's memory across layers.
