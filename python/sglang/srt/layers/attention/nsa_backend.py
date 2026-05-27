@@ -1381,8 +1381,28 @@ class NativeSparseAttnBackend(
                         : precomputed.seqlens_expanded_size
                     ]
                 seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
+
+                metadata_extra = (
+                    1,  # next_n
+                    self.num_q_heads,  # num_heads
+                    self.indexer_head_dim,  # head_dim
+                    (
+                        1
+                        if not (envs.SGLANG_SAIL_BF16_INDEXER.get() and _is_ppu)
+                        else 2
+                    ),  # element size
+                )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d,
+                    64,
+                    deep_gemm.get_num_sms(),
+                    **(
+                        dict(
+                            metadata_extra=metadata_extra,
+                        )
+                        if _is_ppu
+                        else {}
+                    ),
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     object.__setattr__(
