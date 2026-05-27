@@ -474,6 +474,29 @@ class DeepseekV4AttnBackend(
             c128_compress_metadata=create(compress_ratio=128),
         )
 
+    def _get_mtp_decode_out_cache_loc(
+        self, out_cache_loc: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        if (
+            not self.mtp_enabled
+            or out_cache_loc is None
+            or out_cache_loc.shape[0] == batch_size
+        ):
+            return out_cache_loc
+
+        step_width = batch_size * self.topk
+        expected_num_locs = step_width * self.speculative_num_steps
+        assert out_cache_loc.shape[0] == expected_num_locs, (
+            f"{out_cache_loc.shape=} {batch_size=} {self.topk=} "
+            f"{self.speculative_num_steps=}"
+        )
+
+        return (
+            out_cache_loc.reshape(batch_size, self.topk, self.speculative_num_steps)
+            .permute(2, 0, 1)
+            .reshape(self.speculative_num_steps, step_width)[self.speculative_step_id]
+        )
+
     def init_forward_metadata_prefill(
         self,
         max_seq_len: int,
@@ -718,11 +741,14 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            out_cache_loc = self._get_mtp_decode_out_cache_loc(
+                forward_batch.out_cache_loc, seq_lens.shape[0]
+            )
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
