@@ -1180,6 +1180,11 @@ class DeepseekV4AttnBackend(
             return False
         if not envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get():
             return False
+
+        from sglang.srt.layers.attention.nsa.triton_kernel import use_int8_indexer
+
+        if use_int8_indexer():
+            return False
         fm = forward_batch.forward_mode
         if not fm.is_extend():
             return False

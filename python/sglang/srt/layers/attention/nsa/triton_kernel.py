@@ -20,6 +20,17 @@ def _supports_fp8() -> bool:
     return cc >= 89
 
 
+@lru_cache(maxsize=1)
+def use_int8_indexer() -> bool:
+    """Whether the DSV4/NSA indexer should use INT8 quant instead of FP8.
+
+    Single source of truth shared by indexer (read / Q side) and compressor
+    (K write side) to keep their quant formats in sync. Flips to True on
+    devices lacking FP8 compute support.
+    """
+    return not _supports_fp8()
+
+
 # Triton implementation
 @triton.jit
 def _act_quant_kernel(
