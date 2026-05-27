@@ -1010,6 +1010,22 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
+        assert attn_sink is not None
+
+        # Slice attn_sink to current TP rank's heads to match q's head dim
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size > 1:
+            attn_tp_rank = get_attention_tp_rank()
+            n_local_heads = attn_sink.shape[0] // attn_tp_size
+            attn_sink = attn_sink[
+                attn_tp_rank * n_local_heads : (attn_tp_rank + 1) * n_local_heads
+            ]
+
+        assert attn_sink.shape[0] == q.shape[1], (
+            f"attn_sink head count ({attn_sink.shape[0]}) must match "
+            f"q head count ({q.shape[2]})"
+        )
+
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
@@ -1027,7 +1043,6 @@ class DeepseekV4AttnBackend(
                 logger.info_once(
                     f"\033[32m DSV4 Prefill CSA/HCA Use API: flash_mla_sparse_fwd. \033[0m"
                 )
-                assert attn_sink is not None
                 return self._forward_prefill_sparse(
                     q=q,
                     attn_sink=attn_sink,

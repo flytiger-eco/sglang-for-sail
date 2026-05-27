@@ -489,59 +489,8 @@ def forward_prefill_sparse(
     assert (
         head_dim == 512
     ), f"expected DSv4 MQA head_dim=512 (nope 448 + rope 64), got {head_dim=}"
-    in_h_q = q.shape[1]
-    sink_global = attn_sink.shape[0]
-    v_head_dim = output.shape[-1]
+
     device = q.device
-
-    # Slice-down strategy (requires a FlashMLA build that does NOT enforce
-    # h_q ∈ {64, 128}): each rank sends only its local n_local_heads to the
-    # kernel — no zero-padded heads, no wasted compute. attn_sink is sliced
-    # to match. Each query head is independent in softmax, so this is bit-
-    # for-bit equivalent to running with full n_heads_global and discarding
-    # the other ranks' heads after.
-    #
-    # Two input-q layouts both work:
-    # (a) MQALayer built q_padded so q.shape[1] == n_heads_global. Slice
-    #     both q and attn_sink to the local-rank head range; the output
-    #     buffer is the global shape and the local result is placed at the
-    #     rank slice (other positions left as their pre-allocated values —
-    #     they are dropped by MQALayer's o[:, tp_slice, :] cut).
-    # (b) MQALayer skipped q_padded so q.shape[1] == n_local_heads already.
-    #     Only attn_sink is sliced; output is local-shape.
-    n_local = sink_global // attn_tp_size
-    assert (
-        n_local * attn_tp_size == sink_global
-    ), f"sink_global={sink_global} not divisible by attn_tp_size={attn_tp_size}"
-
-    sink_start = attn_tp_rank * n_local
-    sink_end = sink_start + n_local
-    local_sink = attn_sink[sink_start:sink_end].contiguous()
-    if local_sink.dtype != torch.float32:
-        local_sink = local_sink.to(torch.float32)
-
-    if in_h_q == n_local:
-        # Case (b): q is already local-rank-only.
-        q_local = q
-        return_global = False
-        local_slice = slice(None)
-    elif in_h_q == sink_global:
-        # Case (a): q is the full-global tensor with garbage in non-local
-        # head slots. Slice to local; output stays global-shape so the
-        # caller's tp_slice cut works.
-        local_slice = slice(sink_start, sink_end)
-        q_local = q[:, local_slice, :]
-        return_global = True
-    else:
-        raise AssertionError(
-            f"unexpected q.shape[1]={in_h_q}, expected either n_local="
-            f"{n_local} or n_heads_global={sink_global}"
-        )
-
-    # Bind: kernel sees only n_local heads.
-    h_q_kernel = n_local
-    attn_sink = local_sink
-    q = q_local
 
     # Size workspace by the actual batch maxima when available, falling back
     # to max_model_len. With long-context models this cuts the workspace by
@@ -640,19 +589,12 @@ def forward_prefill_sparse(
         # q_chunk: (q_end - q_start, h_q_kernel = n_local, head_dim) bf16
         # attn_sink: (n_local,) float32 — already sliced to local-rank heads
 
-        out_chunk, _, _ = flash_mla.flash_mla_sparse_fwd(
+        flash_mla.flash_mla_sparse_fwd(
             q=q_chunk,
             kv=kv.view(-1, 1, head_dim),
             indices=combined_indices.unsqueeze(1),
             sm_scale=sm_scale,
             attn_sink=attn_sink,
             topk_length=combined_lens,
+            out=output[q_start:q_end],
         )
-        # out_chunk: (q_end - q_start, n_local, v_head_dim) bf16.
-        # Write the local-rank result into the caller's pre-allocated output
-        # buffer. If output was pre-allocated to global shape (return_global),
-        # write into the local-rank slice; otherwise write directly.
-        if return_global:
-            output[q_start:q_end, local_slice, :].copy_(out_chunk[..., :v_head_dim])
-        else:
-            output[q_start:q_end].copy_(out_chunk[..., :v_head_dim])
