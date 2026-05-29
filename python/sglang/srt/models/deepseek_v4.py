@@ -542,14 +542,26 @@ class MQALayer(nn.Module):
     def _get_wo_a_channel_einsum_args(
         self, G: int, R: int, D: int
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
-
+        # Lazy-build the (weight, scale, recipe) for fp8_einsum on the
+        # channelwise FP8 path. (block-FP8 doesn't come through here.)
+        #
+        # Channelwise stores wo_a transposed:
+        #   wo_a.weight       : qweight.t()         -> [D, G*R], non-contig
+        #   wo_a.weight_scale : scale.t().contig()  -> [1, G*R]
+        # We restore weight to [G, R, D], reshape scale to [G, R, 1], and
+        # set recipe[2]=D (contract-block size; channelwise == full row,
+        # not the 128 used by block-FP8).
+        #
+        # Lazy on first forward (not post_load_weights): the quant hook
+        # may run again after post_load_weights (hot reload, draft copy,
+        # offloader requant), so this is the safest snapshot point.
+        # .clone() decouples the cache from later in-place writes.
         wo_a = self.wo_a
         cached = getattr(wo_a, "_einsum_args_cache", None)
         if cached is not None:
             return cached
 
         w = wo_a.weight.data
-
         assert w.shape == (D, G * R), (
             f"channelwise wo_a.weight expected ({D}, {G*R}), " f"got {tuple(w.shape)}"
         )
