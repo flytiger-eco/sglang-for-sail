@@ -42,7 +42,11 @@ class HybridAttnBackend(AttentionBackend):
         """
         if forward_mode.is_decode_or_idle():
             return self.decode_backend
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+        # [Fix] include_v2=True routes DRAFT_EXTEND_V2 to flashmla (decode_backend);
+        # must match the dispatch layer. Only effective with --speculative-attention-mode decode.
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
+            include_v2=True
+        ):
             return (
                 self.decode_backend
                 if self.model_runner.server_args.speculative_attention_mode == "decode"
