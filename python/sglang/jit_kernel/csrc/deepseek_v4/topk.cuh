@@ -388,7 +388,7 @@ SGL_DEVICE void naive_transform(
 [[maybe_unused]]
 SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length) {
   constexpr uint32_t RADIX = 256;
-  constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
+  constexpr uint32_t BLOCK_SIZE = v3::kBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kSMEM / (2 * sizeof(int32_t));
 
   alignas(128) __shared__ uint32_t _s_histogram_buf[2][RADIX + 32];
