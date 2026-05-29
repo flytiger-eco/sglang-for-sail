@@ -274,6 +274,99 @@ SGL_DEVICE static void stream_pass_bf16(
 }
 
 // ============================================================
+// scatter_pass_bf16_warp_steal
+//
+// Work-stealing scatter pass for ultra-long sequences. Each warp
+// independently claims tiles from a shared atomic counter and
+// loads data directly from HBM via vectorized loads (uint4).
+// No block-level __syncthreads() in the main loop -- warps that
+// miss topk hits immediately steal the next unscanned tile.
+// ============================================================
+SGL_DEVICE static void scatter_pass_bf16_warp_steal(
+    const __nv_bfloat16* __restrict__ scores_bf16,
+    const uint32_t length,
+    const uint32_t thr_bin,
+    int32_t* __restrict__ s_topk_indices,
+    PrefillBF16Smem* smem) {
+  using namespace prefill_bf16;
+  const auto tx = threadIdx.x;
+  const auto lane_id = tx & 31u;
+  const auto warp_id = tx >> 5u;
+
+  // Warp-tile granularity: 32 lanes * 8 elements = 256 BF16 values.
+  constexpr uint32_t kWarpTileElems = 32u * kElemPerStage;  // 256
+  const uint32_t num_warp_tiles = cdiv_pf(length, kWarpTileElems);
+
+  // Reuse warp_sum[0] as shared work-steal counter.
+  // Pre-assign first kNumWarps tiles statically to avoid initial stampede.
+  if (tx == 0) {
+    smem->warp_sum[0] = kNumWarps;
+  }
+  __syncthreads();  // single init barrier
+
+  // Each warp starts with its statically-assigned tile.
+  uint32_t my_tile = warp_id;
+
+  while (my_tile < num_warp_tiles) {
+    const uint32_t base = my_tile * kWarpTileElems;
+    const uint32_t global_base = base + lane_id * kElemPerStage;
+
+    if (global_base + kElemPerStage <= length) {
+      // Fast path: vectorized 16-byte load (8 bf16 = uint4).
+      const uint4 data = *reinterpret_cast<const uint4*>(scores_bf16 + global_base);
+      const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&data);
+
+#pragma unroll
+      for (uint32_t e = 0; e < kElemPerStage; ++e) {
+        const float fval = __bfloat162float(vals[e]);
+        const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
+        const uint32_t global_idx = global_base + e;
+
+        if (bin > thr_bin) {
+          const auto pos = atomicAdd(&smem->counter_gt, 1u);
+          if (pos < kTopK) {
+            s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+          }
+        } else if (bin == thr_bin) {
+          const auto pos = atomicAdd(&smem->counter_eq, 1u);
+          if (pos < kMaxTies) {
+            smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = fval};
+          }
+        }
+      }
+    } else if (global_base < length) {
+      // Tail path: element-by-element for partial tile.
+      for (uint32_t e = 0; e < kElemPerStage; ++e) {
+        const uint32_t global_idx = global_base + e;
+        if (global_idx >= length) break;
+
+        const float fval = __bfloat162float(scores_bf16[global_idx]);
+        const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
+
+        if (bin > thr_bin) {
+          const auto pos = atomicAdd(&smem->counter_gt, 1u);
+          if (pos < kTopK) {
+            s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+          }
+        } else if (bin == thr_bin) {
+          const auto pos = atomicAdd(&smem->counter_eq, 1u);
+          if (pos < kMaxTies) {
+            smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = fval};
+          }
+        }
+      }
+    }
+    // else: entire lane range OOB, skip.
+
+    // Warp leader atomically claims the next tile; broadcast to all lanes.
+    if (lane_id == 0) {
+      my_tile = atomicAdd(&smem->warp_sum[0], 1u);
+    }
+    my_tile = __shfl_sync(0xFFFFFFFF, my_tile, 0);
+  }
+}
+
+// ============================================================
 // find_threshold_bf16
 //
 // 4096 bins / 1024 threads = 4 bins/thread. Builds a warp-then-block
@@ -783,7 +876,7 @@ SGL_DEVICE static void streaming_topk_bf16(
 
   // Phase C: scatter pass.
   const auto thr_bin = smem->match.bin;
-  stream_pass_bf16<true>(scores_bf16, length, thr_bin, s_topk_indices, smem);
+  scatter_pass_bf16_warp_steal(scores_bf16, length, thr_bin, s_topk_indices, smem);
 }
 
 // ============================================================
