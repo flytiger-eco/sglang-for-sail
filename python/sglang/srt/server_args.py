@@ -1875,15 +1875,13 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size <= 8
-                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                        
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         # assume that non-810e machine has 8 cards
                         if not "810E" in get_device_name():
                             assert (
-                                self.tp_size == 8
+                                self.tp_size <= 8
                             ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
                         else:
                             assert (
