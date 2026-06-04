@@ -6,5 +6,6 @@ __all__ = [
     "CompressorPrefillPlan",
     "compress_forward",
     "compress_norm_rope_store",
+    "compress_norm_rope_store_mxfp4",
     "make_name",
 ]

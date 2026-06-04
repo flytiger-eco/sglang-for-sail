@@ -32,6 +32,22 @@ def _jit_compress_norm_rope_module(
 
 
 @cache_once
+def _jit_compress_norm_rope_mxfp4_module(
+    dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+) -> Module:
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    return load_jit(
+        make_name(f"fused_norm_rope_v2_mxfp4"),
+        *args,
+        cuda_files=[f"deepseek_v4/fused_norm_rope_v2_mxfp4.cuh"],
+        cuda_wrappers=[("forward", f"FusedNormRopeMxfp4Kernel<{args}>::forward")],
+    )
+
+
+@cache_once
 def _jit_compress_module(
     head_dim: int,
     dtype_in: torch.dtype,
@@ -334,6 +350,41 @@ def compress_norm_rope_store(
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_compress_norm_rope_module(
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+    )
+    module.forward(
+        kv,
+        plan[1],
+        norm_weight,
+        norm_eps,
+        freq_cis,
+        out_loc,
+        kvcache,
+        plan.is_decode,
+        plan.compress_ratio,
+    )
+
+
+def compress_norm_rope_store_mxfp4(
+    kv: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    """FP4 indexer cache variant of `compress_norm_rope_store`.
+
+    Fuses norm + rope + Hadamard rotate + MXFP4 quant + paged store. Drives
+    emission from `plan` (decode or extend), so `kv` may have more rows than
+    `out_loc` --- non-emitting slots are skipped, matching the FP8 fused path.
+    Cache layout matches `fused_store_indexer_mxfp4_cache` (68 B/token).
+    """
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_compress_norm_rope_mxfp4_module(
         kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
     )
     module.forward(

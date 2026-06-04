@@ -301,6 +301,20 @@ def _jit_main_q_indexer_rope_hadamard_quant_int8_module(dtype: torch.dtype) -> M
 
 
 @cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_mxfp4_module(dtype: torch.dtype) -> Module:
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + MXFP4 act-quant (no norm)."""
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant_mxfp4"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope_mxfp4.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardMxfp4Kernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_metadata_module():
     return load_jit(
         make_name("metadata"),
@@ -821,6 +835,48 @@ def fused_q_indexer_rope_hadamard_quant_int8(
         q_input, q_int8, weight, weights_out, float(weight_scale), freqs_real, positions
     )
     return q_int8, weights_out
+
+
+def fused_q_indexer_rope_hadamard_quant_mxfp4(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused MXFP4 Q-side kernel for the C4 indexer.
+
+    Output:
+      - q_packed:    (T, H, 64)        uint8, two packed e2m1 nibbles per byte.
+      - q_sf:        (T, next_n=1, H)  int32, 4 ue8m0 bytes packed little-endian.
+                     Shape matches DeepGEMM's `fp8_fp4_paged_mqa_logits`
+                     contract so the paged consumer can pass it through
+                     without unsqueeze.
+      - weights_out: (T, H, 1)         fp32 = weight * weight_scale.
+
+    q_scale is NOT folded into weights (4 per-token sub-block scales -- no
+    single scalar to fold); it travels alongside q_packed as q_sf.
+    """
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    T, H = q_input.shape[:-1]
+    head_dim = q_input.shape[-1]
+    q_packed = torch.empty(
+        (T, H, head_dim // 2), dtype=torch.uint8, device=q_input.device
+    )
+    q_sf = torch.empty((T, 1, H), dtype=torch.int32, device=q_input.device)
+    weights_out = torch.empty((T, H, 1), dtype=torch.float32, device=q_input.device)
+    module = _jit_main_q_indexer_rope_hadamard_quant_mxfp4_module(q_input.dtype)
+    module.forward(
+        q_input,
+        q_packed,
+        q_sf,
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
+    )
+    return q_packed, q_sf, weights_out
 
 
 def fused_k_norm_rope_flashmla(

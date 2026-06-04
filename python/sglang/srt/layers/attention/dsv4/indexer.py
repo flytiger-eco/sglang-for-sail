@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -8,9 +9,12 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
+
 from sglang.jit_kernel.deepseek_v4 import (
     fused_q_indexer_rope_hadamard_quant,
     fused_q_indexer_rope_hadamard_quant_int8,
+    fused_q_indexer_rope_hadamard_quant_mxfp4,
     fused_rope,
     top_k_per_row_prefill,
     top_k_per_row_prefill_bf16,
@@ -38,7 +42,6 @@ if TYPE_CHECKING:
 from sglang.srt.layers.attention.nsa.triton_kernel import (
     MXFP_BLOCK_SIZE,
     _supports_fp8,
-    downcast_to_mxfp4_indexer,
     is_fp4_indexer_cache_enabled,
 )
 
@@ -53,39 +56,16 @@ else:
 _USE_INT8 = not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get()
 
 
-def split_indexer_prefill_chunks(
-    seq_lens_cpu: List[int],
-    query_lens_cpu: List[int],
-    workspace_size: int,
-    max_logits_bytes: int,
-) -> List[Tuple[slice, slice]]:
-    chunks: List[Tuple[slice, slice]] = []
-    n = len(seq_lens_cpu)
-    max_logits_elems = max(1, max_logits_bytes // 4)
-    end = 0
-
-    while end < n:
-        start, chunk_m, chunk_n = end, 0, 0
-
-        while end < n:
-            q, s = query_lens_cpu[end], seq_lens_cpu[end]
-            new_m, new_n = chunk_m + q, chunk_n + s
-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
-                chunk_m, chunk_n = new_m, new_n
-                end += 1
-            else:
-                break
-
-        if end == start:
-            chunk_m, chunk_n = query_lens_cpu[end], seq_lens_cpu[end]
-            end += 1
-
-        req_slice = slice(start, end)
-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
-        for q_off in range(0, chunk_m, max_q):
-            chunks.append((req_slice, slice(q_off, min(q_off + max_q, chunk_m))))
-
-    return chunks
+def _log_sparse_indexer_budget_once() -> None:
+    # The prefill chunking-budget banner only prints once (the first C4Indexer
+    # the model loads triggers it -- effectively at server startup).
+    mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+    logger.info_once(
+        "[C4Indexer] SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB=%d MiB (prefill "
+        "logits-tile budget per chunk). If you hit OOM during long-prefill "
+        "indexer forward, try lowering this value (e.g. 256 or 128).",
+        mb,
+    )
 
 
 def split_indexer_prefill_chunks(
@@ -93,10 +73,12 @@ def split_indexer_prefill_chunks(
     query_lens_cpu: List[int],
     workspace_size: int,
     max_logits_bytes: int,
+    logits_dtype: torch.dtype,
 ) -> List[Tuple[slice, slice]]:
     chunks: List[Tuple[slice, slice]] = []
     n = len(seq_lens_cpu)
-    max_logits_elems = max(1, max_logits_bytes // 4)
+    bytes_per_elem = torch.empty((), dtype=logits_dtype).element_size()
+    max_logits_elems = max(1, max_logits_bytes // bytes_per_elem)
     end = 0
 
     while end < n:
@@ -465,37 +447,28 @@ class C4IndexerBackendMixin:
             layer_id=c4_indexer.layer_id,
         )
 
-        use_fp4 = c4_indexer.use_fp4_cache
-        # TODO: use no fused path in mxfp4 indexer for now
-        if use_fp4:
-            with torch.cuda.stream(stream_q):
-                if q_lora_ready is not None:
-                    stream_q.wait_event(q_lora_ready)
-                q = c4_indexer.compute_q_no_fused(q_lora, positions=positions)
-                # MXFP4 Q: (T, H, 64) uint8 packed values, (T, H) int32 ue8m0
-                # block scales (4 ue8m0 bytes packed per int32). Q scale is NOT
-                # folded into weights — it stays alongside the Q values.
-                q_packed, q_sf = downcast_to_mxfp4_indexer(q, -1)
-                q_fp8 = (q_packed, q_sf)
-                q_scale_ready = stream_q.record_event()
+        # The weight projection is small and fast; compute it on its own
+        # stream, then have the Q stream wait on it before launching the big
+        # fused Q kernel. Both FP8 and FP4 fused kernels take `weight` as
+        # input and emit the final weights tensor on stream_q, so we only
+        # need to join stream_q at the end (stream_weights is transitively
+        # joined via stream_q's wait on `weights_ready`).
+        with torch.cuda.stream(stream_weights):
+            weights = c4_indexer.compute_weights(x, skip_scale=True)
+            weights_ready = stream_weights.record_event()
 
-            with torch.cuda.stream(stream_weights):
-                weights = c4_indexer.compute_weights(x, skip_scale=True)
-                stream_weights.wait_event(q_scale_ready)
-                weights = fused_scale(weights, c4_indexer.weight_scale)
-        else:
-            # The weight projection is small and fast; compute it on its own
-            # stream, then have the Q stream wait on it before launching the big
-            # fused Q kernel (which folds rope + hadamard + fp8 quant + the
-            # weight*weight_scale*q_scale step into one pass).
-            with torch.cuda.stream(stream_weights):
-                weights = c4_indexer.compute_weights(x, skip_scale=True)
-                weights_ready = stream_weights.record_event()
-
-            with torch.cuda.stream(stream_q):
-                if q_lora_ready is not None:
-                    stream_q.wait_event(q_lora_ready)
-                stream_q.wait_event(weights_ready)
+        with torch.cuda.stream(stream_q):
+            if q_lora_ready is not None:
+                stream_q.wait_event(q_lora_ready)
+            stream_q.wait_event(weights_ready)
+            if c4_indexer.use_fp4_cache:
+                # FP4: fused kernel returns ((q_packed, q_sf), weights_out).
+                # q_scale is NOT folded into weights (4 per-token sub-block
+                # scales); it stays alongside q values as q_sf.
+                q_fp8, weights = c4_indexer.compute_q_mxfp4(q_lora, positions, weights)
+            else:
+                # FP8: fused kernel folds rope + hadamard + fp8 quant +
+                # weight*weight_scale*q_scale into one pass.
                 q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
 
         current_stream.wait_stream(stream_q)
@@ -513,16 +486,11 @@ class C4IndexerBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
-        if not c4_indexer.use_fp4_cache:
-            weights = c4_indexer.compute_weights(x, skip_scale=True)
-            q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        weights = c4_indexer.compute_weights(x, skip_scale=True)
+        if c4_indexer.use_fp4_cache:
+            q_fp8, weights = c4_indexer.compute_q_mxfp4(q_lora, positions, weights)
         else:
-            # TODO: use no fused path in mxfp4 indexer for now
-            q = c4_indexer.compute_q_no_fused(q_lora, positions=positions)
-            weights = c4_indexer.compute_weights(x, skip_scale=True)
-            q_packed, q_sf = downcast_to_mxfp4_indexer(q, -1)
-            q_fp8 = (q_packed, q_sf)
-            weights = fused_scale(weights, c4_indexer.weight_scale)
+            q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
         self.forward_indexer_compressor(
             x=x,
             forward_batch=forward_batch,
@@ -570,9 +538,11 @@ class C4IndexerBackendMixin:
 
             q_packed, q_sf = q_quant
             # DeepGEMM expects q values cast to int8 (kPackedFP4) and 4-D
-            # (batch, next_n=1, num_heads, head_dim/2). q_sf 3-D (batch, 1, H).
+            # (batch, next_n=1, num_heads, head_dim/2). q_sf is already 3-D
+            # (batch, next_n=1, num_heads) -- the fused kernel emits it in
+            # that layout directly, so no unsqueeze needed.
             q_packed_4d = q_packed.unsqueeze(1).contiguous().view(torch.int8)
-            q_sf_3d = q_sf.unsqueeze(1).contiguous()
+            q_sf_3d = q_sf.contiguous()
             block_kv = 64
             num_heads_kv = 1
             # Per-token bytes in cache: 64 packed FP4 + 4 ue8m0 = 68. The
@@ -745,7 +715,14 @@ class C4IndexerBackendMixin:
             kv_packed = k_buf.contiguous().view(torch.int8)
             kv_sf = k_scale_buf.contiguous().view(torch.int32).squeeze(-1)
             q_packed_chunk = q_packed[global_token_start:global_token_end]
-            q_sf_chunk = q_sf[global_token_start:global_token_end]
+            # q_sf is (T, next_n=1, H) (canonical paged layout). Reshape to
+            # (T_chunk, H, 1) for the prefill `fp8_fp4_mqa_logits` path so
+            # the byte layout matches what the previous Triton downcast
+            # produced. Both squeeze(1) and unsqueeze(-1) are zero-copy
+            # metadata ops; the int32 strides land at (H, 1, 1).
+            q_sf_chunk = (
+                q_sf[global_token_start:global_token_end].squeeze(1).unsqueeze(-1)
+            )
             q_packed_int8 = q_packed_chunk.contiguous().view(torch.int8)
             logits = deep_gemm.fp8_fp4_mqa_logits(
                 (q_packed_int8, q_sf_chunk),
@@ -794,11 +771,13 @@ class C4IndexerBackendMixin:
         c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in seq_lens_cpu]
         workspace_size = indexer_metadata.max_seq_len * 40
         max_logits_bytes = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get() * 1024 * 1024
+        logits_dtype = torch.bfloat16 if c4_indexer.use_fp4_cache else torch.float32
         chunk_specs = split_indexer_prefill_chunks(
             c4_seq_lens_cpu,
             extend_lens_cpu,
             workspace_size,
             max_logits_bytes,
+            logits_dtype,
         )
 
         for req_slice, query_slice in chunk_specs:
@@ -1076,6 +1055,8 @@ class C4Indexer(nn.Module):
                 not is_hip()
             ), "FP4 indexer cache is not supported on HIP/AMD platforms yet"
 
+        _log_sparse_indexer_budget_once()
+
     def compute_q(
         self,
         q_lora: torch.Tensor,
@@ -1092,7 +1073,8 @@ class C4Indexer(nn.Module):
             q, weight, self.weight_scale, self.freqs_cis, positions
         )
 
-    # TODO: use no fused path in mxfp4 indexer for now
+    # Fallback path: kept for parity-check / rollback. The fused
+    # `compute_q_mxfp4` below is the production path.
     def compute_q_no_fused(
         self, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
@@ -1106,6 +1088,26 @@ class C4Indexer(nn.Module):
         )
         q = rotate_activation(q)
         return q
+
+    def compute_q_mxfp4(
+        self,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Fused MXFP4 Q path: wq_b GEMM + (rope + Hadamard + MXFP4 quant +
+        weight*weight_scale) in one CUDA launch.
+
+        Returns ((q_packed, q_sf), weights_out) -- same shape contract as the
+        old three-step path (`compute_q_no_fused` + `downcast_to_mxfp4_indexer`
+        + `fused_scale(weights, weight_scale)`).
+        """
+        q, _ = self.wq_b(q_lora)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        q_packed, q_sf, weights_out = fused_q_indexer_rope_hadamard_quant_mxfp4(
+            q, weight, self.weight_scale, self.freqs_cis, positions
+        )
+        return (q_packed, q_sf), weights_out
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)

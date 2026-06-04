@@ -9,6 +9,7 @@ from sglang.jit_kernel.dsv4 import (
     CompressorPrefillPlan,
     compress_forward,
     compress_norm_rope_store,
+    compress_norm_rope_store_mxfp4,
 )
 from sglang.srt.environ import envs
 
@@ -60,9 +61,12 @@ class CompressorBackendMixin:
         rotate: bool,
         compress_ratio: int,
         page_size: int,
+        use_mxfp4_cache: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
+        # MXFP4 cache only exists on the c4 indexer path.
+        assert not use_mxfp4_cache or (is_indexer and compress_ratio == 4)
 
         plan = self._get_paged_compress_metadata(compress_ratio)
         is_online = _use_online_compress(compress_ratio)
@@ -82,8 +86,14 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=is_online,
         )
-        # NOTE: we use some hack here...
-        compress_norm_rope_store(
+        # FP4 indexer cache: fused norm+rope+hadamard+mxfp4-quant+store, sharing
+        # the plan-aware emission contract with the FP8 variant.
+        store_fn = (
+            compress_norm_rope_store_mxfp4
+            if use_mxfp4_cache
+            else compress_norm_rope_store
+        )
+        store_fn(
             kv_compressed,
             plan,
             norm_weight=norm.weight,
@@ -109,9 +119,11 @@ class CompressorBackendMixin:
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
         state_pool = compressor.get_state_pool(forward_batch)
+        use_mxfp4_cache = False
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
+            use_mxfp4_cache = getattr(token_to_kv_pool, "use_fp4_indexer_cache", False)
         else:
             kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
@@ -127,6 +139,7 @@ class CompressorBackendMixin:
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
             page_size=page_size,
+            use_mxfp4_cache=use_mxfp4_cache,
         )
 
     # NOTE: alias for backward compatibility
