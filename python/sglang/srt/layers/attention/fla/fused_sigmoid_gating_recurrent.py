@@ -310,7 +310,7 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
-    if envs.SGLANG_SAIL_CUDA_FLA.get():
+    if envs.SGLANG_SAIL_FLA_CUDA.get():
         from fla import fused_sigmoid_gating_delta_rule_forward_k_last
 
         logger.info_once(

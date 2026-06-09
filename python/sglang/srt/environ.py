@@ -679,7 +679,7 @@ class Envs:
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
-    SGLANG_SAIL_CUDA_FLA = EnvBool(False)
+    SGLANG_SAIL_FLA_CUDA = EnvBool(False)
 
 
 envs = Envs()

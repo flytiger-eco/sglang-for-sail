@@ -374,7 +374,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     grid = (NV, B * HV)
     from sglang.srt.utils import logger
 
-    if envs.SGLANG_SAIL_CUDA_FLA.get():
+    if envs.SGLANG_SAIL_FLA_CUDA.get():
         from fla import (
             fused_sigmoid_gating_delta_rule_forward_k_last_packed,
         )
