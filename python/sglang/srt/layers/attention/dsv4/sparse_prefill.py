@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.nsa.triton_kernel import _supports_fp8
+
 # FlashMLA sparse prefill kernel asserts `params.topk % B_TOPK == 0`. B_TOPK is
 # 64 for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
 # Extra slots stay as -1 sentinels and combined_lens caps the valid range via
@@ -27,6 +29,51 @@ _SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 
 # Bound the bf16 KV gather workspace by chunking prefill requests.
 PREFILL_CHUNK_SIZE = 4
+
+
+@triton.jit
+def _fused_fp8_ue8m0_dequant(x_uint8, ue8m0_uint8):
+    """Fused FP8 e4m3fn + UE8M0 scale → float32 via IEEE754 bit construction.
+
+    Merges the FP8 exponent and UE8M0 scale exponent into a single integer
+    add, producing float32 directly — no tl.exp2 or float multiply.
+
+    Args:
+        x_uint8: FP8 e4m3fn bytes (SEEEEMMM, bias=7).
+        ue8m0_uint8: UE8M0 scale byte (value = 2^(ue8m0 - 127)), scalar
+                     broadcast across the block.
+    Returns:
+        float32 tensor = fp8_value * ue8m0_scale.
+
+   Preconditions (caller's responsibility):
+        1 <= fp8_exp + ue8m0 - 7 <= 254 for nonzero values. Amax-based
+        quantizers satisfy this by construction. Out-of-range ue8m0
+        (e.g. corrupted cache bytes) is NOT detected and yields garbage
+        bit patterns — rule this out first when debugging.
+
+    Numerical notes:
+        - Exactly bit-identical to ``fp8.to(f32) * exp2(ue8m0 - 127)`` for
+          all FP8 *normal* values: multiplying by a power of two only
+          shifts the exponent and introduces no rounding.
+        - FP8 subnormals/zero (exp_bits == 0) are flushed to zero (FTZ).
+          Max e4m3 subnormal is 0.875 * 2^-6 ≈ 0.0137, i.e. ~3e-5 of
+          fp8_max=448 —- negligible but deliberate divergence from native FP8 hardware decode.
+        - e4m3fn NaN codepoints (0x7F / 0xFF) decode to a *finite* value
+          of ~480 * scale instead of NaN (this trick treats exp=15,
+          mant=7 as a normal number). 
+
+    """
+    x_i32 = x_uint8.to(tl.int32)
+    sign = x_i32 >> 7
+    exp = (x_i32 >> 3) & 0xF
+    mant = x_i32 & 0x7
+
+    ue8m0 = ue8m0_uint8.to(tl.int32)
+    # f32 exponent field = fp8_exp + ue8m0 - 7  (bias: 134 - 127)
+    f32_bits = (sign << 31) | ((exp + ue8m0 - 7) << 23) | (mant << 20)
+    result = f32_bits.to(tl.float32, bitcast=True)
+    # FP8 subnormal/zero (exp==0): negligibly small in quantized KV cache.
+    return tl.where(exp != 0, result, 0.0)
 
 
 @triton.jit
@@ -50,6 +97,7 @@ def _dequantize_and_gather_k_kernel(
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7
+    USE_FP8_NATIVE: tl.constexpr = True,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -94,14 +142,19 @@ def _dequantize_and_gather_k_kernel(
                 mask = offsets < fp8_dim
 
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-                x_float = x_fp8.to(tl.float32)
 
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
+                if USE_FP8_NATIVE:
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                    x_float = x_fp8.to(tl.float32)
 
-                x_dequant = x_float * scale
+                    encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                    exponent = encoded_scale.to(tl.float32) - 127.0
+                    scale = tl.exp2(exponent)
+
+                    x_dequant = x_float * scale
+                else:
+                    ue8m0 = tl.load(token_scale_ptr + qblock_idx)
+                    x_dequant = _fused_fp8_ue8m0_dequant(x_uint8, ue8m0)
 
                 tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
 
@@ -163,6 +216,7 @@ def dequantize_and_gather_k_cache(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
+        USE_FP8_NATIVE=_supports_fp8(),
     )
 
 

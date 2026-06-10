@@ -1066,8 +1066,16 @@ class DeepseekV4AttnBackend(
             if self._should_use_prefill_sparse_fwd(
                 forward_batch, compress_ratio, core_attn_metadata
             ):
+                from sglang.srt.layers.attention.nsa.triton_kernel import (
+                    _supports_fp8,
+                )
+
+                dequant_mode = (
+                    "native_fp8" if _supports_fp8() else "fp8_soft_dequant"
+                )
                 logger.info_once(
-                    f"\033[32m DSV4 Prefill CSA/HCA Use API: flash_mla_sparse_fwd. \033[0m"
+                    f"\033[32m DSV4 Prefill CSA/HCA Use API: flash_mla_sparse_fwd, "
+                    f"(dequant={dequant_mode}). \033[0m"
                 )
                 return self._forward_prefill_sparse(
                     q=q,
@@ -1179,11 +1187,6 @@ class DeepseekV4AttnBackend(
         if compress_ratio not in (4, 128):
             return False
         if not envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get():
-            return False
-
-        from sglang.srt.layers.attention.nsa.triton_kernel import use_int8_indexer
-
-        if use_int8_indexer():
             return False
         fm = forward_batch.forward_mode
         if not fm.is_extend():

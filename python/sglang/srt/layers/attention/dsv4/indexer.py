@@ -910,8 +910,12 @@ class C4IndexerBackendMixin:
         # raw_indices and publish on the shared core_metadata so the attention
         # backend (DeepseekV4AttnBackend.forward) can pick them up. Skip if
         # another path (capture/hisparse_decode) already owns raw_indices.
+        fm = forward_batch.forward_mode
         use_sparse_fwd_prefill = (
-            use_prefill_logits and envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get()
+            envs.SGLANG_SAIL_DSV4_USE_FLASH_MLA_SPARSE_FWD.get()
+            and fm.is_extend()
+            and not fm.is_target_verify()
+            and not fm.is_draft_extend(include_v2=True)
         )
         # Reset stale pointer from a prior forward in the same metadata object.
         core_metadata.c4_local_topk_indices = None
