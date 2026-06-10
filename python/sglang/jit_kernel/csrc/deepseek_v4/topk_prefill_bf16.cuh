@@ -117,7 +117,7 @@ struct alignas(128) PrefillBF16Smem {
 //   union { histogram[4096] -> 16KB
 //           histogram_vec   -> same storage as histogram
 //           tie_buffer[1024]-> 8KB }
-//   score_buffer[16384]     -> 64KB
+//   bf16_stage[16384]       -> 32KB
 // ============================================================
 using Vec4PF = device::AlignedVector<float, 4>;
 
@@ -132,7 +132,7 @@ struct RegisterTopKSmemPF {
     HistVec histogram_vec[prefill_bf16::kBlockSize];
     TieV3 tie_buffer[prefill_bf16::kMaxTies];
   };
-  alignas(16) float score_buffer[prefill_bf16::kMax1PassLength];
+  alignas(128) __nv_bfloat16 bf16_stage[prefill_bf16::kMax1PassLength];
 };
 
 // ============================================================
@@ -597,13 +597,29 @@ SGL_DEVICE void register_topk_bf16_pf(
     }
   }
 
-  // Fetch the next chunk of scores via synchronous load + cast (replaces cp.async for bf16)
+  // Async copy bf16 data from global to shared memory staging buffer, then cast to float
   if constexpr (kIs2Pass) {
     const uint32_t extra_length = length - prefill_bf16::kMax1PassLength;
-    for (uint32_t i = tx; i < extra_length; i += prefill_bf16::kBlockSize) {
-      smem->score_buffer[i] = static_cast<float>(scores[prefill_bf16::kMax1PassLength + i]);
+    const __nv_bfloat16* src = scores + prefill_bf16::kMax1PassLength;
+
+    // Issue async copies: each thread copies kElemPerStage (8) bf16 elements per round.
+    // extra_length is at most kMax1PassLength (16384) and kSizePerStage = 8192, so at most 2 rounds.
+#pragma unroll 2
+    for (uint32_t r = 0; r < 2; ++r) {
+      const uint32_t global_base = r * prefill_bf16::kSizePerStage + tx * prefill_bf16::kElemPerStage;
+      if (global_base + prefill_bf16::kElemPerStage <= extra_length) {
+        __pipeline_memcpy_async(
+            &smem->bf16_stage[global_base], &src[global_base], prefill_bf16::kCpAsyncBytes);
+      } else if (global_base < extra_length) {
+#pragma unroll
+        for (uint32_t e = 0; e < prefill_bf16::kElemPerStage; ++e) {
+          if (global_base + e < extra_length) {
+            smem->bf16_stage[global_base + e] = src[global_base + e];
+          }
+        }
+      }
     }
-    __syncthreads();
+    __pipeline_commit();
   }
 
   // Accumulate histogram via shared-memory atomics
@@ -619,8 +635,23 @@ SGL_DEVICE void register_topk_bf16_pf(
     }
   }
   if constexpr (kIs2Pass) {
-    for (uint32_t i = tx; i + prefill_bf16::kMax1PassLength < length; i += prefill_bf16::kBlockSize) {
-      const auto val = smem->score_buffer[i];
+    const uint32_t extra_length = length - prefill_bf16::kMax1PassLength;
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    // Read 32-bit (2 bf16) from staging buffer and accumulate histogram directly
+    const __nv_bfloat162* bf16_pairs = reinterpret_cast<const __nv_bfloat162*>(smem->bf16_stage);
+    const uint32_t pair_len = extra_length / 2;
+    for (uint32_t i = tx; i < pair_len; i += prefill_bf16::kBlockSize) {
+      const __nv_bfloat162 pair = bf16_pairs[i];
+      const float val0 = __bfloat162float(__low2bfloat16(pair));
+      const float val1 = __bfloat162float(__high2bfloat16(pair));
+      atomicAdd(&smem->histogram[extract_coarse_bin_pf<prefill_bf16::kHistBits>(val0)], 1);
+      atomicAdd(&smem->histogram[extract_coarse_bin_pf<prefill_bf16::kHistBits>(val1)], 1);
+    }
+    // Handle trailing odd element
+    if ((extra_length & 1) && tx == 0) {
+      const float val = __bfloat162float(smem->bf16_stage[extra_length - 1]);
       atomicAdd(&smem->histogram[extract_coarse_bin_pf<prefill_bf16::kHistBits>(val)], 1);
     }
   }
@@ -698,13 +729,17 @@ SGL_DEVICE void register_topk_bf16_pf(
         }
       }
     }
-    // prefetch the next scores from smem into registers (for 2-pass)
+    // prefetch the next scores from bf16_stage into registers (for 2-pass)
     if constexpr (kIs2Pass) {
-      local[v].load(smem->score_buffer, tx + v * prefill_bf16::kBlockSize);
+      const uint32_t pf_base = (tx + v * prefill_bf16::kBlockSize) * 4;
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        local[v][e] = __bfloat162float(smem->bf16_stage[pf_base + e]);
+      }
     }
   }
 
-  // 16K ~ 32K: process second chunk from registers (now loaded from score_buffer)
+  // 16K ~ 32K: process second chunk from registers (now loaded from bf16_stage)
   if constexpr (kIs2Pass) {
 #pragma unroll
     for (uint32_t v = 0; v < prefill_bf16::kVecsPerThread; ++v) {
