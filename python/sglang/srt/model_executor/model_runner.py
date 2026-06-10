@@ -1034,10 +1034,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
-
+        # <NOTE>
+        # PPU FA3 does not support MLA. For MLA models on PPU, the attention backend
+        # is split: [--prefill-attention-backend fa3 --decode-attention-backend flashmla].
+        # Therefore we must check prefill_attention_backend (not attention_backend) when
+        # determining chunked-prefix-cache support on PPU.
+        # </NOTE>
+        effective_backend = (
+            server_args.prefill_attention_backend
+            if current_platform.is_ppu() and self.use_mla_backend
+            else server_args.attention_backend
+        )
         if (
             not self.use_mla_backend
-            or server_args.attention_backend
+            or effective_backend
             not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
         ):
             server_args.disable_chunked_prefix_cache = True
