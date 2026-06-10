@@ -155,7 +155,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_ppu()
 
 
 @lru_cache(maxsize=1)
@@ -218,6 +218,11 @@ def is_musa() -> bool:
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
     return torch.backends.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_ppu() -> bool:
+    return "PPU_SDK" in os.environ
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -2082,7 +2087,7 @@ def get_device(device_id: Optional[int] = None) -> str:
         return current_platform.get_device(device_id)
     except Exception:
         raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, PPU) or platform plugin is available."
         )
 
 

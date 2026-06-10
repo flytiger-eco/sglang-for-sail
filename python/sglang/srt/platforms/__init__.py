@@ -19,6 +19,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.ppu import PPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -33,6 +34,12 @@ def _is_cuda_available() -> bool:
 
 def _is_rocm_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is not None)
+
+
+def _is_ppu_available() -> bool:
+    import os
+
+    return bool(torch.cuda.is_available() and "PPU_SDK" in os.environ)
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -51,6 +58,7 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM unset (auto-discover):
          - Import and activate all discovered plugins
+         - 0 activated + PPU available → fallback PPUSRTPlatform
          - 0 activated + CUDA available → fallback CudaSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + neither → fallback base SRTPlatform
@@ -104,6 +112,9 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
+        if _is_ppu_available():
+            logger.debug("No platform plugin detected. Using PPU SRTPlatform defaults.")
+            return PPUSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
