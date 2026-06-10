@@ -139,6 +139,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
+    get_is_capture_mode,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -3447,8 +3448,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if SGLANG_PROFILE_NVTX:
             if use_model_prof:
-                prof_iter(self.iteration)
-            self.iteration += 1
+                # Skip during capture: prof_iter -> cudaDeviceSynchronize() is
+                # illegal under CUDA Graph capture (error 900).
+                if not get_is_capture_mode():
+                    prof_iter(self.iteration)
+                    # Increment inside guard so capture forwards don't bump
+                    # iteration and misalign the trace.
+                    self.iteration += 1
 
         if can_run_graph:
             if SGLANG_PROFILE_NVTX:
