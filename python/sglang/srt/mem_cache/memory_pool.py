@@ -1981,6 +1981,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
+    # MXFP4 quant block — must match downcast_to_mxfp4_indexer / fused store mxfp4.
+    mxfp4_block_size = 32
     use_bf16_indexer = envs.SGLANG_SAIL_BF16_INDEXER.get() and is_ppu()
     index_k_with_scale_buffer_dtype = (
         torch.uint8 if not use_bf16_indexer else torch.bfloat16
@@ -2002,6 +2004,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        use_fp4_indexer: bool = False,
     ):
 
         override_dim = (
@@ -2025,10 +2028,22 @@ class NSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.use_fp4_indexer = use_fp4_indexer
         if index_buf_size is None:
             index_buf_size = size
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
+
+        if self.use_fp4_indexer:
+            assert (
+                not self.use_bf16_indexer
+            ), "FP4 indexer cache is incompatible with SGLANG_SAIL_BF16_INDEXER"
+            assert (
+                index_head_dim % self.mxfp4_block_size == 0
+            ), f"index_head_dim={index_head_dim} must be divisible by MXFP4 block {self.mxfp4_block_size}"
+            assert (
+                is_ppu()
+            ), "FP4 indexer cache is supported on PPU platforms"
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
@@ -2046,32 +2061,51 @@ class NSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
+            num_pages = (index_buf_size + page_size + 1) // self.page_size
+            if self.use_fp4_indexer:
+                # FP4 layout per token: 64 packed FP4 bytes + 4 ue8m0 scale bytes.
+                page_bytes = self.page_size * (
+                    self.packed_bytes_per_token + self.scale_bytes_per_token
+                )
+            elif self.use_bf16_indexer:
+                # bf16 kcache does not need scale; element-count layout.
+                page_bytes = self.page_size * index_head_dim
+            else:
+                # FP8 layout: (head_dim bytes + head_dim/quant_block_size * 4 scale bytes) per token.
+                page_bytes = self.page_size * (
+                    index_head_dim + index_head_dim // self.quant_block_size * 4
+                )
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
                     #     ref: test_attention.py :: kv_cache_cast_to_fp8
-                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
-                    #     data: for page i,
+                    #     FP8:  for page i,
                     #         * buf[i, :page_size * head_dim] for fp8 data
                     #         * buf[i, page_size * head_dim:].view(float32) for scale
-                    (
-                        (index_buf_size + page_size + 1) // self.page_size,
-                        self.page_size
-                        * (
-                            (
-                                index_head_dim
-                                + index_head_dim // self.quant_block_size * 4
-                            )
-                            if not self.use_bf16_indexer
-                            else index_head_dim
-                        ),  # bf16 kcache does not need scale
-                    ),
+                    #     FP4:  for page i,
+                    #         * buf[i, :page_size * 64]              packed E2M1 (uint8)
+                    #         * buf[i, page_size * 64 : +page_size * 4] ue8m0 scales (4 bytes/token)
+                    (num_pages, page_bytes),
                     dtype=self.index_k_with_scale_buffer_dtype,
                     device=device,
                 )
                 for _ in range(layer_num)
             ]
         self._finalize_allocation_log(size)
+
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
+    @property
+    def scale_bytes_per_token(self) -> int:
+        """Per-token scale bytes. FP8: head_dim/quant_block * 4. FP4: head_dim/32 ue8m0 bytes."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // self.mxfp4_block_size
+        return (self.index_head_dim // self.quant_block_size) * 4
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -2088,11 +2122,12 @@ class NSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        """Gather index K data from paged buffer into a contiguous tensor."""
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetK.execute(
-            self, buf, seq_len=seq_len, page_indices=page_indices
+            self, buf, seq_len=seq_len, page_indices=page_indices,
         )
 
     def get_index_k_scale_continuous(
@@ -2123,13 +2158,31 @@ class NSATokenToKVPool(MLATokenToKVPool):
         :param layer_id: Layer index
         :param seq_len: Sequence length
         :param page_indices: Page indices tensor
-        :return: tuple of (k_fp8, k_scale) where
-                 k_fp8: (seq_len, index_head_dim), uint8
-                 k_scale: (seq_len, 4), uint8
+        :return: tuple of (k_buf, k_scale_buf) where
+                 FP8: k_buf  (seq_len, head_dim) uint8, k_scale_buf (seq_len, 4) uint8
+                 FP4: k_buf  (seq_len, head_dim/2) uint8 (packed E2M1),
+                      k_scale_buf (seq_len, head_dim/32) uint8 (ue8m0)
         """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        if self.use_fp4_indexer:
+            # FP4 layout: per-token K bytes = head_dim/2; scale bytes = head_dim/32.
+            # The triton accessor is byte-stride agnostic; pass packed K width as
+            # the "head_dim" to gather K bytes, and gather scales separately.
+            from sglang.srt.layers.attention.nsa.index_buf_accessor import (
+                _get_k_and_s_triton,
+            )
+
+            return _get_k_and_s_triton(
+                buf=buf,
+                page_indices=page_indices,
+                seq_lens=seq_len_tensor,
+                seq_len_sum=seq_len_sum,
+                max_seq_len=max_seq_len,
+                page_size=self.page_size,
+                index_head_dim=self.packed_bytes_per_token,
+            )
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -2146,6 +2199,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        assert not self.use_fp4_indexer, (
+            "Unfused FP4 cache insert is not supported. The FP4 path requires "
+            "the fused store kernel (fused_store_index_k_mxfp4_cache); the "
+            "scalar (k_fp8, k_scale) tensors here have no FP4 analog."
+        )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
