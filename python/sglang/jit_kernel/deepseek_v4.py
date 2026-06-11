@@ -337,6 +337,54 @@ def _jit_topk_prefill_bf16_module(topk: int) -> Module:
 
 
 @cache_once
+def _jit_dequantize_gather_module() -> Module:
+    return load_jit(
+        make_name("dequantize_gather"),
+        cuda_files=["deepseek_v4/dequantize_gather.cuh"],
+        cuda_wrappers=[
+            ("dequantize_and_gather_k", "DequantizeGatherKernel::run"),
+        ],
+    )
+
+
+def dequantize_and_gather_k_cuda(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    offset: int,
+    gather_lens: Optional[torch.Tensor],
+    block_size: int,
+    use_fp8_native: bool = True,
+) -> None:
+    """CUDA equivalent of `_dequantize_and_gather_k_kernel` in sparse_prefill.py.
+
+    Dequantizes FP8 nope + copies BF16 rope from a paged DSv4 K cache into a
+    contiguous BF16 workspace, gathering `gather_len` (or `seq_len`) tokens
+    per request starting at `seq_len - gather_len`.
+
+    Args:
+        use_fp8_native: When True (default), dequantize via the CUDA FP8
+            intrinsic (`__nv_cvt_fp8_to_halfraw`). When False, use a fused
+            IEEE754 bit-construction path that does not require native FP8
+            hardware support (e.g. for SM80/A100). The fused path is
+            bit-identical to native for all FP8 normal values and FTZs
+            FP8 subnormals (exp_bits == 0).
+    """
+    module = _jit_dequantize_gather_module()
+    module.dequantize_and_gather_k(
+        out,
+        k_cache,
+        seq_lens,
+        block_table,
+        offset,
+        gather_lens,
+        block_size,
+        int(use_fp8_native),
+    )
+
+
+@cache_once
 def _jit_silu_mul_quant_varlen_module(
     quant_group_size: int,
     scale_ue8m0: bool,

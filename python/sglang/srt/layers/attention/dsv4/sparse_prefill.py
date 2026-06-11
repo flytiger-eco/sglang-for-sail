@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.deepseek_v4 import dequantize_and_gather_k_cuda
 from sglang.srt.layers.attention.nsa.triton_kernel import _supports_fp8
 
 # FlashMLA sparse prefill kernel asserts `params.topk % B_TOPK == 0`. B_TOPK is
@@ -76,97 +77,6 @@ def _fused_fp8_ue8m0_dequant(x_uint8, ue8m0_uint8):
     return tl.where(exp != 0, result, 0.0)
 
 
-@triton.jit
-def _dequantize_and_gather_k_kernel(
-    out_ptr,
-    out_stride0,
-    out_stride1,
-    k_cache_ptr,
-    seq_lens_ptr,
-    block_table_ptr,
-    offset,
-    gather_lens_ptr,
-    max_blocks_per_seq: tl.constexpr,
-    fp8_dim: tl.constexpr,  # 448
-    bf16_dim: tl.constexpr,  # 64
-    scale_dim: tl.constexpr,  # 8 (incl. 1 pad)
-    quant_block: tl.constexpr,  # 64
-    cache_block_size: tl.constexpr,  # swa=128 / c4=64
-    token_data_size: tl.constexpr,  # 576
-    block_stride: tl.constexpr,  # bytes per cache page
-    output_dim: tl.constexpr,  # 512
-    fp8_max: tl.constexpr,
-    n_quant_blocks: tl.constexpr,  # 7
-    USE_FP8_NATIVE: tl.constexpr = True,
-):
-    batch_idx = tl.program_id(0)
-    worker_id = tl.program_id(1)
-    num_workers = tl.num_programs(1)
-
-    seq_len = tl.load(seq_lens_ptr + batch_idx)
-    if gather_lens_ptr is not None:  # noqa: SIM108
-        gather_len = tl.load(gather_lens_ptr + batch_idx)
-    else:
-        gather_len = seq_len
-    start_pos = seq_len - gather_len
-
-    for i in range(worker_id, gather_len, num_workers):
-        pos = start_pos + i
-
-        block_in_seq = pos // cache_block_size
-        pos_in_block = pos % cache_block_size
-
-        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
-        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)
-
-        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
-
-        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
-
-        token_scale_ptr = (
-            cache_block_ptr
-            + cache_block_size * token_data_size
-            + pos_in_block * scale_dim
-        )
-
-        token_fp8_ptr = token_data_ptr
-        token_bf16_ptr = token_data_ptr + fp8_dim
-
-        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
-
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
-
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
-
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
-
-                if USE_FP8_NATIVE:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-                    x_float = x_fp8.to(tl.float32)
-
-                    encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                    exponent = encoded_scale.to(tl.float32) - 127.0
-                    scale = tl.exp2(exponent)
-
-                    x_dequant = x_float * scale
-                else:
-                    ue8m0 = tl.load(token_scale_ptr + qblock_idx)
-                    x_dequant = _fused_fp8_ue8m0_dequant(x_uint8, ue8m0)
-
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
-
-        bf16_output_offset = fp8_dim
-        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-
-        for j in tl.static_range(bf16_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
-
-
 def dequantize_and_gather_k_cache(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -187,36 +97,15 @@ def dequantize_and_gather_k_cache(
         block_size: tokens per cache page (swa=128, c4=64).
         offset: starting column in `out` for the gathered tokens.
     """
-    TOKEN_FP8_DIM = 448
-    TOKEN_BF16_DIM = 64
-    TOKEN_SCALE_DIM = 8
-    QUANT_BLOCK_SIZE = 64
-    FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
-
-    num_reqs = seq_lens.shape[0]
-    NUM_WORKERS = 128
-    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
-        out,
-        out.stride(0),
-        out.stride(1),
-        k_cache,
-        seq_lens,
-        block_table,
-        offset,
-        gather_lens,
-        max_blocks_per_seq=block_table.shape[-1],
-        fp8_dim=TOKEN_FP8_DIM,
-        bf16_dim=TOKEN_BF16_DIM,
-        scale_dim=TOKEN_SCALE_DIM,
-        quant_block=QUANT_BLOCK_SIZE,
-        cache_block_size=block_size,
-        token_data_size=TOKEN_DATA_SIZE,
-        block_stride=k_cache.stride(0),
-        output_dim=512,
-        fp8_max=FP8_MAX,
-        n_quant_blocks=7,
-        USE_FP8_NATIVE=_supports_fp8(),
+    dequantize_and_gather_k_cuda(
+        out=out,
+        k_cache=k_cache,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        offset=offset,
+        gather_lens=gather_lens,
+        block_size=block_size,
+        use_fp8_native=_supports_fp8(),
     )
 
 
