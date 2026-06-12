@@ -425,6 +425,18 @@ def deep_moe_impl_fused(
     N = w1.shape[1]
     K = a.shape[-1]
 
+    _nvtx_moe_pushed = False
+    if SGLANG_PROFILE_NVTX:
+        _moe_tag = (
+            f"M_{topk_ids.shape[0]}_E_{w1.shape[0]}_"
+            f"H_{w1.shape[2]}_In_{w1.shape[1]}_topk_{top_k}"
+        )
+        if torch.cuda.is_current_stream_capturing():
+            th_nvtx_range_push(f"D_MoE,{_moe_tag}")
+        else:
+            th_nvtx_range_push(f"P_MoE,{_moe_tag}")
+        _nvtx_moe_pushed = True
+
     # print topid only if SGLANG_PROFILE_NVTX_PRINT_TOPID_TOPID set to avoid impact perf compare
     nvtx_pushed = False
     if SGLANG_PROFILE_NVTX and SGLANG_PROFILE_NVTX_PRINT_TOPID:
@@ -541,6 +553,9 @@ def deep_moe_impl_fused(
     )
 
     out_hidden_states *= routed_scaling_factor
+
+    if _nvtx_moe_pushed:
+        th_nvtx_range_pop()
 
 
 @register_fused_func("none", "deep_gemm")
