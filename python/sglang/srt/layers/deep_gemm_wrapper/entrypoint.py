@@ -624,6 +624,39 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
 
 
+def grouped_gemm_nt_bf16i4bf16_nopad(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: Optional[torch.Tensor] = None,
+    configs=None,
+):
+    # lhs: shape [m, k], dtype bf16
+    # rhs[0]: shape [e, k//16, n*2], dtype int32 (packed int4 weights)
+    # rhs[1]: shape [e, k//group_size, n], dtype bf16 (scales)
+    # where group_size is the quantization group size for int4 weights
+
+    assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_bf16i4bf16_nopad"
+
+    m, k = lhs.shape
+    num_groups, n = rhs[0].shape[0], rhs[0].shape[2] // 2
+
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="int4"
+        )
+    )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_w4a16_nopad(
+            lhs, rhs, out, m_indices, m_rows, best_config
+        )
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 

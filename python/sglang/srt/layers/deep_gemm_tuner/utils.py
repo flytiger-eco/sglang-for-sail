@@ -70,8 +70,8 @@ def append_non_tuned_case(M, N, K, NUM_GROUP, nopad, dtype):
 
 @functools.lru_cache(maxsize=None)
 def get_deep_gemm_config(M, N, K, num_groups, nopad=False, dtype="int8"):
-    # deep gemm tuner does not support fp4 yet
-    if dtype == "fp4":
+    # deep gemm tuner does not support fp4 and int4 yet
+    if dtype == "fp4" or dtype == "int4":
         return None
 
     best_config = get_deep_gemm_luts(M, N, K, num_groups, nopad=nopad, dtype=dtype)

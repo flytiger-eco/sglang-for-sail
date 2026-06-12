@@ -163,6 +163,18 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     )
 
 
+@register_custom_op(mutates_args=["C"])
+def grouped_gemm_nt_bf16i4bf16_nopad(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(A, (B, Bs), C, m_indices, m_rows)
+
+
 def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
@@ -344,6 +356,7 @@ def deep_moe_impl_fused(
     use_fp8: bool = False,
     use_int8: bool = False,
     use_mxfp4: bool = False,
+    use_int4_w4a16: bool = False,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     gemm1_alpha: Optional[float] = None,
@@ -358,6 +371,9 @@ def deep_moe_impl_fused(
     num_tokens, K = hidden_states.shape
     E, N, _ = w1.shape
     _, top_k = topk_ids.shape
+
+    if use_int4_w4a16:
+        N = w2.shape[1] * 32
 
     out_hidden_states = hidden_states
     num_tokens_padded = compute_aligned_M(num_tokens, top_k, E, block_align)
@@ -393,14 +409,7 @@ def deep_moe_impl_fused(
         hidden_states, hidden_states_scale = downcast_to_mxfp4(hidden_states, axis=1)
         block_k = block_shape[1]
     else:
-        a = torch.empty(
-            (num_tokens_padded, K),
-            device=hidden_states.device,
-            dtype=torch.bfloat16,
-        )
-        hidden_states = hidden_states
         hidden_states_scale = None
-        a_scale = None
         block_k = K
 
     out1 = torch.empty(
@@ -420,10 +429,6 @@ def deep_moe_impl_fused(
         is_block_wise=(block_shape is not None),
     )
     assert a.size(0) == num_tokens_padded
-
-    M = a.shape[0]
-    N = w1.shape[1]
-    K = a.shape[-1]
 
     _nvtx_moe_pushed = False
     if SGLANG_PROFILE_NVTX:
@@ -473,6 +478,10 @@ def deep_moe_impl_fused(
         grouped_gemm_nt_f4f4bf16_nopad(
             a, a_scale, w1, w1_scale, b1, out1, expert_ids, num_recv_tokens_per_expert
         )
+    elif use_int4_w4a16:
+        grouped_gemm_nt_bf16i4bf16_nopad(
+            a, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
+        )
     else:
         grouped_gemm_nt_bf16bf16bf16_nopad(
             a, w1, out1, expert_ids, num_recv_tokens_per_expert
@@ -517,24 +526,15 @@ def deep_moe_impl_fused(
         )
     elif use_fp8:
         grouped_gemm_nt_f8f8bf16_nopad(
-            a,
-            a_scale,
-            w2,
-            w2_scale,
-            out3,
-            expert_ids,
-            num_recv_tokens_per_expert,
+            a, a_scale, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
         )
     elif use_mxfp4:
         grouped_gemm_nt_f4f4bf16_nopad(
-            a,
-            a_scale,
-            w2,
-            w2_scale,
-            b2,
-            out3,
-            expert_ids,
-            num_recv_tokens_per_expert,
+            a, a_scale, w2, w2_scale, b2, out3, expert_ids, num_recv_tokens_per_expert
+        )
+    elif use_int4_w4a16:
+        grouped_gemm_nt_bf16i4bf16_nopad(
+            a, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
         )
     else:
         grouped_gemm_nt_bf16bf16bf16_nopad(
@@ -574,6 +574,7 @@ def fused_experts_none_to_deep_gemm(
     use_fp8 = quant_info.use_fp8
     use_int8 = quant_info.use_int8
     use_mxfp4 = quant_info.use_mxfp4
+    use_int4_w4a16 = quant_info.use_int4_w4a16
     per_channel_quant = quant_info.per_channel_quant
     w1_scale = quant_info.w13_scale
     w2_scale = quant_info.w2_scale
@@ -596,6 +597,7 @@ def fused_experts_none_to_deep_gemm(
         use_fp8=use_fp8,
         use_int8=use_int8,
         use_mxfp4=use_mxfp4,
+        use_int4_w4a16=use_int4_w4a16,
         b1=b1,
         b2=b2,
         gemm1_alpha=moe_runner_config.gemm1_alpha,

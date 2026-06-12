@@ -104,7 +104,7 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_BF16BF16F32 = auto()
 
     # <NOTE>
-    # new added int8/bf16/fp4 kernel type and nopad impl.
+    # new added int8/bf16/fp4/int4 kernel type and nopad impl.
     # </NOTE>
     GROUPED_GEMM_NT_F8F8BF16_NOPAD = auto()
     GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL = auto()
@@ -125,6 +125,8 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS = auto()
     GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS = auto()
     GEMM_NT_F4F4BF16_BIAS = auto()
+
+    GROUPED_GEMM_NT_BF16I4BF16_NOPAD = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -290,7 +292,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
             # <NOTE>
-            # new executor for i8/bf16 kernel type as well as nopad interface
+            # new executor for int8/bf16/fp4/int4 kernel type as well as nopad interface
             # </NOTE>
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD: _GroupedNopadWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL: _NormalWarmupExecutor_channel,
@@ -308,6 +310,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS: _GroupedMaskedWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS: _GroupedNopadWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -380,6 +383,14 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             ) / _GB
         elif kernel_type in [DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS]:
             return (max_m * k + n * k + n * 4 + max_m * n * 2) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD]:
+            return (
+                max_m * k * 2
+                + num_groups * (k // 16) * (n * 2) * 4
+                + num_groups * (k // 32) * n * 2
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
 
@@ -623,6 +634,24 @@ def _empty_block_uint8(size):
             (*dims, n, k // 16),
             device="cuda",
             dtype=torch.uint8,
+        ),
+    )
+
+
+def _empty_marlin_int4(size):
+    # Currently deepgemm w4a16 only supports group_size=32
+    *dims, n, k = size
+    group_size = 32
+    return (
+        torch.empty(
+            (*dims, k // 16, n * 2),
+            device="cuda",
+            dtype=torch.int32,
+        ),
+        torch.empty(
+            (*dims, k // group_size, n),
+            device="cuda",
+            dtype=torch.bfloat16,
         ),
     )
 
@@ -908,3 +937,22 @@ class _NormalWarmupExecutor_fp4_bias(_NormalWarmupExecutor_fp4):
     def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         super().setup_tensors(max_m, n, k, num_groups)
         self.bias = torch.zeros((n,), device="cuda", dtype=torch.float32)
+
+
+class _GroupedNopadWarmupExecutor_int4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_w4a16_nopad(
+            self.lhs[:m],
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )

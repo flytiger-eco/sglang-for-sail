@@ -805,6 +805,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             else loaded_weight
@@ -1024,6 +1025,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             else loaded_weight
