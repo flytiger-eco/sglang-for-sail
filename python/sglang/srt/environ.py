@@ -573,6 +573,7 @@ class Envs:
     # Force dynamic DeepEP Waterfill with runtime EP all-reduce instead of the
     # default static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_SAIL_DEEPEP_RECV_HOOK = EnvBool(True)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)

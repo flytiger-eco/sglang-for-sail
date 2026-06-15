@@ -50,16 +50,23 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
+    CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -69,12 +76,14 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_ppu,
     print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -98,6 +107,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
+        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get()
         return MaybeTboDeepEPDispatcher(
             group=(
                 get_tp_group().device_group
@@ -112,7 +122,10 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=use_recv_hook,
+            **(
+                dict(dispatch_dtype=moe_runner_config.dispatch_dtype) if _is_ppu else {}
+            ),
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -314,6 +327,23 @@ class FusedMoE(torch.nn.Module):
             moe_intermediate_size=intermediate_size,
         )
 
+        # <NOTE>
+        # Setup dispatch dtype according to quant_method of int8/fp8/mxfp4
+        # </NOTE>
+        if (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            or isinstance(self.quant_method, W8A8FP8MoEMethod)
+            or (
+                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+                and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)
+            )
+        ):
+            self.moe_runner_config.dispatch_dtype = torch.float8_e4m3fn
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+            self.moe_runner_config.dispatch_dtype = torch.int8
+        elif isinstance(self.quant_method, Mxfp4MoEMethod):
+            self.moe_runner_config.dispatch_dtype = torch.uint8
+
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
         self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
@@ -327,6 +357,7 @@ class FusedMoE(torch.nn.Module):
                     "Setting inplace to False for FlashInfer TRTLLM MoE backend."
                 )
             self.moe_runner_config.inplace = False
+        self.dispatcher.set_quant_config(self.quant_config)
 
         self.should_fuse_routed_scaling_factor_in_topk = (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
@@ -621,7 +652,8 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id
+            is None  # TODO: upstream fix for general mxfp4 models support (expert_id may be 0)
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -812,6 +844,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1032,6 +1065,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name

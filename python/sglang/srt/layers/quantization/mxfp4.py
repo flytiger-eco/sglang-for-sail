@@ -33,28 +33,34 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_device_sm,
     is_cpu,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_ppu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -103,6 +109,29 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
+def gemm_nt_f4f4bf16_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,  # bias
+    D: torch.Tensor,  # out
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_f4f4bf16_fake)
+def gemm_nt_f4f4bf16(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,  # bias
+    D: torch.Tensor,  # out
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f4f4bf16((A, As), (B, Bs), C, D)
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
@@ -145,6 +174,7 @@ if TYPE_CHECKING:
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -162,6 +192,16 @@ if _is_hip:
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
         dynamic_mxfp4_quant = e8m0_shuffle = err
+
+if is_ppu():
+    try:
+        # necessary call for mxfp4 deepgemm usage
+        from deep_gemm import preprocess_mxfp4_scales
+    except ImportError as e:
+        from sglang.srt.utils import logger
+
+        logger.warning(f"Import deepgemm error for running mxfp4 on PPU! {e}")
+    from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -244,16 +284,33 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        fp8_channelwise_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        self.fp8_channelwise_layers = fp8_channelwise_layers
+        # TODO: better solution to confirm packed modules
+        self.packed_modules_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            "fused_qkv_a_proj_with_mqa": [
+                "q_a_proj",
+                "kv_a_proj_with_mqa",
+            ],  # for kimi-2.5
+        }
 
     @classmethod
     def from_config(cls, config):
 
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
+        )
+        fp8_channelwise_layers = cls.get_from_keys_or(
+            config, ["fp8_channelwise_layers"], None
+        )
 
         if _is_hip:
             if mxfp_supported():
@@ -267,7 +324,11 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
-        return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
+        return cls(
+            ignored_layers=ignored_layers,
+            is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+            fp8_channelwise_layers=fp8_channelwise_layers,
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -295,28 +356,121 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
+        # fp8 channelwise
+        if self.fp8_channelwise_layers and should_ignore_layer(
+            prefix,
+            ignore=self.fp8_channelwise_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return W8A8Fp8Config(is_checkpoint_fp8_serialized=True).get_quant_method(
+                layer, prefix
+            )
 
         if isinstance(layer, LinearBase):
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
+            if self.ignored_layers and should_ignore_layer(
+                prefix,
+                ignore=self.ignored_layers,
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            # only ppu deepgemm support mxfp4
+            elif self.is_checkpoint_mxfp4_serialized and _is_ppu:
+                return Mxfp4LinearMethod(prefix=prefix)
+            else:
+                raise NotImplementedError
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
             else:
                 return Mxfp4DynamicQuantMoEMethod()
-        else:
-            if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class Mxfp4LinearMethod(LinearMethodBase):
+
+    def __init__(
+        self,
+        prefix: str,
+    ):
+        self.prefix = prefix
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        self.logical_widths = output_partition_sizes
+        weight_dtype = torch.uint8
+        scale_dtype = torch.uint8
+        mxfp4_block = 32
+        extra_weight_attrs.update({"quant_method": "group"})
+
+        if input_size_per_partition % mxfp4_block != 0:
+            raise ValueError(
+                f"Weight input_size_per_partition = {input_size_per_partition} is not divisible by {mxfp4_block}."
+            )
+
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition // 2,
+                dtype=weight_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        weight_scale = GroupQuantScaleParameter(
+            data=torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition // mxfp4_block,
+                dtype=scale_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
+
+    def process_weights_after_loading(self, layer):
+        layer.weight = Parameter(layer.weight.t(), requires_grad=False)
+
+        weight_scale = layer.weight_scale
+        processed_scale = preprocess_mxfp4_scales(weight_scale)
+        layer.weight_scale = Parameter(processed_scale, requires_grad=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ):
+        if bias is not None:
+            bias = bias.to(torch.float32)
+        x_q, x_scale = downcast_to_mxfp4(x, axis=1)
+
+        out = torch.empty(
+            (x_q.shape[0], layer.weight.t().shape[0]),
+            dtype=torch.bfloat16,
+            device=x_q.device,
+        )
+        gemm_nt_f4f4bf16(x_q, x_scale, layer.weight.t(), layer.weight_scale, bias, out)
+        return out.to(x.dtype)
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -359,6 +513,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "moe_runner_backend=flashinfer_mxfp4 requires SM90 or SM100."
                 )
 
+    @staticmethod
+    def is_deepgemm_moe_runner_backend_enabled() -> bool:
+        """Check if MoE will actually use DeepGEMM runner for MXFP4."""
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_deep_gemm():
+            assert (
+                _is_ppu and get_device_sm() >= 89
+            ), f"Only ppu sm89 and above support mxfp4 deep_gemm, use other moe backend on current platform please."
+            return True
+        if moe_runner_backend.is_auto():
+            return (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                    or envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                )
+                and _is_ppu
+                and get_device_sm() >= 89
+            )
+        return False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -369,12 +548,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -464,16 +648,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
-        w13_weight_bias = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_bias", w13_weight_bias)
-        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+        if self.with_bias or not self.is_deepgemm_moe_runner_backend_enabled():
+            w13_weight_bias = torch.nn.Parameter(
+                torch.zeros(
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -500,12 +685,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-        w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_bias", w2_weight_bias)
-        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        if self.with_bias or not self.is_deepgemm_moe_runner_backend_enabled():
+            w2_weight_bias = torch.nn.Parameter(
+                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
@@ -858,6 +1044,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
+        elif self.is_deepgemm_moe_runner_backend_enabled():
+            if self.with_bias:
+                w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
+                w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+                layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
+                layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+
+            w13_weight_scale = layer.w13_weight_scale
+            w2_weight_scale = layer.w2_weight_scale
+            processed_w13_scale = []
+            for idx, scale_uint8 in enumerate(w13_weight_scale):
+                processed_w13_scale.append(scale_uint8)
+            processed_w2_scale = []
+            for idx, scale_uint8 in enumerate(w2_weight_scale):
+                processed_w2_scale.append(scale_uint8)
+
+            w13_scale = preprocess_mxfp4_scales(torch.stack(processed_w13_scale, dim=0))
+            layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+            w2_scale = preprocess_mxfp4_scales(torch.stack(processed_w2_scale, dim=0))
+            layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -1017,10 +1223,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Must match apply() priority: _use_aiter before use_triton_kernels.
             if _use_aiter and get_moe_a2a_backend().supports_aiter():
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif self.is_deepgemm_moe_runner_backend_enabled():
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if moe_runner_backend.is_aiter():
             # MXFP4 hard-codes Swiglu in the AITER kernel path.
@@ -1031,6 +1242,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif (
@@ -1084,7 +1296,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        if not self.is_deepgemm_moe_runner_backend_enabled():
+            topk_output = dispatch_output.topk_output
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
@@ -1112,7 +1325,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
-
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
             if x.shape[-1] == self.hidden_size:
@@ -1136,7 +1348,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
             )
-
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, dispatch_output)
         if self.use_flashinfer:
@@ -1291,13 +1502,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_precision_config=getattr(self, "w13_precision_config", None),
                 w2_precision_config=getattr(self, "w2_precision_config", None),
             )
-        else:
+        elif backend.is_deep_gemm():
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=layer.w13_weight_bias if self.with_bias else None,
+                b2=layer.w2_weight_bias if self.with_bias else None,
+                use_mxfp4=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=[0, 16],
+            )
+        elif backend.is_triton():
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
+        else:
+            raise NotImplementedError("Unsupported runner backend: %s" % backend)
         return self.runner.run(dispatch_output, quant_info)
 
 

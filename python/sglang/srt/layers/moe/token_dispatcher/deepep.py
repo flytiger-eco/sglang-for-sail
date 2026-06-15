@@ -5,6 +5,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from compressed_tensors.quantization import QuantizationStrategy
+
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -27,6 +29,9 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_output_dtype,
     is_tbo_enabled,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
@@ -34,13 +39,19 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_ppu,
     load_json_config,
 )
 
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 
 try:
     if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
@@ -57,6 +68,8 @@ try:
     use_deepep = True
 except ImportError:
     use_deepep = False
+
+DEEPEP_SUPPORT_TIMEOUT_CONTROL = hasattr(Buffer, "set_timeout_seconds")
 
 from enum import Enum, IntEnum, auto
 
@@ -251,13 +264,16 @@ class DeepEPBuffer:
         #            auto-enables fabric in C++ when supported, so we skip it:
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and is_flashinfer_available():
+        if not is_cu12 and is_flashinfer_available() and not is_ppu():
             from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
             if is_mnnvl_fabric_supported(torch.cuda.current_device()):
                 buffer_kwargs["use_fabric"] = True
 
         cls._buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if DEEPEP_SUPPORT_TIMEOUT_CONTROL:
+            timeout = envs.SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT.get()
+            cls._buffer.set_timeout_seconds(timeout)
         return cls._buffer
 
     @classmethod
@@ -330,6 +346,7 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        dispatch_dtype: torch.dtyte,
     ):
         if not use_deepep:
             raise ImportError(
@@ -345,7 +362,7 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-
+        self.dispatch_dtype = dispatch_dtype
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
@@ -475,6 +492,22 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         self.src2dst = None
         self.quant_config = {}
 
+        # TODO: align with the upstream's dispatch method of dispatch_dtype
+        self.use_fp8 = 0
+        self.use_int8 = 0
+        self.use_mxfp4 = 0
+        if self.dispatch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self.use_fp8 = 1
+        elif self.dispatch_dtype == torch.int8:
+            self.use_int8 = 1
+        elif self.dispatch_dtype == torch.uint8:
+            self.use_mxfp4 = 1
+            assert _is_ppu, "Only PPU deepep support uint8"
+        logger.info_once(
+            f" _DeepEPDispatcherImplNormal {self.dispatch_dtype=} "
+            f"{self.use_fp8=} {self.use_int8=} {self.use_mxfp4=}"
+        )
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -484,13 +517,30 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids = topk_ids.to(torch.int64)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
-            hidden_states = sglang_per_token_group_quant_fp8(
-                hidden_states,
-                128,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
+            if self.use_fp8:
+                is_channel_quant = False
+                # FP8 block-wise: FP8Config; FP8 channel-wise: CompressedTensorsConfig.
+                if (
+                    isinstance(self.quant_config, CompressedTensorsConfig)
+                    and self.quant_config.target_scheme_map["Linear"]
+                    .get("weights")
+                    .strategy
+                    == QuantizationStrategy.CHANNEL
+                ):
+                    is_channel_quant = True
+
+                hidden_states = sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    hidden_states.shape[-1] if is_channel_quant else 128,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
+            elif self.use_int8:
+                hidden_states = per_token_quant_int8(hidden_states)
+            elif self.use_mxfp4:
+                # [WA] before deepep support uint16_t column major scale
+                hidden_states = downcast_to_mxfp(hidden_states, torch.uint8, axis=1)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -561,7 +611,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            # Use 1 here in PPU for better compatibility, avoiding recv more token than actually needed
+            expert_alignment=(
+                128 if (deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not _is_ppu) else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -639,6 +692,24 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+        # Use dispatch_dtype to decide dispatch format
+        # TODO: align with the upstream's dispatch method of dispatch_dtype
+        self.use_int8 = 0
+        self.use_fp8 = 0
+        self.use_mxfp4 = 0
+        if self.dispatch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self.use_fp8 = 1
+        elif self.dispatch_dtype == torch.int8:
+            self.use_int8 = 1
+            assert _is_ppu, "Only PPU deepep support int8"
+        elif self.dispatch_dtype == torch.uint8:
+            self.use_mxfp4 = 1
+            assert _is_ppu, "Only PPU deepep support uint8"
+        logger.info_once(
+            f" _DeepEPDispatcherImplLowLatency {self.dispatch_dtype=} "
+            f"{self.use_fp8=} {self.use_int8=} {self.use_mxfp4=}"
+        )
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -651,9 +722,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+        is_channel_quant = self.use_int8
+        # FP8 block-wise: FP8Config; FP8 channel-wise: CompressedTensorsConfig.
+        if (
+            isinstance(self.quant_config, CompressedTensorsConfig)
+            and self.quant_config.target_scheme_map["Linear"].get("weights").strategy
+            == QuantizationStrategy.CHANNEL
+        ):
+            is_channel_quant = True
+        quant_size = hidden_states.shape[-1] if is_channel_quant else 128
+        if self.use_mxfp4:
+            quant_size = 32
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
+            quant_size=quant_size,
         )
         return (
             hidden_states,
@@ -700,8 +783,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
+        quant_size: int = 128,
     ):
-        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if hasattr(self.quant_config, "get"):
+            input_global_scale = self.quant_config.get("input_global_scale", None)
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -735,6 +820,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **(
+                    dict(
+                        use_int8=self.use_int8,
+                        use_mxfp4=self.use_mxfp4,
+                        quant_size=quant_size,
+                        mxfp4_scale_row_major=False,
+                    )
+                    if _is_ppu
+                    else {}
+                ),
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -845,6 +940,7 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        dispatch_dtype: torch.dtype = None,  # PPU: added to separate fp8 from int8 mode
     ):
         super().__init__()
 
@@ -859,6 +955,7 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            dispatch_dtype=dispatch_dtype,
         )
 
         if self.deepep_mode.enable_low_latency():

@@ -2918,6 +2918,19 @@ class ServerArgs:
         self._apply_cuda_graph_compatibility()
         self._validate_cuda_graph_config()
 
+    def _handle_ppu_backends(self):
+        if is_ppu():
+            # acext init
+            if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
+                envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
+            if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+                check_acext_version_compatibility()
+            # deep gemm init
+            if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+            if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
         convenience flags, legacy global flags, and defaults.
@@ -3885,6 +3898,18 @@ class ServerArgs:
                     self.moe_runner_backend = "marlin"
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+                    )
+                elif (
+                    is_ppu()
+                    and get_device_sm() >= 89
+                    and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                    and is_mxfp4_quant_format
+                ):
+                    # For GPT-OSS mxfp4 on PPU, use triton backend, which internally
+                    # invokes the DeepGEMM MOE kernel
+                    self.moe_runner_backend = "deep_gemm"
+                    logger.warning(
+                        "Detected PPU and MXFP4 quantization format for GPT-OSS model, using DeepGEMM MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
