@@ -58,6 +58,10 @@ def get_moe_configs(
         )
         return None
 
+    if os.environ.get("DISABLE_MOE_CONFIG", 0):
+        logger.warning("We have disabled fused moe config loading.")
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     json_file_name = get_config_file_name(

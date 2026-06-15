@@ -496,7 +496,7 @@ def _fused_moe_kernel_sequence(
         num_tokens_post_padded,
         apply_router_weight_on_input,
         topk,
-        config,
+        config["UP"] if "UP" in config.keys() else config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -506,6 +506,7 @@ def _fused_moe_kernel_sequence(
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
+        use_valu=config.get("USE_VALU", False),
     )
 
     if hooks and hooks.after_gate_up:
@@ -686,7 +687,7 @@ def _fused_moe_kernel_sequence(
         num_tokens_post_padded,
         not apply_router_weight_on_input and not no_combine,
         1,
-        down_config or config,
+        down_config or config["DOWN"] if "DOWN" in config.keys() else config,
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -699,6 +700,7 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
+        use_valu=config.get("USE_VALU", False),
     )
 
     if hooks and hooks.after_down:
