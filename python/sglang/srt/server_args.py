@@ -1351,6 +1351,11 @@ class ServerArgs:
                 envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
             if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
                 check_acext_version_compatibility()
+            # deep gemm init
+            if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+            if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
@@ -2214,6 +2219,18 @@ class ServerArgs:
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                    )
+                elif (
+                    is_ppu()
+                    and get_device_sm() >= 89
+                    and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+                    and is_mxfp4_quant_format
+                ):
+                    # For GPT-OSS mxfp4 on PPU, use triton backend, which internally
+                    # invokes the DeepGEMM MOE kernel
+                    self.moe_runner_backend = "deep_gemm"
+                    logger.warning(
+                        "Detected PPU and MXFP4 quantization format for GPT-OSS model, using DeepGEMM MOE kernel."
                     )
                 elif (
                     is_hip() and envs.SGLANG_USE_AITER.get()
