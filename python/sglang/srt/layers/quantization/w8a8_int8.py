@@ -17,6 +17,7 @@ from sglang.srt.layers.amx_utils import (
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -33,6 +34,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_host_cpu_arm64,
+    is_ppu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -51,6 +53,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_is_ppu = is_ppu()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -68,6 +71,9 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
+
+if _is_ppu:
+    from acext import int8_gemm as acext_int8_gemm
 
 logger = logging.getLogger(__name__)
 

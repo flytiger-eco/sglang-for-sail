@@ -62,6 +62,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    check_acext_version_compatibility,
     cpu_has_amx_support,
     get_device,
     get_device_memory_capacity,
@@ -92,6 +93,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    set_acext_token_limit,
     torch_release,
     xpu_has_xmx_support,
 )
@@ -243,6 +245,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "acext",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -2514,6 +2517,7 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+        self._handle_ppu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
@@ -3221,6 +3225,13 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
+
+        # Set acext config for PPU
+        if is_ppu():
+            if self.chunked_prefill_size is not None:
+                set_acext_token_limit(
+                    acext_num_tokens=int(self.chunked_prefill_size * 0.5),
+                )
 
         # Set cuda graph batch sizes
         if self.device != "cpu":
