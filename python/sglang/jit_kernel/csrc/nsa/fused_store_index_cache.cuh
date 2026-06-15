@@ -61,6 +61,19 @@ SGL_DEVICE uint8_t e2m1_nibble(float x) {
   return code | static_cast<uint8_t>(sign << 3);
 }
 
+// Pack two fp32 values into one e2m1x2 byte via PTX hardware instruction.
+// lo nibble = e2m1(lo_val), hi nibble = e2m1(hi_val).
+[[maybe_unused]]
+SGL_DEVICE uint8_t e2m1x2_pack_ptx(float hi_val, float lo_val) {
+  uint8_t tmp;
+  asm(
+      "cvt.rn.satfinite.e2m1x2.f32 %0, %1, %2;"
+      : "=r"(tmp)
+      : "f"(hi_val), "f"(lo_val)
+  );
+  return tmp;
+}
+
 // 1 / 2^(exp - 127) as fp32. Equivalent to `1.0f / __uint_as_float(exp << 23)`.
 [[maybe_unused]]
 SGL_DEVICE float inv_scale_ue8m0(int32_t exp) {
@@ -151,22 +164,32 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   const float local_max = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(y0), fabsf(y1)));
   float amax = warp::reduce_max<kLanesPerBlock>(local_max);
   amax = fmaxf(amax, 1e-4f);
+  // ceil(log2(amax / 6.0)) using fp32 bit trick:
+  //   (float_to_bits(ratio) + 0x007FFFFF) & 0x7F800000
   const float ratio = amax / 6.0f;
-  uint32_t ru = __float_as_uint(ratio);
-  int32_t exp_biased = static_cast<int32_t>((ru >> 23) & 0xFF);
-  uint32_t mant = ru & 0x7FFFFF;
-  exp_biased = exp_biased + (mant != 0 ? 1 : 0);
-  exp_biased = exp_biased < 0 ? 0 : (exp_biased > 254 ? 254 : exp_biased);
+  uint32_t dequant_scale_exp = (__float_as_uint(ratio) + 0x007FFFFFu) & 0x7F800000u;
+  int32_t exp_biased = static_cast<int32_t>(dequant_scale_exp >> 23);
+  exp_biased = exp_biased > 254 ? 254 : exp_biased;
   const uint8_t ue8m0 = static_cast<uint8_t>(exp_biased);
-  // inv_scale = 2^-(exp_biased - 127) = inv_scale_ue8m0 of (exp_biased)
-  const float inv_scale = inv_scale_ue8m0(exp_biased);
+  const float inv_scale = __uint_as_float(static_cast<uint32_t>(254 - exp_biased) << 23);
 
+#if __CUDA_ARCH__ >= 890
+  // ── PTX cvt.rn.satfinite.e2m1x2.f32 (requires sm_89+ / PPU >= 150) ──
+  const float s0 = x0 * inv_scale;
+  const float s1 = x1 * inv_scale;
+  const float s2 = y0 * inv_scale;
+  const float s3 = y1 * inv_scale;
+  const uint8_t byte0 = e2m1x2_pack_ptx(s1, s0);
+  const uint8_t byte1 = e2m1x2_pack_ptx(s3, s2);
+#else
+  // ── Fallback: manual bucket quantization ──
   const uint8_t n0 = e2m1_nibble(x0 * inv_scale);
   const uint8_t n1 = e2m1_nibble(x1 * inv_scale);
   const uint8_t n2 = e2m1_nibble(y0 * inv_scale);
   const uint8_t n3 = e2m1_nibble(y1 * inv_scale);
   const uint8_t byte0 = n0 | static_cast<uint8_t>(n1 << 4);
   const uint8_t byte1 = n2 | static_cast<uint8_t>(n3 << 4);
+#endif
   const uint16_t packed = static_cast<uint16_t>(byte0) | (static_cast<uint16_t>(byte1) << 8);
 
   // Page layout (kPageSize tokens):
@@ -179,12 +202,15 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   const auto value_ptr = pointer::offset(page_ptr, offset * kPackedBytesPerToken);
   const auto scale_ptr = pointer::offset(page_ptr, kPackedBytesPerToken << kPageBits, offset * kScaleBytesPerToken);
 
-  // Each lane writes 2 packed bytes (one uint16) at byte offset 2*lane_id.
-  static_cast<uint16_t*>(value_ptr)[lane_id] = packed;
-
+  // Streaming store: bypass L1/L2 cache for large sequential KV writes.
+  {
+    const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
+    asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(store_addr), "h"(packed) : "memory");
+  }
   // The first lane in each 8-lane group writes its block's ue8m0 byte.
   if ((lane_id % kLanesPerBlock) == 0) {
-    static_cast<uint8_t*>(scale_ptr)[block_idx_in_token] = ue8m0;
+    const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
+    asm volatile("st.global.cs.u8 [%0], %1;" :: "l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
   }
 
   PDLTriggerSecondary<kUsePDL>();

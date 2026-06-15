@@ -37,12 +37,12 @@ namespace {
 
 using deepseek_v4::fp8::inv_scale_ue8m0;
 
-// 4 warps per block, warp-per-(token, head) dispatch -- same layout as the
-// FP8 Q kernel.
-constexpr uint32_t kFusedQMxfp4BlockSize = 128;
-constexpr uint32_t kFusedQMxfp4NumWarps = kFusedQMxfp4BlockSize / device::kWarpThreads;
+// 1 warp per block -- finer scheduling granularity, higher SM occupancy ceiling,
+// and simpler work_id = blockIdx.x (no warp_id arithmetic).
+constexpr uint32_t kFusedQMxfp4BlockSize = device::kWarpThreads;  // 32
+constexpr uint32_t kFusedQMxfp4NumWarps = kFusedQMxfp4BlockSize / device::kWarpThreads;  // 1
 
-#define Q_MXFP4_KERNEL __global__ __launch_bounds__(kFusedQMxfp4BlockSize, 16)
+#define Q_MXFP4_KERNEL __global__ __launch_bounds__(kFusedQMxfp4BlockSize, 64)
 
 struct FusedQIndexerRopeHadamardMxfp4Params {
   const void* __restrict__ q_input;  // (T, H, 128)   DType
@@ -84,6 +84,18 @@ __device__ __forceinline__ uint8_t e2m1_nibble_q(float x) {
   return code | static_cast<uint8_t>(sign << 3);
 }
 
+// Pack two fp32 values into one e2m1x2 byte via PTX hardware instruction.
+// lo nibble = e2m1(lo_val), hi nibble = e2m1(hi_val).
+__device__ __forceinline__ uint8_t e2m1x2_pack_ptx(float hi_val, float lo_val) {
+  uint8_t tmp;
+  asm(
+      "cvt.rn.satfinite.e2m1x2.f32 %0, %1, %2;"
+      : "=r"(tmp)
+      : "f"(hi_val), "f"(lo_val)
+  );
+  return tmp;
+}
+
 template <typename DType, typename PosT, bool kUsePDL>
 Q_MXFP4_KERNEL void
 fused_q_indexer_rope_hadamard_mxfp4(const __grid_constant__ FusedQIndexerRopeHadamardMxfp4Params params) {
@@ -105,9 +117,8 @@ fused_q_indexer_rope_hadamard_mxfp4(const __grid_constant__ FusedQIndexerRopeHad
   using Storage = AlignedVector<DType, kVecSize>;
   using Float4 = AlignedVector<float, kVecSize>;
 
-  const auto warp_id = threadIdx.x / kWarpThreads;
-  const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto work_id = blockIdx.x * kFusedQMxfp4NumWarps + warp_id;
+  const auto lane_id = threadIdx.x;  // 1 warp/block: lane_id = threadIdx.x
+  const auto work_id = blockIdx.x;   // 1 work item per block
   // Last `kRopeSize` lanes own the rope tail; their 4-elem packs cover the
   // trailing kRopeDim elements.
   const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
@@ -173,13 +184,18 @@ fused_q_indexer_rope_hadamard_mxfp4(const __grid_constant__ FusedQIndexerRopeHad
       data[2] = a0 - a2;
       data[3] = a1 - a3;
     }
+    // ILP: batch all 4 shuffles first, then compute — breaks shuffle→compute dep chain.
 #pragma unroll
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
-        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
-      }
+      const float o0 = __shfl_xor_sync(0xFFFFFFFFu, data[0], mask, kWarpThreads);
+      const float o1 = __shfl_xor_sync(0xFFFFFFFFu, data[1], mask, kWarpThreads);
+      const float o2 = __shfl_xor_sync(0xFFFFFFFFu, data[2], mask, kWarpThreads);
+      const float o3 = __shfl_xor_sync(0xFFFFFFFFu, data[3], mask, kWarpThreads);
+      const bool flip = (lane_id & mask) != 0;
+      data[0] = flip ? (o0 - data[0]) : (data[0] + o0);
+      data[1] = flip ? (o1 - data[1]) : (data[1] + o1);
+      data[2] = flip ? (o2 - data[2]) : (data[2] + o2);
+      data[3] = flip ? (o3 - data[3]) : (data[3] + o3);
     }
     const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
 #pragma unroll
@@ -197,40 +213,55 @@ fused_q_indexer_rope_hadamard_mxfp4(const __grid_constant__ FusedQIndexerRopeHad
     // Reduce across the 8 lanes that share a sub-block, not the whole warp.
     float amax = warp::reduce_max<kLanesPerBlock>(local_max);
     amax = fmaxf(amax, 1e-4f);
-    // ceil(log2(amax / 6.0)) using the fp32 bit trick. Matches K-side mxfp4
-    // and Triton `_downcast_to_mxfp4_opt`.
+    // ceil(log2(amax / 6.0)) using fp32 bit trick:
+    //   (float_to_bits(ratio) + 0x007FFFFF) & 0x7F800000
     const float ratio = amax / 6.0f;
-    uint32_t ru = __float_as_uint(ratio);
-    int32_t exp_biased = static_cast<int32_t>((ru >> 23) & 0xFF);
-    uint32_t mant = ru & 0x7FFFFF;
-    exp_biased = exp_biased + (mant != 0 ? 1 : 0);
-    exp_biased = exp_biased < 0 ? 0 : (exp_biased > 254 ? 254 : exp_biased);
+    uint32_t dequant_scale_exp = (__float_as_uint(ratio) + 0x007FFFFFu) & 0x7F800000u;
+    int32_t exp_biased = static_cast<int32_t>(dequant_scale_exp >> 23);
+    exp_biased = exp_biased > 254 ? 254 : exp_biased;
     const uint8_t ue8m0 = static_cast<uint8_t>(exp_biased);
-    const float inv_scale = inv_scale_ue8m0(exp_biased);
+    const float inv_scale = __uint_as_float(static_cast<uint32_t>(254 - exp_biased) << 23);
 
+#if __CUDA_ARCH__ >= 890
+    // ── PTX cvt.rn.satfinite.e2m1x2.f32 (requires sm_89+ / PPU >= 150) ──
+    const float s0 = data[0] * inv_scale;
+    const float s1 = data[1] * inv_scale;
+    const float s2 = data[2] * inv_scale;
+    const float s3 = data[3] * inv_scale;
+    const uint8_t byte0 = e2m1x2_pack_ptx(s1, s0);
+    const uint8_t byte1 = e2m1x2_pack_ptx(s3, s2);
+#else
+    // ── Fallback: manual bucket quantization ──
     const uint8_t n0 = e2m1_nibble_q(data[0] * inv_scale);
     const uint8_t n1 = e2m1_nibble_q(data[1] * inv_scale);
     const uint8_t n2 = e2m1_nibble_q(data[2] * inv_scale);
     const uint8_t n3 = e2m1_nibble_q(data[3] * inv_scale);
     const uint8_t byte0 = n0 | static_cast<uint8_t>(n1 << 4);
     const uint8_t byte1 = n2 | static_cast<uint8_t>(n3 << 4);
+#endif
     const uint16_t packed = static_cast<uint16_t>(byte0) | (static_cast<uint16_t>(byte1) << 8);
 
-    // q_packed row: 64 bytes per (token, head). Each lane writes one uint16
-    // (= 2 packed FP4 bytes) at byte offset lane_id*2.
-    auto value_ptr = static_cast<uint8_t*>(params.q_packed) + work_id * kPackedBytesPerToken;
-    reinterpret_cast<uint16_t*>(value_ptr)[lane_id] = packed;
+    // q_packed row: 64 bytes per (token, head).
+    // Streaming store: bypass L1/L2 cache for large sequential writes.
+    {
+      auto value_ptr = static_cast<uint8_t*>(params.q_packed) + work_id * kPackedBytesPerToken;
+      const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
+      asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(store_addr), "h"(packed) : "memory");
+    }
 
     // q_sf row: int32 per (token, head) holding 4 ue8m0 bytes; write the
     // sub-block ue8m0 byte into byte offset `block_idx_in_token` of that
     // int32 -- little-endian packing matches Triton's `packed_scale`.
     if ((lane_id % kLanesPerBlock) == 0) {
       auto scale_ptr = static_cast<uint8_t*>(params.q_sf) + work_id * kNumScaleBlocks;
-      scale_ptr[block_idx_in_token] = ue8m0;
+      const uint8_t* scale_addr = scale_ptr + block_idx_in_token;
+      asm volatile("st.global.cs.u8 [%0], %1;" :: "l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
     }
 
     if (lane_id == 0) {
-      params.weights_out[work_id] = weight_val * params.weight_scale;
+      float* wout_ptr = &params.weights_out[work_id];
+      float wout_val = weight_val * params.weight_scale;
+      asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(wout_ptr), "f"(wout_val) : "memory");
     }
   }
 }
@@ -333,7 +364,7 @@ struct FusedQIndexerRopeHadamardMxfp4Kernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    const auto num_blocks = div_ceil(total_works, kFusedQMxfp4NumWarps);
+    const auto num_blocks = total_works;  // 1 warp/block: 1 block per work item
     const auto k_int32 = kernel<int32_t>;
     const auto k_int64 = kernel<int64_t>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;

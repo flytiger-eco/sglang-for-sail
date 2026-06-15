@@ -79,6 +79,18 @@ __device__ __forceinline__ uint8_t e2m1_nibble(float x) {
   return code | static_cast<uint8_t>(sign << 3);
 }
 
+// Pack two fp32 values into one e2m1x2 byte via PTX hardware instruction.
+// lo nibble = e2m1(lo_val), hi nibble = e2m1(hi_val).
+__device__ __forceinline__ uint8_t e2m1x2_pack_ptx(float hi_val, float lo_val) {
+  uint8_t tmp;
+  asm(
+      "cvt.rn.satfinite.e2m1x2.f32 %0, %1, %2;"
+      : "=r"(tmp)
+      : "f"(hi_val), "f"(lo_val)
+  );
+  return tmp;
+}
+
 #define INDEXER_KERNEL __global__ __launch_bounds__(kBlockSize, 8)
 
 // Indexer variant: kHeadDim = 128, 1 token per warp (8 tokens per block).
@@ -198,13 +210,18 @@ INDEXER_KERNEL void fused_norm_rope_indexer_mxfp4(const __grid_constant__ FusedN
     }
     // Stages 3..7: cross-lane butterflies. Lower-lane (mask bit clear) keeps
     // the sum, upper-lane (mask bit set) keeps the difference.
+    // ILP: batch all 4 shuffles first, then compute — breaks shuffle→compute dep chain.
 #pragma unroll
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
-#pragma unroll
-      for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
-        data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
-      }
+      const float o0 = __shfl_xor_sync(0xFFFFFFFFu, data[0], mask, kWarpThreads);
+      const float o1 = __shfl_xor_sync(0xFFFFFFFFu, data[1], mask, kWarpThreads);
+      const float o2 = __shfl_xor_sync(0xFFFFFFFFu, data[2], mask, kWarpThreads);
+      const float o3 = __shfl_xor_sync(0xFFFFFFFFu, data[3], mask, kWarpThreads);
+      const bool flip = (lane_id & mask) != 0;
+      data[0] = flip ? (o0 - data[0]) : (data[0] + o0);
+      data[1] = flip ? (o1 - data[1]) : (data[1] + o1);
+      data[2] = flip ? (o2 - data[2]) : (data[2] + o2);
+      data[3] = flip ? (o3 - data[3]) : (data[3] + o3);
     }
     const float kHadamardScale = math::rsqrt(static_cast<float>(kHeadDim));
 #pragma unroll
@@ -222,23 +239,32 @@ INDEXER_KERNEL void fused_norm_rope_indexer_mxfp4(const __grid_constant__ FusedN
     // Reduce across 8 lanes per sub-block, not the whole warp.
     float amax = warp::reduce_max<kLanesPerBlock>(local_max);
     amax = fmaxf(amax, 1e-4f);
-    // ceil(log2(amax / 6.0)) using the fp32 bit trick from
-    // fused_store_indexer_mxfp4_cache (store.cuh:188-196).
+    // ceil(log2(amax / 6.0)) using fp32 bit trick:
+    //   (float_to_bits(ratio) + 0x007FFFFF) & 0x7F800000
     const float ratio = amax / 6.0f;
-    uint32_t ru = __float_as_uint(ratio);
-    int32_t exp_biased = static_cast<int32_t>((ru >> 23) & 0xFF);
-    uint32_t mant = ru & 0x7FFFFF;
-    exp_biased = exp_biased + (mant != 0 ? 1 : 0);
-    exp_biased = exp_biased < 0 ? 0 : (exp_biased > 254 ? 254 : exp_biased);
+    uint32_t dequant_scale_exp = (__float_as_uint(ratio) + 0x007FFFFFu) & 0x7F800000u;
+    int32_t exp_biased = static_cast<int32_t>(dequant_scale_exp >> 23);
+    exp_biased = exp_biased > 254 ? 254 : exp_biased;
     const uint8_t ue8m0 = static_cast<uint8_t>(exp_biased);
-    const float inv_scale = inv_scale_ue8m0(exp_biased);
+    const float inv_scale = __uint_as_float(static_cast<uint32_t>(254 - exp_biased) << 23);
 
+#if __CUDA_ARCH__ >= 890
+    // ── PTX cvt.rn.satfinite.e2m1x2.f32 (requires sm_89+ / PPU >= 150) ──
+    const float s0 = data[0] * inv_scale;
+    const float s1 = data[1] * inv_scale;
+    const float s2 = data[2] * inv_scale;
+    const float s3 = data[3] * inv_scale;
+    const uint8_t byte0 = e2m1x2_pack_ptx(s1, s0);
+    const uint8_t byte1 = e2m1x2_pack_ptx(s3, s2);
+#else
+    // Fallback: manual bucket quantization
     const uint8_t n0 = e2m1_nibble(data[0] * inv_scale);
     const uint8_t n1 = e2m1_nibble(data[1] * inv_scale);
     const uint8_t n2 = e2m1_nibble(data[2] * inv_scale);
     const uint8_t n3 = e2m1_nibble(data[3] * inv_scale);
     const uint8_t byte0 = n0 | static_cast<uint8_t>(n1 << 4);
     const uint8_t byte1 = n2 | static_cast<uint8_t>(n3 << 4);
+#endif
     const uint16_t packed = static_cast<uint16_t>(byte0) | (static_cast<uint16_t>(byte1) << 8);
 
     const int32_t page = out_loc >> kPageBits;
@@ -248,11 +274,15 @@ INDEXER_KERNEL void fused_norm_rope_indexer_mxfp4(const __grid_constant__ FusedN
     const auto scale_ptr = page_ptr + (kPackedBytesPerToken << kPageBits) + offset * kScaleBytesPerToken;
 
     PDLTriggerSecondary<kUsePDL>();
-    // Each lane writes one uint16 (= 2 packed FP4 bytes) at lane_id*2.
-    reinterpret_cast<uint16_t*>(value_ptr)[lane_id] = packed;
+    // Streaming store: bypass L1/L2 cache for large sequential KV writes.
+    {
+      const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
+      asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(store_addr), "h"(packed) : "memory");
+    }
     // The first lane in each 8-lane sub-block publishes its ue8m0 byte.
     if ((lane_id % kLanesPerBlock) == 0) {
-      static_cast<uint8_t*>(scale_ptr)[block_idx_in_token] = ue8m0;
+      const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
+      asm volatile("st.global.cs.u8 [%0], %1;" :: "l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
     }
   }
 }
