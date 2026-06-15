@@ -286,6 +286,15 @@ def _allocate_decode_buffers(
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
 
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 
 def get_is_capture_mode():
     return is_capture_mode
@@ -1160,6 +1169,16 @@ class CudaGraphRunner:
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
+    def _build_decode_replay_kv_len_nvtx_msg(self) -> Optional[str]:
+        raw_bs = int(getattr(self, "raw_bs", 0) or 0)
+        capture_bs = int(getattr(self, "bs", 0) or 0)
+        seq_lens_cpu = self.buffers.seq_lens_cpu[:raw_bs]
+        kv_lens = [int(x) for x in seq_lens_cpu.tolist()]
+        return (
+            "decode_cudagraph_kvlen "
+            f"raw_bs={raw_bs} capture_bs={capture_bs} kv_lens={kv_lens}"
+        )
+
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -1198,8 +1217,13 @@ class CudaGraphRunner:
             else contextlib.nullcontext()
         )
         with ctx:
+            if SGLANG_PROFILE_NVTX:
+                info = self._build_decode_replay_kv_len_nvtx_msg()
+                th_nvtx_range_push(info)
             self.graphs[graph_key].replay()
 
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
