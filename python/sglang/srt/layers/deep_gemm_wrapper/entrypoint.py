@@ -624,6 +624,56 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
 
 
+def grouped_gemm_nt_bf16i4bf16_masked(
+    lhs: torch.Tensor,
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+    configs=None,
+):
+    # lhs: shape [e, m, k], dtype bf16
+    # rhs[0]: shape [e, k//16, n*2], dtype int32 (packed int4 weights)
+    # rhs[1]: shape [e, k//group_size, n], dtype bf16 (scales)
+    # where group_size is the quantization group size for int4 weights
+
+    assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_bf16i4bf16_masked"
+
+    num_groups, _, k = lhs.shape
+    n = rhs[0].shape[2] // 2
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            expected_m, n, k, num_groups=num_groups, dtype="int4"
+        )
+    )
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        deep_gemm.m_grouped_gemm_w4a16_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            best_config,
+            **(
+                dict(
+                    enable_sbo_overlap=True,
+                    max_block_n=max_block_n,
+                    signal=overlap_args.signal,
+                )
+                if overlap_args is not None
+                else {}
+            ),
+        )
+
+
 def grouped_gemm_nt_bf16i4bf16_nopad(
     lhs: torch.Tensor,
     rhs: Tuple[torch.Tensor, torch.Tensor],

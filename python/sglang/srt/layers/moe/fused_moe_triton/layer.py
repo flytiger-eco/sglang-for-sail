@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
+    CompressedTensorsW8A8Fp8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
@@ -324,7 +325,10 @@ class FusedMoE(torch.nn.Module):
         if (
             isinstance(self.quant_method, Fp8MoEMethod)
             or isinstance(self.quant_method, W8A8FP8MoEMethod)
-            or isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            or (
+                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+                and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)
+            )
         ):
             self.moe_runner_config.dispatch_dtype = torch.float8_e4m3fn
         elif isinstance(self.quant_method, W8A8Int8MoEMethod):

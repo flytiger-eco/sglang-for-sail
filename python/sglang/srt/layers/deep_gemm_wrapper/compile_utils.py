@@ -126,6 +126,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS = auto()
     GEMM_NT_F4F4BF16_BIAS = auto()
 
+    GROUPED_GEMM_NT_BF16I4BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_NOPAD = auto()
 
 
@@ -310,6 +311,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS: _GroupedMaskedWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS: _GroupedNopadWarmupExecutor_fp4_bias,
             DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
         }[kernel_type](**kwargs)
 
@@ -390,6 +392,14 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * (k // 32) * n * 2
                 + max_m * 4
                 + max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED]:
+            return (
+                num_groups * max_m * k * 2
+                + num_groups * (k // 16) * (n * 2) * 4
+                + num_groups * (k // 32) * n * 2
+                + num_groups * 4
+                + num_groups * max_m * n * 2
             ) / _GB
         else:
             raise ValueError(f"Invalid kernel type: {kernel_type}")
@@ -510,7 +520,7 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -545,7 +555,7 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             self.b,
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -729,7 +739,7 @@ class _GroupedMaskedWarmupExecutor_channel(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -807,7 +817,7 @@ class _GroupedMaskedWarmupExecutor_int8(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -872,7 +882,7 @@ class _GroupedMaskedWarmupExecutor_fp4(_BaseWarmupExecutor):
             self.bias,
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
@@ -937,6 +947,29 @@ class _NormalWarmupExecutor_fp4_bias(_NormalWarmupExecutor_fp4):
     def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         super().setup_tensors(max_m, n, k, num_groups)
         self.bias = torch.zeros((n,), device="cuda", dtype=torch.float32)
+
+
+class _GroupedMaskedWarmupExecutor_int4(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = _empty_token_bf16((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_marlin_int4((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_w4a16_masked(
+            self.lhs,
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
 
 
 class _GroupedNopadWarmupExecutor_int4(_BaseWarmupExecutor):
