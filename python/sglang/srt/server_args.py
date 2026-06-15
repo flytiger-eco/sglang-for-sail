@@ -1923,9 +1923,15 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size <= 8
-                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                        # assume that non-810e machine has 8 cards
+                        if not "810E" in current_platform.get_device_name():
+                            assert (
+                                self.tp_size <= 8
+                            ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                        else:
+                            assert (
+                                self.tp_size <= 16
+                            ), "Context parallel only supports single machine (tp_size <= 16 on 810e). Cross-machine CP has precision issues."
                         # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                         # DSACPLayerCommunicator does not all-reduce attention-TP
                         # partial o_proj outputs before replicated dense FFNs.
