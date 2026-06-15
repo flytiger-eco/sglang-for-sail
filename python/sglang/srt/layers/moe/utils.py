@@ -225,8 +225,6 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
         return DeepEPOutputDtype.BF16
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
-    # [fix: CompressedTensorsConfig对象无.get()方法, 需先确认是dict] 旧代码如下：
-    # if self.quant_config is not None:
     if self.quant_config is not None and isinstance(self.quant_config, dict):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
