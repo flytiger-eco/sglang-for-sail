@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_prefill,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
     dsa_cp_round_robin_split_data,
@@ -50,7 +51,13 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, is_sm100_supported
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_ppu,
+    is_sm100_supported,
+    print_info_once,
+)
 
 if is_cuda():
     import deep_gemm
@@ -62,6 +69,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 if _is_hip:
     from sglang.srt.layers.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -304,7 +312,9 @@ class DeepseekSparseAttnBackend(
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = (
-            1 if model_runner.server_args.enable_deterministic_inference else 0
+            1
+            if (model_runner.server_args.enable_deterministic_inference and not _is_ppu)
+            else 0
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
@@ -320,6 +330,7 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.indexer_head_dim = model_runner.model_config.index_head_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -383,6 +394,7 @@ class DeepseekSparseAttnBackend(
                     kv_dtype=fp8_dtype,
                 )
 
+        self.flashmla_padding = 64
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -855,8 +867,23 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
+            metadata_extra = (
+                1,  # next_n
+                self.num_q_heads,  # num_heads
+                self.indexer_head_dim,  # head_dim
+                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            )
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                paged_mqa_ctx_lens_2d,
+                64,
+                deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if _is_ppu
+                    else {}
+                ),
             )
 
         metadata = DSAMetadata(
@@ -1132,8 +1159,23 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
+            metadata_extra = (
+                1,  # next_n
+                self.num_q_heads,  # num_heads
+                self.indexer_head_dim,  # head_dim
+                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            )
             paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                paged_mqa_ctx_lens_2d,
+                64,
+                deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if _is_ppu
+                    else {}
+                ),
             )
 
         metadata = DSAMetadata(
@@ -1297,8 +1339,23 @@ class DeepseekSparseAttnBackend(
                 schedule_seqlens_expanded,
                 bs,
             )
+            metadata_extra = (
+                1,  # next_n
+                self.num_q_heads,  # num_heads
+                self.indexer_head_dim,  # head_dim
+                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                seqlens_32_2d,
+                64,
+                deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if _is_ppu
+                    else {}
+                ),
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
@@ -1497,8 +1554,23 @@ class DeepseekSparseAttnBackend(
                     metadata.dsa_seqlens_expanded,
                     bs,
                 )
+            metadata_extra = (
+                1,  # next_n
+                self.num_q_heads,  # num_heads
+                self.indexer_head_dim,  # head_dim
+                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            )
             new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                seqlens_32_2d,
+                64,
+                deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if _is_ppu
+                    else {}
+                ),
             )
             if metadata.paged_mqa_schedule_metadata is None:
                 object.__setattr__(
@@ -1660,6 +1732,20 @@ class DeepseekSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
+            # PPU and dpsk opensource mla need head_num padding here
+            # sglang community uses https://github.com/sgl-project/FlashMLA/, not needing
+            if _is_ppu:
+                if layer.tp_q_head_num % self.flashmla_padding != 0:
+                    assert self.flashmla_padding % layer.tp_q_head_num == 0
+                    print_info_once(
+                        f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
+                    )
+                    q_padded = q_all.new_empty(
+                        (q_all.shape[0], self.flashmla_padding, q_all.shape[2])
+                    )
+                    q_padded[:, : layer.tp_q_head_num, :] = q_all
+                    q_all = q_padded
+
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
@@ -1672,6 +1758,15 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
+
+            if _is_ppu:
+                return self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                )[:, : layer.tp_q_head_num, :]
 
             return self._forward_flashmla_sparse(
                 q_all=q_all,
@@ -1998,7 +2093,7 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.dsa_kv_cache_store_fp8:
+        if NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 and not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -2020,7 +2115,7 @@ class DeepseekSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         )
 
         if target_q_heads != num_q_heads:
@@ -2533,7 +2628,7 @@ class DeepseekSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
             topk=self.dsa_index_topk,
         )
 

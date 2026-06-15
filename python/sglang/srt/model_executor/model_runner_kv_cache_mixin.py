@@ -647,6 +647,14 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            # FP4 indexer cache (DS v3.2 / GLM v5.1): only on the plain NSA pool;
+            # HiSparse layouts aren't covered by the FP4 path yet.
+            if not self.enable_hisparse:
+                from sglang.srt.layers.attention.dsa.triton_kernel import (
+                    is_fp4_indexer_cache_enabled,
+                )
+
+                pool_kwargs["use_fp4_indexer"] = is_fp4_indexer_cache_enabled()
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,

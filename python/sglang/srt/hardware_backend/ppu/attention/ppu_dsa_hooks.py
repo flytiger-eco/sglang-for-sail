@@ -50,6 +50,9 @@ def _ppu_dsa_compute_flashmla_metadata(self, cache_seqlens, seq_len_q):
     from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
         get_mla_metadata,
     )
+    from sglang.srt.layers.attention.dsa.utils import (
+        NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
+    )
     from sglang.srt.layers.attention.dsa_backend import DSAFlashMLAMetadata
 
     num_heads_q = self.flashmla_kv_num_q_heads
@@ -58,7 +61,7 @@ def _ppu_dsa_compute_flashmla_metadata(self, cache_seqlens, seq_len_q):
         num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
         num_heads_k=1,
         num_heads_q=num_heads_q,
-        is_fp8_kvcache=True,
+        is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
         topk=self.dsa_index_topk,
     )
     return DSAFlashMLAMetadata(
