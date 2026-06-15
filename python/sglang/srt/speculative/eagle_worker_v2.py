@@ -1,9 +1,58 @@
 import contextlib
+import functools
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
 import torch
+
+# ==== NVTX profiling for MTP stages ====
+# Import-guarded NVTX helpers (mirror model_runner.py) so non-NVTX builds work.
+try:
+    from torch.cuda.nvtx import range_pop as _th_nvtx_range_pop  # type: ignore
+    from torch.cuda.nvtx import range_push as _th_nvtx_range_push  # type: ignore
+except ImportError:
+
+    def _th_nvtx_range_push(label):  # type: ignore
+        pass
+
+    def _th_nvtx_range_pop():  # type: ignore
+        pass
+
+
+_SGLANG_PROFILE_NVTX = os.getenv("SGLANG_PROFILE_NVTX", False)
+if _SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter as _prof_iter
+
+        from sglang.srt.model_executor.cuda_graph_runner import (
+            get_is_capture_mode as _get_is_capture_mode,
+        )
+
+        _use_model_prof = True
+    except ImportError:
+        _use_model_prof = False
+
+
+def _mtp_nvtx(name: str):
+    """Bracket an MTP stage method with an NVTX range; active under SGLANG_PROFILE_NVTX."""
+
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if _SGLANG_PROFILE_NVTX:
+                _th_nvtx_range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if _SGLANG_PROFILE_NVTX:
+                    _th_nvtx_range_pop()
+
+        return _wrapped
+
+    return _deco
+
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -466,6 +515,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @_mtp_nvtx("mtp_draft_decode")
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
@@ -490,22 +540,42 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            if can_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+            # NVTX: draft bypasses model_runner, so mirror forward() to emit the
+            # same prof_range as verify (throwaway label absorbs prof_iter's pop).
+            _draft_prof = (
+                _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+            )
+            if _draft_prof:
+                _th_nvtx_range_push(
+                    f"total bs={forward_batch.batch_size}, "
+                    f"forward_pass_id={getattr(self.draft_runner, 'iteration', 0)}"
                 )
-            else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+                _prof_iter(getattr(self.draft_runner, "iteration", 0))
+
+            try:
+                if can_cuda_graph:
+                    # cudagraph label, analog of model_runner's decode_cudagraph.
+                    if _SGLANG_PROFILE_NVTX:
+                        _th_nvtx_range_push("draft_decode_cudagraph")
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
+                else:
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and self.speculative_num_steps > 1
+                    ):
+                        # Skip attention backend init for 1-step draft,
+                        # `draft_forward` only does sample in this case.
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.draft_forward(forward_batch)
+                    )
+            finally:
+                if _draft_prof:
+                    # Close prof_range opened by prof_iter (mirrors forward()).
+                    _th_nvtx_range_pop()
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -719,6 +789,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    @_mtp_nvtx("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -806,6 +877,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=1,
         )
 
+    @_mtp_nvtx("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
@@ -1428,6 +1500,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
             dw._rebuild_topk1_chain_buffers()
 
+    @_mtp_nvtx("mtp_target_verify")
     def verify(self, batch: ScheduleBatch):
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info

@@ -52,6 +52,41 @@ if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter
+
+        use_model_prof = True
+
+    except ImportError as e:
+        use_model_prof = False
+
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
+
+@contextlib.contextmanager
+def _nvtx_range(name: str):
+    """Push/pop a paired NVTX range guarded by SGLANG_PROFILE_NVTX.
+
+    The push/pop must be balanced, otherwise the NVTX range stack grows
+    unbounded and profiling ranges nest incorrectly; the finally clause also
+    keeps the range balanced if the wrapped forward raises.
+    """
+    enabled = SGLANG_PROFILE_NVTX
+    if enabled:
+        th_nvtx_range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            th_nvtx_range_pop()
+
 
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner) -> None:
@@ -190,11 +225,14 @@ class EagerRunner(BaseRunner):
     ) -> Any:
         mode = forward_batch.forward_mode
         if mode.is_decode():
-            return self._execute_decode(forward_batch, pp_proxy_tensors)
+            with _nvtx_range("forward_decode"):
+                return self._execute_decode(forward_batch, pp_proxy_tensors)
         if mode.is_idle():
-            return self._execute_idle(forward_batch, pp_proxy_tensors)
+            with _nvtx_range("forward_idle"):
+                return self._execute_idle(forward_batch, pp_proxy_tensors)
         if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
+            with _nvtx_range("forward_extend"):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
         raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _resolve_decode_pdmux(

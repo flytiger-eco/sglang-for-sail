@@ -50,6 +50,16 @@ from sglang.benchmark.utils import (
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
+try:
+    from model_prof import start_active_profile
+except ImportError:
+    print("benchmark_serving: failed to import start_active_profile")
+
+    def start_active_profile():
+        pass
+
+
+ASSISTANT_SUFFIX = "Assistant:"
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
@@ -1295,6 +1305,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    skip_first_concurrency: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1316,10 +1327,17 @@ async def benchmark(
     # From https://github.com/vllm-project/vllm/pull/9390
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(request_func_input, pbar):
+    async def limited_request_func(request_func_input, pbar, task_id):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
+            if skip_first_concurrency:
+                if task_id == 2 * max_concurrency:
+                    print(f"Start active profiling with request id: {task_id}")
+                    start_active_profile()
+                elif task_id == 1:
+                    print("Start active profiling")
+                    start_active_profile()
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
@@ -1423,6 +1441,7 @@ async def benchmark(
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    task_id = 0
     pbar_total = len(input_requests)
     if (
         backend == "sglang" and args.dataset_name == "mooncake"
@@ -1484,9 +1503,12 @@ async def benchmark(
 
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                limited_request_func(
+                    request_func_input=request_func_input, pbar=pbar, task_id=task_id
+                )
             )
         )
+        task_id += 1
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
@@ -2075,6 +2097,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            skip_first_concurrency=getattr(args, "skip_first_concurrency", False),
         )
     )
 
@@ -2647,6 +2670,12 @@ if __name__ == "__main__":
         nargs="+",
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
+    )
+    parser.add_argument(
+        "--skip-first-concurrency",
+        action="store_true",
+        help="Skip the first max_concurrency requests to "
+        "improve the accuracy of the calculation.",
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)
