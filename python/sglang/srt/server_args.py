@@ -2037,6 +2037,10 @@ class ServerArgs:
         bool,
         "Disable the custom all-reduce kernel and fall back to NCCL.",
     ] = False
+    enable_custom_all_reduce: A[
+        bool,
+        "Enable the custom all-reduce kernel and fall back to NCCL.",
+    ] = False
     enable_mscclpp: A[
         bool,
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
@@ -2934,6 +2938,12 @@ class ServerArgs:
                 envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
             if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
                 envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+            # disable custom allreduce by default on ppu
+            if not self.enable_custom_all_reduce:
+                self.disable_custom_all_reduce = True
+                logger.info(
+                    "Disable custom allreduce and use pccl allreduce on ppu for better perf. Launch server with --enable-custom-all-reduce to force use custom allreduce"
+                )
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
