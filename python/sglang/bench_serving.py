@@ -970,10 +970,10 @@ class BenchmarkMetrics:
     p99_ttft_ms: float
 
     # TPOT - Time per Output Token, excluding the first token (ms)
+    p90_tpot_ms: float
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
-    p90_tpot_ms: float
     p95_tpot_ms: float
     p99_tpot_ms: float
 

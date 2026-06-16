@@ -1239,6 +1239,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=None,
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
         else:
