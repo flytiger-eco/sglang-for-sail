@@ -752,6 +752,7 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    enable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
@@ -1356,6 +1357,12 @@ class ServerArgs:
                 envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
             if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
                 envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+            # disable custom allreduce by default on ppu
+            if not self.enable_custom_all_reduce:
+                self.disable_custom_all_reduce = True
+                logger.info(
+                    "Disable custom allreduce and use pccl allreduce on ppu for better perf. Launch server with --enable-custom-all-reduce to force use custom allreduce"
+                )
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
@@ -6639,6 +6646,11 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-custom-all-reduce",
+            action="store_true",
+            help="Enable the custom all-reduce kernel. This option will take over --disable-custom-all-reduce.",
         )
         parser.add_argument(
             "--enable-mscclpp",
