@@ -32,7 +32,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -165,4 +167,21 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         super().load_weights(weights, is_nextn=True)
 
 
-EntryClass = [Glm4MoeForCausalLMNextN]
+class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "model.layers.78": "model.decoder",
+        },
+    )
+
+
+EntryClass = [Glm4MoeForCausalLMNextN, GlmMoeDsaForCausalLMNextN]
