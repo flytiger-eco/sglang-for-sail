@@ -434,6 +434,8 @@ class Envs:
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
+    SGLANG_NSA_USE_DSV4_BF16_TOPK = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)

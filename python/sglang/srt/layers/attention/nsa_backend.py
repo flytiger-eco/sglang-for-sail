@@ -271,6 +271,20 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
+            # Route PAGED path through dsv4's bf16 topk kernel when gate is on
+            # and logits are bf16; falls back to fast_topk_transform_fused otherwise.
+            if (
+                envs.SGLANG_NSA_USE_DSV4_BF16_TOPK.get()
+                and logits.dtype == torch.bfloat16
+            ):
+                return self._topk_transform_dsv4_bf16(
+                    logits=logits,
+                    seq_lens_topk=seq_lens_topk,
+                    page_table_size_1=page_table_size_1,
+                    cu_seqlens_q_topk=cu_seqlens_q_topk,
+                    topk=topk,
+                    ks=ks,
+                )
             # NOTE(dark): if fused, we return a transformed page table directly
             return fast_topk_transform_fused(
                 score=logits,
@@ -295,6 +309,64 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
             )
         else:
             assert False, f"Unsupported {self.topk_transform_method = }"
+
+    def _topk_transform_dsv4_bf16(
+        self,
+        logits: torch.Tensor,
+        seq_lens_topk: torch.Tensor,
+        page_table_size_1: torch.Tensor,
+        cu_seqlens_q_topk: torch.Tensor,
+        topk: int,
+        ks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """PAGED topk via dsv4's bf16 per-row prefill kernel.
+
+        Expands NSA per-request page table to dsv4's per-query layout and
+        performs topk-select plus page-table gather in a single kernel.
+
+        NOTE(perf): expanding to per-query [B, P] costs B*P*4 bytes extra.
+        Gated behind SGLANG_NSA_USE_DSV4_BF16_TOPK (default on).
+        """
+        from sglang.jit_kernel.deepseek_v4 import top_k_per_row_prefill_bf16
+
+        assert logits.dim() == 2
+        assert logits.dtype == torch.bfloat16
+        device = logits.device
+        num_q = logits.shape[0]
+
+        # row_starts / row_ends (per query). NSA passes ks as row_starts; the dsv4
+        # kernel needs an explicit row_ends = row_starts + length.
+        row_starts = (
+            torch.zeros(num_q, dtype=torch.int32, device=device)
+            if ks is None
+            else ks.to(torch.int32)
+        )
+        row_ends = row_starts + seq_lens_topk.to(torch.int32)
+
+        # Expand the per-request page table to per-query rows. Each query block bid
+        # belongs to request r where cu_seqlens_q_topk[r] <= bid < cu_seqlens_q_topk[r+1],
+        # mirroring topk_transform_prefill_kernel's cu_seqlens_q scan.
+        q_ids = torch.arange(num_q, device=device)
+        req_idx = torch.searchsorted(
+            cu_seqlens_q_topk[1:].contiguous(), q_ids, right=True
+        )
+        page_table_per_query = page_table_size_1.index_select(
+            0, req_idx.to(torch.long)
+        ).contiguous()
+
+        page_indices = logits.new_empty((num_q, topk), dtype=torch.int32)
+        # page_size = 1 (NSA PAGED uses page_table_1); page_bits = 0 so the dsv4
+        # built-in transform reduces to a plain gather, matching the fused kernel.
+        top_k_per_row_prefill_bf16(
+            logits,
+            row_starts,
+            row_ends,
+            page_table_per_query,
+            page_indices,
+            1,
+            None,
+        )
+        return page_indices
 
 
 _NSA_IMPL_T: TypeAlias = Literal[
