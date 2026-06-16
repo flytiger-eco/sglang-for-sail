@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQConfig,
     GPTQMarlinConfig,
 )
+from sglang.srt.layers.quantization.mixed_precision_w4 import MixedPrecisionW4Config
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -87,6 +88,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
     "w4afp8": W4AFp8Config,
+    "mixed_precision_w4": MixedPrecisionW4Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
