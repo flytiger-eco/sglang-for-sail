@@ -119,6 +119,7 @@ def _combine_topk_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    cp_positions_ptr,
     M,
     N,
     TOP_K: tl.constexpr,
@@ -141,7 +142,12 @@ def _combine_topk_swa_indices_kernel(
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        if cp_positions_ptr is not None:
+            # CP round-robin: load actual (non-contiguous) position.
+            pos = tl.load(cp_positions_ptr + token_idx)
+        else:
+            # Non-CP fast path: contiguous layout.
+            pos = start_pos + token_idx_in_query
         topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
 
@@ -178,6 +184,7 @@ def _combine_full_swa_indices_kernel(
     query_start_loc_ptr,
     seq_lens_ptr,
     gather_lens_ptr,
+    cp_positions_ptr,
     M,
     N,
     COMPRESS_RATIO: tl.constexpr,
@@ -203,7 +210,10 @@ def _combine_full_swa_indices_kernel(
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        if cp_positions_ptr is not None:
+            pos = tl.load(cp_positions_ptr + token_idx)
+        else:
+            pos = start_pos + token_idx_in_query
         # Full enumeration: every causally-visible compressed token.
         topk_len = (pos + 1) // COMPRESS_RATIO
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
@@ -242,6 +252,7 @@ def combine_full_swa_indices(
     M: int,
     N: int,
     device: torch.device,
+    cp_positions: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Concatenate full-enumeration compressed indices and SWA window indices
     for C128 (HCA) prefill.
@@ -275,6 +286,7 @@ def combine_full_swa_indices(
         query_start_loc,
         seq_lens,
         gather_lens,
+        cp_positions,
         M,
         N,
         COMPRESS_RATIO=compress_ratio,
@@ -294,6 +306,7 @@ def combine_topk_swa_indices(
     topk: int,
     M: int,
     N: int,
+    cp_positions: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Concatenate per-token topk compressed indices and SWA window indices.
 
@@ -328,6 +341,7 @@ def combine_topk_swa_indices(
         query_start_loc,
         seq_lens,
         gather_lens,
+        cp_positions,
         M,
         N,
         TOP_K=topk,
@@ -361,6 +375,7 @@ def forward_prefill_sparse(
     max_model_len: int,
     max_seq_len_in_batch: Optional[int] = None,
     max_qo_len_in_batch: Optional[int] = None,
+    cp_positions: Optional[torch.Tensor] = None,
     attn_tp_rank: int = 0,
     attn_tp_size: int = 1,
     chunk_size: int = PREFILL_CHUNK_SIZE,
@@ -435,6 +450,13 @@ def forward_prefill_sparse(
 
     device = q.device
 
+    # CP round-robin is signalled by passing the per-token positions tensor.
+    # When positions is None (non-CP / TP-only), the combine kernels use the
+    # original contiguous-layout formula and we keep the original (tighter)
+    # workspace bound.  When positions is provided, query tokens may be
+    # non-contiguous and the SWA gather must cover a wider range.
+    _is_cp = cp_positions is not None
+
     # Size workspace by the actual batch maxima when available, falling back
     # to max_model_len. With long-context models this cuts the workspace by
     # >10x for short-input workloads (e.g. 8K input vs 128K model context),
@@ -455,9 +477,13 @@ def forward_prefill_sparse(
     # token of the longest request (seq_len_for_ws // compress_ratio).
     N = (seq_len_for_ws + compress_ratio - 1) // compress_ratio
 
-    # M bounds the concatenated workspace per request: compressed region (N) +
-    # window (SWA) + the longest qo extent in this batch.
-    M = N + window_size + qo_len_for_ws
+    if _is_cp:
+        # CP: gather_len can be up to seq_len per request.
+        M = N + seq_len_for_ws
+    else:
+        # M bounds the concatenated workspace per request: compressed region (N) +
+        # window (SWA) + the longest qo extent in this batch.
+        M = N + window_size + qo_len_for_ws
 
     # Workspace: chunk of bf16 KV. Allocated once per call; the allocator will
     # reuse this hot path's memory across layers.
@@ -474,11 +500,33 @@ def forward_prefill_sparse(
         c_end = min(c_start + chunk_size, num_prefill_reqs)
         cs = c_end - c_start
 
+        q_start = prefill_query_start_loc_cpu[c_start]
+        q_end = prefill_query_start_loc_cpu[c_end]
+        chunk_seq_lens = prefill_seq_lens[c_start:c_end]
+
+        if _is_cp:
+            # CP: derive per-request SWA gather from actual positions.
+            # positions_casual is ascending within each request (stride
+            # cp_size), so the first position is the minimum.
+            chunk_positions = cp_positions[q_start:q_end]
+            first_positions = chunk_positions[
+                prefill_query_start_loc[c_start:c_end]
+                - prefill_query_start_loc[c_start]
+            ]
+            swa_starts = torch.clamp(
+                first_positions - window_size + 1, min=0,
+            )
+            swa_gather_lens = chunk_seq_lens - swa_starts
+        else:
+            # Non-CP fast path: use pre-computed gather_lens from caller.
+            chunk_positions = None
+            swa_gather_lens = prefill_gather_lens[c_start:c_end]
+
         # Gather compressed (C4 / C128) KV → kv[:cs, 0:N) of workspace
         dequantize_and_gather_k_cache(
             out=kv[:cs],
             k_cache=compressed_k_cache,
-            seq_lens=prefill_seq_lens[c_start:c_end] // compress_ratio,
+            seq_lens=chunk_seq_lens // compress_ratio,
             gather_lens=None,
             block_table=compressed_block_table[c_start:c_end],
             block_size=compressed_block_size,
@@ -489,43 +537,42 @@ def forward_prefill_sparse(
         dequantize_and_gather_k_cache(
             out=kv[:cs],
             k_cache=swa_k_cache,
-            seq_lens=prefill_seq_lens[c_start:c_end],
-            gather_lens=prefill_gather_lens[c_start:c_end],
+            seq_lens=chunk_seq_lens,
+            gather_lens=swa_gather_lens,
             block_table=swa_block_table[c_start:c_end],
             block_size=swa_block_size,
             offset=N,
         )
 
         # Combine compressed + SWA indices per query token, rebased to workspace.
-        q_start = prefill_query_start_loc_cpu[c_start]
-        q_end = prefill_query_start_loc_cpu[c_end]
-
         if local_topk_indices is not None:
             # C4 (CSA) — read topk indices from the indexer.
             combined_indices, combined_lens = combine_topk_swa_indices(
                 local_topk_indices[q_start:q_end],
                 prefill_query_start_loc[c_start : c_end + 1],
-                prefill_seq_lens[c_start:c_end],
-                prefill_gather_lens[c_start:c_end],
+                chunk_seq_lens,
+                swa_gather_lens,
                 window_size,
                 compress_ratio,
                 sparse_topk,
                 M,
                 N,
+                cp_positions=chunk_positions,
             )
         else:
             # C128 (HCA) — synthesize sequential [0, (pos+1)//128) indices.
             combined_indices, combined_lens = combine_full_swa_indices(
                 num_q_tokens=q_end - q_start,
                 query_start_loc=prefill_query_start_loc[c_start : c_end + 1],
-                seq_lens=prefill_seq_lens[c_start:c_end],
-                gather_lens=prefill_gather_lens[c_start:c_end],
+                seq_lens=chunk_seq_lens,
+                gather_lens=swa_gather_lens,
                 window_size=window_size,
                 compress_ratio=compress_ratio,
                 max_topk_len=N,
                 M=M,
                 N=N,
                 device=device,
+                cp_positions=chunk_positions,
             )
 
         q_chunk = q[q_start:q_end]

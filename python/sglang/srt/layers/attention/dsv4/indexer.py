@@ -26,6 +26,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_q_seqs_cpu,
+)
+from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -641,6 +646,29 @@ class C4IndexerBackendMixin:
             extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
         if isinstance(seq_lens_cpu, torch.Tensor):
             seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+
+        # CP: tokens are round-robin split across CP ranks, so q_quant only
+        # holds CP-local tokens while extend_seq_lens_cpu has full per-request
+        # lengths.  Compute CP-local extend lengths to match.
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_local_extend, bs_idx = nsa_cp_round_robin_split_q_seqs_cpu(
+                extend_lens_cpu
+            )
+            extend_lens_cpu = cp_local_extend
+            seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+            extend_seq_lens = torch.tensor(
+                extend_lens_cpu,
+                dtype=torch.int32,
+                device=forward_batch.extend_seq_lens.device,
+            )
+            # Also filter the GPU seq_lens tensor so that downstream
+            # forward_batch.seq_lens[req_start:req_stop] inside
+            # _get_prefill_c4_logits indexes the correct (CP-local) requests.
+            seq_lens = forward_batch.seq_lens[bs_idx].contiguous()
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            seq_lens = forward_batch.seq_lens
+
         if request_slice is None:
             request_slice = slice(0, len(extend_lens_cpu))
         req_start = 0 if request_slice.start is None else request_slice.start
@@ -664,7 +692,10 @@ class C4IndexerBackendMixin:
         total_kv_len = sum(final_c4_lens_cpu)
         max_c4_seq_len = max(final_c4_lens_cpu) if final_c4_lens_cpu else 0
         max_extend_len = max(local_extend_lens_cpu) if local_extend_lens_cpu else 0
-        assert sum(extend_lens_cpu) <= num_q_tokens
+        assert sum(extend_lens_cpu) <= num_q_tokens, (
+            f"CP-local extend sum {sum(extend_lens_cpu)} > num_q_tokens {num_q_tokens}; "
+            f"cp_size={get_attention_cp_size()}"
+        )
 
         if total_kv_len == 0:
             logits = torch.empty(
@@ -681,8 +712,8 @@ class C4IndexerBackendMixin:
 
         c4_seq_lens, page_indices, ks, ke, total_kv_len = (
             _build_prefill_c4_logits_metadata(
-                forward_batch.seq_lens[req_start:req_stop],
-                forward_batch.extend_seq_lens[req_start:req_stop],
+                seq_lens[req_start:req_stop],
+                extend_seq_lens[req_start:req_stop],
                 indexer_metadata.c4_seq_lens[
                     global_query_start : global_query_start + local_num_q_tokens
                 ],
@@ -768,13 +799,27 @@ class C4IndexerBackendMixin:
         if isinstance(extend_lens_cpu, torch.Tensor):
             extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
 
-        c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in seq_lens_cpu]
+        # CP: tokens are round-robin split across ranks.  Use CP-local extend
+        # lengths for chunk planning and token offsets so that indexing into
+        # CP-local core_metadata (page_table, c4_sparse_page_indices, …) is
+        # correct.
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_local_extend, bs_idx = nsa_cp_round_robin_split_q_seqs_cpu(
+                extend_lens_cpu
+            )
+            chunk_extend_lens_cpu = cp_local_extend
+            chunk_seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+        else:
+            chunk_extend_lens_cpu = extend_lens_cpu
+            chunk_seq_lens_cpu = seq_lens_cpu
+
+        c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in chunk_seq_lens_cpu]
         workspace_size = indexer_metadata.max_seq_len * 40
         max_logits_bytes = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get() * 1024 * 1024
         logits_dtype = torch.bfloat16 if c4_indexer.use_fp4_cache else torch.float32
         chunk_specs = split_indexer_prefill_chunks(
             c4_seq_lens_cpu,
-            extend_lens_cpu,
+            chunk_extend_lens_cpu,
             workspace_size,
             max_logits_bytes,
             logits_dtype,
@@ -782,7 +827,7 @@ class C4IndexerBackendMixin:
 
         for req_slice, query_slice in chunk_specs:
             req_start = 0 if req_slice.start is None else req_slice.start
-            global_query_start = sum(extend_lens_cpu[:req_start])
+            global_query_start = sum(chunk_extend_lens_cpu[:req_start])
             query_start = 0 if query_slice.start is None else query_slice.start
             query_stop = query_slice.stop
             assert query_stop is not None

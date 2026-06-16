@@ -48,6 +48,10 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.nsa.utils import (
+    can_nsa_prefill_cp_round_robin_split,
+    nsa_cp_round_robin_split_q_seqs,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -1209,7 +1213,44 @@ class DeepseekV4AttnBackend(
     ) -> _PrefillPerReqMeta:
         device = forward_batch.seq_lens.device
         seq_lens = forward_batch.seq_lens.to(torch.int32)
-        qo_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        bs = seq_lens.shape[0]
+
+        # In decode mode each request generates exactly 1 query token, so
+        # extend_seq_lens is semantically an all-ones vector of length bs.
+        # synthesise it when the batch was built without the field.
+        if forward_batch.extend_seq_lens is not None:
+            qo_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        else:
+            qo_lens = torch.ones(bs, dtype=torch.int32, device=device)
+
+        # CPU mirror of extend lengths (needed for chunked sparse prefill
+        # offset calculations that must avoid GPU→CPU sync).
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None:
+            if forward_batch.extend_seq_lens is not None:
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens.tolist()
+            else:
+                extend_seq_lens_cpu = [1] * bs
+
+        # CP: tokens are round-robin split across CP ranks.  qo_lens /
+        # extend_seq_lens_cpu from the scheduler carry full per-request
+        # lengths while the indexer metadata (c4_local_topk_indices, …)
+        # only has CP-local rows.  Convert to CP-local so the offsets
+        # produced here correctly address CP-local tensors downstream.
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_qo_lens_cpu, cp_qo_lens, cp_bs_idx_cpu, _cp_bs_idx = (
+                nsa_cp_round_robin_split_q_seqs(
+                    extend_seq_lens_cpu, qo_lens
+                )
+            )
+            qo_lens = cp_qo_lens
+            extend_seq_lens_cpu = cp_qo_lens_cpu
+            # seq_lens stays full (KV cache length), but we must drop
+            # requests that have zero CP-local query tokens so the
+            # per-request tensors stay aligned.
+            seq_lens = seq_lens[cp_bs_idx_cpu].contiguous()
+            bs = seq_lens.shape[0]
+
         assert qo_lens.shape == seq_lens.shape, (
             f"{qo_lens.shape=} vs {seq_lens.shape=}; sparse_fwd prefill "
             "requires per-request extend_seq_lens"
@@ -1220,15 +1261,8 @@ class DeepseekV4AttnBackend(
         # gather_len = min(seq_len, qo_len + WINDOW - 1).
         gather_lens = torch.minimum(seq_lens, qo_lens + (SWA_WINDOW - 1))
 
-        bs = seq_lens.shape[0]
         query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         torch.cumsum(qo_lens, dim=0, dtype=torch.int32, out=query_start_loc[1:])
-        # CPU mirror to avoid GPU->CPU sync in the per-layer driver loop.
-        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        if extend_seq_lens_cpu is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens.tolist()
-        elif isinstance(extend_seq_lens_cpu, torch.Tensor):
-            extend_seq_lens_cpu = extend_seq_lens_cpu.tolist()
         query_start_loc_cpu: List[int] = [0]
         acc = 0
         max_qo_len_cpu = 0
@@ -1268,8 +1302,11 @@ class DeepseekV4AttnBackend(
         # req_to_token is (max_num_reqs, MAX_SEQ_LEN_FOR_CAPTURE)
         # Take every swa_page_size-th slot id per request, then translate.
         max_seq_len = self.req_to_token.shape[1]
+        req_pool_indices = forward_batch.req_pool_indices
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            req_pool_indices = req_pool_indices[cp_bs_idx_cpu]
         raw_first_in_block = self.req_to_token[
-            forward_batch.req_pool_indices, :max_seq_len:swa_page_size
+            req_pool_indices, : max_seq_len : swa_page_size
         ]
         swa_block_table = (full_to_swa[raw_first_in_block] // swa_page_size).to(
             torch.int32
@@ -1347,6 +1384,13 @@ class DeepseekV4AttnBackend(
 
         out = q.new_empty(q.shape[0], q.shape[1], self.head_dim_v)
 
+        # Only pass positions when CP round-robin is active.  When positions
+        # is None, forward_prefill_sparse uses the original contiguous-layout
+        # formula with zero extra overhead (ideal for TP-only deployments).
+        cp_positions = None
+        if can_nsa_prefill_cp_round_robin_split(forward_batch):
+            cp_positions = core_attn_metadata.positions_casual[:num_q_tokens]
+
         forward_prefill_sparse(
             q=q,
             attn_sink=attn_sink,
@@ -1369,6 +1413,7 @@ class DeepseekV4AttnBackend(
             max_model_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             max_seq_len_in_batch=prep.max_seq_len_cpu,
             max_qo_len_in_batch=prep.max_qo_len_cpu,
+            cp_positions=cp_positions,
             attn_tp_rank=get_attention_tp_rank(),
             attn_tp_size=get_attention_tp_size(),
         )
