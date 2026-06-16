@@ -667,7 +667,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from deep_gemm import preprocess_mxfp4_scales
-        from sglang.jit_kernel.silu_mul_quant import silu_and_mul_post_quant_mxfp4
+
+        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -713,10 +714,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
-            gateup_output, swiglu_limit=self.swiglu_limit
+        if self.swiglu_limit is not None:
+            gateup_output = _apply_swiglu_limit(
+                gateup_output, swiglu_limit=self.swiglu_limit
+            )
+
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.bfloat16,
         )
+        _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
+
+        down_input_fp4, down_input_scale = downcast_to_mxfp4(down_input, axis=1)
+        del down_input
 
         down_output = torch.empty(
             (all_tokens, K * 2),
@@ -1347,8 +1362,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
     ) -> torch.Tensor:
 
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.jit_kernel.silu_mul_quant import (
-            silu_and_mul_masked_post_quant_mxfp4,
+        from sglang.srt.layers.moe.ep_moe.kernels import (
+            silu_and_mul_masked_post_quant_fwd,
         )
 
         hidden_states = runner_input.hidden_states
@@ -1419,12 +1434,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=gateup_output.device,
             dtype=torch.uint16,
         )
-
-        silu_and_mul_masked_post_quant_mxfp4(
+        silu_and_mul_masked_post_quant_fwd(
             gateup_output,
             down_input,
             down_input_scale,
+            scale_block_size,
             masked_m,
+            use_fp8=False,
+            use_int8=False,
+            use_mxfp4=True,
             swiglu_limit=swiglu_limit_arg,
         )
         del gateup_output
