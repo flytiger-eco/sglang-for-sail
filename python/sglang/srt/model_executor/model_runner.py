@@ -3355,14 +3355,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ) as recorder_outputs,
         ):
             if SGLANG_PROFILE_NVTX:
-                if forward_batch.extend_seq_lens_cpu is None:
-                    th_nvtx_range_push(
-                        f"total bs={forward_batch.batch_size}, forward_pass_id={self.forward_pass_id}"
-                    )
+                # Use forward_mode to detect real prefill; MTP decode fakes extend mode
+                if (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                    and forward_batch.extend_seq_lens_cpu is not None
+                ):
+                    p_bs = len(forward_batch.extend_seq_lens_cpu)
                 else:
-                    th_nvtx_range_push(
-                        f"total bs={forward_batch.batch_size}, P bs={len(forward_batch.extend_seq_lens_cpu)}, forward_pass_id={self.forward_pass_id}"
-                    )
+                    p_bs = 0
+                th_nvtx_range_push(
+                    f"total bs={forward_batch.batch_size}, P bs={p_bs}, forward_pass_id={self.forward_pass_id}"
+                )
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
