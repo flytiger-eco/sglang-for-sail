@@ -281,6 +281,13 @@ class Fp8Config(QuantizationConfig):
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
 
+            if self.is_fp4_experts and _is_ppu:
+                from sglang.srt.layers.quantization.mxfp4 import (
+                    Mxfp4MoEMethod,
+                )
+
+                return Mxfp4MoEMethod(prefix=prefix)
+
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():

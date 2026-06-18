@@ -531,6 +531,10 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+
+        if _is_ppu and isinstance(self.quant_method, Mxfp4MoEMethod):
+            loaded_weight = loaded_weight.view(torch.uint8)
+
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -599,6 +603,9 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
+
+        if _is_ppu and isinstance(self.quant_method, Mxfp4MoEMethod):
+            loaded_weight = loaded_weight.view(torch.uint8)
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)

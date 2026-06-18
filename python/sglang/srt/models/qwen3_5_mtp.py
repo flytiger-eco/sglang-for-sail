@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
 
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     def __init__(
         self,
         config: PretrainedConfig,
