@@ -338,7 +338,7 @@ def fused_sigmoid_gating_delta_rule_update(
             intermediate_states_buffer,
             intermediate_state_indices,
             cache_steps,
-            retrieve_parent_token.int() if retrieve_parent_token is not None else None,
+            retrieve_parent_token,
         )
         return output
 
