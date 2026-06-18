@@ -2944,6 +2944,9 @@ class ServerArgs:
                 logger.info(
                     "Disable custom allreduce and use pccl allreduce on ppu for better perf. Launch server with --enable-custom-all-reduce to force use custom allreduce"
                 )
+            # use cuda fla by default on ppu
+            if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
+                envs.SGLANG_SAIL_FLA_CUDA.set(True)
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
