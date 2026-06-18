@@ -317,7 +317,6 @@ def fused_sigmoid_gating_delta_rule_update(
             f"USE PPU SAIL CUDA FLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
         )
 
-        s_cuda = initial_state_source.clone()
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
             A_log,
             a,
@@ -328,7 +327,7 @@ def fused_sigmoid_gating_delta_rule_update(
             k,
             v,
             b,
-            s_cuda,
+            initial_state_source,
             initial_state_indices,
             scale,
             use_qk_l2norm_in_kernel,
