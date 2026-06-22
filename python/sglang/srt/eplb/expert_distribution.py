@@ -735,6 +735,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                     eplb_balancedness=utilization_rate_gpu,
                 )
             else:
+                if torch.cuda.is_current_stream_capturing():
+                    return  # skip during CUDA graph capture to avoid gpu->cpu sync crash
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
                 self._history.append(utilization_rate_cpu)
