@@ -389,12 +389,19 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.use_fp4_cache:
+            store_type = "indexer_mxfp4"
+        else:
+            from sglang.srt.layers.attention.nsa.triton_kernel import _supports_fp8
+
+            use_int8 = not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get()
+            store_type = "indexer_int8" if use_int8 else "indexer"
         return fused_store_cache(
             input=cache_k,
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
             indices=loc,
             page_size=self.page_size,
-            type="indexer_mxfp4" if self.use_fp4_cache else "indexer",
+            type=store_type,
         )
 
 

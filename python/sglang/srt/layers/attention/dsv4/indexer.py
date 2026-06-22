@@ -517,7 +517,6 @@ class C4IndexerBackendMixin:
             and not forward_mode.is_draft_extend(include_v2=True)
             and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            and not _USE_INT8
         )
 
     def _get_paged_c4_logits(
@@ -765,17 +764,28 @@ class C4IndexerBackendMixin:
                 logits_dtype=torch.bfloat16,
             )
         else:
-            q_fp8_chunk = q_quant[global_token_start:global_token_end]
-            kv_fp8 = k_buf.view(FP8_DTYPE)
+            q_chunk = q_quant[global_token_start:global_token_end]
             kv_scale = k_scale_buf.view(torch.float32).squeeze(-1)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8_chunk,
-                (kv_fp8, kv_scale),
-                weights,
-                ks,
-                ke,
-                clean_logits=False,
-            )
+            if _USE_INT8:
+                kv_int8 = k_buf.view(torch.int8)
+                logits = deep_gemm.int8_mqa_logits(
+                    q_chunk,
+                    (kv_int8, kv_scale),
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
+            else:
+                kv_fp8 = k_buf.view(FP8_DTYPE)
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_chunk,
+                    (kv_fp8, kv_scale),
+                    weights,
+                    ks,
+                    ke,
+                    clean_logits=False,
+                )
         return logits, ks, ke
 
     def _forward_prefill_c4_topk_chunked(

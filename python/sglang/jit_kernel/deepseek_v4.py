@@ -226,7 +226,7 @@ def _jit_norm_rope_module(
 
 @cache_once
 def _jit_fused_store_module(
-    name: Literal["flashmla", "indexer", "indexer_mxfp4"],
+    name: Literal["flashmla", "indexer", "indexer_mxfp4", "indexer_int8"],
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
@@ -238,6 +238,8 @@ def _jit_fused_store_module(
         cname = "Indexer"
     elif name == "indexer_mxfp4":
         cname = "IndexerMXFP4"
+    elif name == "indexer_int8":
+        cname = "IndexerInt8"
     else:
         raise ValueError(f"unknown fused store kernel name: {name!r}")
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
@@ -1098,7 +1100,7 @@ def fused_store_cache(
     indices: torch.Tensor,
     *,
     page_size: int,
-    type: Literal["flashmla", "indexer", "indexer_mxfp4"],
+    type: Literal["flashmla", "indexer", "indexer_mxfp4", "indexer_int8"],
 ) -> None:
     module = _jit_fused_store_module(
         name=type,

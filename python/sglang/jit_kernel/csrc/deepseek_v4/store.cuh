@@ -52,11 +52,7 @@ __device__ __forceinline__ uint8_t e2m1_nibble(float x) {
 // lo nibble = e2m1(lo_val), hi nibble = e2m1(hi_val).
 __device__ __forceinline__ uint8_t e2m1x2_pack_ptx(float hi_val, float lo_val) {
   uint8_t tmp;
-  asm(
-      "cvt.rn.satfinite.e2m1x2.f32 %0, %1, %2;"
-      : "=r"(tmp)
-      : "f"(hi_val), "f"(lo_val)
-  );
+  asm("cvt.rn.satfinite.e2m1x2.f32 %0, %1, %2;" : "=r"(tmp) : "f"(hi_val), "f"(lo_val));
   return tmp;
 }
 
@@ -238,12 +234,12 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   // Streaming store: bypass L1/L2 cache for large sequential KV writes.
   {
     const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
-    asm volatile("st.global.cs.u16 [%0], %1;" :: "l"(store_addr), "h"(packed) : "memory");
+    asm volatile("st.global.cs.u16 [%0], %1;" ::"l"(store_addr), "h"(packed) : "memory");
   }
   // The first lane in each 8-lane group writes its block's ue8m0 byte.
   if ((lane_id % kLanesPerBlock) == 0) {
     const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
-    asm volatile("st.global.cs.u8 [%0], %1;" :: "l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
+    asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -296,6 +292,94 @@ struct FusedStoreCacheIndexerMXFP4Kernel {
   // 64 packed FP4 bytes + 4 ue8m0 bytes per token = 68 bytes.
   static constexpr int64_t kPageBytes = 68 * kPageSize;
   static constexpr auto kernel = fused_store_indexer_mxfp4_cache<Float, IndicesT, kLogSize, kUsePDL>;
+
+  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(1 << kLogSize == kPageSize);
+
+  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({N, 128})  // input
+        .with_dtype<Float>()
+        .with_device(device_)
+        .verify(input);
+    TensorMatcher({-1, -1})  // cache
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({N})  // indices
+        .with_dtype<IndicesT>()
+        .with_device(device_)
+        .verify(indices);
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto params = FusedStoreCacheParam{
+        .input = input.data_ptr(),
+        .cache = cache.data_ptr(),
+        .indices = indices.data_ptr(),
+        .num_tokens = num_tokens,
+    };
+    const auto kBlockSize = 128;
+    const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);
+    LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
+__global__ void fused_store_indexer_int8_cache(const __grid_constant__ FusedStoreCacheParam param) {
+  using namespace device;
+
+  /// NOTE: 132 = 128 + 4  (same page layout as FP8 indexer)
+  constexpr int64_t kPageBytes = 132 << kPageBits;
+  constexpr float kInt8Max = 127.0f;
+
+  const auto& [input, cache, indices, num_tokens] = param;
+  const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const auto global_wid = global_tid / 32;
+  const auto lane_id = threadIdx.x % 32;
+
+  if (global_wid >= num_tokens) return;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto index = static_cast<const IndicesT*>(indices)[global_wid];
+  using Float2 = packed_t<Float>;
+  using InStorage = AlignedVector<Float2, 2>;
+  const auto elems = static_cast<const InStorage*>(input)[global_tid];
+  const auto [x0, x1] = cast<fp32x2_t>(elems[0]);
+  const auto [y0, y1] = cast<fp32x2_t>(elems[1]);
+  const auto local_max = fmaxf(fmaxf(fabs(x0), fabs(x1)), fmaxf(fabs(y0), fabs(y1)));
+  const auto abs_max = warp::reduce_max(local_max);
+  const auto scale = fmaxf(1e-4f, abs_max) / kInt8Max;
+  const auto inv_scale = 1.0f / scale;
+  const int32_t page = index >> kPageBits;
+  const int32_t offset = index & ((1 << kPageBits) - 1);
+  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+  const auto value_ptr = pointer::offset(page_ptr, offset * 128);
+  const auto scale_ptr = pointer::offset(page_ptr, 128 << kPageBits, offset * 4);
+
+  auto to_int8 = [&](float v) -> int8_t {
+    float clamped = fminf(fmaxf(rintf(v * inv_scale), -128.0f), kInt8Max);
+    return static_cast<int8_t>(clamped);
+  };
+  struct int8x4_t {
+    int8_t a, b, c, d;
+  };
+  int8x4_t result = {to_int8(x0), to_int8(x1), to_int8(y0), to_int8(y1)};
+  static_cast<int8x4_t*>(value_ptr)[lane_id] = result;
+  static_cast<float*>(scale_ptr)[0] = scale;
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <typename Float, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+struct FusedStoreCacheIndexerInt8Kernel {
+  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  static constexpr int64_t kPageBytes = 132 * kPageSize;
+  static constexpr auto kernel = fused_store_indexer_int8_cache<Float, IndicesT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);

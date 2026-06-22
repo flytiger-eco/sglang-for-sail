@@ -19,7 +19,9 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import (
+    _supports_fp8,
     act_quant,
+    int8_act_quant,
     is_fp4_indexer_cache_enabled,
 )
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -168,15 +170,21 @@ class CompressorBackendMixin:
         else:
             assert not is_fp4_indexer_cache_enabled(), (
                 "FP4 indexer cache requires SGLANG_OPT_USE_FUSED_STORE_CACHE=1; "
-                "the unfused store path only supports FP8."
+                "the unfused store path only supports FP8/INT8."
             )
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
+            _use_int8 = not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get()
+            if _use_int8:
+                new_compressed_kv_quant, new_compressed_kv_scale = int8_act_quant(
+                    new_compressed_kv
+                )
+            else:
+                new_compressed_kv_quant, new_compressed_kv_scale = act_quant(
+                    new_compressed_kv
+                )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
-                index_k=new_compressed_kv_fp8,
+                index_k=new_compressed_kv_quant,
                 index_k_scale=new_compressed_kv_scale,
             )
 
