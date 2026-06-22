@@ -30,6 +30,7 @@ from .moe import (
 from .topk import (
     plan_topk_v2,
     top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
     topk_transform_512,
     topk_transform_512_v2,
 )
