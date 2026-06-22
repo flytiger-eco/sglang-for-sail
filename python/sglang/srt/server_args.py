@@ -1366,6 +1366,9 @@ class ServerArgs:
             # use cuda fla by default on ppu
             if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
                 envs.SGLANG_SAIL_FLA_CUDA.set(True)
+            # disable deepseek v4 topk_v2 on PPU
+            if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
