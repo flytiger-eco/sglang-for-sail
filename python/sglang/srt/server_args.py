@@ -2950,6 +2950,8 @@ class ServerArgs:
             # disable deepseek v4 topk_v2 on PPU
             if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            if not envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.is_set():
+                envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.set(4096)
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
