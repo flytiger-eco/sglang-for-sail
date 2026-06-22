@@ -937,6 +937,8 @@ class Envs:
     SGLANG_SAIL_FLA_CUDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
+    # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
+    SGLANG_NSA_USE_DSV4_BF16_TOPK = EnvBool(True)
 
 
 envs = Envs()
