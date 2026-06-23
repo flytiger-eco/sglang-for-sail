@@ -11,9 +11,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     get_attention_cp_group,
+    get_attention_cp_rank,
     get_attention_cp_size,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -109,6 +111,30 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
         dim=-1,
     )
     return positions
+
+
+def cp_round_robin_input_ids(input_ids):
+    """
+    input input_ids:
+    rank0~7: 0,1,2,3,4,5,...
+
+    output input_ids:
+    a2a none:
+    rank0~7: 0,8,16,...,1,9,17,...,2,10,18,...
+
+    not a2a none:
+    rank0: 0,8,16,...
+    rank1: 1,9,17,...
+    rank2: 2,10,18,...
+    ...
+    """
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
+    if get_moe_a2a_backend().is_none():
+        input_ids = input_ids.reshape(-1, cp_size).T.flatten()
+    else:
+        input_ids = input_ids[cp_rank::cp_size].contiguous()
+    return input_ids
 
 
 def cp_all_gather_reorganized_into_tensor(

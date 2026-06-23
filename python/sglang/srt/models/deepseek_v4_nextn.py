@@ -7,6 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -18,6 +19,11 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.cp_utils import (
+    cp_round_robin_input_ids,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -143,6 +149,12 @@ class DeepseekV4ModelNextN(nn.Module):
             dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
         else:
+            input_ids_global = input_ids
+
+        if nsa_use_prefill_cp(forward_batch):
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
         hidden_states = self.decoder(

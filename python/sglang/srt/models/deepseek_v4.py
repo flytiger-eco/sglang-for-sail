@@ -42,6 +42,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator_nsa_cp import (
+    nsa_cp_gather_hidden_states,
+    nsa_cp_reduce_scatter_hidden_states,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -69,6 +73,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
@@ -913,14 +918,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             and not get_moe_a2a_backend().is_none()
         )
         if _use_cp:
-            assert get_moe_a2a_backend().is_deepep(), (
-                "CP requires DeepEP (moe_a2a_backend == deepep). "
-                "Only DeepEP is tested with CP's per-rank token split."
-            )
-            cp_rank = get_attention_cp_rank()
-            cp_size = get_attention_cp_size()
-            input_ids = input_ids[cp_rank::cp_size].contiguous()
-            input_ids_global = input_ids
+            if get_moe_a2a_backend().is_none():
+                hidden_states = nsa_cp_gather_hidden_states(hidden_states)
+            else:
+                assert get_moe_a2a_backend().is_deepep(), (
+                    "CP requires DeepEP (moe_a2a_backend == deepep). "
+                    "Only DeepEP is tested with CP's per-rank token split."
+                )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -939,8 +943,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+            use_reduce_scatter=_use_cp,
         )
-        if _use_tp_moe_gather:
+        if _use_cp and get_moe_a2a_backend().is_none():
+            hidden_states = nsa_cp_reduce_scatter_hidden_states(hidden_states)
+        elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -1075,6 +1082,8 @@ class DeepseekV4Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
