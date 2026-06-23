@@ -17,9 +17,11 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
+    _mask_topk_ids_padded_region_to_int64,
     _zero_topk_weights_padded_region,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
+from sglang.srt.utils import is_hip, is_ppu
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +180,10 @@ class HashTopK(nn.Module):
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        elif is_ppu() and topk_ids.dtype == torch.int32 and is_deepep_class_backend():
+            topk_ids = _mask_topk_ids_padded_region_to_int64(
+                topk_ids, num_token_non_padded
+            )
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)

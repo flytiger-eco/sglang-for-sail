@@ -110,6 +110,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -130,6 +131,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_is_ppu = is_ppu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -1136,11 +1138,33 @@ def _zero_topk_weights_padded_region(
     topk_weights[indices >= num_token_non_padded, :] = 0.0
 
 
+def _mask_topk_ids_padded_region_to_int64(
+    topk_ids: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Mask padded rows then return int64 topk_ids.
+    On PPU with int32 input, fuses mask+cast in one kernel.
+    """
+    if (
+        num_token_non_padded is not None
+        and _is_ppu
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+    ):
+        from sglang.jit_kernel.dsv4.moe import mask_topk_ids_to_int64
+
+        return mask_topk_ids_to_int64(topk_ids, num_token_non_padded)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids.to(torch.int64)
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
+    topk_ids, expert_location_dispatch_info, num_token_non_padded, cast_to_int64=False
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    if cast_to_int64:
+        return _mask_topk_ids_padded_region_to_int64(topk_ids, num_token_non_padded)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
@@ -1505,8 +1529,15 @@ def _post_process_topk_ids(
             # so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
         else:
+            # PPU + DeepEP: fuse int32->int64 cast into the mask kernel.
+            cast_to_int64 = (
+                _is_ppu and topk_ids.dtype == torch.int32 and is_deepep_class_backend()
+            )
             topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
+                topk_ids,
+                expert_location_dispatch_info,
+                num_token_non_padded,
+                cast_to_int64=cast_to_int64,
             )
     elif _is_hip:
         # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
