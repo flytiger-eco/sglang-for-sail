@@ -153,5 +153,42 @@ def test_ep_scale_layout_nonaligned() -> None:
     assert out_quant.shape == (E, T, H // 2)
 
 
+_EXPECTED_M_CASES = [
+    # (E, T, twoN, expected_m_values)
+    (8, 8192, 6144, [31, 64, 128, 256]),    # Pro EP32, T_padded=8192
+    (13, 8192, 6144, [31, 64, 128]),         # Pro EP20
+    (16, 8192, 4096, [31, 64, 128, 256]),    # Flash EP16
+    (8, 4096, 6144, [16, 32, 64]),           # Pro smaller T
+    (4, 1024, 4096, [8, 16, 31]),            # Flash small T
+]
+
+
+@pytest.mark.parametrize("E,T,twoN,em_list", _EXPECTED_M_CASES)
+@pytest.mark.parametrize("swiglu_limit", [None, 8.0, 10.0])
+def test_expected_m_bitexact(E, T, twoN, em_list, swiglu_limit) -> None:
+    """Verify expected_m grid optimization produces bit-exact results."""
+    from sglang.jit_kernel.silu_mul_quant import silu_and_mul_masked_post_quant_mxfp4
+
+    torch.manual_seed(E * T + twoN)
+    inp = torch.randn((E, T, twoN), dtype=torch.bfloat16, device="cuda")
+    masked_m = torch.randint(1, min(T, 300) + 1, (E,), dtype=torch.int32, device="cuda")
+
+    # Baseline: no expected_m
+    out_base, scale_base = silu_and_mul_masked_post_quant_mxfp4(
+        inp, masked_m, swiglu_limit=swiglu_limit, expected_m=None
+    )
+
+    masked_cpu = masked_m.cpu().tolist()
+    for em in em_list:
+        out_opt, scale_opt = silu_and_mul_masked_post_quant_mxfp4(
+            inp, masked_m, swiglu_limit=swiglu_limit, expected_m=em
+        )
+        for e, m in enumerate(masked_cpu):
+            assert torch.equal(out_base[e, :m], out_opt[e, :m]), \
+                f"quant mismatch: E={E} T={T} em={em} expert={e}"
+            assert torch.equal(scale_base[e, :, :m], scale_opt[e, :, :m]), \
+                f"scale mismatch: E={E} T={T} em={em} expert={e}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

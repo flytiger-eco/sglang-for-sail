@@ -1403,6 +1403,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             swiglu_limit=swiglu_limit_arg,
+            expected_m=expected_m,
         )
         del gateup_output
 

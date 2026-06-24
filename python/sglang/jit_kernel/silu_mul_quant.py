@@ -142,6 +142,7 @@ def silu_and_mul_masked_post_quant_mxfp4(
     input: torch.Tensor,
     masked_m: torch.Tensor,
     swiglu_limit: Optional[float] = None,
+    expected_m: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert input.ndim == 3, "input must be 3D (E, T, 2H)"
     assert input.dtype == torch.bfloat16, "input must be bfloat16"
@@ -162,7 +163,9 @@ def silu_and_mul_masked_post_quant_mxfp4(
     apply_clamp = swiglu_limit is not None
     limit_val = float(swiglu_limit) if apply_clamp else 0.0
 
+    max_masked_m = int(expected_m) if expected_m is not None else int(T)
+
     module = _jit_ep_module(apply_clamp)
-    module.run(input, out_quant, out_scale, masked_m, limit_val)
+    module.run(input, out_quant, out_scale, masked_m, limit_val, max_masked_m)
 
     return out_quant, out_scale[:, :S_valid, :]

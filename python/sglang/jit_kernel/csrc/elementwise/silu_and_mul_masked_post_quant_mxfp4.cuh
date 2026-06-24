@@ -340,7 +340,8 @@ struct SiluMulMxfp4EP {
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView output_scale,
       const tvm::ffi::TensorView masked_m,
-      double swiglu_limit) {
+      double swiglu_limit,
+      int64_t max_masked_m) {
     using namespace host;
 
     const int E        = static_cast<int>(input.size(0));
@@ -354,7 +355,7 @@ struct SiluMulMxfp4EP {
     RuntimeCheck(T_padded > 0, "T_padded must be positive");
 
     int blocks_per_expert = (kBlocksYZTarget + E - 1) / E;
-    const int amort_cap = (T_padded + 1) / 2;
+    const int amort_cap = static_cast<int>(max_masked_m > 0 ? max_masked_m : T_padded);
     if (blocks_per_expert > amort_cap) blocks_per_expert = amort_cap;
     if (blocks_per_expert < 1)         blocks_per_expert = 1;
 
