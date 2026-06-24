@@ -49,9 +49,14 @@ class _RepoInfo:
         self.source_dir = third_party / name
 
 
-_CUTLASS_DIR = Path(
-    os.environ.get("SGL_KERNEL_CUTLASS_DIR", root / "3rdparty" / "cutlass")
+_CUTLASS_REPO = _RepoInfo(
+    name="cutlass",
+    git_repository="https://github.com/NVIDIA/cutlass",
+    git_tag="57e3cfb47a2d9e0d46eb6335c3dc411498efa198",
+    git_shallow=False,
 )
+
+_CUTLASS_DIR = Path(os.environ.get("SGL_KERNEL_CUTLASS_DIR", _CUTLASS_REPO.source_dir))
 
 _FLASHINFER_REPO = _RepoInfo(
     name="flashinfer",
@@ -68,6 +73,7 @@ _TRITON_REPO = _RepoInfo(
 )
 
 ALL_REPOS = [
+    _CUTLASS_REPO,
     _FLASHINFER_REPO,
     _TRITON_REPO,
 ]
