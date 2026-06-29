@@ -310,7 +310,7 @@ def deepgemm_moe_permute(
             (M_sum, scale_hidden), device=device, dtype=torch.float32
         )
 
-    expert_ids = torch.zeros((M_sum), device=device, dtype=torch.int32)
+    expert_ids = torch.empty((M_sum), device=device, dtype=torch.int32)
     inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
 
     expert_num_tokens = count_expert_num_tokens(
@@ -489,9 +489,7 @@ def deep_moe_impl_fused(
         )
 
     if gemm1_alpha is None and gemm1_limit is None and use_mxfp4:
-        a, a_scale = silu_and_mul_post_quant_mxfp4(
-            out1, swiglu_limit=swiglu_limit
-        )
+        a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
         if gemm1_alpha is not None:
             out2 = swiglu_with_alpha_and_limit(
