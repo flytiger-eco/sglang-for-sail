@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.utils import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
+    concat_mla_absorb_q_general,
 )
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -311,20 +312,38 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
+                if k_rope is not None:
+                    self.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+                else:
+                    self.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+
         bs = forward_batch.batch_size
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+        if q_rope is not None:
+            q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q = concat_mla_absorb_q_general(q, q_rope)
 
         # [PPU patch] The draft proposal builds attn metadata (block_kv_indices,
         # flashmla_metadata) for the real batch size, but the draft model's decode
@@ -406,23 +425,47 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         if forward_batch.forward_mode in (
             ForwardMode.EXTEND,
             # ppu use flashmla instead of flashinfer for draft_extend
             # ForwardMode.DRAFT_EXTEND_V2,
         ):
-            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
         else:
             cache_loc = forward_batch.out_cache_loc
 
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    if k_rope is not None:
+                        self.token_to_kv_pool.set_mla_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            k_rope,
+                        )
+                    else:
+                        self.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            v,
+                        )
 
             bs = forward_batch.batch_size
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+            if q_rope is not None:
+                q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+                q = concat_mla_absorb_q_general(q, q_rope)
 
             # [PPU patch] Both TARGET_VERIFY and DRAFT_EXTEND_V2 use the rectangular
             # [bs, num_draft_tokens, ...] layout, but the token dim can be padded to a
