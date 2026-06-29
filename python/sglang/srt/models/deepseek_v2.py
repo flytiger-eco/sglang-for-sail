@@ -317,12 +317,11 @@ class DeepseekV2MLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         # Only Support for PPU fp8 channelwise.
         if (
-            self.swiglu_limit is not None
+            _is_ppu
             and not self.down_proj.reduce_results
             and self.down_proj.weight.dtype == torch.float8_e4m3fn
             and getattr(self.down_proj, "weight_scale", None) is not None
             and self.down_proj.weight_scale.numel() == self.down_proj.weight.shape[1]
-            and _is_ppu
         ):
             from sglang.jit_kernel.silu_mul_quant import (
                 silu_and_mul_post_per_token_quant_fp8,
@@ -330,7 +329,7 @@ class DeepseekV2MLP(nn.Module):
 
             M = gate_up.shape[0]
             down_input_fp8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
-                gate_up, swiglu_limit=float(self.swiglu_limit)
+                gate_up, swiglu_limit=self.swiglu_limit
             )
             down_output = gate_up.new_empty(
                 (M, self.down_proj.output_size), dtype=torch.bfloat16
@@ -533,7 +532,7 @@ class MoEGate(nn.Module):
             elif _is_npu:
                 logits = F.linear(hidden_states, self.weight, None)
             else:
-                if self.is_deepseek_v4:
+                if self.is_deepseek_v4 or _is_ppu:
                     from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                     logits = linear_bf16_fp32(hidden_states, self.weight)
