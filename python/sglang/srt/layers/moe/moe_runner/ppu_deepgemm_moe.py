@@ -310,7 +310,7 @@ def deepgemm_moe_permute(
             (M_sum, scale_hidden), device=device, dtype=torch.float32
         )
 
-    expert_ids = torch.zeros((M_sum), device=device, dtype=torch.int32)
+    expert_ids = torch.empty((M_sum), device=device, dtype=torch.int32)
     inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
 
     expert_num_tokens = count_expert_num_tokens(
