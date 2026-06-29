@@ -1,4 +1,5 @@
 from .attn import (
+    dequantize_k_cache_paged_cuda,
     fused_store_cache,
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
