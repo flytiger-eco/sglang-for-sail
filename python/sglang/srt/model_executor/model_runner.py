@@ -3453,7 +3453,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if use_model_prof:
                 # Skip during capture: prof_iter -> cudaDeviceSynchronize() is
                 # illegal under CUDA Graph capture (error 900).
-                if not get_is_capture_mode():
+                # always use target_worker for prof_iter to avoid iteration mismatch
+                if not get_is_capture_mode() and not self.is_draft_worker:
                     prof_iter(self.iteration)
                     # Increment inside guard so capture forwards don't bump
                     # iteration and misalign the trace.

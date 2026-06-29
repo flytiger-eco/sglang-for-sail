@@ -6,6 +6,7 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
+from sglang.srt.environ import envs
 
 # ==== NVTX profiling for MTP stages ====
 # Import-guarded NVTX helpers (mirror model_runner.py) so non-NVTX builds work.
@@ -21,7 +22,7 @@ except ImportError:
         pass
 
 
-_SGLANG_PROFILE_NVTX = os.getenv("SGLANG_PROFILE_NVTX", False)
+_SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
 if _SGLANG_PROFILE_NVTX:
     try:
         from model_prof import prof_iter as _prof_iter
@@ -53,7 +54,6 @@ def _mtp_nvtx(name: str):
     return _deco
 
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
@@ -403,11 +403,13 @@ class EagleDraftWorker(BaseDraftWorker):
             _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
         )
         if _draft_prof:
+            #always use target_worker.model_runner's iteration to keep id sync
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
             _th_nvtx_range_push(
                 f"total bs={forward_batch.batch_size}, "
-                f"forward_pass_id={getattr(self.draft_runner, 'iteration', 0)}"
+                f"forward_pass_id={target_iteration}"
             )
-            _prof_iter(getattr(self.draft_runner, "iteration", 0))
+            _prof_iter(target_iteration)
         try:
             if can_cuda_graph:
                 # cudagraph label, analog of model_runner's decode_cudagraph.
@@ -597,6 +599,15 @@ class EagleDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+
+        #nvtx: use target_worker.model_runner's iteration to keep id sync
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration-1}")
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             pt = 0
@@ -633,12 +644,19 @@ class EagleDraftWorker(BaseDraftWorker):
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        if _draft_prof:
+            _th_nvtx_range_pop()
         return next_draft_input
 
     @_mtp_nvtx("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
+        #nvtx: use target_worker.model_runner's iteration to keep id sync
+        _draft_prof = (_SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode())
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration-1}")
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -715,6 +733,8 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        if _draft_prof:
+            _th_nvtx_range_pop()
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
