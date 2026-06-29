@@ -31,6 +31,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
+    _is_ppu,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -336,7 +337,7 @@ class DeepseekMLAForwardMixin:
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
                     )
 
-        elif self.w_kc.dtype == torch.float8_e4m3fn:
+        elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_ppu:
             if _is_cpu:
                 q_nope_out = torch.bmm(
                     q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -610,7 +611,7 @@ class DeepseekMLAForwardMixin:
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_ppu:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
