@@ -7,6 +7,7 @@ import torch
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.utils import concat_mla_absorb_q_general
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -528,8 +529,8 @@ class DeepseekMLAForwardMixin:
 
                 save_kv_cache = False
             else:
-                q = torch.cat([q_nope_out, q_pe], dim=-1)
-                k = torch.cat([k_nope, k_pe], dim=-1)
+                q = concat_mla_absorb_q_general(q_nope_out, q_pe)
+                k = concat_mla_absorb_q_general(k_nope, k_pe)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
