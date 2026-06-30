@@ -445,7 +445,7 @@ class MoEGate(nn.Module):
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
-                if self.is_deepseek_v4:
+                if self.is_deepseek_v4 or _is_ppu:
                     from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
 
                     logits = linear_bf16_fp32(hidden_states, self.weight)
