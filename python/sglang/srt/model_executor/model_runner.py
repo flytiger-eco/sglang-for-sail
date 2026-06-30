@@ -3475,11 +3475,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
-            if (
-                hasattr(forward_batch, "_original_batch_size")
-                and forward_batch._original_batch_size != forward_batch.batch_size
-            ):
-                skip_attn_backend_init = False
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
