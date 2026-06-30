@@ -14,9 +14,9 @@ from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import (
+    concat_mla_absorb_q_general,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
-    concat_mla_absorb_q_general,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
