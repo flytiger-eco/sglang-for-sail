@@ -70,11 +70,6 @@ class MoeRunnerConfig:
     # otherwise chunk gate/up then apply alpha/limit).
     gate_up_interleaved: bool = True
 
-    # <NOTE>
-    # PPU specialize params
-    # </NOTE>
-    dispatch_dtype: Optional[torch.dtype] = None
-
 
 @dataclass
 class RunnerInput(ABC):

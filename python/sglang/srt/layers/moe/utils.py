@@ -186,12 +186,14 @@ class DeepEPOutputDtype(Enum):
     - BF16: dispatch hidden states in bf16
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
+    - UINT8: dispatch hidden states in uint8 (mxfp4, PPU only)
     - NVFP4: dispatch hidden states in nvfp4
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
+    UINT8 = "uint8"
     NVFP4 = "nvfp4"
 
 
@@ -203,7 +205,10 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     0. Parse server argument.
     1. Parse deprecated environment variables.
     2. If quant_config contains input_global_scale → NVFP4 path.
-    3. Parse quant config
+    3. Parse quant config (dict). Recognized fields:
+       - ``dispatcher_output_dtype``: explicit dtype string.
+       - ``is_channel_quant``: channel-wise fp8 quantization; uses FP8
+         dispatch on GPU and falls back to BF16 on NPU.
     4. If flashinfer_cutedsl or is_cutlass backend is active → BF16 (it quantizes hidden_states internally).
     5. Otherwise default for NPU → BF16 (the default for NPU).
     6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
@@ -223,13 +228,14 @@ def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
         )
         return DeepEPOutputDtype.BF16
 
-    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
-    if self.quant_config is not None:
+    # 2. / 3. Parse the quant config dict. We intentionally only support dicts
+    # here; callers are expected to convert any quant-config objects into a
+    # dictionary before calling set_quant_config.
+    if self.quant_config is not None and isinstance(self.quant_config, dict):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             return DeepEPOutputDtype.NVFP4
 
-        # 3. Parse quant config to determine the output dtype of dispatcher
         dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
         if dispatcher_output_dtype is not None:
             return DeepEPOutputDtype(dispatcher_output_dtype)
