@@ -95,6 +95,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
@@ -333,6 +334,7 @@ class TopK(MultiPlatformOp):
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
+        is_nextn: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -342,6 +344,7 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         if num_fused_shared_experts > 0:
             from sglang.srt.server_args import get_global_server_args
 
@@ -419,6 +422,11 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
+
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -448,6 +456,8 @@ class TopK(MultiPlatformOp):
             )
         else:
             self.topk_config.torch_native = False
+            if updater is not None:
+                updater.wait_gpu_stage()
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
@@ -1002,6 +1012,7 @@ def _mask_topk_ids_padded_region_to_int64(
         and topk_ids.is_contiguous()
     ):
         from sglang.jit_kernel.deepseek_v4 import mask_topk_ids_to_int64
+
         return mask_topk_ids_to_int64(topk_ids, num_token_non_padded)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids.to(torch.int64)
@@ -1315,9 +1326,7 @@ def _post_process_topk_ids(
         else:
             # PPU + DeepEP: fuse int32->int64 cast into the mask kernel.
             cast_to_int64 = (
-                _is_ppu
-                and topk_ids.dtype == torch.int32
-                and is_deepep_class_backend()
+                _is_ppu and topk_ids.dtype == torch.int32 and is_deepep_class_backend()
             )
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids,

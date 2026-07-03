@@ -7,6 +7,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -157,13 +158,14 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
 
-        hidden_states = self.decoder(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states = self.decoder(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -201,6 +203,11 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        # Not support EPLB in NextN model
+        return {}
 
     @torch.no_grad()
     def forward(

@@ -1193,6 +1193,8 @@ class CudaGraphRunner:
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
+            # give owner to GPU before forward
+            self.model_runner.on_eplb_async_capture_start()
             run_once()
             attn_backend.on_after_cuda_graph_warmup()
 
@@ -1200,7 +1202,8 @@ class CudaGraphRunner:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
-
+        # give owner to GPU before forward
+        self.model_runner.on_eplb_async_capture_start()
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
