@@ -744,7 +744,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         # Register MoE layers for EPLB async runtime (creates GPU-CPU sync signals)
         self.expert_location_updater.prepare_async_layers(
-            self.model.routed_experts_weights_of_layer
+            getattr(self.model, "routed_experts_weights_of_layer", None)
         )
 
         if (
@@ -933,8 +933,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def build_eplb_async_host_mirror(self):
         if self.eplb_async_host_mirror_manager is None:
             return
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
         self.eplb_async_host_mirror_manager.build_from_loaded_model(
-            self.model.routed_experts_weights_of_layer
+            routed_experts_weights_of_layer
         )
 
     def init_routed_experts_capturer(self):
@@ -1751,8 +1756,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
         p2p_missing_logical_experts = self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
+            routed_experts_weights_of_layer,
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,

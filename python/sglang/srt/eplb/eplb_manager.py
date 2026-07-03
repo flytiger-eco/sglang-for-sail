@@ -235,9 +235,12 @@ class EPLBManager:
         return True
 
     def _compute_update_layer_ids_chunks(self) -> List[List[int]]:
-        all_layer_ids = sorted(
-            list(self._model_runner.model.routed_experts_weights_of_layer.keys())
+        routed_experts_weights_of_layer = getattr(
+            self._model_runner.model, "routed_experts_weights_of_layer", None
         )
+        if not routed_experts_weights_of_layer:
+            return []
+        all_layer_ids = sorted(list(routed_experts_weights_of_layer.keys()))
         chunk_size = self._rebalance_layers_per_chunk or 1000000
         return list(_chunk_list(all_layer_ids, chunk_size=chunk_size))
 

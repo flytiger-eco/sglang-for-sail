@@ -115,11 +115,23 @@ class ExpertLocationUpdater:
         self._runtime.shutdown()
         self._runtime = None
 
+    def _disable_async_due_to_missing_layers(self):
+        logger.warning_once(
+            "EPLB async is disabled because the model does not expose "
+            "routed_experts_weights_of_layer. Expert location updates will "
+            "fall back to no-op behavior for this model."
+        )
+        self.close()
+        self._enable_async = False
+
     # Register layers with the C++ async runtime.
     def prepare_async_layers(
-        self, routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]]
+        self, routed_experts_weights_of_layer: Optional[Dict[int, List[torch.Tensor]]]
     ):
         if not self._enable_async or not torch.cuda.is_available():
+            return
+        if not routed_experts_weights_of_layer:
+            self._disable_async_due_to_missing_layers()
             return
 
         for layer_id in sorted(routed_experts_weights_of_layer):
