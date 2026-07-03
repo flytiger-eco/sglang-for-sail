@@ -940,38 +940,58 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
       params.raw_indices == nullptr ? nullptr : params.raw_indices + static_cast<int64_t>(row_id) * kTopK;
 
   if (length <= kTopK) {
-    // Trivial case: just transform indices
+    // Use stride loop to handle kTopK > kBlockSize correctly.
     const auto tx = threadIdx.x;
-    if (tx < length) {
-      page_indices_ptr[tx] = page_to_indices_pf(page_ptr, tx, params.page_bits);
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = tx;
-      }
-    } else if (tx < kTopK) {
-      page_indices_ptr[tx] = -1;
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = -1;
+    for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
+      if (i < length) {
+        page_indices_ptr[i] = page_to_indices_pf(page_ptr, i, params.page_bits);
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = static_cast<int32_t>(i);
+        }
+      } else {
+        page_indices_ptr[i] = -1;
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = -1;
+        }
       }
     }
   } else if (length <= kMax1PassLength) {
     register_topk_bf16_pf<false>(scores_ptr, s_topk_indices, length, smem_raw);
     __syncthreads();
+    // Use stride loop to handle kTopK > kBlockSize correctly.
     const auto tx = threadIdx.x;
-    if (tx < kTopK) {
-      page_indices_ptr[tx] = page_to_indices_pf(page_ptr, s_topk_indices[tx], params.page_bits);
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+    for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
+      const auto raw = s_topk_indices[i];
+      if (raw >= 0) {
+        page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = raw;
+        }
+      } else {
+        page_indices_ptr[i] = -1;
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = -1;
+        }
       }
     }
   } else if (length <= kMax2PassLength) {
     [[likely]];
     register_topk_bf16_pf<true>(scores_ptr, s_topk_indices, length, smem_raw);
     __syncthreads();
+    // Use stride loop to handle kTopK > kBlockSize correctly.
     const auto tx = threadIdx.x;
-    if (tx < kTopK) {
-      page_indices_ptr[tx] = page_to_indices_pf(page_ptr, s_topk_indices[tx], params.page_bits);
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+    for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
+      const auto raw = s_topk_indices[i];
+      if (raw >= 0) {
+        page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = raw;
+        }
+      } else {
+        page_indices_ptr[i] = -1;
+        if (raw_indices_ptr != nullptr) {
+          raw_indices_ptr[i] = -1;
+        }
       }
     }
   }
