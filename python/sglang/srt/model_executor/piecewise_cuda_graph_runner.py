@@ -439,6 +439,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 dsa_indexers=self.dsa_indexers,
             ):
+                # give owner to GPU before forward
+                self.model_runner.on_eplb_async_capture_start()
                 _ = self.model_runner.model.forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
@@ -644,6 +646,8 @@ class PiecewiseCudaGraphRunner:
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
+                # give owner to GPU before forward
+                self.model_runner.on_eplb_async_capture_start()
                 run_once()
 
         return

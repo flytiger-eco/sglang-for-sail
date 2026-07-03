@@ -93,6 +93,14 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
+from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    EPLBAsyncHostMirrorManager,
+    set_global_eplb_async_host_mirror_manager,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -102,12 +110,16 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    set_global_expert_location_updater,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
@@ -650,6 +662,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 port=self.dist_port,
             )
 
+    def _warmup_eplb_cpp_extensions(self):
+        if not self.server_args.enable_eplb or self.is_draft_worker:
+            return
+
+        model_config_for_expert_location = (
+            ModelConfigForExpertLocation.from_model_config(self.model_config)
+        )
+        if model_config_for_expert_location is None:
+            return
+
+        logger.info("Warming up EPLB C++ extensions.")
+        warmup_eplb_expert_location_cpp()
+
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=self.server_args.eplb_algorithm,
+            num_groups=model_config_for_expert_location.num_groups,
+            num_nodes=self.server_args.nnodes,
+        )
+        if algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]:
+            warmup_eplb_deepseek_cpp()
+
+        if self.server_args.enable_eplb_async:
+            warmup_eplb_async_runtime_cpp()
+
     def initialize(self, pre_model_load_memory: float):
         server_args = self.server_args
 
@@ -687,7 +726,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
-        self.expert_location_updater = ExpertLocationUpdater()
+
+        self.eplb_async_host_mirror_manager = (
+            EPLBAsyncHostMirrorManager(self.server_args, self.model_config)
+            if self.server_args.enable_eplb_async and (not self.is_draft_worker)
+            else None
+        )
+        if not self.is_draft_worker:
+            set_global_eplb_async_host_mirror_manager(
+                self.eplb_async_host_mirror_manager
+            )
+        self.expert_location_updater = ExpertLocationUpdater(
+            enable_async=self.server_args.enable_eplb_async
+            and not self.is_draft_worker,
+        )
+
+        if not self.is_draft_worker:
+            set_global_expert_location_updater(self.expert_location_updater)
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
@@ -695,6 +750,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args=server_args,
             vocab_size=self.model_config.vocab_size,
         )
+        self._warmup_eplb_cpp_extensions()
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -708,6 +764,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.server_args.elastic_ep_backend is not None
             )
             else None
+        )
+        # Register MoE layers for EPLB async runtime (creates GPU-CPU sync signals)
+        self.expert_location_updater.prepare_async_layers(
+            getattr(self.model, "routed_experts_weights_of_layer", None)
         )
 
         if (
@@ -914,6 +974,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ]
         self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
+
+    def build_eplb_async_host_mirror(self):
+        if self.eplb_async_host_mirror_manager is None:
+            return
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
+        self.eplb_async_host_mirror_manager.build_from_loaded_model(
+            routed_experts_weights_of_layer
+        )
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -1585,15 +1657,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
     ):
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
         p2p_missing_logical_experts = self.expert_location_updater.update(
-            self.model.routed_experts_weights_of_layer,
+            routed_experts_weights_of_layer,
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
 
-        if len(p2p_missing_logical_experts) > 0:
+        if (
+            p2p_missing_logical_experts is not None
+            and len(p2p_missing_logical_experts) > 0
+        ):
             # Load the missing expert weights from disk
             if callable(getattr(self.model, "generate_weight_name_filter", None)):
                 # Filter and load only missing expert weights
@@ -1690,6 +1770,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         recapture_cuda_graph: bool = False,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
+        if self.server_args.enable_eplb_async:
+            raise RuntimeError(
+                "update_weights_from_disk is incompatible with --enable-eplb-async."
+            )
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
@@ -3447,6 +3531,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        # Transfer iteration info to eplb_async_runtime
+        self.on_forward_pass_start()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3529,8 +3615,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+        self.on_forward_pass_end()
 
         if dumper.may_enable:
             dumper.step()
@@ -3543,6 +3628,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.maybe_recover_ep_ranks()
 
         return output
+
+    # Transfer iteration info to eplb_async_runtime
+    def on_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
+
+    def on_forward_pass_end(self):
+        if self.eplb_manager is not None:
+            # Trigger EPLB rebalance logic at the end of forward pass
+            self.eplb_manager.on_forward_pass_end()
+
+    # Give layer owner to GPU
+    def on_eplb_async_capture_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_start()
 
     def _forward_raw(
         self,
