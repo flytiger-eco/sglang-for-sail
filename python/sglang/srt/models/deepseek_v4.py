@@ -112,7 +112,13 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     try_fused_hc_post_pre,
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    _is_ppu,
+)
 from sglang.srt.models.triton_ops.deepseek_v4 import (
     rms_normalize_triton as rms_normalize_triton,
 )
@@ -941,23 +947,32 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
-            if self._attn_sink_local is None:
-                # Build once on the first forward (post weight load); a per-call
-                # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
-                sink = self.attn_sink.new_zeros(padded_num_heads)
-                sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
-                ]
-                self._attn_sink_local = sink
+            rank = self.tp_rank
+            if _is_ppu:
+                if self._attn_sink_local is None:
+                    # Community FlashMLA only support h_q for {64, 128} currently;
+                    # PPU FlashMLA support more h_q; 
+                    # But PPU flashmla needs q local_head matches attn_sink_local.
+                    self._attn_sink_local = self.attn_sink[
+                        rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                    ]
+            else:
+                # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+                # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+                # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+                # this rank and padded to match.
+                padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                tp_slice = slice(0, self.n_local_heads)
+                q_out = q_padded[:, tp_slice, :]
+                if self._attn_sink_local is None:
+                    # Build once on the first forward (post weight load); a per-call
+                    # rebuild would replay a fill+copy per layer in the decode graph.
+                    sink = self.attn_sink.new_zeros(padded_num_heads)
+                    sink[: self.n_local_heads] = self.attn_sink[
+                        rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                    ]
+                    self._attn_sink_local = sink
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -2106,10 +2121,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
-                logger.info("Execute dequant fp8 wo_a")
-                weights = _dequant_fp8_wo_a(weights)
+                logger.info("Execute dequant wo_a")
+                weights = _dequant_wo_a(weights)
             else:
-                logger.info("Skip dequant fp8 wo_a")
+                logger.info("Skip dequant wo_a")
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -2467,7 +2482,31 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return result.to(torch.bfloat16)
 
 
-def _dequant_fp8_wo_a(
+def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    from einops import rearrange
+
+    assert weight.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ), f"expected fp8_e4m3f or int8, got {weight.dtype}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
+
+    bn = weight.shape[0] // scale.shape[0]
+    bk = weight.shape[1] // scale.shape[1]
+    weight_f32 = rearrange(
+        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=bn, bk=bk
+    )
+    result = rearrange(
+        weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
+    )
+
+    return result.to(torch.bfloat16)
+
+
+def _dequant_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     weights_dict = dict(weights)
@@ -2481,6 +2520,6 @@ def _dequant_fp8_wo_a(
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
+        yield name, _dequant(weight, scale)
 
     yield from weights_dict.items()
