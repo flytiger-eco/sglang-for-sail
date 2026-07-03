@@ -525,12 +525,21 @@ class Envs:
 
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
+    SGLANG_EPLB_ASYNC_HOST_MIRROR_REUSE_SHM = EnvBool(True)
+    SGLANG_EPLB_ASYNC_HOST_MIRROR_MEMORY_LOG = EnvBool(False)
+    SGLANG_EPLB_ASYNC_DUMMY_H2D = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
     SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
+    # When True, add_row (expert distribution) and set_cpu_stage (EPLB) kernels
+    # are dispatched to dedicated streams (gather_stream / async_eplb_stream),
+    # allowing them to overlap with subsequent operations at the cost of extra
+    # inter-stream synchronization.  When False (default), they run directly on
+    # the current CUDA stream, executing sequentially but avoiding sync overhead.
+    SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE = EnvBool(False)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)

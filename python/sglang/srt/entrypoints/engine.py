@@ -1250,6 +1250,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
         )
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
