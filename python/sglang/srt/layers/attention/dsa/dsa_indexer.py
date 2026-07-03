@@ -610,10 +610,7 @@ class Indexer(MultiPlatformOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
-                # [DSV4-BF16-TOPK] FP4 path must emit bf16 logits so the dsv4
-                # bf16 per-row topk kernel can consume them directly (default
-                # would be fp32, which falls back to fast_topk_transform_fused).
-                logits_dtype=torch.bfloat16,
+                # Decode path must NOT emit bf16 logits to avoid entering the prefill-only DSV4 BF16 topk kernel.
             )
 
         if self.bf16_indexer:
