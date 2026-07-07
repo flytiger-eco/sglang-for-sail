@@ -17,8 +17,8 @@ from sgl_kernel.flash_mla import (
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import (
-    create_flashmla_kv_indices_triton,
     concat_mla_absorb_q_general,
+    create_flashmla_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
@@ -678,8 +678,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_table=self.forward_metadata.block_kv_indices[:eff_bs],
                 cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,
-                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata.tile_scheduler_metadata,
-                num_splits=self.forward_metadata.flashmla_metadata.num_splits,
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=None,
                 softmax_scale=layer.scaling,
                 causal=True,
             )
@@ -806,8 +806,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     cache_seqlens=forward_batch.seq_lens[:eff_bs].to(torch.int32)
                     + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
-                    tile_scheduler_metadata=self.forward_metadata.flashmla_metadata.tile_scheduler_metadata,
-                    num_splits=self.forward_metadata.flashmla_metadata.num_splits,
+                    tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                    num_splits=None,
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
@@ -918,3 +918,36 @@ class FlashMLAMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, call_fn)
+
+
+def reset_flashmla_metadata(attn_backend):
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.nsa_backend import (
+        NativeSparseAttnBackend,
+        NativeSparseAttnMultiStepBackend,
+        NSAMetadata,
+    )
+
+    forward_metadata = None
+    if isinstance(attn_backend, (FlashMLABackend, NativeSparseAttnBackend)):
+        forward_metadata = attn_backend.forward_metadata
+    elif isinstance(attn_backend, HybridAttnBackend) and isinstance(
+        attn_backend.decode_backend, FlashMLABackend
+    ):
+        forward_metadata = attn_backend.decode_backend.forward_metadata
+    elif isinstance(
+        attn_backend, (FlashMLAMultiStepDraftBackend, NativeSparseAttnMultiStepBackend)
+    ):
+        for backend in attn_backend.attn_backends:
+            reset_flashmla_metadata(backend)
+
+    if isinstance(forward_metadata, FlashMLADecodeMetadata):
+        assert forward_metadata.flashmla_metadata is not None
+        forward_metadata.flashmla_metadata.have_initialized = False
+    elif (
+        isinstance(forward_metadata, NSAMetadata)
+        and attn_backend.nsa_decode_impl == "flashmla_kv"
+    ):
+        assert forward_metadata.flashmla_metadata is not None
+        assert forward_metadata.flashmla_metadata.flashmla_metadata is not None
+        forward_metadata.flashmla_metadata.flashmla_metadata.have_initialized = False

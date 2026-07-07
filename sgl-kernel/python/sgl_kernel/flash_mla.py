@@ -102,8 +102,8 @@ def flash_mla_with_kvcache(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     head_dim_v: int,
-    tile_scheduler_metadata: torch.Tensor,
-    num_splits: torch.Tensor,
+    tile_scheduler_metadata: torch.Tensor | FlashMLASchedMeta,
+    num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     descale_q: torch.Tensor | None = None,
@@ -118,8 +118,8 @@ def flash_mla_with_kvcache(
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32.
         cache_seqlens: (batch_size), torch.int32.
         head_dim_v: Head dimension of v.
-        tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), torch.int32, returned by get_mla_metadata.
-        num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
+        tile_scheduler_metadata: Either a torch.Tensor of shape (num_sm_parts, TileSchedulerMetaDataSize) with dtype torch.int32, returned by get_mla_metadata; or a FlashMLASchedMeta object that contains both tile_scheduler_metadata and num_splits.
+        num_splits: Optional torch.Tensor of shape (batch_size + 1) with dtype torch.int32. Required when tile_scheduler_metadata is a torch.Tensor, ignored when it's a FlashMLASchedMeta object.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
         descale_q: (batch_size), torch.float32. Descaling factors for Q, used for fp8 quantization.
@@ -190,10 +190,8 @@ def flash_mla_with_kvcache(
                 block_table,
                 cache_seqlens,
                 head_dim_v,
-                tile_scheduler_metadata=FlashMLASchedMeta(
-                    tile_scheduler_metadata=tile_scheduler_metadata,
-                    num_splits=num_splits,
-                ),
+                tile_scheduler_metadata,
+                num_splits,
                 softmax_scale=softmax_scale,
                 causal=causal,
                 is_fp8_kvcache=is_fp8_kvcache,

@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_hip,
+    is_ppu,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -1197,6 +1198,18 @@ class CudaGraphRunner:
             self.model_runner.on_eplb_async_capture_start()
             run_once()
             attn_backend.on_after_cuda_graph_warmup()
+
+        # For PPU FlashMLA, `get_mla_metadata` runs only on the first
+        # `flash_mla_with_kvcache` call. To capture this init logic in
+        # the CUDA Graph, reset flashmla_metadata before starting capture.
+        # This forces metadata generation to occur within the capture scope.
+        if is_ppu():
+            # Avoid circular import
+            from sglang.srt.layers.attention.flashmla_backend import (
+                reset_flashmla_metadata,
+            )
+
+            reset_flashmla_metadata(attn_backend)
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())

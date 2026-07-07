@@ -31,6 +31,7 @@ from sglang.srt.speculative.spec_utils import (
     maybe_detect_oob,
 )
 from sglang.srt.utils import (
+    is_ppu,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -378,6 +379,18 @@ class EAGLEDraftCudaGraphRunner:
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
         self._capture_init(run_once)
+
+        # For PPU FlashMLA, `get_mla_metadata` runs only on the first
+        # `flash_mla_with_kvcache` call. To capture this init logic in
+        # the CUDA Graph, reset flashmla_metadata before starting capture.
+        # This forces metadata generation to occur within the capture scope.
+        if is_ppu():
+            # Avoid circular import
+            from sglang.srt.layers.attention.flashmla_backend import (
+                reset_flashmla_metadata,
+            )
+
+            reset_flashmla_metadata(self.draft_attn_backend)
 
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once

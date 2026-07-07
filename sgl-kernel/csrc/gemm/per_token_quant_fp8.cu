@@ -4,35 +4,45 @@
 #include <cuda_pipeline.h>
 
 #include <cmath>
-#include <type_traits>
-
 #include <flashinfer/vec_dtypes.cuh>
+#include <type_traits>
 
 #include "utils.h"
 
 static constexpr int kWarpSize = 32;
 static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
 
-
 #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 template <typename Dtype, bool trans>
-__device__ __forceinline__ void load_128b_aiu(void* smem_ptr, const void* gmem_ptr, const int32_t tensor_dims_x, const int32_t tensor_dims_z,
-  const int32_t cube_w, const int32_t cube_h, const int32_t x_offset, const int32_t z_offset) {
-
+__device__ __forceinline__ void load_128b_aiu(
+    void* smem_ptr,
+    const void* gmem_ptr,
+    const int32_t tensor_dims_x,
+    const int32_t tensor_dims_z,
+    const int32_t cube_w,
+    const int32_t cube_h,
+    const int32_t x_offset,
+    const int32_t z_offset) {
   uint64_t tensor_stride_w = tensor_dims_x * 2;
   uint64_t tensor_stride_n = tensor_stride_w * tensor_dims_z;
   int swzl_mode = cube_w * 2 == 128 ? 0 : 1;
-  static_assert(!trans && sizeof(Dtype)==2);
+  static_assert(!trans && sizeof(Dtype) == 2);
   asm volatile(
-    "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.padz.linear.b16"
-    "[%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n"
-    :: "r"(smem_ptr), "l"(gmem_ptr),
-      "r"(tensor_dims_x), "r"(tensor_dims_z), "r"(1),
-      "r"(cube_w), "r"(cube_h), "r"(1),
-      "l"(tensor_stride_w), "l"(tensor_stride_n),
-      "r"(x_offset), "r"(z_offset), "r"(0),
-      "r"(swzl_mode)
-  );
+      "ppu.cp.async.aiu.bulk.tensor.shared.global.2d.tile.padz.linear.b16"
+      "[%0], [%1], {%2, %3, %4}, {%5, %6, %7}, {%8, %9}, {%10, %11, %12}, %13;\n" ::"r"(smem_ptr),
+      "l"(gmem_ptr),
+      "r"(tensor_dims_x),
+      "r"(tensor_dims_z),
+      "r"(1),
+      "r"(cube_w),
+      "r"(cube_h),
+      "r"(1),
+      "l"(tensor_stride_w),
+      "l"(tensor_stride_n),
+      "r"(x_offset),
+      "r"(z_offset),
+      "r"(0),
+      "r"(swzl_mode));
 }
 #endif
 
@@ -149,18 +159,14 @@ __global__ void per_token_quant_fp8_kernel(
 
         // fp16x2 multiply
         uint32_t scaled_f16x2;
-        asm("mul.rn.f16x2 %0, %1, %2;\n"
-            : "=r"(scaled_f16x2)
-            : "r"(input_f16x2), "r"(scale_inv_f16x2));
+        asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(scaled_f16x2) : "r"(input_f16x2), "r"(scale_inv_f16x2));
 
         // fp16x2 -> e4m3x2
         // cvt.rn.satfinite.e4m3x2.f16x2: d[15:8]=cvt(a[31:16]), d[7:0]=cvt(a[15:0])
         // On little-endian: a[15:0] is first element, a[31:16] is second
         // So d[7:0]=cvt(first)=output_arr[j*2], d[15:8]=cvt(second)=output_arr[j*2+1] -> correct!
         uint16_t packed_fp8x2;
-        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n"
-            : "=h"(packed_fp8x2)
-            : "r"(scaled_f16x2));
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed_fp8x2) : "r"(scaled_f16x2));
 
         output_u16[j] = packed_fp8x2;
       }
@@ -184,9 +190,7 @@ __global__ void per_token_quant_fp8_kernel(
         // So pass val_b as first arg (-> high byte = arr[j*2+1]),
         //         val_a as second arg (-> low byte = arr[j*2])
         uint16_t packed_fp8x2;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
-            : "=h"(packed_fp8x2)
-            : "f"(val_b), "f"(val_a));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(packed_fp8x2) : "f"(val_b), "f"(val_a));
 
         output_u16[j] = packed_fp8x2;
       }
@@ -263,24 +267,24 @@ __global__ void per_token_quant_fp8_persistent_kernel(
     const T* src = input + token_id * hidden_dim;
     // hidden_dim x fp16 per warp
 #if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
-  if constexpr (sizeof(T) == 2 and useAIU){
-    constexpr int AIU_CHUNK_SLISE_4 = 16 * 64;
-    for(int aiu_cp_offset = 0; aiu_cp_offset < hidden_dim; aiu_cp_offset += AIU_CHUNK_SLISE_4){
-      load_128b_aiu<T, false>(smem_buf + aiu_cp_offset, src + aiu_cp_offset, 64, 16, 64, 16, 0, 0);
-    }
-  }else
+    if constexpr (sizeof(T) == 2 and useAIU) {
+      constexpr int AIU_CHUNK_SLISE_4 = 16 * 64;
+      for (int aiu_cp_offset = 0; aiu_cp_offset < hidden_dim; aiu_cp_offset += AIU_CHUNK_SLISE_4) {
+        load_128b_aiu<T, false>(smem_buf + aiu_cp_offset, src + aiu_cp_offset, 64, 16, 64, 16, 0, 0);
+      }
+    } else
 #endif
-  {
-    for (int32_t i = lane_id; i < num_vec_elems; i += kWarpSize) {
+    {
+      for (int32_t i = lane_id; i < num_vec_elems; i += kWarpSize) {
 #pragma unroll
-      for (int j = 0; j < kCopiesPerVec; ++j) {
-        __pipeline_memcpy_async(
-            reinterpret_cast<char*>(smem_buf + i * kVecSize) + j * 16,
-            reinterpret_cast<const char*>(src + i * kVecSize) + j * 16,
-            16);
+        for (int j = 0; j < kCopiesPerVec; ++j) {
+          __pipeline_memcpy_async(
+              reinterpret_cast<char*>(smem_buf + i * kVecSize) + j * 16,
+              reinterpret_cast<const char*>(src + i * kVecSize) + j * 16,
+              16);
+        }
       }
     }
-  }
     __pipeline_commit();
     __pipeline_wait_prior(0);
     __syncwarp();
@@ -412,14 +416,10 @@ __global__ void per_token_quant_fp8_persistent_kernel(
                 "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2 + 1]));
 
           uint32_t scaled_f16x2;
-          asm("mul.rn.f16x2 %0, %1, %2;\n"
-              : "=r"(scaled_f16x2)
-              : "r"(input_f16x2), "r"(scale_inv_f16x2));
+          asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(scaled_f16x2) : "r"(input_f16x2), "r"(scale_inv_f16x2));
 
           uint16_t packed_fp8x2;
-          asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n"
-              : "=h"(packed_fp8x2)
-              : "r"(scaled_f16x2));
+          asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed_fp8x2) : "r"(scaled_f16x2));
 
           output_u16[j] = packed_fp8x2;
         }
@@ -438,9 +438,7 @@ __global__ void per_token_quant_fp8_persistent_kernel(
           float val_b = static_cast<float>(input_vec[j * 2 + 1]) * scale_inv;
 
           uint16_t packed_fp8x2;
-          asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
-              : "=h"(packed_fp8x2)
-              : "f"(val_b), "f"(val_a));
+          asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(packed_fp8x2) : "f"(val_b), "f"(val_a));
 
           output_u16[j] = packed_fp8x2;
         }
@@ -552,14 +550,10 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
               "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2 + 1]));
 
         uint32_t scaled_f16x2;
-        asm("mul.rn.f16x2 %0, %1, %2;\n"
-            : "=r"(scaled_f16x2)
-            : "r"(input_f16x2), "r"(scale_inv_f16x2));
+        asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(scaled_f16x2) : "r"(input_f16x2), "r"(scale_inv_f16x2));
 
         uint16_t packed_fp8x2;
-        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n"
-            : "=h"(packed_fp8x2)
-            : "r"(scaled_f16x2));
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed_fp8x2) : "r"(scaled_f16x2));
 
         output_u16[j] = packed_fp8x2;
       }
@@ -578,9 +572,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
         float val_b = static_cast<float>(input_vec[j * 2 + 1]) * scale_inv;
 
         uint16_t packed_fp8x2;
-        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n"
-            : "=h"(packed_fp8x2)
-            : "f"(val_b), "f"(val_a));
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(packed_fp8x2) : "f"(val_b), "f"(val_a));
 
         output_u16[j] = packed_fp8x2;
       }
@@ -719,45 +711,44 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
 
         // Get the kernel function pointer for this candidate
         void* kfunc = nullptr;
-        if (useAIU){
+        if (useAIU) {
           switch (cta) {
             case 2:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, true>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, true>);
               break;
             case 4:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, true>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, true>);
               break;
             case 8:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, true>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, true>);
               break;
             default:
               continue;
           }
-        }else{
+        } else {
           switch (cta) {
             case 2:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, false>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, false>);
               break;
             case 4:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, false>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 4, 16, false>);
               break;
             case 8:
-              kfunc = reinterpret_cast<void*>(
-                  per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, false>);
+              kfunc =
+                  reinterpret_cast<void*>(per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 8, 16, false>);
               break;
             default:
               continue;
           }
         }
 
-
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            kfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+        cudaError_t attr_err =
+            cudaFuncSetAttribute(kfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
         if (attr_err != cudaSuccess) {
           // Clear error state so subsequent CUDA calls are not affected
           (void)cudaGetLastError();
@@ -782,7 +773,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
         int grid_size = sm_count * best_blocks_per_sm;
         if (grid_size > max_useful_grid) grid_size = max_useful_grid;
 
-        if(useAIU){
+        if (useAIU) {
           switch (best_cta) {
             case 2:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, true>
@@ -812,7 +803,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
                       num_tokens);
               break;
           }
-        }else{
+        } else {
           switch (best_cta) {
             case 2:
               per_token_quant_fp8_persistent_kernel<scalar_t, __nv_fp8_e4m3, 2, 16, false>

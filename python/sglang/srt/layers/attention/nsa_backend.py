@@ -956,15 +956,21 @@ class NativeSparseAttnBackend(
             seqlens_expanded = cache_seqlens_int32
             nsa_extend_seq_lens_list = [1] * num_tokens
             if self.nsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, num_tokens + 1))
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
+                if _is_ppu:
+                    flashmla_metadata = self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
                         seq_len_q=1,
                     )
-                )
+                else:
+                    flashmla_metadata = self.decode_cuda_graph_metadata[
+                        "flashmla_metadata"
+                    ].slice(slice(0, num_tokens + 1))
+                    flashmla_metadata.copy_(
+                        self._compute_flashmla_metadata(
+                            cache_seqlens=nsa_cache_seqlens_int32,
+                            seq_len_q=1,
+                        )
+                    )
             else:
                 flashmla_metadata = None
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
@@ -1015,16 +1021,22 @@ class NativeSparseAttnBackend(
             nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
             if self.nsa_decode_impl == "flashmla_kv":
-                flashmla_metadata = self.decode_cuda_graph_metadata[
-                    "flashmla_metadata"
-                ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
-
-                flashmla_metadata.copy_(
-                    self._compute_flashmla_metadata(
+                if _is_ppu:
+                    flashmla_metadata = self._compute_flashmla_metadata(
                         cache_seqlens=nsa_cache_seqlens_int32,
                         seq_len_q=1,
                     )
-                )
+                else:
+                    flashmla_metadata = self.decode_cuda_graph_metadata[
+                        "flashmla_metadata"
+                    ].slice(slice(0, bs * self.speculative_num_draft_tokens + 1))
+
+                    flashmla_metadata.copy_(
+                        self._compute_flashmla_metadata(
+                            cache_seqlens=nsa_cache_seqlens_int32,
+                            seq_len_q=1,
+                        )
+                    )
             else:
                 flashmla_metadata = None
 
@@ -1330,7 +1342,7 @@ class NativeSparseAttnBackend(
                 flashmla_num_splits_dst = None
                 flashmla_metadata_src = None
                 flashmla_metadata_dst = None
-                if precomputed.flashmla_metadata is not None:
+                if not _is_ppu and precomputed.flashmla_metadata is not None:
                     flashmla_num_splits_src = precomputed.flashmla_metadata.num_splits
                     flashmla_num_splits_dst = metadata.flashmla_metadata.num_splits
                     flashmla_metadata_src = (
@@ -2487,8 +2499,8 @@ class NativeSparseAttnBackend(
         )
 
         return NSAFlashMLAMetadata(
-            flashmla_metadata=flashmla_metadata.tile_scheduler_metadata,
-            num_splits=flashmla_metadata.num_splits,
+            flashmla_metadata=flashmla_metadata,
+            num_splits=None,
         )
 
 
