@@ -61,6 +61,8 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
+    from sglang.srt.utils import is_ppu
+
     if not server_args.enable_nsa_prefill_context_parallel:
         return
 
@@ -76,9 +78,16 @@ def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     assert (
         server_args.dp_size == 1
     ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    if is_ppu():
+        if server_args.tp_size > 8:
+            logger.warning(
+                f"Context parallel with tp_size={server_args.tp_size} (> 8) spans multiple machines. "
+                f"Cross-machine CP may have precision issues. Proceed with caution."
+            )
+    else:
+        assert (
+            server_args.tp_size <= 8
+        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
