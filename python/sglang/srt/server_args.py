@@ -2947,6 +2947,9 @@ class ServerArgs:
             # use cuda fla by default on ppu
             if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
                 envs.SGLANG_SAIL_FLA_CUDA.set(True)
+            # disable deepseek v4 topk_v2 on PPU
+            if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -5989,14 +5992,15 @@ class ServerArgs:
                 "DeepGEMM FP4 indexer support."
             )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and get_device_sm() < 100:
-            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
-                    "detected sm%d.",
-                    get_device_sm(),
-                )
-            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+        if envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            if is_ppu() and get_device_sm() < 89:
+                if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                    logger.warning(
+                        "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                        "detected sm%d.",
+                        get_device_sm(),
+                    )
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
