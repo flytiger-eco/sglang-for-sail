@@ -157,6 +157,11 @@ def flash_mla_with_kvcache(
         causal=causal,
         is_fp8_kvcache=is_fp8_kvcache,
         indices=indices,
+        attn_sink=attn_sink,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices_in_kvcache,
+        topk_length=topk_length,
+        extra_topk_length=extra_topk_length,
     )
 
     if SGLANG_PROFILE_NVTX:
@@ -175,8 +180,7 @@ def flash_mla_sparse_fwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sparse prefill attention on PPU.
 
-    ``attn_sink`` and ``topk_length`` are accepted for API compatibility
-    but not forwarded to ``flash_mla`` (not supported by the PPU library).
+    Delegates to ``flash_mla.flash_mla_sparse_fwd``.
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
@@ -187,4 +191,6 @@ def flash_mla_sparse_fwd(
         indices,
         sm_scale,
         d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
     )
