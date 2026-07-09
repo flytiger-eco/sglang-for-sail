@@ -1292,6 +1292,7 @@ def _fwd_kernel_ep_gather(
     output_tensor,
     output_tensor_stride0,
     output_tensor_stride1,
+    routed_scaling_factor,
     topk_num: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -1336,7 +1337,7 @@ def _fwd_kernel_ep_gather(
             + cur_token * output_tensor_stride0
             + cur_block * BLOCK_D
             + off_d,
-            accumulator.to(output_tensor.dtype.element_ty),
+            (accumulator * routed_scaling_factor).to(output_tensor.dtype.element_ty),
         )
 
 
@@ -1347,6 +1348,7 @@ def ep_gather(
     recv_topk_weight: torch.Tensor,
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
@@ -1377,6 +1379,7 @@ def ep_gather(
         output_tensor,
         output_tensor.stride(0),
         output_tensor.stride(1),
+        routed_scaling_factor,
         topk_num=recv_topk_ids.shape[1],
         num_warps=num_warps,
         BLOCK_D=BLOCK_D,
