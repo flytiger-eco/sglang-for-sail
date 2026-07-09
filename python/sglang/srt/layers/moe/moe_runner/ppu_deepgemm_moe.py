@@ -554,9 +554,8 @@ def deep_moe_impl_fused(
         recv_topk_weight=topk_weights,
         input_index=inv_perm,
         output_tensor=out_hidden_states,
+        routed_scaling_factor=routed_scaling_factor,
     )
-
-    out_hidden_states *= routed_scaling_factor
 
     if _nvtx_moe_pushed:
         th_nvtx_range_pop()
