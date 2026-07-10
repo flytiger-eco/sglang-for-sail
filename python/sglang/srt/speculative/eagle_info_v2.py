@@ -454,7 +454,7 @@ class EagleVerifyInputV2Mixin:
         """
         device = batch.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=device)
+            predict = torch.empty(0, dtype=torch.int64, device=device)
             num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
             accept_index = torch.empty(0, dtype=torch.int32, device=device)
             return predict, num_correct_drafts, accept_index
