@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# `is_silu_after_clamp` was introduced in acext 2.1.1(i.e. 2010100)
+# pass it unconditionally would break on older runtimes.
+_ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION = 2010100
+
 
 @register_fused_func("none", "acext")
 def fused_experts_none_to_acext(
@@ -37,6 +41,7 @@ def fused_experts_none_to_acext(
         fusedmoe_wrapper,
         get_enum_from_booleans,
         get_fusedmoe_status_wrapper,
+        get_version,
     )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
@@ -101,6 +106,28 @@ def fused_experts_none_to_acext(
         )
         return fused_experts_none_to_triton(dispatch_output, quant_info, runner_config)
 
+    # Pick the SwiGLU clamp limit from two mutually-exclusive fields, which
+    # also encodes the clamp order:
+    #   - gemm1_clamp_limit (Step3.5): silu then clamp -> is_silu_after_clamp=False
+    #   - swiglu_limit (DeepSeek V4): clamp then silu -> is_silu_after_clamp=True
+    gemm1_clamp_limit = moe_runner_config.gemm1_clamp_limit
+    swiglu_limit = moe_runner_config.swiglu_limit
+    is_silu_after_clamp = True
+    if gemm1_clamp_limit is not None:
+        act_limit = gemm1_clamp_limit
+        is_silu_after_clamp = False  # Step3.5: silu then clamp
+    else:
+        act_limit = swiglu_limit
+
+    # act_limit + is_silu_after_clamp are only used together since 2010100,
+    # so add them conditionally to stay compatible with older acext runtimes.
+    fused_kwargs = dict(
+        routed_scaling_factor=routed_scaling_factor,
+    )
+    if get_version() >= _ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION:
+        fused_kwargs["act_limit"] = act_limit
+        fused_kwargs["is_silu_after_clamp"] = is_silu_after_clamp
+
     fusedmoe_wrapper(
         hidden_states,
         w1,
@@ -118,11 +145,7 @@ def fused_experts_none_to_acext(
         0,
         1,
         Q_type,
-        None,
+        **fused_kwargs,
     )
-
-    # FIXME: PERF issue to fuse routed_scaling_factor in acext fusedmoe
-    if routed_scaling_factor is not None:
-        hidden_states *= routed_scaling_factor
 
     return StandardCombineInput(hidden_states=hidden_states)

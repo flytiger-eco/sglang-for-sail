@@ -24,6 +24,10 @@ from sglang.srt.utils import is_ppu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
+# `is_silu_after_clamp` was introduced in acext 2.1.1(i.e. 2010100)
+# pass it unconditionally would break on older runtimes.
+_ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION = 2010100
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -280,6 +284,28 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
                 f"topk{topk_ids.shape[1]}"
             )
 
+        # Pick the SwiGLU clamp limit from two mutually-exclusive fields, which
+        # also encodes the clamp order:
+        #   - gemm1_clamp_limit (Step3.5): silu then clamp -> is_silu_after_clamp=False
+        #   - swiglu_limit (DeepSeek V4): clamp then silu -> is_silu_after_clamp=True
+        gemm1_clamp_limit = self.moe_runner_config.gemm1_clamp_limit
+        swiglu_limit = self.moe_runner_config.swiglu_limit
+        is_silu_after_clamp = True
+        if gemm1_clamp_limit is not None:
+            act_limit = gemm1_clamp_limit
+            is_silu_after_clamp = False  # Step3.5: silu then clamp
+        else:
+            act_limit = swiglu_limit
+
+        # act_limit + is_silu_after_clamp are only used together since 2010100,
+        # so add them conditionally to stay compatible with older acext runtimes.
+        fused_kwargs = dict(
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+        )
+        if acext.get_version() >= _ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION:
+            fused_kwargs["act_limit"] = act_limit
+            fused_kwargs["is_silu_after_clamp"] = is_silu_after_clamp
+
         acext.fusedmoe_wrapper(
             x,
             layer.w13_weight,
@@ -297,8 +323,7 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
             ep_rank,
             ep_size,
             Q_type,
+            **fused_kwargs,
         )
 
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
