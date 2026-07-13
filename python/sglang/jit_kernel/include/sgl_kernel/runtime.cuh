@@ -68,6 +68,37 @@ inline auto get_cc_major(int device_id) -> int {
   return cc_major;
 }
 
+// Return the Minor compute capability for the given device
+inline auto get_cc_minor(int device_id) -> int {
+  int cc_minor;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device_id));
+  return cc_minor;
+}
+
+// Return the full compute capability for the given device (e.g. 89 for 8.9)
+inline auto get_cc(int device_id) -> int {
+  return get_cc_major(device_id) * 10 + get_cc_minor(device_id);
+}
+
+// Return the name of the given device
+inline auto get_device_name(int device_id) -> std::string {
+  cudaDeviceProp prop;
+  RuntimeDeviceCheck(cudaGetDeviceProperties(&prop, device_id));
+  return std::string(prop.name);
+}
+
+// Return TensorCore num; On PPU-810E, num_tensor_core != num_sm;
+inline auto get_num_tensor_core(int device_id) -> int {
+  const int cc = get_cc(device_id);
+  const uint32_t sm_count = get_sm_count(device_id);
+  const std::string name = get_device_name(device_id);
+  int num_tensor_core = sm_count;
+  if (name.find("ZW810E") != std::string::npos && cc < 89) {
+    num_tensor_core = 20;
+  }
+  return num_tensor_core;
+}
+
 // Return the runtime version
 inline auto get_runtime_version() -> int {
   int runtime_version;
