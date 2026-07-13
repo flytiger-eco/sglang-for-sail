@@ -2813,6 +2813,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         elif is_wint4afp8_or_wint4a16_config(self.quant_config):
             disable_reason = "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        elif self.quant_config and self.quant_config.get_name() == "mixed_precision_w4":
+            disable_reason = "Deepseek V3/R1 mixed_precision_w4 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override
