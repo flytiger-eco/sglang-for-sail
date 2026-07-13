@@ -48,6 +48,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -479,7 +480,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.is_attention_backend_not_set():
         if is_sm100_supported():
             overrides["attention_backend"] = "trtllm_mha"
-        elif is_sm90_supported():
+        elif is_sm90_supported() or is_ppu():
             overrides["attention_backend"] = "fa3"
         elif is_cpu() and cpu_has_amx_support():
             overrides["attention_backend"] = "intel_amx"
@@ -523,6 +524,18 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["moe_runner_backend"] = "marlin"
             logger.warning(
                 "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling Marlin MOE kernel."
+            )
+        elif (
+            is_ppu()
+            and get_device_sm() >= 89
+            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+            and is_mxfp4_quant_format
+        ):
+            # For GPT-OSS mxfp4 on PPU, use triton backend, which internally
+            # invokes the DeepGEMM MOE kernel
+            overrides["moe_runner_backend"] = "deep_gemm"
+            logger.warning(
+                "Detected PPU and MXFP4 quantization format for GPT-OSS model, using DeepGEMM MOE kernel."
             )
         elif (is_hip() and envs.SGLANG_USE_AITER.get()) and is_mxfp4_quant_format:
             overrides["moe_runner_backend"] = "auto"

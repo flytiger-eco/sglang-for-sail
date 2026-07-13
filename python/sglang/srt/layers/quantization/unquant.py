@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -36,6 +37,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_ppu,
     set_weight_attrs,
     use_intel_amx_backend,
     use_intel_xpu_backend,
@@ -460,7 +462,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and is_ppu()
+            and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -474,8 +484,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
+        elif (
+            get_moe_runner_backend().is_auto()
+            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
+        if backend.is_deep_gemm():
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
@@ -547,7 +565,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
             # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            use_fp8 = (
+                not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+                and w13_weight.dtype == torch.float8_e4m3fn
+            )
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,

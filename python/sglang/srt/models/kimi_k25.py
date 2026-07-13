@@ -15,6 +15,8 @@ from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization import (
     MixedPrecisionW4Config,
+    Mxfp4Config,
+    W8A8Int8Config,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
@@ -662,13 +664,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
             prefix_config = (
                 MixedPrecisionW4Config,
                 ModelSlimConfig,
+                Mxfp4Config,
+                W8A8Int8Config,
                 QuarkConfig,
             )
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
                 prefix=(
-                    "language_model" if isinstance(quant_config, prefix_config) else ""
+                    add_prefix("language_model", prefix)
+                    if isinstance(quant_config, prefix_config)
+                    else ""
                 ),
             )
 
