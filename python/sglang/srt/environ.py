@@ -988,6 +988,8 @@ class Envs:
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
+    SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
+    SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
 
 
 envs = Envs()
