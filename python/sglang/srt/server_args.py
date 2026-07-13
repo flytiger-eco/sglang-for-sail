@@ -80,6 +80,7 @@ from sglang.srt.utils.common import (
     is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
+    is_ppu,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
@@ -4905,9 +4906,9 @@ class ServerArgs:
             # MHA architecture
             from sglang.srt.arg_groups.overrides import resolved_view
 
-            if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(
-                resolved_view(self)
-            ):
+            if (
+                is_ppu() or is_hopper_with_cuda_12_3()
+            ) and is_no_spec_infer_or_topk_one(resolved_view(self)):
                 # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
                 # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
                 # ref: https://github.com/sgl-project/sglang/issues/17411
@@ -5060,6 +5061,13 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+            
+        if is_ppu() and (
+            self.attention_backend == "fa3"
+            or self.decode_attention_backend == "fa3"
+            or self.prefill_attention_backend == "fa3"
+        ):
+            envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
 
     def _handle_mxfp8_kv_cache_compatibility(self):
         """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
