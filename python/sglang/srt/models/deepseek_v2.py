@@ -765,6 +765,8 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "gptq",
+                "gptq_marlin",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -1780,7 +1782,7 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "gptq", "gptq_marlin"}
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
@@ -1793,6 +1795,7 @@ class DeepseekV2AttentionMLA(
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
         self.use_min_latency_q_b_gemm = (
             self.has_q_b_proj
+            and hasattr(self.q_b_proj, "weight")
             and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
             and fused_a_gemm_weight_eligible(self.q_b_proj)
         )

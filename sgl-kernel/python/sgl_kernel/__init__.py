@@ -58,6 +58,7 @@ else:
         bmm_fp8,
         dsv3_fused_a_gemm,
         fp8_scaled_mm,
+        gptq_dequantize,
         gptq_gemm,
         gptq_shuffle,
         int8_scaled_mm,
