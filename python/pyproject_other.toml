@@ -160,6 +160,18 @@ diffusion_mps = [
   "xatlas",
 ]
 
+# https://docs.sglang.io/platforms/ppu.md
+srt_ppu = [
+    "sglang[runtime_common]",
+    "torch",
+    "apache-tvm-ffi==0.1.9",
+    "deep_ep",
+    "deep_gemm",
+    "flash-attn-3",
+    "flash_mla",
+    "flashinfer"
+]
+
 test = [
   "accelerate",
   "pymupdf",
@@ -178,11 +190,13 @@ all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
+all_ppu = ["sglang[srt_ppu]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
+dev_ppu = ["sglang[all_ppu]", "sglang[test]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

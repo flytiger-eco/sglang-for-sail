@@ -24,6 +24,7 @@ from typing import (
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
@@ -350,10 +351,12 @@ def _init_jit_cuda_arch_once():
     try:
         device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
+        suffix = current_platform.get_jit_cuda_arch_suffix()
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
-    _CUDA_ARCH = ArchInfo(major, minor, "")
+        suffix = ""
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
 @contextmanager
