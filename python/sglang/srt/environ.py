@@ -979,6 +979,10 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # SAIL
+    SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
+    SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
