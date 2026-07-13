@@ -691,6 +691,7 @@ class Envs:
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_SAIL_DEEPEP_RECV_HOOK = EnvBool(True)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
@@ -1163,6 +1164,9 @@ class Envs:
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
     SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
+    SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
 
 
 envs = Envs()

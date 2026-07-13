@@ -310,6 +310,7 @@ def triton_kernel_fused_experts_with_bias(
     M, K = hidden_states.shape
     E, _, N = w1.shape
     n_expts_act = routing_data.n_expts_act
+    dtype = hidden_states.dtype
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -324,10 +325,13 @@ def triton_kernel_fused_experts_with_bias(
         w2, w2_flex = quantize(w2, "bf16", device, **optg)
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
 
-    act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
-        (gemm1_alpha, gemm1_clamp_limit),
-    )
+    if gemm1_alpha is not None:
+        act = FusedActivation(
+            FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+            (gemm1_alpha, gemm1_clamp_limit),
+        )
+    else:
+        act = None
 
     intermediate_cache = torch.empty(
         (1, M * n_expts_act, N // 2),
@@ -349,6 +353,13 @@ def triton_kernel_fused_experts_with_bias(
         fused_activation=act,
         y=intermediate_cache,
     )
+
+    if gemm1_alpha is None:
+        intermediate_cache2 = torch.empty(
+            (intermediate_cache.shape[0], N // 2), device="cuda", dtype=dtype
+        )
+        silu_and_mul(intermediate_cache, intermediate_cache2)
+        intermediate_cache = intermediate_cache2
 
     matmul_ogs(
         intermediate_cache.view(M * n_expts_act, N // 2),
