@@ -57,10 +57,12 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
         return super().get_device_num_tensorcores(device_id)
 
 
-# Load PPU FA3 ops hook when running on PPU hardware.
-# The module-level @plugin_hook decorator registers an AROUND hook on
-# FlashAttentionBackend.__init__ so PPU-specific FA3 ops are used transparently.
+# Load PPU attention hooks when running on PPU hardware.
+# Each module registers @plugin_hook decorators that inject PPU-native ops
+# into the respective attention backends transparently.
 import os
 
 if "PPU_SDK" in os.environ:
+    import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
