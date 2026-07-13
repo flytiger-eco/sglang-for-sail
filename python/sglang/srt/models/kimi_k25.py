@@ -13,6 +13,9 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization import (
+    MixedPrecisionW4Config,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
@@ -623,6 +626,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         }
     )
 
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: KimiK25Config,
@@ -648,13 +659,16 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         self.language_model = None
         if not config.encoder_only:
+            prefix_config = (
+                MixedPrecisionW4Config,
+                ModelSlimConfig,
+                QuarkConfig,
+            )
             self.language_model = DeepseekV3ForCausalLM(
                 config.text_config,
                 quant_config,
                 prefix=(
-                    "language_model"
-                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
-                    else ""
+                    "language_model" if isinstance(quant_config, prefix_config) else ""
                 ),
             )
 
