@@ -980,6 +980,9 @@ class Envs:
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
 
+    # Memory Pool
+    SGLANG_SORT_PAGE = EnvBool(False)  # enable page sorting when not in PD mode
+
     # SAIL
     SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
