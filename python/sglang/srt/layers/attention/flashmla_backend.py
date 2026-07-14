@@ -88,6 +88,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         }
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.speculative_num_steps = model_runner.server_args.speculative_num_steps or 0
 
         self.cuda_graph_kv_indices = None
         self.cuda_graph_mla_metadata = None
@@ -336,7 +337,26 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         bs = forward_batch.batch_size
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        # [PPU patch] The draft proposal builds attn metadata (block_kv_indices,
+        # flashmla_metadata) for the real batch size, but the draft model's decode
+        # forward pads bs up to a cuda-graph bucket before attention, leaving the
+        # block table short. Run the kernel for exactly the rows the metadata
+        # describes and scatter the output back to the padded length. For ordinary
+        # (non-draft) decode real_bs == bs, so this is a no-op.
+        num_total_rows = q.shape[0]
+        real_bs = self.forward_metadata.block_kv_indices.shape[0]
+        strip_pad = real_bs < bs and num_total_rows % bs == 0
+        if strip_pad:
+            tokens_per_seq = num_total_rows // bs
+            real_rows = real_bs * tokens_per_seq
+            q = q[:real_rows]
+            eff_bs = real_bs
+            cache_seqlens = forward_batch.seq_lens[:real_bs].to(torch.int32)
+        else:
+            eff_bs = bs
+            cache_seqlens = forward_batch.seq_lens.to(torch.int32)
+
+        reshape_q = q.view(eff_bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
             assert (
                 self.dcp_world_size == 1
@@ -361,8 +381,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                block_table=self.forward_metadata.block_kv_indices[:eff_bs],
+                cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -372,14 +392,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 descale_k=descale_k,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if strip_pad:
+                o = torch.cat(
+                    [o, o.new_zeros(num_total_rows - o.shape[0], *o.shape[1:])],
+                    dim=0,
+                )
+            return o
         else:
             # todo: need check all causal True or False?
             o, lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                block_table=self.forward_metadata.block_kv_indices[:bs],
-                cache_seqlens=forward_batch.seq_lens.to(torch.int32),
+                block_table=self.forward_metadata.block_kv_indices[:eff_bs],
+                cache_seqlens=cache_seqlens,
                 head_dim_v=self.kv_lora_rank,
                 tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
                 num_splits=self.forward_metadata.num_splits,
@@ -387,10 +413,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
             o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if strip_pad:
+                o = torch.cat(
+                    [o, o.new_zeros(num_total_rows - o.shape[0], *o.shape[1:])],
+                    dim=0,
+                )
             # TODO uniform output for forward_decode and forward_extend to
             # return tuple instead of single output
             # decode context parallel needs lse to correct attn_output via online softmax
             if dcp_enabled():
+                if strip_pad:
+                    lse = torch.cat(
+                        [lse, lse.new_zeros(bs - lse.shape[0], *lse.shape[1:])],
+                        dim=0,
+                    )
                 return o, lse
             return o
 
@@ -420,7 +456,28 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             bs = forward_batch.batch_size
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-            reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+            # [PPU patch] Both TARGET_VERIFY and DRAFT_EXTEND_V2 use the rectangular
+            # [bs, num_draft_tokens, ...] layout, but the token dim can be padded to a
+            # cuda-graph bucket (e.g. q has 128 rows for bs=42, num_draft_tokens=3 ->
+            # real 126). This happens whenever the path runs eager (batch exceeds
+            # cuda-graph-max-bs), for verify as well as draft-extend. The view below
+            # needs exactly bs*num_draft_tokens tokens, so drop the trailing padding
+            # here and scatter the output back to the padded length afterwards. The
+            # token-count guard makes this a no-op for the uniform (graph-captured) case.
+            num_total_tokens = q.shape[0]
+            real_bs = self.forward_metadata.block_kv_indices.shape[0]
+            num_tokens_per_req = self.speculative_num_steps + 1
+            strip_pad = (
+                forward_batch.forward_mode.is_draft_extend_v2()
+                or forward_batch.forward_mode.is_target_verify()
+            ) and num_total_tokens > real_bs * num_tokens_per_req
+            if strip_pad:
+                eff_bs = real_bs
+                q = q[: eff_bs * num_tokens_per_req]
+            else:
+                eff_bs = bs
+
+            reshape_q = q.view(eff_bs, -1, layer.tp_q_head_num, layer.head_dim)
             if self.is_fp8_kvcache:
                 if layer.k_scale is not None:
                     q_scale = layer.k_scale
@@ -444,8 +501,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                    block_table=self.forward_metadata.block_kv_indices[:bs],
-                    cache_seqlens=forward_batch.seq_lens.to(torch.int32)
+                    block_table=self.forward_metadata.block_kv_indices[:eff_bs],
+                    cache_seqlens=forward_batch.seq_lens[:eff_bs].to(torch.int32)
                     + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
@@ -459,8 +516,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
-                    block_table=self.forward_metadata.block_kv_indices[:bs],
-                    cache_seqlens=forward_batch.seq_lens.to(torch.int32)
+                    block_table=self.forward_metadata.block_kv_indices[:eff_bs],
+                    cache_seqlens=forward_batch.seq_lens[:eff_bs].to(torch.int32)
                     + self.num_draft_tokens,
                     head_dim_v=self.kv_lora_rank,
                     tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
@@ -468,7 +525,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            if strip_pad:
+                # Restore the original (padded) token count so downstream ops keep
+                # their expected shape; padding rows are left zero (they are unused).
+                out = torch.cat(
+                    [
+                        out,
+                        out.new_zeros(num_total_tokens - out.shape[0], *out.shape[1:]),
+                    ],
+                    dim=0,
+                )
+            return out
 
 
 class FlashMLAMultiStepDraftBackend:
