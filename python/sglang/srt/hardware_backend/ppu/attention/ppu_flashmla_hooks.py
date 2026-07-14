@@ -413,9 +413,7 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
     "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.forward_decode",
     type=HookType.AROUND,
 )
-def _ppu_flashmla_forward_decode(
-    original_fn, self, q, k, v, layer, forward_batch, save_kv_cache=True
-):
+def _ppu_flashmla_forward_decode(original_fn, self, *args, **kwargs):
     """Adapt PPU metadata format before calling the community forward_decode.
 
     PPU stores a FlashMLASchedMeta-like object as ``flashmla_metadata``
@@ -438,11 +436,11 @@ def _ppu_flashmla_forward_decode(
         )
         self.forward_metadata = adapted
         try:
-            return original_fn(self, q, k, v, layer, forward_batch, save_kv_cache)
+            return original_fn(self, *args, **kwargs)
         finally:
             self.forward_metadata = meta
     else:
-        return original_fn(self, q, k, v, layer, forward_batch, save_kv_cache)
+        return original_fn(self, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -454,9 +452,7 @@ def _ppu_flashmla_forward_decode(
     "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.forward_extend",
     type=HookType.AROUND,
 )
-def _ppu_flashmla_forward_extend(
-    original_fn, self, q, k, v, layer, forward_batch, save_kv_cache=True
-):
+def _ppu_flashmla_forward_extend(original_fn, self, *args, **kwargs):
     """Adapt PPU metadata format before calling the community forward_extend.
 
     Same adaptation as ``_ppu_flashmla_forward_decode``, but with a guard
@@ -480,8 +476,8 @@ def _ppu_flashmla_forward_extend(
         )
         self.forward_metadata = adapted
         try:
-            return original_fn(self, q, k, v, layer, forward_batch, save_kv_cache)
+            return original_fn(self, *args, **kwargs)
         finally:
             self.forward_metadata = meta
     else:
-        return original_fn(self, q, k, v, layer, forward_batch, save_kv_cache)
+        return original_fn(self, *args, **kwargs)

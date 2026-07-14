@@ -70,6 +70,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "tokenspeed_mla",
     "ascend",
     "intel_xpu",
+    "flashmla",
 ]
 
 
