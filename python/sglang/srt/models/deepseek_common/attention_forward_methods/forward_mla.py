@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
+from sglang.srt.layers.attention.utils import concat_mla_absorb_q_general
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -63,6 +64,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
+    _is_ppu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -511,7 +513,7 @@ class DeepseekMLAForwardMixin:
                             self.w_kc.to(torch.bfloat16) * self.w_scale,
                         )
 
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
+            elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_ppu:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -783,8 +785,8 @@ class DeepseekMLAForwardMixin:
 
                 save_kv_cache = False
             else:
-                q = torch.cat([q_nope_out, q_pe], dim=-1)
-                k = torch.cat([k_nope, k_pe], dim=-1)
+                q = concat_mla_absorb_q_general(q_nope_out, q_pe)
+                k = concat_mla_absorb_q_general(k_nope, k_pe)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
@@ -919,7 +921,7 @@ class DeepseekMLAForwardMixin:
             else:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_ppu:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),

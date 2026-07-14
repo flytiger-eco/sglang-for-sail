@@ -55,6 +55,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_ppu,
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
@@ -631,8 +632,12 @@ class DeepseekV2WeightLoaderMixin:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
 
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    if _is_ppu:
+                        # dequant channel-wise fp8 to bf16
+                        w = w.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+                    else:
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
                 # only enter block quant path when block size is not None
