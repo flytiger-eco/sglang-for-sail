@@ -1640,6 +1640,10 @@ class ServerArgs:
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_custom_all_reduce: A[
+        bool,
+        "Enable the custom all-reduce kernel.",
+    ] = False
     disable_custom_all_reduce: A[
         bool,
         Arg(
@@ -3564,6 +3568,12 @@ class ServerArgs:
                 envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
             if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
                 envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+            # disable custom allreduce by default on ppu
+            if not self.enable_custom_all_reduce:
+                self.disable_custom_all_reduce = True
+                logger.info(
+                    "Disable custom allreduce and use pccl allreduce on ppu for better perf. Launch server with --enable-custom-all-reduce to force use custom allreduce"
+                )
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
