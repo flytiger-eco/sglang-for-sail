@@ -77,6 +77,17 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+    CompressedTensorsW8A8Fp8,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
+)
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -418,6 +429,7 @@ class MQALayer(nn.Module):
         self._attn_sink_local: Optional[torch.Tensor] = (
             self.attn_sink if (attn_tp_size == 1 or _is_ppu) else None
         )
+        self.quant_config = quant_config
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
@@ -464,10 +476,16 @@ class MQALayer(nn.Module):
             **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
-            self.wo_a.weight_scale_inv.format_ue8m0 = True
+            if isinstance(self.quant_config, Fp8Config):
+                assert hasattr(
+                    self.wo_a, "weight_scale_inv"
+                ), "FP8 quant_config must create weight_scale_inv"
+                self.wo_a.weight_scale_inv.format_ue8m0 = True
+            else:
+                # channelwise
+                assert hasattr(
+                    self.wo_a, "weight_scale"
+                ), "FP8 quant_config must create weight_scale_inv"
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -936,6 +954,47 @@ class MQALayer(nn.Module):
 
         return q, kv
 
+    def _get_wo_a_channel_einsum_args(
+        self, G: int, R: int, D: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
+        # Lazy-build the (weight, scale, recipe) for fp8_einsum on the
+        # channelwise FP8 path. (block-FP8 doesn't come through here.)
+        #
+        # Channelwise stores wo_a transposed:
+        #   wo_a.weight       : qweight.t()         -> [D, G*R], non-contig
+        #   wo_a.weight_scale : scale.t().contig()  -> [1, G*R]
+        # We restore weight to [G, R, D], reshape scale to [G, R, 1], and
+        # set recipe[2]=D (contract-block size; channelwise == full row,
+        # not the 128 used by block-FP8).
+        #
+        # Lazy on first forward (not post_load_weights): the quant hook
+        # may run again after post_load_weights (hot reload, draft copy,
+        # offloader requant), so this is the safest snapshot point.
+        # .clone() decouples the cache from later in-place writes.
+        wo_a = self.wo_a
+        cached = getattr(wo_a, "_einsum_args_cache", None)
+        if cached is not None:
+            return cached
+
+        w = wo_a.weight.data
+        assert w.shape == (D, G * R), (
+            f"channelwise wo_a.weight expected ({D}, {G*R}), " f"got {tuple(w.shape)}"
+        )
+        weight_3d = w.t().contiguous().clone().view(G, R, D)
+
+        ws = wo_a.weight_scale.data
+        assert ws.numel() == G * R, (
+            f"channelwise weight_scale expected {G*R} elems, "
+            f"got shape {tuple(ws.shape)}"
+        )
+        scale = ws.reshape(G * R).contiguous().clone().view(G, R, 1)
+
+        recipe = (1, 1, D)
+
+        out = (weight_3d, scale, recipe)
+        wo_a._einsum_args_cache = out
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1094,15 +1153,64 @@ class MQALayer(nn.Module):
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
-                recipe=(1, 1, 128),
-            )
+            # PPU does not need ceil to ue8m0
+            if not _is_ppu:
+                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_s),
+                    (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                    output,
+                    recipe=(1, 1, 128),
+                )
+            elif isinstance(self.wo_a.quant_method, Fp8LinearMethod):
+                o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                    o.reshape(T * G, D).contiguous(),
+                    group_size=128,
+                )
+                if not _is_ppu:
+                    o_s = deep_gemm.ceil_to_ue8m0(o_s)
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                    (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                    output,
+                    recipe=(1, 1, 128),
+                )
+            # rely on deep_gemm commit "[DeepGemm] : add int8 einsum"
+            # w8a8 int8 and w4a8 int8 both use int8_einsum
+            elif isinstance(self.wo_a.quant_method, W8A8Int8LinearMethod):
+                wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                    self._get_wo_a_channel_einsum_args(G, R, D)
+                )
+                o_int8, o_s = per_token_quant_int8(o.reshape(T * G, D).contiguous())
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.int8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_int8.view(T, G, D), o_s.view(T, G, -1)),
+                    (wo_a_weight_3d, wo_a_scale),
+                    output,
+                    recipe=wo_a_recipe,
+                )
+            elif isinstance(
+                self.wo_a.quant_method, CompressedTensorsLinearMethod
+            ) and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8):
+                wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                    self._get_wo_a_channel_einsum_args(G, R, D)
+                )
+                o_fp8, o_s = sglang_per_token_quant_fp8(
+                    o.reshape(T * G, D).contiguous()
+                )
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                    (wo_a_weight_3d, wo_a_scale),
+                    output,
+                    recipe=wo_a_recipe,
+                )
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -2347,7 +2455,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if _FP8_WO_A_GEMM:
-            self._setup_fp8_wo_a_scales(is_nextn)
+            if not _is_ppu:
+                self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
             return
