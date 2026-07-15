@@ -9,6 +9,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -22,6 +23,15 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
+
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
 
 logger = logging.getLogger(__name__)
 
@@ -936,7 +946,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_decode(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_decode,type:D,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+        output = self.linear_attn_backend.forward_decode(
             q=q,
             k=k,
             v=v,
@@ -948,6 +965,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward_extend(
         self,
@@ -966,7 +986,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_extend(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_extend,type:P,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+
+        output = self.linear_attn_backend.forward_extend(
             q=q,
             k=k,
             v=v,
@@ -978,6 +1006,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward(
         self,

@@ -52,6 +52,13 @@ _is_hip = is_hip()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    from sglang.srt.utils.nvtx_ops import (
+        nvtx_pop_range_for_gemm,
+        nvtx_push_range_for_gemm,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +285,14 @@ class ReplicatedLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
+        if SGLANG_PROFILE_NVTX:
+            tmp_weight = getattr(self, "weight", None)
+            nvtx_push_range_for_gemm(
+                "ReplicatedLinear", x, tmp_weight, None, None, bias
+            )
         output = self.quant_method.apply(self, x, bias)
+        if SGLANG_PROFILE_NVTX:
+            nvtx_pop_range_for_gemm(output)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -470,7 +484,14 @@ class ColumnParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
+        if SGLANG_PROFILE_NVTX:
+            tmp_weight = getattr(self, "weight", None)
+            nvtx_push_range_for_gemm(
+                "ColumnParallelLinear", input_, tmp_weight, None, None, bias
+            )
         output_parallel = self.quant_method.apply(self, input_, bias)
+        if SGLANG_PROFILE_NVTX:
+            nvtx_pop_range_for_gemm(output_parallel)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1578,7 +1599,14 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
+            if SGLANG_PROFILE_NVTX:
+                tmp_weight = getattr(self, "weight", None)
+                nvtx_push_range_for_gemm(
+                    "RowParallelLinear", input_parallel, tmp_weight, None, None, bias_
+                )
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if SGLANG_PROFILE_NVTX:
+                nvtx_pop_range_for_gemm(output_parallel)
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
@@ -1673,7 +1701,20 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         self.prefix = prefix
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return self.quant_method.apply(self, input_)
+        if SGLANG_PROFILE_NVTX:
+            tmp_weight = getattr(self, "weight", None)
+            nvtx_push_range_for_gemm(
+                "MergedColumnParallelRepeatedLinear",
+                input_,
+                tmp_weight,
+                None,
+                None,
+                None,
+            )
+        output = self.quant_method.apply(self, input_)
+        if SGLANG_PROFILE_NVTX:
+            nvtx_pop_range_for_gemm(output)
+        return output
 
     def weight_loader(
         self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
@@ -1714,7 +1755,15 @@ class ColumnParallelBatchedLinear(nn.Module):
         setattr(self.weight, "weight_loader", self.weight_loader)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return torch.bmm(input, self.weight.transpose(-1, -2))
+        if SGLANG_PROFILE_NVTX:
+            tmp_weight = getattr(self, "weight", None)
+            nvtx_push_range_for_gemm(
+                "ColumnParallelBatchedLinear", input, tmp_weight, None, None, None
+            )
+        output = torch.bmm(input, self.weight.transpose(-1, -2))
+        if SGLANG_PROFILE_NVTX:
+            nvtx_pop_range_for_gemm(output)
+        return output
 
     def weight_loader(
         self, param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int
