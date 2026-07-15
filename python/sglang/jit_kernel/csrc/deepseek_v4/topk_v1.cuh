@@ -118,6 +118,11 @@ SGL_DEVICE void cp_async_commit() {
 SGL_DEVICE void cp_async_wait_all() {
   asm volatile("cp.async.wait_all;");
 }
+// Wait until at most kKeep prior cp.async groups remain in flight.
+template <uint32_t kKeep>
+SGL_DEVICE void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;" ::"n"(kKeep) : "memory");
+}
 
 struct RegisterTopKSmem {
   using HistVec = device::AlignedVector<uint32_t, v3::kHistBins / v3::kBlockSize>;
@@ -425,12 +430,52 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     }
   };
 
-  // stage 1: 8bit coarse histogram
+  // cp.async pipelined chunk loader, shared by stage 1 and stage 1b.
+  // Each thread issues one 16-byte cp.async per chunk (4 floats), so chunk size
+  // = BLOCK_SIZE * (16 B / sizeof(float)) = BLOCK_SIZE * 4 = 4096 floats at 1024 threads.
+  constexpr uint32_t kChunkFloats = BLOCK_SIZE * 4;
+  alignas(16) __shared__ float s_chunk_buf[2][kChunkFloats];
+  const uint32_t num_chunks = (length + kChunkFloats - 1) / kChunkFloats;
+  auto issue_chunk = [&](uint32_t ci, uint32_t bi) {
+    const uint32_t base = ci * kChunkFloats + tx * 4;
+    if (base + 3 < length) {
+      cp_async_cg_shared_global_16(&s_chunk_buf[bi][tx * 4], input + base);
+    } else if (base < length) {
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        s_chunk_buf[bi][tx * 4 + e] = (base + e < length) ? input[base + e] : 0.0f;
+      }
+    }
+  };
+
+  // stage 1: 8bit coarse histogram, pipelined via the chunk loader above.
+  // Always issue + commit. Past-end chunks are bounded out inside issue_chunk
+  // (no cp.async fired); their empty commits keep two groups in flight, so
+  // wait_group<1> correctly blocks for the current chunk every iteration.
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
-  for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx]);
-    ::atomicAdd(&s_histogram[bin], 1);
+  {
+    issue_chunk(0, 0);
+    cp_async_commit();
+    issue_chunk(1, 1);
+    cp_async_commit();
+    for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+      const uint32_t bi = ci & 1;
+      cp_async_wait_group<1>();
+      __syncthreads();
+      const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        const uint32_t idx = base + tx * 4 + e;
+        if (idx < length) {
+          ::atomicAdd(&s_histogram[convert_to_uint8(s_chunk_buf[bi][tx * 4 + e])], 1);
+        }
+      }
+      __syncthreads();
+      issue_chunk(ci + 2, bi);
+      cp_async_commit();
+    }
+    cp_async_wait_all();
   }
   __syncthreads();
   run_cumsum();
@@ -460,21 +505,41 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     }
     __syncthreads();
 
-    for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const float raw_input = input[idx];
-      const uint32_t bin = convert_to_uint8(raw_input);
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        output[pos] = idx;
-      } else if (bin == threshold_bin) {
-        const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        if (pos < SMEM_INPUT_SIZE) {
-          [[likely]] s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
+    // stage 1b: same pipeline pattern as stage 1, reusing s_chunk_buf + issue_chunk.
+    {
+      issue_chunk(0, 0);
+      cp_async_commit();
+      issue_chunk(1, 1);
+      cp_async_commit();
+      for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+        const uint32_t bi = ci & 1;
+        cp_async_wait_group<1>();
+        __syncthreads();
+        const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+        for (uint32_t e = 0; e < 4; ++e) {
+          const uint32_t idx = base + tx * 4 + e;
+          if (idx >= length) continue;
+          const float raw_input = s_chunk_buf[bi][tx * 4 + e];
+          const uint32_t bin = convert_to_uint8(raw_input);
+          if (bin > threshold_bin) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            output[pos] = idx;
+          } else if (bin == threshold_bin) {
+            const auto pos = ::atomicAdd(&s_num_input[0], 1);
+            if (pos < SMEM_INPUT_SIZE) {
+              [[likely]] s_input_idx[0][pos] = idx;
+              const auto bin2 = convert_to_uint32(raw_input);
+              const auto sub_bin = (bin2 >> 24) & 0xFF;
+              ::atomicAdd(&s_histogram[sub_bin], 1);
+            }
+          }
         }
+        __syncthreads();
+        issue_chunk(ci + 2, bi);
+        cp_async_commit();
       }
+      cp_async_wait_all();
     }
     __syncthreads();
   }
