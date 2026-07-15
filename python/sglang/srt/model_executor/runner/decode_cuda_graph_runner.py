@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -115,6 +116,16 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
 
 
 def build_replay_fb_view(
@@ -1006,6 +1017,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.bs, stream_idx, variant_label
         )
 
+    def _build_decode_replay_kv_len_nvtx_msg(self) -> Optional[str]:
+        raw_bs = int(getattr(self, "raw_bs", 0) or 0)
+        capture_bs = int(getattr(self, "bs", 0) or 0)
+        seq_lens_cpu = self.buffers.seq_lens_cpu[:raw_bs]
+        kv_lens = [int(x) for x in seq_lens_cpu.tolist()]
+        return (
+            "decode_cudagraph_kvlen "
+            f"raw_bs={raw_bs} capture_bs={capture_bs} kv_lens={kv_lens}"
+        )
+
     def execute(
         self,
         forward_batch: ForwardBatch,
@@ -1030,7 +1051,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            if SGLANG_PROFILE_NVTX:
+                info = self._build_decode_replay_kv_len_nvtx_msg()
+                th_nvtx_range_push(info)
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
