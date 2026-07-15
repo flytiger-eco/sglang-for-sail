@@ -25,6 +25,7 @@ from .gemm import linear_bf16_fp32
 from .moe import (
     hash_topk,
     mask_topk_ids,
+    mask_topk_ids_to_int64,
     mega_moe_pre_dispatch,
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
