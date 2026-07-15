@@ -514,6 +514,8 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.index_n_heads = model_runner.model_config.hf_text_config.index_n_heads
+        self.index_head_dim = model_runner.model_config.index_head_dim
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -553,12 +555,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         *,
         use_prefill_cuda_graph: bool = False,
+        build_paged_mqa_logits_metadata: bool = True,
     ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
+            q_fp8_shape=torch.Size(
+                (
+                    core_attn_metadata.c4_topk_lengths_raw.shape[0],
+                    1,
+                    self.index_n_heads,
+                    self.index_head_dim,
+                )
+            ),
         )
 
     def init_forward_metadata_decode(
@@ -620,6 +632,7 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
+        build_paged_mqa_logits_metadata: bool = True,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -644,6 +657,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             )
             if need_compress
             else None
@@ -1180,6 +1194,9 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=not is_draft,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                build_paged_mqa_logits_metadata=not self._use_prefill_logits(
+                    forward_batch
+                ),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")

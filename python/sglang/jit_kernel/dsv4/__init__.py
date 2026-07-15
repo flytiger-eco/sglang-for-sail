@@ -15,6 +15,7 @@ from .elementwise import (
     fused_k_norm_rope_flashmla,
     fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_int8_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
@@ -29,7 +30,12 @@ from .moe import (
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
 )
-from .topk import plan_topk_v2, topk_transform_512, topk_transform_512_v2
+from .topk import (
+    plan_topk_v2,
+    top_k_per_row_prefill,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
 from .utils import make_name
 
 __all__ = [
@@ -43,6 +49,7 @@ __all__ = [
     "fused_rope_inplace",
     "fused_q_norm_rope",
     "fused_q_indexer_rope_first_quant",
+    "fused_q_indexer_rope_hadamard_int8_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
@@ -53,6 +60,7 @@ __all__ = [
     "triton_create_paged_compress_data",
     "topk_transform_512",
     "topk_transform_512_v2",
+    "top_k_per_row_prefill",
     "plan_topk_v2",
     "hash_topk",
     "mega_moe_pre_dispatch",
