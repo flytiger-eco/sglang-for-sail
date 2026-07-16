@@ -77,6 +77,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -1068,6 +1070,21 @@ class MQALayer(nn.Module):
                     (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                     output,
                     recipe=(1, 1, 128),
+                )
+            # rely on deep_gemm commit "[DeepGemm] : add int8 einsum"
+            # w8a8 int8 and w4a8 int8 both use int8_einsum
+            elif isinstance(self.wo_a.quant_method, W8A8Int8LinearMethod):
+                wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                    self._get_wo_a_channel_einsum_args(G, R, D)
+                )
+                o_int8, o_s = per_token_quant_int8(o.reshape(T * G, D).contiguous())
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.int8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_int8.view(T, G, D), o_s.view(T, G, -1)),
+                    (wo_a_weight_3d, wo_a_scale),
+                    output,
+                    recipe=wo_a_recipe,
                 )
             else:
                 wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
