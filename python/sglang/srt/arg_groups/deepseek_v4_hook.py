@@ -90,9 +90,20 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     assert (
         server_args.dp_size == 1
     ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        server_args.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_ppu():
+        # PPU 810E machines have 16 cards per node, so tp_size > 8 can still
+        # be single-machine; only warn instead of hard-failing.
+        if server_args.tp_size > 8:
+            logger.warning(
+                f"Context parallel with tp_size={server_args.tp_size} > 8 on PPU. "
+                "Cross-machine CP has precision issues; make sure this runs on a single machine."
+            )
+    else:
+        assert (
+            server_args.tp_size <= 8
+        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
