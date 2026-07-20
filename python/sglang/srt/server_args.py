@@ -1372,6 +1372,14 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
             if not envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.is_set():
                 envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.set(4096)
+            # disable shared experts fusion for mxfp4 and mixed_precision_w4
+            hf_config = self.get_model_config().hf_config
+            quant_method = get_quantization_config(hf_config)
+            if quant_method in ("mxfp4", "mixed_precision_w4"):
+                self.disable_shared_experts_fusion = True
+                logger.info(
+                    f"{quant_method} model uses different quant method for routed experts and shared experts. --disable-shared-experts-fusion is automatically set."
+                )
 
     def _handle_piecewise_cuda_graph(self):
         # Skip auto-disable when enforce flag is set (for testing)
