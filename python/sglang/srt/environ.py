@@ -908,6 +908,8 @@ class Envs:
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(512)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
     SGLANG_NSA_USE_DSV4_BF16_TOPK = EnvBool(True)
+    # Enable NaN check on logits valid range before topk_transform (debug/diag).
+    SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
 
 
 envs = Envs()
