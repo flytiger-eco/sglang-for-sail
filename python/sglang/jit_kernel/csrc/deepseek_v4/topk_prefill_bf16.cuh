@@ -45,8 +45,8 @@ constexpr uint32_t kElemPerStage = 8;                                      // bf
 constexpr uint32_t kSizePerStage = kElemPerStage * kBlockSize;             // 8192 bf16 / stage
 constexpr uint32_t kCpAsyncBytes = kElemPerStage * sizeof(__nv_bfloat16);  // 16B
 
-constexpr uint32_t kMaxTies = 1024;
-constexpr uint32_t kMax1PassLength = 16384;                // single-pass register cap
+constexpr uint32_t kMaxTies = kTopK;         // Must equal kTopK to cover all tie slots when scores are NaN
+constexpr uint32_t kMax1PassLength = 16384;  // single-pass register cap
 constexpr uint32_t kMax2PassLength = 2 * kMax1PassLength;  // 32768
 constexpr uint32_t kVecsPerThread = 4;
 
@@ -89,7 +89,7 @@ struct alignas(8) TieV3 {
 //   match       : 128B
 //   warp_sum    : 128B (32 warps * 4B = 128B)
 //   union { histogram[4096]  -> 16KB
-//           tie_buffer[1024] ->  8KB }
+//           tie_buffer[kTopK] -> kTopK*8B }
 //   bf16_buffer[2][8192]     -> 32KB
 // s_topk_indices (kTopK * int32) = 2KB lives at the tail of dynamic smem
 // (allocated separately by the caller).
@@ -116,7 +116,7 @@ struct alignas(128) PrefillBF16Smem {
 //   match + warp_sum        : 32B + 128B
 //   union { histogram[4096] -> 16KB
 //           histogram_vec   -> same storage as histogram
-//           tie_buffer[1024]-> 8KB }
+//           tie_buffer[kTopK]-> kTopK*8B }
 //   bf16_stage[16384]       -> 32KB
 // ============================================================
 using Vec4PF = device::AlignedVector<float, 4>;
@@ -450,7 +450,10 @@ SGL_DEVICE static void tie_handle_and_transform_bf16(
   } else {
     // Tie-break: rank each tie within the bin and keep top `topk_remain`.
     const auto is_greater = [](const TieV3& a, const TieV3& b) {
-      return (a.score > b.score) || (a.score == b.score && a.idx < b.idx);
+      if (a.score > b.score) return true;
+      if (a.score < b.score) return false;
+      // Neither > nor < means equal OR NaN; use idx as deterministic tiebreaker
+      return a.idx < b.idx;
     };
 
     if (num_ties <= 32u) {
@@ -775,7 +778,10 @@ SGL_DEVICE void register_topk_bf16_pf(
   const uint32_t topk_remain = prefill_bf16::kTopK - num_above;
 
   const auto is_greater = [](const TieV3& a, const TieV3& b) {
-    return (a.score > b.score) || (a.score == b.score && a.idx < b.idx);
+    if (a.score > b.score) return true;
+    if (a.score < b.score) return false;
+    // Neither > nor < means equal OR NaN; use idx as deterministic tiebreaker
+    return a.idx < b.idx;
   };
 
   if (num_ties <= 32u) {
