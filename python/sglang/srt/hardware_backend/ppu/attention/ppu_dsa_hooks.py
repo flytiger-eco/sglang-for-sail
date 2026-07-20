@@ -1,73 +1,27 @@
 """PPU DSA backend hooks.
 
-Uses ``@plugin_hook`` with ``HookType.REPLACE`` on DSA backend methods to
-inject PPU-specific behavior without modifying the community source code.
-
-None of these hooks call the original function, so REPLACE is used instead
-of AROUND to avoid the unnecessary ``original_fn`` parameter.
+Uses ``@plugin_hook`` to inject PPU-specific behavior into DSA backend
+methods without modifying the community source code.
 
 Registered hooks:
 
-1. ``_compute_flashmla_metadata`` (REPLACE) — Replaces the method body on
-   PPU so that the PPU ``get_mla_metadata`` is used instead of the community
-   ``sgl_kernel.flash_mla.get_mla_metadata``.  The DSA backend imports
-   ``get_mla_metadata`` locally inside this method, so the flashmla_backend
-   REPLACE hook does not cover it.  On PPU, ``get_mla_metadata`` returns
-   ``(FlashMLASchedMeta_like, _)`` where the first element carries
-   ``.tile_scheduler_metadata`` / ``.num_splits`` attributes.  The hook
-   extracts these to build ``DSAFlashMLAMetadata``.
-
-2. ``DSAFlashMLAMetadata.copy_`` (REPLACE) — Skips the copy on PPU because
+1. ``DSAFlashMLAMetadata.copy_`` (REPLACE) — Skips the copy on PPU because
    PPU metadata tensors are cached/immutable and must not be overwritten
    during CUDA graph replay.
 
-3. ``DSAFlashMLAMetadata.slice`` (REPLACE) — Returns ``num_splits`` without
+2. ``DSAFlashMLAMetadata.slice`` (REPLACE) — Returns ``num_splits`` without
    slicing on PPU because the tensor shape semantics differ from CUDA.
 
-4. ``get_mla_metadata`` (REPLACE) — Replaces the community
-   ``sgl_kernel.flash_mla.get_mla_metadata`` with the PPU implementation.
+3. ``DeepseekSparseAttnBackend.init_forward_metadata_in_graph`` (REPLACE) —
+   Resets ``flashmla_metadata.have_initialized`` before CUDA graph capture
+   so that PPU metadata generation occurs within the capture scope.
 
-5. ``flash_mla_with_kvcache`` (REPLACE) — Same, for the decode kernel.
-
-6  ``flash_mla_with_kvcache`` (REPLACE) — Same, for the decode kernel.
+4. ``DeepseekSparseAttnBackend.init_forward_metadata_replay_cuda_graph_from_precomputed``
+   (AROUND) — Skips flashmla_metadata copy on PPU by temporarily clearing
+   and restoring the precomputed metadata.
 """
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend._compute_flashmla_metadata",
-    type=HookType.REPLACE,
-)
-def _ppu_dsa_compute_flashmla_metadata(self, cache_seqlens, seq_len_q):
-    """Use PPU ``get_mla_metadata`` for DSA backend metadata computation.
-
-    On PPU, ``get_mla_metadata`` returns ``(FlashMLASchedMeta_like, _)``
-    where the first element has ``.tile_scheduler_metadata`` and
-    ``.num_splits`` attributes.  This hook discards the second return value
-    and extracts the two tensor fields from the sched-meta object.
-    """
-    from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
-        get_mla_metadata,
-    )
-    from sglang.srt.layers.attention.dsa.utils import (
-        NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
-    )
-    from sglang.srt.layers.attention.dsa_backend import DSAFlashMLAMetadata
-
-    num_heads_q = self.flashmla_kv_num_q_heads
-    flashmla_metadata, _ = get_mla_metadata(
-        cache_seqlens=cache_seqlens,
-        num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
-        num_heads_k=1,
-        num_heads_q=num_heads_q,
-        is_fp8_kvcache=NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8,
-        topk=self.dsa_index_topk,
-    )
-    return DSAFlashMLAMetadata(
-        flashmla_metadata=flashmla_metadata.tile_scheduler_metadata,
-        num_splits=flashmla_metadata.num_splits,
-    )
 
 
 @plugin_hook(
@@ -91,3 +45,37 @@ def _ppu_dsa_flashmla_slice(self, sli):
         flashmla_metadata=self.flashmla_metadata,
         num_splits=self.num_splits,
     )
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend.init_forward_metadata_in_graph",
+    type=HookType.REPLACE,
+)
+def _ppu_dsa_init_forward_metadata_in_graph(self, forward_batch):
+    """Replace init_forward_metadata_in_graph on PPU.
+
+    For PPU FlashMLA, `get_mla_metadata` runs only on the first
+    `flash_mla_with_kvcache` call. To capture this init logic in
+    the CUDA Graph, reset flashmla_metadata before starting capture.
+    This forces metadata generation to occur within the capture scope.
+    """
+    if self.dsa_decode_impl == "flashmla_kv":
+        assert self.forward_metadata.flashmla_metadata is not None
+        assert self.forward_metadata.flashmla_metadata.flashmla_metadata is not None
+        self.forward_metadata.flashmla_metadata.flashmla_metadata.have_initialized = (
+            False
+        )
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend.init_forward_metadata_replay_cuda_graph_from_precomputed",
+    type=HookType.AROUND,
+)
+def _ppu_dsa_init_forward_metadata_replay_cuda_graph_from_precomputed(
+    original_fn, self, bs, precomputed, forward_mode
+):
+    """Skip flashmla_metadata copy on PPU."""
+    flashmla_metadata = precomputed.flashmla_metadata
+    precomputed.flashmla_metadata = None
+    original_fn(self, bs, precomputed, forward_mode)
+    precomputed.flashmla_metadata = flashmla_metadata

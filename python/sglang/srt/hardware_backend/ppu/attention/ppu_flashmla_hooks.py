@@ -405,79 +405,24 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
 
 
 # ---------------------------------------------------------------------------
-# 7. forward_decode — adapt PPU metadata format for community code
+# 7. init_forward_metadata_in_graph — reset flashmla_metadata
 # ---------------------------------------------------------------------------
 
 
 @plugin_hook(
-    "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.forward_decode",
-    type=HookType.AROUND,
+    "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.init_forward_metadata_in_graph",
+    type=HookType.REPLACE,
 )
-def _ppu_flashmla_forward_decode(original_fn, self, *args, **kwargs):
-    """Adapt PPU metadata format before calling the community forward_decode.
+def _ppu_flashmla_init_forward_metadata_in_graph(self, forward_batch):
+    """Replace init_forward_metadata_in_graph on PPU.
 
-    PPU stores a FlashMLASchedMeta-like object as ``flashmla_metadata``
-    (with ``.tile_scheduler_metadata`` / ``.num_splits`` attributes).
-    The community code expects ``flashmla_metadata`` and ``num_splits`` to
-    be plain tensors.  This hook temporarily adapts the metadata so the
-    original function works unchanged.
+    For PPU FlashMLA, `get_mla_metadata` runs only on the first
+    `flash_mla_with_kvcache` call. To capture this init logic in
+    the CUDA Graph, reset flashmla_metadata before starting capture.
+    This forces metadata generation to occur within the capture scope.
     """
     from sglang.srt.layers.attention.flashmla_backend import FlashMLADecodeMetadata
 
-    meta = self.forward_metadata
-    # Only adapt when metadata is in PPU format (FlashMLASchedMeta-like
-    # flashmla_metadata with .tile_scheduler_metadata / .num_splits).
-    sched = meta.flashmla_metadata
-    if sched is not None and hasattr(sched, "tile_scheduler_metadata"):
-        adapted = FlashMLADecodeMetadata(
-            flashmla_metadata=sched.tile_scheduler_metadata,
-            num_splits=sched.num_splits,
-            block_kv_indices=meta.block_kv_indices,
-        )
-        self.forward_metadata = adapted
-        try:
-            return original_fn(self, *args, **kwargs)
-        finally:
-            self.forward_metadata = meta
-    else:
-        return original_fn(self, *args, **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# 8. forward_extend — adapt PPU metadata format for community code
-# ---------------------------------------------------------------------------
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.forward_extend",
-    type=HookType.AROUND,
-)
-def _ppu_flashmla_forward_extend(original_fn, self, *args, **kwargs):
-    """Adapt PPU metadata format before calling the community forward_extend.
-
-    Same adaptation as ``_ppu_flashmla_forward_decode``, but with a guard
-    because ``forward_extend`` is also called for EXTEND / DRAFT_EXTEND /
-    DRAFT_EXTEND_V2 modes whose metadata is NOT in PPU format.  In those
-    cases the original function is called without adaptation.
-    """
-    from sglang.srt.layers.attention.flashmla_backend import FlashMLADecodeMetadata
-
-    meta = self.forward_metadata
-    # Only adapt when metadata is in PPU format (FlashMLASchedMeta-like
-    # flashmla_metadata with .tile_scheduler_metadata / .num_splits).
-    # For EXTEND / DRAFT_EXTEND modes the metadata is NOT in PPU format,
-    # so we skip the adaptation and call the original function directly.
-    sched = getattr(meta, "flashmla_metadata", None)
-    if sched is not None and hasattr(sched, "tile_scheduler_metadata"):
-        adapted = FlashMLADecodeMetadata(
-            flashmla_metadata=sched.tile_scheduler_metadata,
-            num_splits=sched.num_splits,
-            block_kv_indices=meta.block_kv_indices,
-        )
-        self.forward_metadata = adapted
-        try:
-            return original_fn(self, *args, **kwargs)
-        finally:
-            self.forward_metadata = meta
-    else:
-        return original_fn(self, *args, **kwargs)
+    if isinstance(self.forward_metadata, FlashMLADecodeMetadata):
+        assert self.forward_metadata.flashmla_metadata is not None
+        self.forward_metadata.flashmla_metadata.have_initialized = False
