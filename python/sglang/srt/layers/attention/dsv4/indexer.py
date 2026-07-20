@@ -19,8 +19,13 @@ from sglang.jit_kernel.dsv4 import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs_cpu,
+)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
@@ -657,6 +662,21 @@ class C4IndexerBackendMixin:
             extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
         if isinstance(seq_lens_cpu, torch.Tensor):
             seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+
+        # q_fp8 and indexer metadata are already CP-local. ForwardBatch keeps
+        # global per-request lengths, so reconstruct only the CP-local request
+        # boundaries needed by the non-paged gather plan.
+        if can_dsa_prefill_cp_round_robin_split(forward_batch):
+            extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
+                extend_lens_cpu
+            )
+            seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+            extend_seq_lens = forward_batch.extend_seq_lens.new_tensor(extend_lens_cpu)
+            seq_lens = forward_batch.seq_lens[bs_idx].contiguous()
+        else:
+            extend_seq_lens = forward_batch.extend_seq_lens
+            seq_lens = forward_batch.seq_lens
+
         if request_slice is None:
             request_slice = slice(0, len(extend_lens_cpu))
         req_start = 0 if request_slice.start is None else request_slice.start
@@ -680,7 +700,10 @@ class C4IndexerBackendMixin:
         total_kv_len = sum(final_c4_lens_cpu)
         max_c4_seq_len = max(final_c4_lens_cpu) if final_c4_lens_cpu else 0
         max_extend_len = max(local_extend_lens_cpu) if local_extend_lens_cpu else 0
-        assert sum(extend_lens_cpu) <= num_q_tokens
+        assert sum(extend_lens_cpu) <= num_q_tokens, (
+            f"CP-local extend sum {sum(extend_lens_cpu)} > "
+            f"num_q_tokens {num_q_tokens}; cp_size={get_attention_cp_size()}"
+        )
 
         if total_kv_len == 0:
             logits = torch.empty(
@@ -697,8 +720,8 @@ class C4IndexerBackendMixin:
 
         c4_seq_lens, page_indices, ks, ke, total_kv_len = (
             _build_prefill_c4_logits_metadata(
-                forward_batch.seq_lens[req_start:req_stop],
-                forward_batch.extend_seq_lens[req_start:req_stop],
+                seq_lens[req_start:req_stop],
+                extend_seq_lens[req_start:req_stop],
                 indexer_metadata.c4_seq_lens[
                     global_query_start : global_query_start + local_num_q_tokens
                 ],
@@ -777,19 +800,30 @@ class C4IndexerBackendMixin:
         if isinstance(extend_lens_cpu, torch.Tensor):
             extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
 
-        c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in seq_lens_cpu]
+        # Chunk offsets index tensors that were reindexed by the outer CP
+        # layer, so plan chunks using the matching CP-local request lengths.
+        if can_dsa_prefill_cp_round_robin_split(forward_batch):
+            chunk_extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
+                extend_lens_cpu
+            )
+            chunk_seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+        else:
+            chunk_extend_lens_cpu = extend_lens_cpu
+            chunk_seq_lens_cpu = seq_lens_cpu
+
+        c4_seq_lens_cpu = [int(seq_len) // 4 for seq_len in chunk_seq_lens_cpu]
         workspace_size = indexer_metadata.max_seq_len * 40
         max_logits_bytes = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get() * 1024 * 1024
         chunk_specs = split_indexer_prefill_chunks(
             c4_seq_lens_cpu,
-            extend_lens_cpu,
+            chunk_extend_lens_cpu,
             workspace_size,
             max_logits_bytes,
         )
 
         for req_slice, query_slice in chunk_specs:
             req_start = 0 if req_slice.start is None else req_slice.start
-            global_query_start = sum(extend_lens_cpu[:req_start])
+            global_query_start = sum(chunk_extend_lens_cpu[:req_start])
             query_start = 0 if query_slice.start is None else query_slice.start
             query_stop = query_slice.stop
             assert query_stop is not None
