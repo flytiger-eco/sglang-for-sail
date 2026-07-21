@@ -164,6 +164,7 @@ if _is_cuda:
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         topk_result: torch.Tensor,
+        q_sf: Optional[torch.Tensor] = None,
     ) -> None:
         assert (
             _is_cuda
@@ -184,11 +185,16 @@ if _is_cuda:
             act_quant=act_quant,
             out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
         )
+        q_for_topk = (
+            q_fp8[:extend_num_tokens]
+            if q_sf is None
+            else (q_fp8[:extend_num_tokens], q_sf[:extend_num_tokens])
+        )
         indexer._get_topk_ragged(
             False,
             forward_batch,
             layer_id,
-            q_fp8[:extend_num_tokens],
+            q_for_topk,
             weights,
             metadata,
             topk_result,
@@ -220,7 +226,19 @@ if _is_cuda:
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
 
-    @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
+    def _logits_head_gate_no_q_scale_pcg_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        n_heads_inv_sqrt: float,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.shape[0], weight.shape[0], 1),
+            dtype=torch.float32,
+            device=x.device,
+        )
+
+    @register_custom_op(fake_impl=_logits_head_gate_no_q_scale_pcg_impl)
     def logits_head_gate_no_q_scale_pcg(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -1630,13 +1648,16 @@ class Indexer(MultiPlatformOp):
         out_cache_loc will default to forward_batch.out_cache_loc if not provided.
         """
 
+        if out_cache_loc is None:
+            out_cache_loc = forward_batch.out_cache_loc
+
         # FP4 path: must use the fused MXFP4 store kernel — the unfused
         # quant+store fallback is FP8-only (no scalar fp32 scale exists).
         if self.use_fp4:
             assert _is_cuda and not _is_fp8_fnuz
             assert can_use_nsa_fused_store_mxfp4(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
+                out_cache_loc.dtype,
                 get_token_to_kv_pool().page_size,
             ), "MXFP4 fused store JIT failed to load"
             buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
@@ -1645,13 +1666,10 @@ class Indexer(MultiPlatformOp):
             fused_store_index_k_mxfp4_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
+                out_cache_loc,
                 get_token_to_kv_pool().page_size,
             )
             return
-
-        if out_cache_loc is None:
-            out_cache_loc = forward_batch.out_cache_loc
 
         if (
             _is_cuda
@@ -1818,31 +1836,7 @@ class Indexer(MultiPlatformOp):
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
 
-            if self.use_fp4:
-                # MXFP4 path: Q goes through downcast_to_mxfp4_indexer producing
-                # (packed_uint8, ue8m0_scale_int32). Per-block Q scales travel
-                # alongside Q values, so there is no per-token scalar `q_scale`
-                # to fold into the head-gate weights (handled below via
-                # `_get_logits_head_gate_no_q_scale`). K-side store is the
-                # fused MXFP4 kernel inside `_store_index_k_cache`.
-                # TODO: explore dual-stream MXFP4 quant fusion later (mirrors
-                # the dpsk-v4 TODO).
-                from sglang.srt.layers.attention.dsa.triton_kernel import (
-                    downcast_to_mxfp4_indexer,
-                )
-
-                q_packed, q_sf = downcast_to_mxfp4_indexer(query, -1)
-                q_fp8 = (q_packed, q_sf)
-                q_scale = None
-                k_fp8, k_scale = None, None
-                self._store_index_k_cache(
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    key=key,
-                    act_quant=act_quant,
-                )
-
-            elif self.bf16_indexer:
+            if self.bf16_indexer:
                 q_fp8, q_scale = query, 1
                 k_fp8, k_scale = key, None
             elif self.use_int8:
@@ -1862,7 +1856,24 @@ class Indexer(MultiPlatformOp):
                     )
                 current_stream.wait_stream(self.alt_stream)
             elif not is_in_piecewise_cuda_graph():
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                if self.use_fp4:
+                    # MXFP4 path: Q goes through downcast_to_mxfp4_indexer producing
+                    # (packed_uint8, ue8m0_scale_int32). Per-block Q scales travel
+                    # alongside Q values, so there is no per-token scalar `q_scale`
+                    # to fold into the head-gate weights (handled below via
+                    # `_get_logits_head_gate_no_q_scale`). K-side store is the
+                    # fused MXFP4 kernel inside `_store_index_k_cache`.
+                    # TODO: explore dual-stream MXFP4 quant fusion later (mirrors
+                    # the dpsk-v4 TODO).
+                    from sglang.srt.layers.attention.dsa.triton_kernel import (
+                        downcast_to_mxfp4_indexer,
+                    )
+
+                    q_packed, q_sf = downcast_to_mxfp4_indexer(query, -1)
+                    q_fp8 = (q_packed, q_sf)
+                else:
+                    q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
@@ -1872,7 +1883,15 @@ class Indexer(MultiPlatformOp):
             else:
                 # piecewise CUDA graph need to split graph on store_k_cache and mqa_logits,
                 # so delay store_k_cache after weights proj.
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                if self.use_fp4:
+                    from sglang.srt.layers.attention.dsa.triton_kernel import (
+                        downcast_to_mxfp4_indexer,
+                    )
+
+                    q_packed, q_sf = downcast_to_mxfp4_indexer(query, -1)
+                    q_fp8 = (q_packed, q_sf)
+                else:
+                    q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
@@ -2051,18 +2070,30 @@ class Indexer(MultiPlatformOp):
                         not enable_dual_stream
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
 
+                    if self.use_fp4:
+                        assert isinstance(q_fp8, tuple) and len(q_fp8) == 2
+                        q_packed, q_sf = q_fp8
+                        q_probe = q_packed
+                        q_for_pcg = q_packed
+                        q_sf_for_pcg = q_sf
+                    else:
+                        q_probe = q_fp8
+                        q_for_pcg = q_fp8
+                        q_sf_for_pcg = None
+
                     topk_result = torch.full(
-                        (q_fp8.shape[0], self.index_topk),
+                        (q_probe.shape[0], self.index_topk),
                         -1,
-                        device=q_fp8.device,
+                        device=q_probe.device,
                         dtype=torch.int32,
                     )
                     k_cache_and_topk_result(
                         layer_id=layer_id,
                         key=key,
-                        q_fp8=q_fp8,
+                        q_fp8=q_for_pcg,
                         weights=weights,
                         topk_result=topk_result,
+                        q_sf=q_sf_for_pcg,
                     )
                 else:
                     topk_result = self._get_topk_ragged(
