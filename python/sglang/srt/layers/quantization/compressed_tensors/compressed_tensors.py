@@ -714,7 +714,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                             "Using CompressedTensorsWNA16DeepGemmMoE "
                             "(moe_runner_backend=deep_gemm)"
                         )
-                        return CompressedTensorsWNA16DeepGemmMoE(self)
+                        return CompressedTensorsWNA16DeepGemmMoE(
+                            self, weight_quant=weight_quant
+                        )
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             else:
