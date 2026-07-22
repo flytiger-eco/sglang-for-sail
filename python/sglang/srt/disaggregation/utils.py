@@ -34,9 +34,39 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
 
-def get_dsa_seed_metadata_dim(hf_config) -> int:
-    """Return the model-defined PD seed width, independent of local spec mode."""
+def _resolve_speculative_backend_type(server_args: ServerArgs, backend_name: str):
+    backend_type = (
+        server_args.speculative_draft_attention_backend
+        if server_args.speculative_draft_attention_backend
+        else getattr(server_args, backend_name)
+    )
+    if backend_type is None:
+        backend_type = server_args.attention_backend
+    return backend_type
+
+
+def dsa_seed_backend_enabled(server_args: ServerArgs) -> bool:
+    decode_backend = _resolve_speculative_backend_type(
+        server_args, "decode_attention_backend"
+    )
+    draft_extend_backend_name = (
+        "decode_attention_backend"
+        if server_args.speculative_attention_mode == "decode"
+        else "prefill_attention_backend"
+    )
+    draft_extend_backend = _resolve_speculative_backend_type(
+        server_args, draft_extend_backend_name
+    )
+    return decode_backend in ("dsa", "nsa") and draft_extend_backend in ("dsa", "nsa")
+
+
+def get_dsa_seed_metadata_dim(
+    hf_config, server_args: Optional[ServerArgs] = None
+) -> int:
+    """Return the DSA seed width only when the active spec backend supports it."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    if server_args is not None and not dsa_seed_backend_enabled(server_args):
         return 0
     return get_dsa_index_topk(hf_config)
 
