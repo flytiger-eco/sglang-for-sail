@@ -65,8 +65,8 @@ from sglang.srt.utils import (
     is_hip,
     is_ppu,
     is_sm100_supported,
-    print_warning_once,
     print_info_once,
+    print_warning_once,
 )
 
 # Opt-in (default off): route the fp8 sparse-MLA prefill path through the Triton
@@ -634,18 +634,59 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
+    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+        return (
+            1,  # next_n
+            self.num_q_heads,  # num_heads
+            self.indexer_head_dim,  # head_dim
+            (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+        )
+
+    def _build_paged_mqa_schedule_metadata(
+        self,
+        seqlens_32_2d: torch.Tensor,
+    ) -> torch.Tensor:
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_32_2d,
+            64,
+            deep_gemm.get_num_sms(),
+            **(
+                dict(metadata_extra=self._paged_mqa_schedule_metadata_extra())
+                if _is_ppu
+                else {}
+            ),
+        )
+
     def _refresh_paged_mqa_schedule_metadata(
         self,
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-            seqlens_32_2d, 64, deep_gemm.get_num_sms()
-        )
-        if metadata.paged_mqa_schedule_metadata is None:
+        new_schedule = self._build_paged_mqa_schedule_metadata(seqlens_32_2d)
+        current_schedule = metadata.paged_mqa_schedule_metadata
+        if current_schedule is None:
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
-        else:
-            metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            return
+
+        if current_schedule.shape == new_schedule.shape:
+            current_schedule.copy_(new_schedule)
+            return
+
+        if (
+            current_schedule.dim() == new_schedule.dim()
+            and current_schedule.shape[1:] == new_schedule.shape[1:]
+            and current_schedule.shape[0] >= new_schedule.shape[0]
+        ):
+            current_schedule.zero_()
+            current_schedule[: new_schedule.shape[0]].copy_(new_schedule)
+            return
+
+        raise RuntimeError(
+            "DSA paged MQA schedule metadata buffer is too small for CUDA graph "
+            f"replay: buffer_shape={tuple(current_schedule.shape)}, "
+            f"new_shape={tuple(new_schedule.shape)}. This usually means the graph "
+            "was captured with insufficient max context length."
+        )
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -984,23 +1025,8 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            metadata_extra = (
-                1,  # next_n
-                self.num_q_heads,  # num_heads
-                self.indexer_head_dim,  # head_dim
-                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
-            )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d,
-                64,
-                deep_gemm.get_num_sms(),
-                **(
-                    dict(
-                        metadata_extra=metadata_extra,
-                    )
-                    if _is_ppu
-                    else {}
-                ),
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1337,23 +1363,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            metadata_extra = (
-                1,  # next_n
-                self.num_q_heads,  # num_heads
-                self.indexer_head_dim,  # head_dim
-                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            # CUDA graph captures the schedule tensor's shape and data pointer.
+            # Reserve schedule capacity for the largest context this graph can
+            # replay; per-replay code refreshes the valid prefix in-place.
+            paged_mqa_ctx_lens_2d = torch.full_like(
+                paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d,
-                64,
-                deep_gemm.get_num_sms(),
-                **(
-                    dict(
-                        metadata_extra=metadata_extra,
-                    )
-                    if _is_ppu
-                    else {}
-                ),
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1641,28 +1658,6 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
 
-            metadata_extra = (
-                1,  # next_n
-                self.num_q_heads,  # num_heads
-                self.indexer_head_dim,  # head_dim
-                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
-            )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d,
-                64,
-                deep_gemm.get_num_sms(),
-                **(
-                    dict(
-                        metadata_extra=metadata_extra,
-                    )
-                    if _is_ppu
-                    else {}
-                ),
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                object.__setattr__(
-                    metadata, "paged_mqa_schedule_metadata", new_schedule
-                )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
@@ -1862,30 +1857,6 @@ class DeepseekSparseAttnBackend(
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
-            metadata_extra = (
-                1,  # next_n
-                self.num_q_heads,  # num_heads
-                self.indexer_head_dim,  # head_dim
-                (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
-            )
-            new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32_2d,
-                64,
-                deep_gemm.get_num_sms(),
-                **(
-                    dict(
-                        metadata_extra=metadata_extra,
-                    )
-                    if _is_ppu
-                    else {}
-                ),
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                object.__setattr__(
-                    metadata, "paged_mqa_schedule_metadata", new_schedule
-                )
-            else:
-                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
             if metadata.paged_mqa_ctx_lens_2d is None:
                 object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
             else:

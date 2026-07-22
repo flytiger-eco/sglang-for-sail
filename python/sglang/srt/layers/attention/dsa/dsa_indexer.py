@@ -1199,23 +1199,30 @@ class Indexer(MultiPlatformOp):
                     ),
                     q_sf[:q_offset].view(B, next_n, q_sf.shape[1], q_sf.shape[2]),
                 )
-            else:
-                q_for_call = q_fp8[:q_offset].view(
-                    B, next_n, q_fp8.shape[1], q_fp8.shape[2]
+                logits = self._get_paged_mqa_logits_dispatch(
+                    q_for_call,
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables[::next_n],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
                 )
-            logits = self._get_paged_mqa_logits_dispatch(
-                q_for_call,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
-            )
+            else:
+                logits = deepgemm_paged_mqa_logits_native(
+                    self._get_paged_mqa_logits_dispatch,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
         else:
             if self.use_fp4:
                 q_packed, q_sf = q_fp8
@@ -1223,19 +1230,28 @@ class Indexer(MultiPlatformOp):
                     q_packed[:q_offset].unsqueeze(1),
                     q_sf[:q_offset].unsqueeze(1),
                 )
+                logits = self._get_paged_mqa_logits_dispatch(
+                    q_for_call,
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
             else:
-                q_for_call = q_fp8[:q_offset].unsqueeze(1)
-            logits = self._get_paged_mqa_logits_dispatch(
-                q_for_call,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-            )
+                logits = deepgemm_paged_mqa_logits_split(
+                    self._get_paged_mqa_logits_dispatch,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
