@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import dsa_seed_backend_enabled
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -52,11 +53,12 @@ def build_eagle_disagg_draft_input(
     ).to(batch.device)
 
     dsa_topk_indices = None
-    dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
-    if dsa_indices_list and all(t is not None for t in dsa_indices_list):
-        dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
-        if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
-            dsa_topk_indices = None
+    if dsa_seed_backend_enabled(server_args):
+        dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
+        if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+            dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
+            if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+                dsa_topk_indices = None
 
     spec_info = EagleDraftInput(
         topk_p=topk_p,

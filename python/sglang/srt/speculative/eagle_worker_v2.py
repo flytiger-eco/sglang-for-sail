@@ -317,11 +317,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.topk == 1
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # (last verified token), not draft-decode step 0. The backend gate is
+        # applied in init_attention_backend(), after speculative backend names
+        # are resolved from ServerArgs.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
-        self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
-        )
+        self.seed_dsa_topk_from_draft_extend = False
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
@@ -425,6 +425,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
+        )
+        dsa_index_share_backend = (
+            draft_backend_factory.resolve_decode_backend_type() in ("dsa", "nsa")
+            and draft_backend_factory.resolve_draft_extend_backend_type()
+            in ("dsa", "nsa")
+        )
+        self.index_share_for_mtp_iteration = (
+            self.index_share_for_mtp_iteration and dsa_index_share_backend
+        )
+        self.seed_dsa_topk_from_draft_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+        draft_backend_factory.seed_dsa_topk_from_draft_extend = (
+            self.seed_dsa_topk_from_draft_extend
         )
 
         # Initialize decode attention backend

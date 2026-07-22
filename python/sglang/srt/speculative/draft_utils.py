@@ -22,9 +22,7 @@ class DraftBackendFactory:
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
         self.draft_attn_backend = server_args.speculative_draft_attention_backend
 
-    def _create_backend(
-        self, backend_name: str, backend_map: dict, error_template: str
-    ):
+    def _resolve_backend_type(self, backend_name: str):
         backend_type = (
             self.draft_attn_backend
             if self.draft_attn_backend
@@ -32,6 +30,23 @@ class DraftBackendFactory:
         )
         if backend_type is None:
             backend_type = self.server_args.attention_backend
+        return backend_type
+
+    def resolve_decode_backend_type(self):
+        return self._resolve_backend_type("decode_attention_backend")
+
+    def resolve_draft_extend_backend_type(self):
+        backend_name = (
+            "decode_attention_backend"
+            if self.server_args.speculative_attention_mode == "decode"
+            else "prefill_attention_backend"
+        )
+        return self._resolve_backend_type(backend_name)
+
+    def _create_backend(
+        self, backend_name: str, backend_map: dict, error_template: str
+    ):
+        backend_type = self._resolve_backend_type(backend_name)
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))

@@ -1156,7 +1156,7 @@ class Scheduler(
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
-            self.model_config.hf_config
+            self.model_config.hf_config, self.server_args
         )
 
         if (
