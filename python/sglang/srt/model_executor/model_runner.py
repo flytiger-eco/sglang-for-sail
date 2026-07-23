@@ -52,6 +52,14 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
+from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    EPLBAsyncHostMirrorManager,
+    set_global_eplb_async_host_mirror_manager,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -62,13 +70,25 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     append_trivial_expert_slots,
+    ModelConfigForExpertLocation,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    set_global_expert_location_updater,
+)
+from sglang.srt.eplb.lplb_solver import (
+    LPLBSolver,
+    assert_lplb_supported_model,
+    clear_global_lplb_solvers,
+    set_global_lplb_solver,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -609,15 +629,61 @@ class ModelRunner:
                 port=self.dist_port,
             )
 
+    def _warmup_eplb_cpp_extensions(self):
+        if not self.server_args.enable_eplb or self.is_draft_worker:
+            return
+
+        model_config_for_expert_location = (
+            ModelConfigForExpertLocation.from_model_config(self.model_config)
+        )
+        if model_config_for_expert_location is None:
+            return
+
+        logger.info("Warming up EPLB C++ extensions.")
+        warmup_eplb_expert_location_cpp()
+
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=self.server_args.eplb_algorithm,
+            num_groups=model_config_for_expert_location.num_groups,
+            num_nodes=self.server_args.nnodes,
+        )
+        if algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]:
+            warmup_eplb_deepseek_cpp()
+
+        if self.server_args.enable_eplb_async:
+            warmup_eplb_async_runtime_cpp()
+
     def initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
-        self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
+
+        self.eplb_async_host_mirror_manager = (
+            EPLBAsyncHostMirrorManager(self.server_args, self.model_config)
+            if self.server_args.enable_eplb_async and (not self.is_draft_worker)
+            else None
+        )
+        if not self.is_draft_worker:
+            set_global_eplb_async_host_mirror_manager(
+                self.eplb_async_host_mirror_manager
+            )
+        self.expert_location_updater = ExpertLocationUpdater(
+            enable_async=self.server_args.enable_eplb_async
+            and not self.is_draft_worker,
+        )
+
+        if not self.is_draft_worker:
+            set_global_expert_location_updater(self.expert_location_updater)
+
+        self._warmup_eplb_cpp_extensions()
+        # Load the model
         self.sampler = create_sampler()
         self.load_model()
         prepare_moe_topk(
@@ -730,6 +796,10 @@ class ModelRunner:
                 and self.server_args.elastic_ep_backend is not None
             )
             else None
+        )
+        # Register MoE layers for EPLB async runtime (creates GPU-CPU sync signals)
+        self.expert_location_updater.prepare_async_layers(
+            getattr(self.model, "routed_experts_weights_of_layer", None)
         )
 
     def maybe_apply_post_load_model_transforms(self):
@@ -898,6 +968,18 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+
+    def build_eplb_async_host_mirror(self):
+        if self.eplb_async_host_mirror_manager is None:
+            return
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
+        self.eplb_async_host_mirror_manager.build_from_loaded_model(
+            routed_experts_weights_of_layer
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1068,6 +1150,604 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             is_ep_scale_joiner=self.server_args.is_ep_scale_joiner,
         )
+
+    def _prepare_moe_topk(self):
+        balancer_cls = None
+        num_prepared = 0
+        num_routed_experts = None
+        for module in self.model.modules():
+            if not isinstance(module, (TopK, HashTopK)):
+                continue
+            if (
+                not module.enable_deepep_waterfill
+                or module.deepep_waterfill_balancer is not None
+            ):
+                continue
+            if num_routed_experts is None:
+                num_routed_experts = getattr(
+                    self.model_config.hf_config, "n_routed_experts", None
+                )
+                if num_routed_experts is None:
+                    raise ValueError(
+                        "DeepEP waterfill requires model config n_routed_experts."
+                    )
+            if balancer_cls is None:
+                from sglang.srt.layers.moe.deepep_waterfill import (
+                    DeepEPWaterfillBalancer,
+                )
+
+                balancer_cls = DeepEPWaterfillBalancer
+            # Static EPLB remaps TopK ids to physical expert ids before Waterfill.
+            # Redundant experts therefore need to be included in the per-rank
+            # expert count used for Waterfill's shared-expert slot remapping.
+            num_physical_routed_experts = (
+                num_routed_experts + self.server_args.ep_num_redundant_experts
+            )
+            if isinstance(module, TopK):
+                routed_scaling_factor = module.topk_config.routed_scaling_factor
+            else:
+                routed_scaling_factor = module.routed_scaling_factor
+            module.deepep_waterfill_balancer = balancer_cls(
+                num_routed_experts=num_physical_routed_experts,
+                world_size=self.moe_ep_size,
+                rank=self.moe_ep_rank,
+                layer_id=module.layer_id,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor is not None else 1.0
+                ),
+            )
+            num_prepared += 1
+        if num_prepared:
+            log_info_on_rank0(
+                logger, f"Prepared {num_prepared} DeepEP waterfill TopK modules."
+            )
+
+    def _init_lplb_solvers(self):
+        """Initialize per-layer LPLB solvers from current expert location metadata."""
+        from sglang.srt.distributed import get_moe_ep_group
+
+        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+        # don't participate in the EP all-reduce (would deadlock under DP-
+        # attention). Failure here happens before any forward pass.
+        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        if architectures:
+            assert_lplb_supported_model(architectures[0])
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+        clear_global_lplb_solvers()
+        ep_group = get_moe_ep_group()
+        for lid in range(metadata.num_layers):
+            solver = LPLBSolver(
+                phy2log=metadata.physical_to_logical_map[lid],
+                log2phy=metadata.logical_to_all_physical_map[lid],
+                num_gpus=metadata.ep_size,
+                ep_group=ep_group,
+                logical_to_all_physical_map_num_valid=(
+                    metadata.logical_to_all_physical_map_num_valid[lid]
+                ),
+            )
+            set_global_lplb_solver(lid, solver)
+        logger.info(f"Initialized LPLB solvers for {metadata.num_layers} layers")
+
+    def update_expert_location(
+        self,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
+    ):
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
+        p2p_missing_logical_experts = self.expert_location_updater.update(
+            routed_experts_weights_of_layer,
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=self.server_args.nnodes,
+            rank=self.tp_rank,
+        )
+
+        if (
+            p2p_missing_logical_experts is not None
+            and len(p2p_missing_logical_experts) > 0
+        ):
+            # Load the missing expert weights from disk
+            if callable(getattr(self.model, "generate_weight_name_filter", None)):
+                # Filter and load only missing expert weights
+                weight_name_filter = self.model.generate_weight_name_filter(
+                    p2p_missing_logical_experts
+                )
+            else:
+                # Do a full reload from disk/DRAM
+                logger.info(
+                    "[Elastic EP] Model does not implement generate_weight_name_filter. "
+                    "Performing full weight reload."
+                )
+                weight_name_filter = None
+
+            if (
+                self.expert_backup_client is not None
+                and self.expert_backup_client.use_backup
+            ):
+                # Load the missing weights from the DRAM backup
+                self.expert_backup_client.update_weights(weight_name_filter)
+            else:
+                # Load the missing weights from disk
+                self.update_weights_from_disk(
+                    get_global_server_args().model_path,
+                    get_global_server_args().load_format,
+                    weight_name_filter=weight_name_filter,
+                )
+
+        # Re-init LPLB solvers after expert location update
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            self._init_lplb_solvers()
+
+    def maybe_recover_ep_ranks(self):
+        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+        # synchronization, and this function is on the forward-path.
+        # This check only runs when `--elastic-ep-backend` is enabled, so the
+        # synchronization overhead does not propagate to other configs.
+        # Leave for future optimization of the elastic EP path.
+        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+            return
+
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+        # tp-group index is the same as the global rank index.
+        ranks_to_recover = [
+            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        ]
+
+        # try_recover_ranks polls peer state via Mooncake EP backend.
+        # Mooncake's internal semantics guarantee that all ranks observe
+        # consistent peer readiness state, so collective operations below
+        # are safe even though polling appears local.
+        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+            self.forward_pass_id = 0
+            self.eplb_manager.reset_generator()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=False
+                )
+            )
+            ElasticEPStateManager.instance().reset()
+
+            broadcast_pyobj(
+                [self.server_args.random_seed],
+                get_world_group().rank,
+                get_world_group().cpu_group,
+                src=get_world_group().ranks[0],
+            )
+            logger.info(f"recover ranks {ranks_to_recover} done")
+
+    def _get_healthy_expert_location_src_rank(
+        self, invoked_in_elastic_ep_rejoin_path: bool
+    ) -> int:
+        world_group = get_world_group()
+        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+        # A rank that was started as a rejoin rank may later act as a healthy
+        # rank in a subsequent recovery cycle.
+        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+            if not is_rejoin_rank:
+                return world_group.ranks[rank_in_group]
+
+        raise RuntimeError(
+            "No healthy rank found for broadcasting expert location metadata. "
+            "All ranks are marked as elastic_ep_rejoin."
+        )
+
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        load_format: str,
+        weight_name_filter: Optional[Callable[[str], bool]] = None,
+        recapture_cuda_graph: bool = False,
+    ) -> tuple[bool, str]:
+        """Update engine weights in-place from the disk."""
+        if self.server_args.enable_eplb_async:
+            raise RuntimeError(
+                "update_weights_from_disk is incompatible with --enable-eplb-async."
+            )
+        logger.info(
+            f"Update engine weights online from disk begin. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
+        )
+
+        target_device = torch.device(self.device)
+        self.model_config.model_path = model_path
+        load_config = LoadConfig(load_format=load_format)
+
+        # Only support DefaultModelLoader for now
+        loader = get_model_loader(load_config, self.model_config)
+        if not isinstance(loader, DefaultModelLoader):
+            message = f"Failed to get model loader: {loader}."
+            return False, message
+
+        def get_weight_iter(config):
+            iter = loader._get_weights_iterator(
+                DefaultModelLoader.Source.init_new(config, self.model)
+            )
+            if weight_name_filter is not None:
+                iter = (
+                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                )
+
+            return iter
+
+        def model_load_weights(model, iter):
+            loader.load_weights_and_postprocess(model, iter, target_device)
+            return model
+
+        with set_default_torch_dtype(self.model_config.dtype):
+            try:
+                iter = get_weight_iter(self.model_config)
+            except Exception as e:
+                message = f"Failed to get weights iterator: {e}."
+                return False, message
+            try:
+                model = model_load_weights(self.model, iter)
+            except Exception as e:
+                message = (
+                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                )
+                del iter
+                gc.collect()
+                iter = get_weight_iter(self.model_config)
+                self.model = model_load_weights(self.model, iter)
+                return False, message
+
+        self.model = model
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.load_config = load_config
+
+        if recapture_cuda_graph and (
+            self.device == "cuda"
+            or self.device == "musa"
+            or (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            )
+        ):
+            self.init_decode_cuda_graph()
+
+        logger.info("Update weights end.")
+        return True, "Succeeded to update model weights."
+
+    def init_weights_send_group_for_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_rank,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        logger.info(
+            f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "
+            f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        current_platform.empty_cache()
+        success = False
+        message = ""
+        try:
+            na = NetworkAddress(master_address, group_port)
+            self._weights_send_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=na.to_tcp(),
+                world_size=world_size,
+                rank=group_rank,
+                group_name=group_name,
+                device_id=torch.device("cuda", self.gpu_id),
+            )
+            dist.barrier(group=self._weights_send_group[group_name])
+            success = True
+            message = f"Succeeded to init group through {na.to_host_port_str()} group."
+        except Exception as e:
+            message = f"Failed to init group: {e}."
+            logger.error(message)
+
+        current_platform.empty_cache()
+        return success, message
+
+    def send_weights_to_remote_instance(
+        self,
+        master_address,
+        ports,
+        group_name,
+    ):
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert (
+            len(ports_list) == self.tp_size
+        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        group_port = ports_list[self.tp_rank]
+        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        if self._weights_send_group[group_name] is not None:
+            send_group = self._weights_send_group[group_name]
+        else:
+            message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
+            logger.error(message)
+            return False, message
+
+        current_platform.empty_cache()
+        success = False
+        na = NetworkAddress(master_address, group_port)
+        message = ""
+        try:
+            for _, weights in self.model.named_parameters():
+                torch.distributed.broadcast(
+                    weights,
+                    src=0,
+                    group=send_group,
+                )
+            success = True
+            message = f"Succeeded to send weights through {na.to_host_port_str()} {group_name}."
+        except Exception as e:
+            message = f"Failed to send weights: {e}."
+            logger.error(message)
+
+        # destroy the process group after sending weights
+        del self._weights_send_group[group_name]
+        torch.distributed.distributed_c10d.destroy_process_group(send_group)
+        current_platform.empty_cache()
+        return success, message
+
+    def init_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Initialize the Torch process group for model parameter updates.
+
+        `_model_update_group` is used in the RLHF workflow, where rank
+        0 is the actor model in the training engine, and the other ranks are
+        the inference engine, which is used for rollout.
+
+        In the RLHF workflow, the training engine updates the model
+        weights/parameters online, and broadcasts them to the inference
+        engine through the `_model_update_group` process group.
+        """
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        rank = rank_offset + self.tp_rank
+
+        logger.info(
+            f"init custom process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            na = NetworkAddress(master_address, master_port)
+            self._model_update_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=na.to_tcp(),
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            return True, "Succeeded to initialize custom process group."
+        except Exception as e:
+            message = f"Failed to initialize custom process group: {e}."
+            logger.error(message)
+            return False, message
+
+    def destroy_weights_update_group(self, group_name):
+        try:
+            if group_name in self._model_update_group:
+                pg = self._model_update_group.pop(group_name)
+                torch.distributed.destroy_process_group(pg)
+                return True, "Succeeded to destroy custom process group."
+            else:
+                return False, "The group to be destroyed does not exist."
+        except Exception as e:
+            message = f"Failed to destroy custom process group: {e}."
+            logger.error(message)
+            return False, message
+
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """
+        Update specific parameter in the model weights online
+        through `_model_update_group` process group.
+
+        Args:
+            name: the name of the parameter to be updated.
+            dtype: the data type of the parameter to be updated.
+            shape: the shape of the parameter to be updated.
+        """
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        if load_format == "flattened_bucket":
+            return self._update_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
+        try:
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, "Succeeded to update parameter online."
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _update_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.model.load_weights(reconstructed_tensors)
+            return True, f"Succeeded to update parameter online."
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def update_weights_from_tensor(
+        self,
+        named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
+        load_format: Optional[str] = None,
+    ):
+        monkey_patch_torch_reductions()
+        if load_format == "flattened_bucket":
+            # Handle flattened bucket format
+            return self._update_weights_from_flattened_bucket(
+                flattened_tensor_bucket_dict=named_tensors
+            )
+
+        # We need to get device after patch otherwise the device would be wrong
+        device_module = torch.get_device_module(self.device)
+        infered_device = device_module.current_device()
+
+        named_tensors = [
+            (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
+            for name, tensor in named_tensors
+        ]
+        if load_format == "direct":
+            _model_load_weights_direct(self.model, named_tensors)
+        elif load_format in self.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.model, named_tensors)
+        elif load_format is None:
+            self.model.load_weights(named_tensors)
+        else:
+            raise NotImplementedError(f"Unknown load_format={load_format}")
+        return True, "Success"
+
+    def _update_weights_from_flattened_bucket(
+        self,
+        flattened_tensor_bucket_dict,
+    ):
+        """Handle flattened bucket format for weight updates"""
+        flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
+        metadata = flattened_tensor_bucket_dict["metadata"]
+
+        # Convert metadata dict to our format
+        converted_metadata = []
+        for meta in metadata:
+            converted_meta = FlattenedTensorMetadata(
+                name=meta.name,
+                shape=meta.shape,
+                dtype=meta.dtype,
+                start_idx=meta.start_idx,
+                end_idx=meta.end_idx,
+                numel=meta.numel,
+            )
+            converted_metadata.append(converted_meta)
+
+        # Create bucket and reconstruct tensors
+        bucket = FlattenedTensorBucket(
+            flattened_tensor=flattened_tensor, metadata=converted_metadata
+        )
+        reconstructed_tensors = bucket.reconstruct_tensors()
+
+        # Load the reconstructed tensors using the standard method
+        self.model.load_weights(reconstructed_tensors)
+
+        return True, "Success"
+
+    def get_weights_by_name(
+        self, name: str, truncate_size: int = 100
+    ) -> Optional[torch.Tensor]:
+        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
+
+        Only used for unit test with an unoptimized performance.
+        For optimized performance, please use torch.save and torch.load.
+        """
+        # TODO: (chenyang) Add support for Qwen models.
+        try:
+            return self.model.get_weights_by_name(
+                name, truncate_size, tp_size=self.tp_size
+            )
+        except Exception as e:
+            logger.error(f"Error when getting parameter {name}: {e}")
+            return None
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -1296,6 +1976,8 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        # Transfer iteration info to eplb_async_runtime
+        self.on_forward_pass_start()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1379,8 +2061,7 @@ class ModelRunner:
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
-        if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end()
+        self.on_forward_pass_end()
 
         if dumper.may_enable:
             dumper.step()
@@ -1441,6 +2122,21 @@ class ModelRunner:
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
+
+    # Transfer iteration info to eplb_async_runtime
+    def on_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
+
+    def on_forward_pass_end(self):
+        if self.eplb_manager is not None:
+            # Trigger EPLB rebalance logic at the end of forward pass
+            self.eplb_manager.on_forward_pass_end()
+
+    # Give layer owner to GPU
+    def on_eplb_async_capture_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_start()
 
     def _forward_raw(
         self,
