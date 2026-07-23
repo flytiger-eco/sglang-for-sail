@@ -87,6 +87,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1194,9 +1195,10 @@ class MQALayer(nn.Module):
                     output,
                     recipe=wo_a_recipe,
                 )
-            elif isinstance(
-                self.wo_a.quant_method, CompressedTensorsLinearMethod
-            ) and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8):
+            elif isinstance(self.wo_a.quant_method, W8A8Fp8LinearMethod) or (
+                isinstance(self.wo_a.quant_method, CompressedTensorsLinearMethod)
+                and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8)
+            ):
                 wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
                     self._get_wo_a_channel_einsum_args(G, R, D)
                 )
@@ -1210,6 +1212,16 @@ class MQALayer(nn.Module):
                     (wo_a_weight_3d, wo_a_scale),
                     output,
                     recipe=wo_a_recipe,
+                )
+            else:
+                quant_name = type(self.wo_a.quant_method).__name__
+                scheme_obj = getattr(self.wo_a, "scheme", None)
+                scheme_name = (
+                    type(scheme_obj).__name__ if scheme_obj is not None else "None"
+                )
+
+                raise NotImplementedError(
+                    f"Unsupported wo_a quant_method on PPU: quant_method={quant_name}, scheme={scheme_name}"
                 )
             o = output
         else:
