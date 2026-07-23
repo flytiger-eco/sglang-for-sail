@@ -1272,6 +1272,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":

@@ -1825,6 +1825,7 @@ class ServerArgs:
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
+    enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[
         int,
@@ -5233,6 +5234,19 @@ class ServerArgs:
         return self.chunked_prefill_size
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_eplb_async:
+            assert self.enable_eplb, (
+                "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+                "passed together."
+            )
+            assert self.device == "cuda", "EPLB async is only supported on CUDA."
+            os.environ["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] = "1"
+            # avoid warmup request timeout
+            os.environ["SGLANG_WARMUP_TIMEOUT"] = "3600"
+
+            if envs.SGLANG_PROFILE_NVTX.get():
+                os.environ["SGLANG_EPLB_RUNTIME_NVTX"] = "1"
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
@@ -5248,6 +5262,11 @@ class ServerArgs:
             assert self._resolved().ep_size > 1
 
     def _handle_elastic_ep(self):
+        if self.enable_eplb_async:
+            assert (
+                self.elastic_ep_backend is None
+            ), "EPLB async is incompatible with elastic EP."
+
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":

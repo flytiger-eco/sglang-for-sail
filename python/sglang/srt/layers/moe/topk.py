@@ -98,6 +98,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
@@ -390,6 +391,7 @@ class TopK(MultiPlatformOp):
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
         allow_routed_experts_capture: bool = True,
+        is_nextn: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -400,6 +402,8 @@ class TopK(MultiPlatformOp):
 
         self.layer_id = layer_id
         from sglang.srt.server_args import get_global_server_args
+
+        self.is_nextn = is_nextn
 
         self.enable_deepep_waterfill = (
             num_fused_shared_experts > 0
@@ -472,6 +476,11 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
+
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -515,6 +524,8 @@ class TopK(MultiPlatformOp):
             )
         else:
             self.topk_config.torch_native = False
+            if updater is not None:
+                updater.wait_gpu_stage()
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
