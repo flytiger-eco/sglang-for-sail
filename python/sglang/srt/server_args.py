@@ -1875,7 +1875,7 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
-                        
+
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         # assume that non-810e machine has 8 cards
@@ -4334,15 +4334,20 @@ class ServerArgs:
                     "All operations will run eagerly through the graph capture/replay path."
                 )
         # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
-        if envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            if is_ppu() and get_device_sm() < 89:
-                if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
-                    logger.warning(
-                        "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
-                        "detected sm%d.",
-                        get_device_sm(),
-                    )
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+        # ppu always support einsum
+        if (
+            not is_ppu()
+            and is_cuda()
+            and envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+            and get_device_sm() < 100
+        ):
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM: requires sm100+ (Blackwell), "
+                    "detected sm%d.",
+                    get_device_sm(),
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
