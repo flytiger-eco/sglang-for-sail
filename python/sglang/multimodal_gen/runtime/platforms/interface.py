@@ -184,7 +184,12 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
+        return self._enum in (
+            PlatformEnum.CUDA,
+            PlatformEnum.ROCM,
+            PlatformEnum.MUSA,
+            PlatformEnum.PPU,
+        )
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:

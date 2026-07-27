@@ -16,6 +16,8 @@ import torch
 from sglang.jit_kernel.utils.arch import get_default_target_flags, get_jit_cuda_arch
 from sglang.jit_kernel.utils.common import cache_once, is_hip_runtime
 from sglang.jit_kernel.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.srt.platforms import current_platform
+from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -291,6 +293,36 @@ def load_jit(
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
+
+
+
+@dataclass
+class ArchInfo:
+    major: int
+    minor: int
+    suffix: str
+
+    @property
+    def target_name(self) -> str:
+        return f"{self.major}.{self.minor}{self.suffix}"
+
+    @property
+    def jit_flag(self) -> str:
+        return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
+
+
+@cache_once
+def _init_jit_cuda_arch_once():
+    global _CUDA_ARCH
+    try:
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+        suffix = current_platform.get_jit_cuda_arch_suffix()
+    except Exception:
+        logger.warning("Cannot detect CUDA architecture.")
+        major, minor = 0, 0  # invalid value to trigger compile error if used
+        suffix = ""
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
 @contextmanager

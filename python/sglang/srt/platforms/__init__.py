@@ -21,6 +21,7 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.ppu import PPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -39,6 +40,12 @@ def _is_rocm_available() -> bool:
 
 def _is_cpu_available() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
+
+
+def _is_ppu_available() -> bool:
+    import os
+
+    return bool(torch.cuda.is_available() and "PPU_SDK" in os.environ)
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -116,6 +123,9 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if _is_ppu_available():
+            logger.debug("No platform plugin detected. Using PPU SRTPlatform defaults.")
+            return PPUSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
