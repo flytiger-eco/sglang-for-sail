@@ -240,11 +240,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
-                self.draft_runner.model_config.hf_config, "eagle_config", {}
+                self.draft_runner.model_config.hf_config, "eagle_config", None
             )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
-            )
+            # No eagle_config means a built-in MTP/NEXTN head running in
+            # EAGLE3 mode: it consumes the plain last hidden state. Keep this
+            # in sync with get_draft_hidden_dim (also non-aux by default) and
+            # the target-side capture, which stays off without an explicit
+            # --speculative-draft-model-path.
+            if eagle_config is not None:
+                self.eagle_use_aux_hidden_state = eagle_config.get(
+                    "use_aux_hidden_state", True
+                )
         # Reuse the first draft step's NSA/DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
         self.index_share_for_mtp_iteration = (

@@ -115,6 +115,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.logits_processor = LogitsProcessor(config)
 
+        # EAGLE3-mode compatibility: this built-in MTP head shares both the
+        # embedding and lm_head with the target model, so init_lm_head takes
+        # the set_embed_and_head path (same as the EAGLE branch), and there
+        # is no EAGLE3 hot-token (d2t) vocab map.
+        self.load_lm_head_from_target = True
+        self.hot_token_id = None
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         text_config = getattr(config, "text_config", config)
