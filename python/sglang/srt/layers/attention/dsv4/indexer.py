@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
@@ -49,7 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang.srt.layers.attention.dsa.triton_kernel import (
+from sglang.kernels.ops.attention.dsa.triton_kernel import (
     _supports_fp8,
 )
 

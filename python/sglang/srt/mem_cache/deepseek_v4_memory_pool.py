@@ -344,7 +344,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 "FP4 indexer cache requires the (seq_len_sum, max_seq_len) "
                 "gather form"
             )
-            from sglang.srt.layers.attention.dsa.index_buf_accessor import (
+            from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
                 _get_k_and_s_triton,
             )
 

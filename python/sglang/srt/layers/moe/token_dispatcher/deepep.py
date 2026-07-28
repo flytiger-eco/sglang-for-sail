@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 try:
     if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:

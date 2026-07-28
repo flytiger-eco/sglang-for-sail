@@ -37,7 +37,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +85,11 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.cuda.Stream) -> bool:
-    # On ROCm/HIP, cuda-python is unavailable, so use the portable torch API
+    # On ROCm/HIP and PPU, cuda-python is unavailable, so use the portable torch API
     # (which maps to the HIP runtime). On NVIDIA, keep querying the CUDA runtime
     # directly via cuda-python: torch.cuda.is_current_stream_capturing() has
     # proven unreliable there, so we preserve the original behavior.
-    if is_hip():
+    if is_hip() or is_ppu():
         with torch.cuda.stream(stream):
             return torch.cuda.is_current_stream_capturing()
     return (

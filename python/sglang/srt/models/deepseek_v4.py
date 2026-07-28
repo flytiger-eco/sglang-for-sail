@@ -90,11 +90,11 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsW8A8Fp8,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
-from sglang.srt.layers.quantization.fp8_kernel import (
+from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper

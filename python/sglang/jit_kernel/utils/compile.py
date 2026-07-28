@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
 
 import torch

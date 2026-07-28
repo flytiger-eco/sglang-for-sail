@@ -540,7 +540,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+        from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -616,7 +616,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+        from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -1126,10 +1126,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import (
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_8bit,
         )
 
@@ -1280,10 +1280,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import (
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_8bit,
         )
 

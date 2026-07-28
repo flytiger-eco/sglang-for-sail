@@ -855,7 +855,7 @@ class ModelRunnerKVCacheMixin:
             # FP4 indexer cache (DS v3.2 / GLM v5.1): only on the plain NSA pool;
             # HiSparse layouts aren't covered by the FP4 path yet.
             if not self.enable_hisparse:
-                from sglang.srt.layers.attention.dsa.triton_kernel import (
+                from sglang.kernels.ops.attention.dsa.triton_kernel import (
                     is_fp4_indexer_cache_enabled,
                 )
 

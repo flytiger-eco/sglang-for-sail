@@ -131,7 +131,7 @@ def _ppu_flashmla_init_forward_metadata(self, forward_batch):
         PAGE_SIZE,
         FlashMLADecodeMetadata,
     )
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.kvcache.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )
@@ -309,7 +309,7 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
         PAGE_SIZE,
         FlashMLADecodeMetadata,
     )
-    from sglang.srt.layers.attention.utils import (
+    from sglang.kernels.ops.kvcache.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )

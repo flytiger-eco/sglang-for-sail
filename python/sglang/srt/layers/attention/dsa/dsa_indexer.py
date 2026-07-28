@@ -28,7 +28,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -551,7 +551,7 @@ class Indexer(MultiPlatformOp):
         # the FP4 flag below opt-in upgrades K-cache layout + Q-side quant to
         # the FP4 flag below opt-in upgrades K-cache layout + Q-side quant to
         # DeepGEMM's fp8_fp4_{paged_,}mqa_logits.
-        from sglang.srt.layers.attention.dsa.triton_kernel import (
+        from sglang.kernels.ops.attention.dsa.triton_kernel import (
             MXFP_BLOCK_SIZE,
             is_fp4_indexer_cache_enabled,
         )
@@ -2334,7 +2334,7 @@ class Indexer(MultiPlatformOp):
                 # fused MXFP4 kernel inside `_store_index_k_cache`.
                 # TODO: explore dual-stream MXFP4 quant fusion later (mirrors
                 # the dpsk-v4 TODO).
-                from sglang.srt.layers.attention.dsa.triton_kernel import (
+                from sglang.kernels.ops.attention.dsa.triton_kernel import (
                     downcast_to_mxfp4_indexer,
                 )
 

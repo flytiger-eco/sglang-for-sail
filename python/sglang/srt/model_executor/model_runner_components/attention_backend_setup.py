@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.utils import init_cublas
+from sglang.srt.utils import init_cublas, is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -70,7 +70,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     server_args = model_runner.server_args
 
     # TODO: Refactor device-specific init branches into platform interface (separate PR).
-    if model_runner.device in ("cuda", "musa"):
+    if model_runner.device in ("cuda", "musa") and not is_ppu():
         init_cublas()
 
     resolved = _resolve_attention_backend_strs(

@@ -8,7 +8,7 @@ from sgl_kernel import silu_and_mul
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.moe.ep_moe.kernels import ep_gather, ep_scatter_sail
+from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
@@ -17,12 +17,12 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmMoeQuantInfo,
     _apply_swiglu_limit,
 )
-from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import get_device_sm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if get_device_sm() >= 89:
-    from sglang.srt.layers.quantization.fp8_kernel import (
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8,
         sglang_per_token_quant_fp8,
     )

@@ -14,6 +14,7 @@ from sglang.jit_kernel.utils.common import (
     is_hip_runtime,
     is_musa_runtime,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_cuda_version
 
 logger = logging.getLogger(__name__)
@@ -60,13 +61,11 @@ def _init_jit_cuda_arch_once():
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
-    # JIT builds target the exact local GPU, so the arch-specific target is
-    # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
     suffix = (
         ""
         if (is_hip_runtime() or is_musa_runtime())
-        else _cuda_arch_suffix(major, minor)
+        else current_platform.get_jit_cuda_arch_suffix() or _cuda_arch_suffix(major, minor)
     )
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 

@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_graph_dsa_split_op_surface,
 )
-from sglang.srt.layers.attention.utils import concat_mla_absorb_q_general
+from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (

@@ -4423,7 +4423,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             # FP4 layout: per-token K bytes = head_dim/2; scale bytes = head_dim/32.
             # The triton accessor is byte-stride agnostic; pass packed K width as
             # the "head_dim" to gather K bytes, and gather scales separately.
-            from sglang.srt.layers.attention.dsa.index_buf_accessor import (
+            from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
                 _get_k_and_s_triton,
             )
 

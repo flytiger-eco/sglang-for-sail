@@ -27,7 +27,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
