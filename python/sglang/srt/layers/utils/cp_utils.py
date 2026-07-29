@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,20 @@ from sglang.srt.runtime_context import (
     get_parallel,
     uses_mla_backend,
 )
+
+
+@dataclass
+class CPLocalIndexerMetadata:
+    extend_lens_cpu: List[int]
+    seq_lens_cpu: List[int]
+    # CPU indices are retained for CPU-only sparse-prefill planning, avoiding
+    # a device-to-host sync when the cached metadata is reused.
+    bs_idx_cpu: List[int]
+    extend_seq_lens: torch.Tensor
+    seq_lens: torch.Tensor
+    # Indices of the requests that have local query tokens on this CP rank;
+    # used to select CP-local views of per-request tensors (e.g. req_pool_indices).
+    bs_idx: torch.Tensor
 
 
 @dataclass
@@ -60,6 +74,10 @@ class ContextParallelMetadata:
     # Aggregate sum of extend_seq_lens across the batch.
     total_seq_lens: int = 0
     bs: int = 1
+
+    # CP-local request metadata for the non-paged indexer. It is produced once
+    # during attention metadata initialization and reused by every model layer.
+    cp_local_indexer_metadata: Optional[CPLocalIndexerMetadata] = None
 
 
 def is_prefill_context_parallel_enabled():
@@ -526,13 +544,16 @@ def prepare_context_parallel_metadata(
     seqs_len,
     extend_seqs_len=None,
     device="cuda",
+    cp_local_indexer_metadata: Optional[CPLocalIndexerMetadata] = None,
 ):
     from sglang.srt.layers.attention.dsa.utils import (
         is_dsa_prefill_cp_round_robin_split,
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        return ContextParallelMetadata()
+        return ContextParallelMetadata(
+            cp_local_indexer_metadata=cp_local_indexer_metadata
+        )
 
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4, single sequence):

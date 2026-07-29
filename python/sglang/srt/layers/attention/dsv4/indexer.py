@@ -34,7 +34,6 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     can_dsa_prefill_cp_round_robin_split,
-    dsa_cp_round_robin_split_q_seqs_cpu,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -864,24 +863,24 @@ class C4IndexerBackendMixin:
         c4_page_size = indexer_metadata.c4_page_size
         assert c4_page_size == 64
 
-        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if isinstance(extend_lens_cpu, torch.Tensor):
-            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
-        if isinstance(seq_lens_cpu, torch.Tensor):
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
-
         # q_fp8 and indexer metadata are already CP-local. ForwardBatch keeps
-        # global per-request lengths, so reconstruct only the CP-local request
-        # boundaries needed by the non-paged gather plan.
+        # global per-request lengths. Reuse the CP-local request metadata built
+        # once by the attention backend instead of splitting again per layer.
         if can_dsa_prefill_cp_round_robin_split(forward_batch):
-            extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
-                extend_lens_cpu
-            )
-            seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
-            extend_seq_lens = forward_batch.extend_seq_lens.new_tensor(extend_lens_cpu)
-            seq_lens = forward_batch.seq_lens[bs_idx].contiguous()
+            cp_meta = forward_batch.attn_cp_metadata
+            assert cp_meta is not None and cp_meta.cp_local_indexer_metadata is not None
+            cp_local_metadata = cp_meta.cp_local_indexer_metadata
+            extend_lens_cpu = cp_local_metadata.extend_lens_cpu
+            seq_lens_cpu = cp_local_metadata.seq_lens_cpu
+            extend_seq_lens = cp_local_metadata.extend_seq_lens
+            seq_lens = cp_local_metadata.seq_lens
         else:
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if isinstance(extend_lens_cpu, torch.Tensor):
+                extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
             extend_seq_lens = forward_batch.extend_seq_lens
             seq_lens = forward_batch.seq_lens
 
@@ -1001,21 +1000,20 @@ class C4IndexerBackendMixin:
         assert forward_batch.seq_lens_cpu is not None
         assert forward_batch.extend_seq_lens_cpu is not None
 
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-        if isinstance(seq_lens_cpu, torch.Tensor):
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
-        if isinstance(extend_lens_cpu, torch.Tensor):
-            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
-
         # Chunk offsets index tensors that were reindexed by the outer CP
         # layer, so plan chunks using the matching CP-local request lengths.
         if can_dsa_prefill_cp_round_robin_split(forward_batch):
-            chunk_extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
-                extend_lens_cpu
-            )
-            chunk_seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+            cp_meta = forward_batch.attn_cp_metadata
+            assert cp_meta is not None and cp_meta.cp_local_indexer_metadata is not None
+            chunk_extend_lens_cpu = cp_meta.cp_local_indexer_metadata.extend_lens_cpu
+            chunk_seq_lens_cpu = cp_meta.cp_local_indexer_metadata.seq_lens_cpu
         else:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+            if isinstance(extend_lens_cpu, torch.Tensor):
+                extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
             chunk_extend_lens_cpu = extend_lens_cpu
             chunk_seq_lens_cpu = seq_lens_cpu
 
