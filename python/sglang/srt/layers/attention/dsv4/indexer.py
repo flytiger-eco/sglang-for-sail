@@ -22,7 +22,6 @@ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
-    dsa_cp_round_robin_split_q_seqs_cpu,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -39,7 +38,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu, is_ppu
+from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_ppu, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -788,24 +787,24 @@ class C4IndexerBackendMixin:
         c4_page_size = indexer_metadata.c4_page_size
         assert c4_page_size == 64
 
-        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if isinstance(extend_lens_cpu, torch.Tensor):
-            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
-        if isinstance(seq_lens_cpu, torch.Tensor):
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
-
         # q_fp8 and indexer metadata are already CP-local. ForwardBatch keeps
-        # global per-request lengths, so reconstruct only the CP-local request
-        # boundaries needed by the non-paged gather plan.
+        # global per-request lengths. Reuse the CP-local request metadata built
+        # once by the attention backend instead of splitting again per layer.
         if can_dsa_prefill_cp_round_robin_split(forward_batch):
-            extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
-                extend_lens_cpu
-            )
-            seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
-            extend_seq_lens = forward_batch.extend_seq_lens.new_tensor(extend_lens_cpu)
-            seq_lens = forward_batch.seq_lens[bs_idx].contiguous()
+            cp_meta = forward_batch.attn_cp_metadata
+            assert cp_meta is not None and cp_meta.cp_local_indexer_metadata is not None
+            cp_local_metadata = cp_meta.cp_local_indexer_metadata
+            extend_lens_cpu = cp_local_metadata.extend_lens_cpu
+            seq_lens_cpu = cp_local_metadata.seq_lens_cpu
+            extend_seq_lens = cp_local_metadata.extend_seq_lens
+            seq_lens = cp_local_metadata.seq_lens
         else:
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if isinstance(extend_lens_cpu, torch.Tensor):
+                extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
             extend_seq_lens = forward_batch.extend_seq_lens
             seq_lens = forward_batch.seq_lens
 
@@ -834,7 +833,7 @@ class C4IndexerBackendMixin:
         max_extend_len = max(local_extend_lens_cpu) if local_extend_lens_cpu else 0
         assert sum(extend_lens_cpu) <= num_q_tokens, (
             f"CP-local extend sum {sum(extend_lens_cpu)} > "
-            f"num_q_tokens {num_q_tokens}; cp_size={get_attention_cp_size()}"
+            f"num_q_tokens {num_q_tokens}; cp_size={get_parallel().attn_cp_size}"
         )
 
         if total_kv_len == 0:
@@ -925,21 +924,20 @@ class C4IndexerBackendMixin:
         assert forward_batch.seq_lens_cpu is not None
         assert forward_batch.extend_seq_lens_cpu is not None
 
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-        if isinstance(seq_lens_cpu, torch.Tensor):
-            seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
-        if isinstance(extend_lens_cpu, torch.Tensor):
-            extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
-
         # Chunk offsets index tensors that were reindexed by the outer CP
         # layer, so plan chunks using the matching CP-local request lengths.
         if can_dsa_prefill_cp_round_robin_split(forward_batch):
-            chunk_extend_lens_cpu, bs_idx = dsa_cp_round_robin_split_q_seqs_cpu(
-                extend_lens_cpu
-            )
-            chunk_seq_lens_cpu = [seq_lens_cpu[i] for i in bs_idx]
+            cp_meta = forward_batch.attn_cp_metadata
+            assert cp_meta is not None and cp_meta.cp_local_indexer_metadata is not None
+            chunk_extend_lens_cpu = cp_meta.cp_local_indexer_metadata.extend_lens_cpu
+            chunk_seq_lens_cpu = cp_meta.cp_local_indexer_metadata.seq_lens_cpu
         else:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            if isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens_cpu = [int(x) for x in seq_lens_cpu.tolist()]
+            if isinstance(extend_lens_cpu, torch.Tensor):
+                extend_lens_cpu = [int(x) for x in extend_lens_cpu.tolist()]
             chunk_extend_lens_cpu = extend_lens_cpu
             chunk_seq_lens_cpu = seq_lens_cpu
 
@@ -1095,6 +1093,7 @@ class C4IndexerBackendMixin:
                     fn = fp8_paged_mqa_logits_torch
             elif is_xpu():
                 from sgl_kernel import fp8_paged_mqa_logits_triton
+
                 fn = fp8_paged_mqa_logits_triton
             else:
                 from deep_gemm import fp8_paged_mqa_logits as fn

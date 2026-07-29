@@ -59,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.utils.cp_utils import CPLocalIndexerMetadata
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -398,6 +399,7 @@ class DSV4Metadata:
     # reused across every layer in the chunk. Reset to ``None`` when graph
     # metadata is refreshed so replay rebuilds it from the live batch.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
+    cp_local_indexer_metadata: Optional[CPLocalIndexerMetadata] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -411,6 +413,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        self.cp_local_indexer_metadata = other.cp_local_indexer_metadata
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -430,6 +433,7 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+        self.cp_local_indexer_metadata = static_metadata.cp_local_indexer_metadata
 
 
 @dataclass
@@ -734,7 +738,24 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
         build_paged_mqa_logits_metadata: bool = True,
+        build_cp_local_indexer_metadata: bool = False,
     ) -> DSV4Metadata:
+        cp_local_indexer_metadata = None
+        if build_cp_local_indexer_metadata:
+            (
+                cp_extend_seq_lens_cpu,
+                cp_extend_seq_lens,
+                cp_bs_idx_cpu,
+                cp_bs_idx,
+            ) = dsa_cp_round_robin_split_q_seqs(extend_seq_lens_cpu, extend_seq_lens)
+            cp_local_indexer_metadata = CPLocalIndexerMetadata(
+                extend_lens_cpu=cp_extend_seq_lens_cpu,
+                seq_lens_cpu=[int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu],
+                extend_seq_lens=cp_extend_seq_lens,
+                seq_lens=seq_lens[cp_bs_idx].contiguous(),
+                bs_idx=cp_bs_idx,
+            )
+
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -811,6 +832,7 @@ class DeepseekV4AttnBackend(
             indexer_metadata,
             c4_compress_metadata=c4_compress_metadata,
             c128_compress_metadata=c128_compress_metadata,
+            cp_local_indexer_metadata=cp_local_indexer_metadata,
         )
 
     def init_forward_metadata_target_verify(
@@ -1460,6 +1482,7 @@ class DeepseekV4AttnBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
+            use_prefill_logits = self._use_prefill_logits(forward_batch)
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
@@ -1472,8 +1495,10 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
-                build_paged_mqa_logits_metadata=not self._use_prefill_logits(
-                    forward_batch
+                build_paged_mqa_logits_metadata=not use_prefill_logits,
+                build_cp_local_indexer_metadata=(
+                    can_dsa_prefill_cp_round_robin_split(forward_batch)
+                    and use_prefill_logits
                 ),
             )
         else:
@@ -1832,21 +1857,36 @@ class DeepseekV4AttnBackend(
                 else max(seq_lens_cpu)
             )
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
-                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-                if isinstance(extend_seq_lens_cpu, torch.Tensor):
-                    extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu.tolist()]
-                (
-                    cp_extend_seq_lens_cpu,
-                    extend_seq_lens,
-                    cp_bs_idx_cpu,
-                    cp_bs_idx,
-                ) = dsa_cp_round_robin_split_q_seqs(
-                    extend_seq_lens_cpu,
-                    extend_seq_lens,
-                )
-                seq_lens = seq_lens[cp_bs_idx].contiguous()
-                req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
-                max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
+                cp_local_metadata = self.forward_metadata.cp_local_indexer_metadata
+                if cp_local_metadata is not None:
+                    # Reuse the CP-local request metadata built once during
+                    # attention metadata initialization — the same source the
+                    # non-paged indexer consumes.
+                    extend_seq_lens = cp_local_metadata.extend_seq_lens.to(torch.int32)
+                    seq_lens = cp_local_metadata.seq_lens.to(torch.int32)
+                    req_pool_indices = req_pool_indices[
+                        cp_local_metadata.bs_idx
+                    ].contiguous()
+                    max_seq_len = max(cp_local_metadata.seq_lens_cpu)
+                    cp_extend_seq_lens_cpu = cp_local_metadata.extend_lens_cpu
+                else:
+                    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                    if isinstance(extend_seq_lens_cpu, torch.Tensor):
+                        extend_seq_lens_cpu = [
+                            int(x) for x in extend_seq_lens_cpu.tolist()
+                        ]
+                    (
+                        cp_extend_seq_lens_cpu,
+                        extend_seq_lens,
+                        cp_bs_idx_cpu,
+                        cp_bs_idx,
+                    ) = dsa_cp_round_robin_split_q_seqs(
+                        extend_seq_lens_cpu,
+                        extend_seq_lens,
+                    )
+                    seq_lens = seq_lens[cp_bs_idx].contiguous()
+                    req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+                    max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
                 cp_positions = core_attn_metadata.positions_casual[
                     : q_flat.shape[0]
                 ].contiguous()
