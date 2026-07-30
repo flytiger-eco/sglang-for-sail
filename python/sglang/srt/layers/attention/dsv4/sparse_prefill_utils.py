@@ -68,6 +68,7 @@ def combine_topk_swa_indices(
     topk: int,
     out_indices: Optional[torch.Tensor] = None,
     out_lens: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Combine topk + SWA indices into a single ``flash_mla_sparse_fwd`` row.
 
@@ -98,6 +99,9 @@ def combine_topk_swa_indices(
             valid-prefix length must hold across reuses).
         out_lens: optional preallocated ``(num_tokens,)`` int32 buffer; the
             kernel fully overwrites it, so any dtype-correct buffer works.
+        positions: optional absolute position for each query token. CP
+            round-robin passes this because local query positions are strided;
+            the non-CP path leaves it unset and uses contiguous positions.
 
     Returns:
         combined_indices: (num_tokens, padded_topk_swa) int32, padded to a
@@ -110,6 +114,7 @@ def combine_topk_swa_indices(
     assert gather_lens.dtype == torch.int32
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
+    assert positions is None or positions.dtype == torch.int32
     assert compress_ratio >= 1, "COMPRESS_RATIO must be >= 1 (use TOP_K=0 for SWA-only)"
 
     num_tokens = topk_indices.shape[0]
@@ -147,6 +152,7 @@ def combine_topk_swa_indices(
         gather_lens,
         compressed_base,
         swa_base,
+        positions,
         TOP_K=topk,
         COMPRESS_RATIO=compress_ratio,
         WINDOW_SIZE=window_size,
@@ -162,6 +168,8 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    query_start_loc: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -183,6 +191,9 @@ def build_swa_token_ids(
         full_to_swa: (full_pool_size + extra,) int64. Maps full kv id to
             SWA-cache id.
         swa_window: int. SWA window size.
+        query_start_loc: optional CP-local cumulative query lengths.
+        positions: optional CP-local absolute query positions. When provided,
+            the SWA gather begins at the first local query's window boundary.
 
     Returns:
         swa_token_ids: (total_swa,) int32, flat physical SWA-cache token IDs.
@@ -199,10 +210,19 @@ def build_swa_token_ids(
     num_reqs = seq_lens.shape[0]
     device = seq_lens.device
 
-    swa_gather_lens = torch.minimum(seq_lens, extend_seq_lens + (swa_window - 1)).to(
-        torch.int32
-    )
-    swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
+    if positions is None:
+        swa_gather_lens = torch.minimum(
+            seq_lens, extend_seq_lens + (swa_window - 1)
+        ).to(torch.int32)
+        swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
+    else:
+        assert query_start_loc is not None
+        assert positions.dtype == torch.int32
+        first_positions = positions[query_start_loc[:-1].long()]
+        swa_first_pos = torch.clamp(first_positions - swa_window + 1, min=0)
+        # CP-local query positions are strided. Gather through the request's
+        # current end so every local query window is covered.
+        swa_gather_lens = (seq_lens - swa_first_pos).to(torch.int32)
     swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
     total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
@@ -266,6 +286,7 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     compressed_base_ptr,
     swa_base_ptr,
+    positions_ptr,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
@@ -293,7 +314,10 @@ def _combine_topk_swa_indices_kernel(
 
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
-        pos = start_pos + token_idx_in_query
+        if positions_ptr is not None:
+            pos = tl.load(positions_ptr + token_idx)
+        else:
+            pos = start_pos + token_idx_in_query
         # Both the C4 indexer and the C128 metadata builder emit
         # min((pos+1)//compress_ratio, topk_tokens) valid entries. Caller
         # passes TOP_K=0 for SWA-only layers to zero this out.
@@ -351,6 +375,7 @@ class SparsePrefillChunkCache:
     swa_page_size: int
     seq_lens: torch.Tensor  # (num_reqs,) int32
     query_start_loc: torch.Tensor  # (num_reqs+1,) int32
+    positions: Optional[torch.Tensor]  # CP-local absolute positions
 
     # SWA-side (every layer needs these, all chunk-invariant).
     swa_token_ids: torch.Tensor  # (total_swa,) int32
@@ -395,6 +420,7 @@ class SparsePrefillChunkCache:
         swa_window_size: int,
         swa_page_size: int,
         num_qo_tokens: int,
+        cp_positions: Optional[torch.Tensor] = None,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
@@ -410,6 +436,8 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                query_start_loc=query_start_loc,
+                positions=cp_positions,
             )
         )
 
@@ -420,6 +448,7 @@ class SparsePrefillChunkCache:
             swa_page_size=swa_page_size,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
+            positions=cp_positions,
             swa_token_ids=swa_token_ids,
             swa_first_pos=swa_first_pos,
             swa_gather_lens=swa_gather_lens,
@@ -441,6 +470,7 @@ class SparsePrefillChunkCache:
             window_size=swa_window_size,
             compress_ratio=1,
             topk=0,
+            positions=cp_positions,
         )
         cache.c0_workspace = torch.empty(
             (swa_token_ids.shape[0], 1, WORKSPACE_DIM),
@@ -494,6 +524,7 @@ class SparsePrefillChunkCache:
             window_size=self.swa_window_size,
             compress_ratio=128,
             topk=c128_max,
+            positions=self.positions,
         )
 
         self.c128_flat_token_ids = flat_c128_ids
@@ -584,4 +615,5 @@ class SparsePrefillChunkCache:
             topk=topk,
             out_indices=self.c4_combined_indices,
             out_lens=self.c4_combined_lens,
+            positions=self.positions,
         )
