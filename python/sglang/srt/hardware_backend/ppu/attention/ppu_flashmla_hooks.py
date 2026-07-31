@@ -131,7 +131,7 @@ def _ppu_flashmla_init_forward_metadata(self, forward_batch):
         PAGE_SIZE,
         FlashMLADecodeMetadata,
     )
-    from sglang.kernels.ops.kvcache.kv_indices import (
+    from sglang.kernels.ops.attention.utils import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )
@@ -233,6 +233,7 @@ def _ppu_flashmla_init_forward_metadata(self, forward_batch):
             mla_metadata,
             None,
             block_kv_indices,
+            seq_lens.to(torch.int32),
         )
     else:
         super(type(self), self).init_forward_metadata(forward_batch)
@@ -309,7 +310,7 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
         PAGE_SIZE,
         FlashMLADecodeMetadata,
     )
-    from sglang.kernels.ops.kvcache.kv_indices import (
+    from sglang.kernels.ops.attention.utils import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )
@@ -401,6 +402,7 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
             scheduler_metadata,
             None,
             self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            seq_lens.to(torch.int32),
         )
 
 

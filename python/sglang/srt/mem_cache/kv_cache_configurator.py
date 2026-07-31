@@ -1119,6 +1119,13 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+            from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                is_fp4_indexer_cache_enabled,
+            )
+
+            pool_kwargs["use_fp4_indexer"] = (
+                current_platform.is_ppu() and is_fp4_indexer_cache_enabled()
+            )
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,

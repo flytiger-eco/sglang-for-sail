@@ -4300,7 +4300,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             if self.custom_mem_pool
             else nullcontext()
         ):
-            num_pages = (index_buf_size + page_size + 1) // self.page_size
             if self.use_fp4_indexer:
                 # FP4 layout per token: 64 packed FP4 bytes + 4 ue8m0 scale bytes.
                 page_bytes = self.page_size * (
@@ -4308,11 +4307,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
             elif self.use_bf16_indexer:
                 # bf16 kcache does not need scale; element-count layout.
-                page_bytes = self.page_size * index_head_dim
+                page_bytes = self.page_size * self.index_head_dim
             else:
                 # FP8 layout: (head_dim bytes + head_dim/quant_block_size * 4 scale bytes) per token.
                 page_bytes = self.page_size * (
-                    index_head_dim + index_head_dim // self.quant_block_size * 4
+                    self.index_head_dim
+                    + self.index_head_dim // self.quant_block_size * 4
                 )
             self.index_k_with_scale_buffer = [
                 torch.zeros(
@@ -4423,11 +4423,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             # FP4 layout: per-token K bytes = head_dim/2; scale bytes = head_dim/32.
             # The triton accessor is byte-stride agnostic; pass packed K width as
             # the "head_dim" to gather K bytes, and gather scales separately.
-            from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
-                _get_k_and_s_triton,
-            )
-
-            return _get_k_and_s_triton(
+            return index_buf_accessor._get_k_and_s_triton(
                 buf=buf,
                 page_indices=page_indices,
                 seq_lens=seq_len_tensor,
