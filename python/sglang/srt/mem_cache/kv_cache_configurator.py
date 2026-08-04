@@ -25,7 +25,11 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.allocation_sizing import (
+    estimate_max_running_requests,
+    estimate_req_to_token_pool_bytes,
+    get_req_to_token_extra_context_len,
+)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -1629,33 +1633,35 @@ class KVCacheConfigurator:
     def resolve_max_num_reqs(self, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = self.server_args.max_running_requests
-        if max_num_reqs is not None:
-            requested_per_worker = max_num_reqs // self.ps.attn_dp_size
-            max_num_reqs = min(requested_per_worker, token_capacity // 2)
-        else:
-            requested_per_worker = None
-            max_num_reqs = min(estimated, token_capacity // 2)
-
-        if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+        requested_per_worker = None
+        if self.server_args.max_running_requests is not None:
+            requested_per_worker = (
+                self.server_args.max_running_requests // self.ps.attn_dp_size
             )
 
-            if max_num_reqs <= 0:
-                raise RuntimeError(
-                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
-                    f"(2) increase --mem-fraction-static, or "
-                    f"(3) use GPUs with more memory."
-                )
+        mamba_req_cap = None
+        if self.mambaish_config is not None:
+            mamba_req_cap = (
+                self.server_args.max_mamba_cache_size // self._calculate_mamba_ratio()
+            )
+
+        max_num_reqs = estimate_max_running_requests(
+            token_capacity=token_capacity,
+            context_len=self.model_config.context_len,
+            server_args=self.server_args,
+            attn_dp_size=self.ps.attn_dp_size,
+            mamba_req_cap=mamba_req_cap,
+        )
+
+        if self.mambaish_config is not None and max_num_reqs <= 0:
+            raise RuntimeError(
+                f"Hybrid (mamba/linear-attention) state cache is too small to serve "
+                f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                f"mamba_ratio={self._calculate_mamba_ratio()}, resulting max_num_reqs={max_num_reqs}. "
+                f"Try: (1) reduce --max-running-requests, "
+                f"(2) increase --mem-fraction-static, or "
+                f"(3) use GPUs with more memory."
+            )
         if requested_per_worker is not None and max_num_reqs < requested_per_worker:
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
@@ -1664,6 +1670,48 @@ class KVCacheConfigurator:
                 max_num_reqs,
             )
         return max_num_reqs
+
+    def _estimate_req_to_token_pool_bytes(self, available_bytes: int) -> int:
+        """Bytes to carve out of the KV budget for the req_to_token map.
+
+        _init_pools allocates the req_to_token pool *before* the KV pools, out
+        of the same free memory the budget is measured against, but its size
+        (num_req_slots x max_context_len x int32) is not part of any per-token
+        cell_size. For long-context models this is gigabytes (e.g. a 1M-context
+        model hits the 2048-request floor and costs ~8 GiB), so KV pools sized
+        to the full budget OOM in the tail sub-pool.
+
+        One-iteration fixed point: a provisional token capacity T0 is an upper
+        bound (the budget only shrinks after the deduction), the request
+        estimate is monotone in token capacity and clamped to [2048, 4096], so
+        deducting for the T0 estimate and re-sizing yields T1 <= T0 whose own
+        request estimate never exceeds the deducted one -- a single pass never
+        under-deducts.
+        """
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mamba_req_cap = None
+        if self.mambaish_config is not None:
+            mamba_req_cap = (
+                self.server_args.max_mamba_cache_size // self._calculate_mamba_ratio()
+            )
+
+        configurator = create_memory_pool_configurator(self)
+        provisional = configurator.calculate_pool_sizes(
+            available_bytes, self.server_args.page_size
+        )
+        provisional_tokens = self._apply_token_constraints(
+            provisional.max_total_num_tokens
+        )
+        return estimate_req_to_token_pool_bytes(
+            token_capacity=provisional_tokens,
+            context_len=self.model_config.context_len,
+            server_args=self.server_args,
+            attn_dp_size=self.ps.attn_dp_size,
+            mamba_req_cap=mamba_req_cap,
+        )
 
     def _resolve_memory_pool_config(
         self, pre_model_load_memory: int
@@ -1674,7 +1722,15 @@ class KVCacheConfigurator:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        config = self.config_from_budget(available_bytes)
+        # Charge the req_to_token map against the budget before sizing the
+        # token pools; it is allocated first out of the same free memory.
+        req_pool_bytes = self._estimate_req_to_token_pool_bytes(available_bytes)
+        if req_pool_bytes > 0:
+            logger.info(
+                f"Reserving {req_pool_bytes / (1 << 30):.2f} GB of the KV cache "
+                "budget for the req_to_token pool."
+            )
+        config = self.config_from_budget(max(available_bytes - req_pool_bytes, 0))
         config.max_running_requests = self.resolve_max_num_reqs(
             config.max_total_num_tokens
         )
