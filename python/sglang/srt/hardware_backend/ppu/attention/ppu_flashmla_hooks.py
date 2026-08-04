@@ -4,6 +4,13 @@ Uses ``@plugin_hook`` to inject PPU-specific behavior into
 ``sglang.srt.layers.attention.flashmla_backend`` without modifying the
 community source code.
 
+The community ``FlashMLABackend.init_forward_metadata`` already handles
+``seq_lens_cpu is None`` (via ``eager_max_k`` fallback to
+``self.max_context_len``) and calls ``get_mla_metadata``, which is
+hooked separately (item 1 below).  Therefore no REPLACE hook is needed
+for ``init_forward_metadata`` — the community method runs as-is and
+automatically uses the PPU ``get_mla_metadata`` implementation.
+
 Registered hooks
 ~~~~~~~~~~~~~~~~
 
@@ -12,13 +19,10 @@ Registered hooks
 
 2. ``flash_mla_with_kvcache`` (REPLACE) — Same, for the decode kernel.
 
-3. ``FlashMLABackend.init_cuda_graph_state`` (AROUND) — Caps the
-   ``cuda_graph_mla_metadata`` buffer to PPU's hard-limit of 320 sm_parts.
+3. ``flash_mla_sparse_fwd`` (REPLACE) — Same, for the sparse fwd kernel.
 
-4. ``FlashMLABackend.init_forward_metadata`` (REPLACE) — Replaces the
-   method body on PPU.  Uses ``mla_metadata, _ = get_mla_metadata(...)``
-   and stores the sched-meta object as ``flashmla_metadata`` (no separate
-   ``num_splits``).  Also adds the ``is_draft_extend_v2()`` branch.
+4. ``FlashMLABackend.init_cuda_graph_state`` (AROUND) — Caps the
+   ``cuda_graph_mla_metadata`` buffer to PPU's hard-limit of 320 sm_parts.
 
 5. ``FlashMLABackend.init_forward_metadata_out_graph`` (AROUND) — Routes
    DRAFT_EXTEND_V2 through the decode/target-verify metadata path.
@@ -29,14 +33,9 @@ Registered hooks
    ``if is_ppu(): raise`` guard, and the ``.tile_scheduler_metadata`` /
    ``.num_splits`` attribute pattern.
 
-7. ``FlashMLABackend.forward_decode`` (AROUND) — Adapts the PPU metadata
-   format (``.flashmla_metadata.tile_scheduler_metadata`` /
-   ``.flashmla_metadata.num_splits``) to the community format
-   (``.flashmla_metadata`` / ``.num_splits``) before delegating to the
-   original function.
-
-8. ``FlashMLABackend.forward_extend`` (AROUND) — Same adaptation as
-   ``forward_decode``.
+7. ``FlashMLABackend.init_forward_metadata_in_graph`` (REPLACE) —
+   Resets ``flashmla_metadata.have_initialized`` before CUDA Graph
+   capture so PPU's lazy init runs inside the capture scope.
 """
 
 import torch
@@ -47,7 +46,7 @@ _PPU_MAX_SM_PARTS = 320  # hard limit on num_sm_parts returned by PPU flash_mla
 
 
 # ---------------------------------------------------------------------------
-# 1 & 2. Replace the module-level ops with PPU implementations
+# 1, 2 & 3. Replace the module-level ops with PPU implementations
 # ---------------------------------------------------------------------------
 
 
@@ -86,7 +85,7 @@ def _ppu_get_mla_metadata(*args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# 3. init_cuda_graph_state — cap cuda_graph_mla_metadata buffer
+# 4. init_cuda_graph_state — cap cuda_graph_mla_metadata buffer
 # ---------------------------------------------------------------------------
 
 
@@ -103,140 +102,6 @@ def _ppu_flashmla_cuda_graph_state(original_fn, self, *args, **kwargs):
             dtype=torch.int32,
             device=buf.device,
         )
-
-
-# ---------------------------------------------------------------------------
-# 4. init_forward_metadata — PPU metadata format + DRAFT_EXTEND_V2 branch
-# ---------------------------------------------------------------------------
-
-
-@plugin_hook(
-    "sglang.srt.layers.attention.flashmla_backend.FlashMLABackend.init_forward_metadata",
-    type=HookType.REPLACE,
-)
-def _ppu_flashmla_init_forward_metadata(self, forward_batch):
-    """Replace init_forward_metadata on PPU.
-
-    PPU ``get_mla_metadata`` returns ``(FlashMLASchedMeta_like, _)``; the
-    community code unpacks ``mla_metadata, num_splits = ...`` which is
-    incompatible.  This hook uses ``mla_metadata, _ = ...`` and stores
-    the sched-meta object as ``flashmla_metadata`` (no separate num_splits).
-
-    Also adds the ``is_draft_extend_v2()`` branch (same as target_verify).
-    """
-    import triton
-
-    from sglang.srt.hardware_backend.ppu.attention.flash_mla import get_mla_metadata
-    from sglang.srt.layers.attention.flashmla_backend import (
-        PAGE_SIZE,
-        FlashMLADecodeMetadata,
-    )
-    from sglang.kernels.ops.attention.utils import (
-        create_flashmla_kv_indices_triton,
-        get_num_kv_index_blocks_flashmla,
-    )
-
-    bs = forward_batch.batch_size
-    if forward_batch.forward_mode.is_decode_or_idle():
-        max_seqlen_pad = triton.cdiv(forward_batch.seq_lens_cpu.max().item(), PAGE_SIZE)
-        block_kv_indices = torch.full(
-            (bs, max_seqlen_pad),
-            -1,
-            dtype=torch.int32,
-            device=forward_batch.seq_lens.device,
-        )
-        create_flashmla_kv_indices_triton[
-            (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-        ](
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_seqlen_pad,
-        )
-        mla_metadata, _ = get_mla_metadata(
-            forward_batch.seq_lens.to(torch.int32),
-            self.num_q_heads,
-            1,
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-        self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            None,
-            block_kv_indices,
-        )
-    elif forward_batch.forward_mode.is_target_verify():
-        seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
-        seq_lens = forward_batch.seq_lens + self.num_draft_tokens
-
-        max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-        block_kv_indices = torch.full(
-            (bs, max_seqlen_pad),
-            -1,
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-        create_flashmla_kv_indices_triton[
-            (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-        ](
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_seqlen_pad,
-        )
-        mla_metadata, _ = get_mla_metadata(
-            seq_lens.to(torch.int32),
-            self.num_draft_tokens * self.num_q_heads,
-            1,
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-        self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            None,
-            block_kv_indices,
-        )
-    elif forward_batch.forward_mode.is_draft_extend_v2():
-        # [Fix] DRAFT_EXTEND_V2 reuses target_verify logic
-        seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
-        seq_lens = forward_batch.seq_lens + self.num_draft_tokens
-
-        max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-        block_kv_indices = torch.full(
-            (bs, max_seqlen_pad),
-            -1,
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-        create_flashmla_kv_indices_triton[
-            (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-        ](
-            self.req_to_token,
-            forward_batch.req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_seqlen_pad,
-        )
-        mla_metadata, _ = get_mla_metadata(
-            seq_lens.to(torch.int32),
-            self.num_draft_tokens * self.num_q_heads,
-            1,
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-        self.forward_metadata = FlashMLADecodeMetadata(
-            mla_metadata,
-            None,
-            block_kv_indices,
-            seq_lens.to(torch.int32),
-        )
-    else:
-        super(type(self), self).init_forward_metadata(forward_batch)
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +170,14 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
 
     import triton
 
+    from sglang.kernels.ops.attention.utils import (
+        create_flashmla_kv_indices_triton,
+        get_num_kv_index_blocks_flashmla,
+    )
     from sglang.srt.hardware_backend.ppu.attention.flash_mla import get_mla_metadata
     from sglang.srt.layers.attention.flashmla_backend import (
         PAGE_SIZE,
         FlashMLADecodeMetadata,
-    )
-    from sglang.kernels.ops.attention.utils import (
-        create_flashmla_kv_indices_triton,
-        get_num_kv_index_blocks_flashmla,
     )
     from sglang.srt.utils import is_ppu
 
