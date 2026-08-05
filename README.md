@@ -1,91 +1,154 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
-
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
-
+<div align="center" id="ppusglangtop">
+  <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 </div>
 
 --------------------------------------------------------------------------------
 
 <p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
+<a href="https://www.t-head.cn/product?id=7"><b>About T-Head</b></a> |
+<a href="https://lmsys.org/blog/"><b>Community Blog</b></a> |
+<a href="https://docs.sglang.io/"><b>Community Docs</b></a> |
 <a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
+<a href="https://slack.sglang.io/"><b>Slack</b></a> |
+<a href="https://meet.sglang.io/"><b>Weekly Meeting</b></a> |
 <a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
 </p>
 
-## News
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] 🔥 SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+---
 
-<details>
-<summary>More</summary>
+## Introduction
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+SGLang-for-SAIL is a PPU-adapted inference engine based on SGLang v0.5.13.
+It provides runtime dependency, backend kernel, and deployment workflow adaptations for T-Head AI accelerator chips.
+It keeps SGLang's high-performance serving capabilities and integrates PPU platform optimizations for deploying large language models and multimodal models on PPU devices.
 
-</details>
+This document only covers the basic installation, verification, and deployment workflow.
+For quantization, environment variables, Attention Backend, DeepGEMM tuning, known issues, and model-specific instructions, see the <a href="https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&chapterId=46"><b>SGLang-for-SAIL User Guide</b></a>.
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+## Requirements
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+Before installing SGLang-for-SAIL v0.5.13, make sure the SAIL SDK and required runtime components are available in your environment.
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+- SAIL SDK v2.1.1 or later
+- Python 3.12
+- PyTorch-for-SAIL 2.10.0 or later
+- FlashInfer-for-SAIL 0.6.8.post1 or later
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+For supported operating systems, CUDA Wrapper versions, and the full dependency list, see the <a href="https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&chapterId=46"><b>SGLang-for-SAIL User Guide</b></a>.
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+## Quick Start
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+### Option 1: Use the Docker Image
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+Using the SGLang-for-SAIL Docker image is recommended because it avoids manual setup of the base runtime environment.
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+```bash
+IMAGE_NAME="<SGLang-for-SAIL_IMAGE>"
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+sudo docker run -it \
+  --name SGLang-for-SAIL_0.5.13 \
+  --privileged \
+  --ipc=host \
+  --device=/dev/alixpu_ctl \
+  --device=/dev/alixpu \
+  --network=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --init \
+  --shm-size=8g \
+  -v /path/to/host/:/path/to/container/ \
+  ${IMAGE_NAME} bash
+```
+
+### Option 2: Install from PyPI
+
+* Install SGLang-for-SAIL from PyPI index:
+
+```bash
+pip install sglang==0.5.13 --force-reinstall --no-deps -i https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
+```
+
+### Option 3: Build from Source
+* Please make sure using SAIL SDK or SAIL Docker Image
+```bash
+# setup build tools
+pip install scikit-build-core cmake==3.31.2 uv
+
+# setup rust
+pip install setuptools_rust maturin[patchelf]
+apt update && apt install -y libssl-dev protobuf-compiler
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# build and install sglang
+cd python
+rm -rf build dist *.egg-info
+python -m uv build --no-build-isolation --wheel -Cbuild-dir=build --color=always .
+pip install  dist/*.whl --force-reinstall --no-deps
+
+# build and install sglang-kernel
+cd ../sgl-kernel
+rm -rf build dist
+python3 setup_ppu.py bdist_wheel
+pip install  dist/*.whl --force-reinstall
+
+# build and install sglang-router
+cd ../sgl-model-gateway/bindings/python
+maturin build --release --out dist --features vendored-openssl
+pip install dist/*.whl --force-reinstall
+```
+* For more detailed source builds, see the <a href="https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&chapterId=46"><b>SGLang-for-SAIL User Guide</b></a>.
+
+## Verify Installation
+
+After entering the Docker container or completing the PyPI installation, run the following command to verify that SGLang is installed correctly:
+
+```bash
+python3 -c "import sglang; print(sglang.__version__)"
+```
+
+The command should print `0.5.13`.
+
+## Deploy a Model
+
+Start an SGLang server with a local model path.
+The following example uses tensor parallelism across 8 PPU devices and enables the FA3 attention backend:
+
+```bash
+python3 -m sglang.launch_server \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 8999 \
+  --model-path /path/to/model \
+  --tp-size 8 \
+  --attention-backend fa3 \
+  --mem-fraction-static 0.9 \
+  --disable-radix-cache \
+  --quantization w8a8_int8
+```
+
+Adjust `--model-path`, `--tp-size`, memory settings, and quantization options based on your model size and machine configuration.
+For more deployment parameters and model recommendations, see <a href="https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&chapterId=46"><b>SGLang-for-SAIL User Guide</b></a>.
+
+## Send a Request
+
+SGLang-for-SAIL is compatible with the OpenAI API.
+After the service starts, send a chat completion request with the following command:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+
+curl -X POST http://127.0.0.1:8999/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "Who are you?"}
+    ],
+    "max_completion_tokens": 200,
+    "top_k": 1
+  }'
+```
+
+## More Documentation
+
+Please refer to the <a href="https://www.flytiger-eco.com/docs_center/doc_detail/index.html?projectId=6&chapterId=46"><b>SGLang-for-SAIL User Guide</b></a>.
