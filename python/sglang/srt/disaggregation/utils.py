@@ -63,10 +63,8 @@ def dsa_seed_backend_enabled(server_args: ServerArgs) -> bool:
 def get_dsa_seed_metadata_dim(
     hf_config, server_args: Optional[ServerArgs] = None
 ) -> int:
-    """Return the DSA seed width only when the active spec backend supports it."""
+    """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
-        return 0
-    if server_args is not None and not dsa_seed_backend_enabled(server_args):
         return 0
     return get_dsa_index_topk(hf_config)
 
