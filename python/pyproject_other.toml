@@ -167,7 +167,7 @@ srt_ppu = [
     "torch",
     "apache-tvm-ffi==0.1.9",
     "deep_ep",
-    "deep_gemm",
+    "deep_gemm>=1.1.0",
     "flash-attn-3",
     "flash_mla",
     "flashinfer",
