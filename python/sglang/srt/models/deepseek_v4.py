@@ -34,7 +34,9 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
 )
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -90,11 +92,6 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsW8A8Fp8,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-    sglang_per_token_quant_fp8,
-)
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -157,7 +154,6 @@ if not _is_hip:
     )
 
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -519,6 +515,8 @@ class MqaAttentionBase(nn.Module):
         )
         if _FP8_WO_A_GEMM:
             if isinstance(self.quant_config, Fp8Config):
+                from sglang.srt.layers import deep_gemm_wrapper
+
                 assert hasattr(
                     self.wo_a, "weight_scale_inv"
                 ), "FP8 quant_config must create weight_scale_inv"
@@ -1313,7 +1311,10 @@ class MQALayer(MqaAttentionBase):
                     deep_gemm.fp8_einsum(
                         "bhr,hdr->bhd",
                         (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                        (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                        (
+                            self.wo_a.weight.view(G, R, D),
+                            self.wo_a.weight_scale_inv.data,
+                        ),
                         output,
                         recipe=(1, 1, 128),
                     )
@@ -2945,11 +2946,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                     _FP8_WO_A_GEMM
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
+                    and not (_is_ppu and loaded_weight.dtype == torch.int8)
                 ):
                     raise ValueError(
                         f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
-                        "torch.float8_e4m3fn. This checkpoint does not provide "
+                        "torch.float8_e4m3fn"
+                        + (" or torch.int8 (PPU)" if _is_ppu else "")
+                        + ". This checkpoint does not provide "
                         "a supported fp8-quantized wo_a; rerun with "
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
