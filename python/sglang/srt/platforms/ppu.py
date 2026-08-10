@@ -55,3 +55,12 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
         if self.is_zw810e():
             return 20
         return super().get_device_num_tensorcores(device_id)
+
+
+# Load PPU FA3 ops hook when running on PPU hardware.
+# The module-level @plugin_hook decorator registers an AROUND hook on
+# FlashAttentionBackend.__init__ so PPU-specific FA3 ops are used transparently.
+import os
+
+if "PPU_SDK" in os.environ:
+    import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401

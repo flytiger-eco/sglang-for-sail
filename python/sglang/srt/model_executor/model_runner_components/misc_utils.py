@@ -8,6 +8,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_kimi_k3,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_context, get_exec, get_schedule
 from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
@@ -29,10 +30,20 @@ def maybe_disable_chunked_prefix_cache(
     # model's (often non-MLA) config must not flip the shared setting.
     if is_draft_worker:
         return
+    # <NOTE>
+    # PPU FA3 does not support MLA. For MLA models on PPU, the attention backend
+    # is split: [--prefill-attention-backend fa3 --decode-attention-backend flashmla].
+    # Therefore we must check prefill_attention_backend (not attention_backend) when
+    # determining chunked-prefix-cache support on PPU.
+    # </NOTE>
+    effective_backend = (
+        get_exec().kernel.prefill_attention_backend
+        if current_platform.is_ppu() and use_mla_backend
+        else get_exec().kernel.attention_backend
+    )
     if (
         not use_mla_backend
-        or get_exec().kernel.attention_backend
-        not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
+        or effective_backend not in CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
     ):
         if not get_schedule().disable_chunked_prefix_cache:
             get_context().override(
