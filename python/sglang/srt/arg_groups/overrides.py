@@ -38,6 +38,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
     get_device_capability,
@@ -633,9 +634,14 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     assert (
                         server_args.dp_size == 1
                     ), "interleave DSA CP does not support DP attention."
-                assert (
-                    server_args.tp_size <= 8
-                ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                if not "810E" in current_platform.get_device_name():
+                    assert (
+                        server_args.tp_size <= 8
+                    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                else:
+                    assert (
+                        server_args.tp_size <= 16
+                    ), "Context parallel only supports single machine (tp_size <= 16 on 810e). Cross-machine CP has precision issues."
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # DSACPLayerCommunicator does not all-reduce attention-TP
                 # partial o_proj outputs before replicated dense FFNs.
