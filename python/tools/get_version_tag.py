@@ -16,6 +16,10 @@ Strategy:
 2. Otherwise, find the highest version tag across all branches
    and describe relative to it. This handles local dev installs
    from main where release tags only exist on release branches.
+3. If no version tags exist at all, synthesize a describe string
+   (0.0.0-0-g<short_hash>) so that setuptools_scm can still produce
+   a version with branch+commit metadata via the custom local_scheme
+   (e.g. 0.0.0+main.0041a12).
 """
 
 import re
@@ -133,7 +137,18 @@ def get_version_describe() -> str:
         return exact
 
     # Fallback for untagged commits (e.g., dev install from main)
-    return get_latest_version_tag_describe()
+    describe = get_latest_version_tag_describe()
+    if describe:
+        return describe
+
+    # No version tags found: synthesize a describe string so that
+    # setuptools_scm can still produce a version with branch+commit metadata
+    # via the custom local_scheme (e.g. 0.0.0+main.0041a12).
+    short_hash = run_git("rev-parse", "--short=7", "HEAD")
+    if short_hash:
+        return f"0.0.0-0-g{short_hash}"
+
+    return ""
 
 
 def get_latest_version_tag() -> str:
@@ -154,12 +169,11 @@ def main() -> None:
         result = get_version_describe()
     if not result:
         print(
-            "ERROR: Could not determine version from git tags.\n"
+            "ERROR: Could not determine version from git.\n"
             "Possible causes:\n"
-            "  - No version tags (v*.*.*) exist: run 'git fetch --tags'\n"
-            "  - Shallow clone without tags: run 'git fetch --unshallow --tags'\n"
             "  - Git safe.directory issue: run 'git config --global --add safe.directory <repo>'\n"
             "  - Not inside a git repository\n"
+            "  - git command not available\n"
             "setuptools-scm will fall back to version 0.0.0.dev0",
             file=sys.stderr,
         )

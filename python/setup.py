@@ -28,7 +28,15 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+# Ensure the python/ directory is on sys.path so that setuptools_scm can
+# import _sglang_version_local_scheme for custom version/local schemes.
+# This avoids the need to set PYTHONPATH manually when building.
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
 
 from setuptools import setup
 

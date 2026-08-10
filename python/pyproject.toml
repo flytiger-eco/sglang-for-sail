@@ -233,6 +233,8 @@ exclude = [
 root = ".."
 version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+version_scheme = "_sglang_version_local_scheme:version_scheme"
+local_scheme = "_sglang_version_local_scheme:local_scheme"
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
