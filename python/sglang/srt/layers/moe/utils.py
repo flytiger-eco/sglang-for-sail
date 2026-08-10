@@ -175,6 +175,9 @@ class _MoeRunnerBackendPredicates:
     def is_intel_xpu(self):
         return self.value == MoeRunnerBackend.INTEL_XPU.value
 
+    def is_acext(self):
+        return self.value == MoeRunnerBackend.ACEXT.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -196,6 +199,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
+    ACEXT = "acext"
 
 
 @dataclass(frozen=True)
