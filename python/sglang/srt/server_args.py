@@ -65,6 +65,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    check_acext_version_compatibility,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -92,6 +93,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    set_acext_token_limit,
     torch_release,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -263,6 +265,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "acext",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -3517,6 +3520,7 @@ class ServerArgs:
         self._handle_npu_backends()
         self._handle_mps_backends()
         self._handle_xpu_backends()
+        self._handle_ppu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
         current_platform.apply_server_args_defaults(self)
@@ -4207,6 +4211,14 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
 
+    def _handle_ppu_backends(self):
+        if is_ppu():
+            # acext init
+            if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
+                envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
+            if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+                check_acext_version_compatibility()
+
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
@@ -4693,6 +4705,13 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if decode_cuda_graph_config.max_bs is None:
                 decode_cuda_graph_config.max_bs = 160
+
+        # Set acext config for PPU
+        if is_ppu():
+            if self.chunked_prefill_size is not None:
+                set_acext_token_limit(
+                    acext_num_tokens=int(self.chunked_prefill_size * 0.5),
+                )
 
         # Set cuda graph batch sizes
         if self.device != "cpu":

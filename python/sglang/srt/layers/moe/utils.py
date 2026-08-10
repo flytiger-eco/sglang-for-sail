@@ -110,6 +110,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    ACEXT = "acext"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -172,6 +173,9 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+    def is_acext(self):
+        return self == MoeRunnerBackend.ACEXT
 
 
 class DeepEPMode(Enum):
