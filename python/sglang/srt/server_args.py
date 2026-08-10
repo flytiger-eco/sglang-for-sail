@@ -4423,6 +4423,8 @@ class ServerArgs:
                 envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
             if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
                 envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+            if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
+                envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution

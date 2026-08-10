@@ -106,7 +106,7 @@ class TestGlm52PpuFlashmlaFa3DpAttnMtp(GSM8KMixin, CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0",
+                "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0",
             },
         )
 
