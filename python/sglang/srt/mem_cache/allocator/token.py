@@ -69,9 +69,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+                self.release_pages = torch.cat((free_index, self.release_pages))
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
+                self.free_pages = torch.cat((free_index, self.free_pages))
         else:
             self.free_group.append(free_index)
 
