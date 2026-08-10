@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any, Callable, Dict, List, TypeVar
 
 import torch
@@ -58,6 +59,11 @@ def is_hip_runtime() -> bool:
 @cache_once
 def is_musa_runtime() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@cache_once
+def is_ppu_runtime() -> bool:
+    return "PPU_SDK" in os.environ
 
 
 _REGISTERED_CLASSES: Dict[type, type] = {}
