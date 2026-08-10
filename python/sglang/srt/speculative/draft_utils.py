@@ -1,3 +1,5 @@
+import logging
+
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
@@ -7,7 +9,10 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
@@ -407,6 +412,14 @@ class DraftBackendFactory:
         return AscendAttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
+        if is_ppu():
+            # ppu does not use flashinfer for mla model prefill
+            logger.warning(
+                "flashmla prefill backend is not yet supported for draft extend "
+                "on PPU, falling back to HybridAttnBackend (fa3 prefill)."
+            )
+            return None
+
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
         return FlashMLABackend(self.draft_model_runner, skip_prefill=False)
