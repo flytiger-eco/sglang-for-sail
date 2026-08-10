@@ -1592,6 +1592,9 @@ class Envs:
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
+    # Memory Pool
+    SGLANG_SORT_PAGE = EnvBool(False)  # enable page sorting when not in PD mode
+
     # SAIL
     SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
     SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)

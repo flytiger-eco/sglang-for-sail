@@ -87,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     process_model_config,
 )
+from sglang.srt.server_args import get_global_server_args
 
 # get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
 # Importing from the wrong module causes this file to fail import, which prevents the
@@ -1252,6 +1253,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=None,
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
         else:
