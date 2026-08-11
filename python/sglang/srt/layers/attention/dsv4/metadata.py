@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import is_hip, is_ppu, is_xpu
 
 if TYPE_CHECKING:
     pass
@@ -112,8 +112,10 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    q_fp8_shape: torch.Size
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -125,6 +127,7 @@ class PagedIndexerMetadata:
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or not self.build_paged_mqa_logits_metadata
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
@@ -144,10 +147,29 @@ class PagedIndexerMetadata:
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
+
+            metadata_extra = None
+            if (
+                self.q_fp8_shape is not None
+                and not envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            ):
+                metadata_extra = (
+                    1,  # next_n
+                    self.q_fp8_shape[2],  # num_heads
+                    self.q_fp8_shape[3],  # head_dim
+                    1,  # element size
+                )
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
                 _c4,
                 self.c4_page_size,
                 deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if is_ppu() and metadata_extra is not None
+                    else {}
+                ),
             )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
@@ -188,6 +210,7 @@ class PagedIndexerMetadata:
                 "page_size",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
+                "build_paged_mqa_logits_metadata",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

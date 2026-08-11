@@ -8143,7 +8143,9 @@ class ServerArgs:
                     "All operations will run eagerly through the graph capture/replay path."
                 )
         if self.enable_deepseek_v4_fp4_indexer and not (
-            is_sm100_supported() or is_sm120_supported()
+            (is_ppu() and get_device_sm() >= 89)
+            or is_sm100_supported()
+            or is_sm120_supported()
         ):
             raise ValueError(
                 "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
