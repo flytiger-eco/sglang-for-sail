@@ -1,0 +1,142 @@
+name: PR Test (PPU)
+
+on:
+  # push:
+  #   branches: [ v0.5.13 ]
+  # pull_request:
+  #   branches: [ v0.5.13 ]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PPU_BASE_IMAGE: reg.docker.alibaba-inc.com/aisw/llm:v2.1.0-pytorch2.10.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
+        || steps.run-mode.outputs.run_all_tests == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            ppu_code:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "python/pyproject_other.toml"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "sgl-kernel/**"
+              - "test/registered/ppu/**"
+              - "scripts/ci/ppu/**"
+
+  # ==================== Stage A: Smoke Test ==================== #
+  stage-a-test-1-gpu-ppu:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: ppu
+    timeout-minutes: 60
+    steps:
+      - name: Clean workspace (root-owned files from prior Docker runs)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Run PPU smoke test
+        timeout-minutes: 45
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          docker run --rm \
+            --privileged \
+            --network host \
+            --device=/dev/alixpu_ctl \
+            --device=/dev/alixpu \
+            --ipc=host \
+            --shm-size=8g \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            -v ${{ github.workspace }}:/workspace \
+            -v /nas_aisw:/nas_aisw \
+            -e SGLANG_IS_IN_CI=true \
+            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e PPU_ARTIFACTORY_USER \
+            -e PPU_ARTIFACTORY_PASSWORD \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "
+              cd /workspace && \
+              bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              cd test && \
+              python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu
+            "
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    needs:
+      [
+        check-changes,
+        stage-a-test-1-gpu-ppu,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "Job $job did not succeed (result: $result)."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
