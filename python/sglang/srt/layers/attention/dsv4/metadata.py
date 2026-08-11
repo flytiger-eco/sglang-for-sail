@@ -7,7 +7,7 @@ from typing import Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_ppu, is_sm120_supported, is_xpu
 
 _IS_SM120 = is_sm120_supported()
 
@@ -114,8 +114,10 @@ class PagedIndexerMetadata:
     page_table: torch.Tensor
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
+    q_fp8_shape: Optional[torch.Size] = None
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -124,7 +126,10 @@ class PagedIndexerMetadata:
 
     def __post_init__(self):
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or not self.build_paged_mqa_logits_metadata
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
@@ -141,27 +146,33 @@ class PagedIndexerMetadata:
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
-            compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
-            if compressed_seq_lens.dim() == 1:
-                compressed_seq_lens = compressed_seq_lens.unsqueeze(-1)
-            if _IS_SM120 and compressed_seq_lens.shape[0] > _SM120_INDEXER_M_CHUNK:
-                # Chunk metadata is shared by all indexer layers in this forward.
-                self.deep_gemm_metadata = [
-                    get_paged_mqa_logits_metadata(
-                        compressed_seq_lens[_s : _s + _SM120_INDEXER_M_CHUNK],
-                        self.compressed_page_size,
-                        deep_gemm.get_num_sms(),
-                    )
-                    for _s in range(
-                        0, compressed_seq_lens.shape[0], _SM120_INDEXER_M_CHUNK
-                    )
-                ]
-            else:
-                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                    compressed_seq_lens,
-                    self.compressed_page_size,
-                    deep_gemm.get_num_sms(),
+            _c4 = self.compressed_seq_lens.to(torch.int32)
+            if _c4.dim() == 1:
+                _c4 = _c4.unsqueeze(-1)
+
+            metadata_extra = None
+            if (
+                self.q_fp8_shape is not None
+                and not envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            ):
+                metadata_extra = (
+                    1,  # next_n
+                    self.q_fp8_shape[2],  # num_heads
+                    self.q_fp8_shape[3],  # head_dim
+                    1,  # element size
                 )
+            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                _c4,
+                self.compressed_page_size,
+                deep_gemm.get_num_sms(),
+                **(
+                    dict(
+                        metadata_extra=metadata_extra,
+                    )
+                    if is_ppu() and metadata_extra is not None
+                    else {}
+                ),
+            )
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
@@ -199,6 +210,7 @@ class PagedIndexerMetadata:
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
+                "build_paged_mqa_logits_metadata",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
