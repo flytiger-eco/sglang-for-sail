@@ -3691,7 +3691,7 @@ def _dequant_fp8_wo_a_streaming(
             if scale is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield name, _dequant_fp8(tensor, scale)
+                yield name, _dequant(tensor, scale)
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -3704,7 +3704,7 @@ def _dequant_fp8_wo_a_streaming(
             if weight is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield prefix + ".weight", _dequant_fp8(weight, tensor)
+                yield prefix + ".weight", _dequant(weight, tensor)
             else:
                 bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -3721,6 +3721,30 @@ def _dequant_fp8_wo_a_streaming(
             yield prefix + ".scale", bucket["scale"]
 
 
+def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    from einops import rearrange
+
+    assert weight.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ), f"expected fp8_e4m3f or int8, got {weight.dtype}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
+
+    bn = weight.shape[0] // scale.shape[0]
+    bk = weight.shape[1] // scale.shape[1]
+    weight_f32 = rearrange(
+        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=bn, bk=bk
+    )
+    result = rearrange(
+        weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
+    )
+
+    return result.to(torch.bfloat16)
+
+
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -3735,6 +3759,6 @@ def _dequant_fp8_wo_a(
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
+        yield name, _dequant(weight, scale)
 
     yield from weights_dict.items()
