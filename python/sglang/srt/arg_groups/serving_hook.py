@@ -432,7 +432,8 @@ def handle_environment_variables(server_args: Any):
     # it, mirroring the forward scale split: the ue8m0 path
     # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
     # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+    # PPU always supports channelwise wo_a einsum; skip the disable.
+    if not is_ppu() and get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
         sm = get_platform().device_sm
