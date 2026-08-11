@@ -8154,11 +8154,14 @@ class ServerArgs:
                 "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
                 "DeepGEMM FP4 indexer support."
             )
-        # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
-        # it, mirroring the forward scale split: the ue8m0 path
-        # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
-        # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-        if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        # FP8 W_o GEMM requires Blackwell (sm100+). Auto-disable on Hopper.
+        # ppu always support einsum
+        if (
+            not is_ppu()
+            and is_cuda()
+            and envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+            and get_device_sm() < 100
+        ):
             from sglang.srt.layers import deep_gemm_wrapper
 
             sm = get_device_sm()
