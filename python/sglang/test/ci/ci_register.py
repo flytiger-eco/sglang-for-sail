@@ -136,6 +136,7 @@ def register_xpu_ci(
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
+
 def register_ppu_ci(
     est_time: float,
     suite: Optional[str] = None,
