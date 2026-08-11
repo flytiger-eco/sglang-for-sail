@@ -6013,6 +6013,77 @@ class ServerArgs:
             run_post_process_pass,
         )
 
+        # [q_v-not-support fallback] On PPU, fa3+flashmla combo crashes with
+        # "q_v not support" under certain configs; detect and fall back to flashmla.
+        if (
+            is_ppu()
+            and self.prefill_attention_backend == "fa3"
+            and self.decode_attention_backend == "flashmla"
+        ):
+            _qv_mtp_wo_decode_sam = (
+                self.speculative_algorithm is not None
+                and self.speculative_attention_mode != "decode"
+            )
+            _qv_prefill_cg_enabled = (
+                self.cuda_graph_config is not None
+                and self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            )
+            _qv_chunked_prefix_disabled = self.disable_chunked_prefix_cache
+            if (
+                _qv_mtp_wo_decode_sam
+                or _qv_prefill_cg_enabled
+                or _qv_chunked_prefix_disabled
+            ):
+                _qv_reasons = []
+                if _qv_mtp_wo_decode_sam:
+                    _qv_reasons.append(
+                        "MTP enabled without --speculative-attention-mode decode "
+                        "(draft-extend would run on the fa3 prefill backend)"
+                    )
+                if _qv_prefill_cg_enabled:
+                    _qv_reasons.append(
+                        "prefill-phase CUDA graph is not disabled "
+                        "(fa3 prefill backend would be captured)"
+                    )
+                if _qv_chunked_prefix_disabled:
+                    _qv_reasons.append(
+                        "--disable-chunked-prefix-cache is set "
+                        "(MLA dispatch would pass q_v to fa3)"
+                    )
+                logger.warning(
+                    "Unsafe attention backend combo detected: "
+                    "--prefill-attention-backend fa3 --decode-attention-backend "
+                    "flashmla with "
+                    + "; ".join(_qv_reasons)
+                    + ". This triggers the 'q_v not support' crash. Falling back "
+                    "to a unified flashmla backend (--prefill-attention-backend "
+                    "flashmla), which is MLA-native and supports q_v and CUDA "
+                    "graph capture. To keep the fa3 prefill backend, set "
+                    "--speculative-attention-mode decode, disable the prefill "
+                    "CUDA graph (--disable-piecewise-cuda-graph), and do NOT set "
+                    "--disable-chunked-prefix-cache."
+                )
+                self.prefill_attention_backend = "flashmla"
+
+        # [fp8-kv-cache fallback] On PPU, flashmla/flashmla_sparse do not support
+        # fp8_e4m3 kv-cache; disable fp8 kv-cache and keep backend unchanged.
+        if is_ppu() and self.kv_cache_dtype == "fp8_e4m3":
+            if (
+                self.decode_attention_backend == "flashmla"
+                or self.dsa_prefill_backend == "flashmla_sparse"
+            ):
+                _incompatible = []
+                if self.decode_attention_backend == "flashmla":
+                    _incompatible.append("--decode-attention-backend flashmla")
+                if self.dsa_prefill_backend == "flashmla_sparse":
+                    _incompatible.append("--dsa-prefill-backend flashmla_sparse")
+                logger.warning(
+                    f"On PPU, {' and '.join(_incompatible)} does not support "
+                    "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
+                    "(falling back to --kv-cache-dtype auto)."
+                )
+                self.kv_cache_dtype = "auto"
+
         # Split-backend override + default fill.
         run_post_process_pass(self, _attention_backend_default)
 
