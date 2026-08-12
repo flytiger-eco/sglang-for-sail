@@ -5,9 +5,10 @@ plus an end-to-end check of `match_prefix_for_req` driving a populated
 RadixCache.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 import unittest
 import unittest.mock

@@ -16,6 +16,7 @@ except ModuleNotFoundError:
 
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 
 def _load_mmmu_eval_utils():

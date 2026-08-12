@@ -17,12 +17,18 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.lora_utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=200, suite="nightly-amd-1-gpu", nightly=True)
+register_ppu_ci(est_time=200, suite="nightly-1-ppu", nightly=True)
 
 PROMPTS = [
     "AI is a field of computer science focused on",
@@ -38,6 +44,7 @@ PROMPTS = [
 ]
 
 
+@skip_if_model_missing("meta-llama/Llama-2-7b-hf")
 class TestLoRARadixCache(CustomTestCase):
 
     def test_lora_radix_cache(self):

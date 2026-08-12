@@ -5,7 +5,8 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -16,8 +17,10 @@ from sglang.test.test_utils import (
 
 # FlashInfer MLA backend tests with MTP speculative decoding
 register_cuda_ci(est_time=130, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=130, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("lmsys/sglang-ci-dsv3-test")
 class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

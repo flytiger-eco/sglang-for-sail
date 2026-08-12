@@ -10,7 +10,8 @@ from msgspec.msgpack import Decoder
 
 from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
@@ -23,11 +24,13 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=540, stage="extra-b", runner_config="4-gpu-h100")
+register_ppu_ci(est_time=540, suite="nightly-4-ppu", nightly=True)
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
 
 
+@skip_if_model_missing("Qwen/Qwen3.5-27B")
 class TestQwen35WithHiCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):

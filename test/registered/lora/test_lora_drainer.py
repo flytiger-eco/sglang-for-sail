@@ -5,7 +5,12 @@ from unittest import mock
 
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.managers.schedule_batch import Req
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
@@ -14,6 +19,7 @@ from sglang.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=100, suite="nightly-1-ppu", nightly=True)
 
 MOCK_START_TIME = 1000.0
 LORA_DRAIN_WAIT_THRESHOLD = 3.0
@@ -31,6 +37,7 @@ def make_req(lora_id, wait_queue_entry_time, max_new_tokens, output_len=0):
     return cast(Req, req_ns)
 
 
+@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestLoRADrainer(unittest.TestCase):
     def test_update_draining_marks_adapter(self):
         if is_in_ci():

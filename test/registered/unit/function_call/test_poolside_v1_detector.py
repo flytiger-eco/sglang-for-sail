@@ -5,10 +5,11 @@ import json
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
+register_ppu_ci(est_time=1, suite="per-commit-1-ppu")
 
 
 class TestPoolsideV1Detector(CustomTestCase):

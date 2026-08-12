@@ -7,10 +7,11 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 
 class DummyDetector(BaseFormatDetector):

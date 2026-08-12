@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
+register_ppu_ci(est_time=443, suite="nightly-8-ppu", nightly=True)
 
 
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):

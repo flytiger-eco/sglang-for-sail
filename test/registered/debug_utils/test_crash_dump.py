@@ -13,7 +13,9 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_ppu_ci,
 )
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -24,8 +26,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=40, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=40, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=225, suite="base-b-test-cpu")
+register_ppu_ci(est_time=40, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("Qwen/Qwen3-0.6B")
 class TestCrashDump(CustomTestCase):
     crash_dump_folder = None
     MAX_NEW_TOKENS = 4

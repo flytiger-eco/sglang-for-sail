@@ -16,7 +16,8 @@ import unittest
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.lora_utils import (
     MOE_BASE_MODEL_PATH,
     MOE_LORA_PATH,
@@ -29,6 +30,7 @@ register_cuda_ci(
     stage="base-b",
     runner_config="1-gpu-large",
 )
+register_ppu_ci(est_time=50, suite="nightly-1-ppu", nightly=True)
 
 # Format: [{"text": "result string", "lps": [0.1, 0.2, ...]}, ...]
 VLLM_CACHED_RESULTS = [
@@ -283,6 +285,7 @@ REFERENCE_STATS = {
 }
 
 
+@skip_if_model_missing("Qwen/Qwen1.5-MoE-A2.7B")
 class TestMoELoraRegression(unittest.TestCase):
 
     def test_sglang_moe_parity_strict(self):

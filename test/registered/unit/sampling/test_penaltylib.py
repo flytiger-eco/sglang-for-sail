@@ -1,9 +1,10 @@
 """Unit tests for srt/sampling/penaltylib/ — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_ppu_ci(est_time=9, suite="per-commit-1-ppu")
 
 import unittest
 from unittest.mock import MagicMock

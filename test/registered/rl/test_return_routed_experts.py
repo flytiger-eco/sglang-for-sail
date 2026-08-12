@@ -15,7 +15,8 @@ from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,6 +26,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_ppu_ci(est_time=400, suite="nightly-4-ppu", nightly=True)
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
@@ -39,6 +41,7 @@ _QWEN3_30B_A3B_NUM_LAYERS = 48
 _QWEN3_30B_A3B_TOPK = 8
 
 
+@skip_if_model_missing("Qwen/Qwen3-30B-A3B-FP8")
 class TestReturnRoutedExperts(CustomTestCase):
     """End-to-end check that --enable-return-routed-experts stays correct
     under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
@@ -349,6 +352,7 @@ def compare_baseline_w_reference(baseline, reference):
     return num_total_mismatches
 
 
+@skip_if_model_missing("Qwen/Qwen3-30B-A3B")
 class TestRoutedExpertsStartLen(CustomTestCase):
     """Verify the `routed_experts_start_len` parameter:
 

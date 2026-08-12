@@ -5,9 +5,10 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_ppu_ci(est_time=12, suite="per-commit-1-ppu")
 
 
 class _FakeAllocator:

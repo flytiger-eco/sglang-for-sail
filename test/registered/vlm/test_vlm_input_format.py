@@ -18,7 +18,7 @@ from transformers import (
     Qwen2_5_VLForConditionalGeneration,
 )
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
@@ -37,8 +37,10 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=747, suite="nightly-1-ppu", nightly=True)
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -207,6 +209,7 @@ class VLMInputTestBase:
         raise NotImplementedError
 
 
+@skip_if_model_missing("Qwen/Qwen2.5-VL-3B-Instruct")
 class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
     chat_template = "qwen2-vl"
@@ -234,6 +237,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
         return dict(processor_output, format="processor_output")
 
 
+@skip_if_model_missing("google/gemma-3-4b-it")
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "google/gemma-3-4b-it"
     chat_template = "gemma-it"
@@ -263,6 +267,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 
 
 # Updated Kimi-VL test to use the new input format.
+@skip_if_model_missing("moonshotai/Kimi-VL-A3B-Instruct")
 class TestKimiVLImageUnderstandsImage(
     VLMInputTestBase, unittest.IsolatedAsyncioTestCase
 ):
@@ -403,6 +408,7 @@ class TestKimiVLImageUnderstandsImage(
 #         return dict(processor_output, format="processor_output")
 
 
+@skip_if_model_missing("OpenGVLab/InternVL2-2B")
 class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "OpenGVLab/InternVL2-2B"
     chat_template = "internvl-2-5"
@@ -590,6 +596,7 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+@skip_if_model_missing("openbmb/MiniCPM-V-4")
 class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "openbmb/MiniCPM-V-4"
     chat_template = "minicpmv"

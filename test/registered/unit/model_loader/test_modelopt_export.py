@@ -17,10 +17,15 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=11, suite="per-commit-1-ppu")
 
 # Note: PYTHONPATH=python should be set when running tests
 

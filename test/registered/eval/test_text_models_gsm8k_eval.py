@@ -4,7 +4,8 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
+register_ppu_ci(est_time=3600, suite="nightly-2-ppu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
     # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
@@ -47,6 +49,7 @@ MODEL_SCORE_THRESHOLDS = {
 
 
 # Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
+@skip_if_model_missing("meta-llama/Llama-3.1-70B-Instruct")
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

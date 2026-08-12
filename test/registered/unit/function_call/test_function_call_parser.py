@@ -29,10 +29,12 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=61, suite="base-b-test-cpu")
+register_ppu_ci(est_time=15, suite="nightly-1-ppu", nightly=True)
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1263,6 +1265,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params2["city"], "Beijing")
 
 
+@skip_if_model_missing("deepseek-ai/DeepSeek-V3.2")
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
         """Set up test tools and detector for DeepSeekV32 format testing."""
@@ -1713,6 +1716,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.assertEqual(json.loads(result.calls[0].parameters), {})
 
 
+@skip_if_model_missing("deepseek-ai/DeepSeek-V3.2")
 class TestDeepSeekV4Detector(unittest.TestCase):
     def setUp(self):
         """Set up test tools and detector for DeepSeekV4 format testing."""
