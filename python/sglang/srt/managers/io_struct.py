@@ -1120,7 +1120,7 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
         return iter(self.batch)
 
 
-@dataclass
+@dataclass(kw_only=True)
 class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
@@ -1194,9 +1194,19 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
 
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]] = None
+    # Accepted drafts
+    spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
+    # Acceptance histogram
+    spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
-@dataclass
-class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+
+@dataclass(kw_only=True)
+class BatchStrOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     # The output decoded strings
@@ -1262,8 +1272,18 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
 
+    # Verify count: number of verification forward passes
+    spec_verify_ct: Optional[List[int]] = None
+    # Accepted drafts
+    spec_num_correct_drafts: Optional[List[int]] = None
+    spec_num_block_accept_tokens: Optional[List[int]] = None
+    spec_num_cap_tokens: Optional[List[int]] = None
+    # Acceptance histogram
+    spec_correct_drafts_histogram: Optional[List[List[int]]] = None
+    spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
-@dataclass
+
+@dataclass(kw_only=True)
 class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[BaseFinishReason]

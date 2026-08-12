@@ -58,17 +58,18 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW8A8Fp8MoE,
+    PPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
@@ -397,7 +398,10 @@ class FusedMoE(torch.nn.Module):
             )
         ):
             quant_config_dict["dispatcher_output_dtype"] = "fp8"
-        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod) or (
+            isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            and isinstance(self.scheme, PPUCompressedTensorsW8A8Int8DynamicMoE)
+        ):
             quant_config_dict["dispatcher_output_dtype"] = "int8"
         elif isinstance(self.quant_method, Mxfp4MoEMethod):
             quant_config_dict["dispatcher_output_dtype"] = "uint8"
@@ -415,7 +419,10 @@ class FusedMoE(torch.nn.Module):
             ):
                 is_channel_quant = True
 
-        if isinstance(self.quant_method, W8A8Int8MoEMethod):
+        if isinstance(self.quant_method, W8A8Int8MoEMethod) or (
+            isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            and isinstance(self.scheme, PPUCompressedTensorsW8A8Int8DynamicMoE)
+        ):
             is_channel_quant = True
 
         quant_config_dict["is_channel_quant"] = is_channel_quant

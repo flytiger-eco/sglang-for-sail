@@ -158,6 +158,40 @@ logger = logging.getLogger(__name__)
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
 
+DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+]
+
+
+def make_hc_head_params(
+    hc_mult: int, hidden_size: int
+) -> Tuple[nn.Parameter, nn.Parameter, nn.Parameter]:
+    hc_dim = hc_mult * hidden_size
+    return (
+        nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32)),
+        nn.Parameter(torch.empty(hc_mult, dtype=torch.float32)),
+        nn.Parameter(torch.empty(1, dtype=torch.float32)),
+    )
+
+
+def hc_head_torch(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    shape, dtype = x.size(), x.dtype
+    x = x.flatten(-2).float()
+    rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(x, hc_fn) * rsqrt
+    pre = torch.sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
+    return y.to(dtype)
+
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # The fused path directly reuses TileLang mhc_post/mhc_pre kernels and their
@@ -1006,7 +1040,7 @@ class MQALayer(nn.Module):
             if _is_ppu:
                 if self._attn_sink_local is None:
                     # Community FlashMLA only support h_q for {64, 128} currently;
-                    # PPU FlashMLA support more h_q; 
+                    # PPU FlashMLA support more h_q;
                     # But PPU flashmla needs q local_head matches attn_sink_local.
                     self._attn_sink_local = self.attn_sink[
                         rank * self.n_local_heads : (rank + 1) * self.n_local_heads
@@ -1139,9 +1173,9 @@ class MQALayer(nn.Module):
                     group_size=128,
                     scale_ue8m0=True,
                 )
-                #* scale_ue8m0=True already rounds o_s to power-of-2 (UE8M0)
-                # inside `sglang_per_token_group_quant_fp8``, so extra 
-                # deep_gemm.ceil_to_ue8m0 is removed . 
+                # * scale_ue8m0=True already rounds o_s to power-of-2 (UE8M0)
+                # inside `sglang_per_token_group_quant_fp8``, so extra
+                # deep_gemm.ceil_to_ue8m0 is removed .
                 output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
                 deep_gemm.fp8_einsum(
                     "bhr,hdr->bhd",
@@ -1816,6 +1850,11 @@ class DeepseekV4Model(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
 
+        self.dspark_layers_to_capture: Optional[List[int]] = None
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -1887,6 +1926,15 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
+        capture_dspark = self.dspark_layers_to_capture is not None
+        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+            raise NotImplementedError(
+                "DSpark aux hidden-state capture is not supported together with "
+                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
+                "of them: DSpark static-verify is CP-off for v1."
+            )
+        dspark_aux_hidden_states: List[torch.Tensor] = []
+
         use_fused = self.use_fused_mhc_post_pre
         prev_residual, prev_post, prev_comb = None, None, None
         last_layer = None
@@ -1909,6 +1957,14 @@ class DeepseekV4Model(nn.Module):
                     prev_post=prev_post,
                     prev_comb=prev_comb,
                 )
+            if capture_dspark and i in self.dspark_layers_to_capture:
+                if use_fused:
+                    completed = layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
+                else:
+                    completed = hidden_states
+                dspark_aux_hidden_states.append(completed.mean(dim=1))
         if use_fused and last_layer is not None:
             hidden_states = last_layer.hc_post(
                 hidden_states, prev_residual, prev_post, prev_comb
@@ -1933,6 +1989,9 @@ class DeepseekV4Model(nn.Module):
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
+
+        if capture_dspark:
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
 
         return hidden_states, pre_hc_head
 
@@ -2030,6 +2089,19 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.get_input_embeddings()
+
+    def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
@@ -2105,7 +2177,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.lm_head,
             forward_batch,
             aux_hidden_states,
-            hidden_states_before_norm=pre_hc_head,
+            hidden_states_before_norm=(
+                None if aux_hidden_states is not None else pre_hc_head
+            ),
         )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -2252,10 +2326,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 logger.info("Skip dequant wo_a")
 
-        stacked_params_mapping = [
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
@@ -2652,3 +2723,8 @@ def _dequant_wo_a(
         yield name, _dequant(weight, scale)
 
     yield from weights_dict.items()
+
+
+# Aliases for DSpark compatibility (PR #30711 renamed these)
+MqaAttentionBase = MQALayer
+_dequant_fp8_wo_a = _dequant_wo_a

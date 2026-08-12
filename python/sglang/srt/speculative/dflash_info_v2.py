@@ -68,8 +68,14 @@ class DFlashDraftInputV2(SpecInput):
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
 
+    verify_token_budget: Optional[int] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
+
+    @property
+    def bonus_tokens(self) -> torch.Tensor:
+        return self.verified_id
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Spec v2 draft state itself does not change token accounting.

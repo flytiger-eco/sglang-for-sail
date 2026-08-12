@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_MATCHED_TOKEN,
     Req,
     ScheduleBatch,
 )
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
@@ -542,6 +544,17 @@ class SchedulerBatchResultProcessor:
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        block_accept_lens = (
+            result.block_accept_lens.tolist()
+            if result.block_accept_lens is not None
+            else None
+        )
+        result.num_block_accept_tokens = (
+            sum(block_accept_lens) if block_accept_lens else 0
+        )
+        cap_lens = result.cap_lens.tolist() if result.cap_lens is not None else None
+        result.num_cap_tokens = sum(cap_lens) if cap_lens else 0
+
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
@@ -562,7 +575,7 @@ class SchedulerBatchResultProcessor:
                 # reset_for_retract() already zeroes committed/allocated KV.
                 pass
             elif req.finished():
-                if not batch.spec_algorithm.is_dflash():
+                if not batch.spec_algorithm.is_dflash_family():
                     # EAGLE prepare_for_decode pre-claimed the bonus slot.
                     req.kv_committed_len -= 1
             else:
@@ -574,7 +587,7 @@ class SchedulerBatchResultProcessor:
                     accept_tokens = self._accept_grammar_tokens(req, accept_tokens)
 
                 num_accept_tokens = len(accept_tokens)
-                if batch.spec_algorithm.is_dflash():
+                if batch.spec_algorithm.is_dflash_family():
                     # DFLASH materialized accepted draft tokens plus the bonus token.
                     req.kv_committed_len += num_accept_tokens
                 else:
@@ -585,6 +598,12 @@ class SchedulerBatchResultProcessor:
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
+                if block_accept_lens is not None:
+                    req.spec_num_block_accept_tokens += block_accept_lens[i]
+                if cap_lens is not None:
+                    req.spec_num_cap_tokens += cap_lens[i]
+                    req.update_spec_cap_lens_histogram(cap_lens[i])
 
             predict_tokens.append(accept_tokens)
 
@@ -663,7 +682,10 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_correct_drafts
+                batch.batch_size(),
+                result.num_correct_drafts,
+                num_block_accept_tokens=result.num_block_accept_tokens,
+                num_cap_tokens=result.num_cap_tokens,
             )
         if self.server_args.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
@@ -842,6 +864,14 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # isinstance narrowing: create_worker may also return plain
+            # TpModelWorker-based drafts, which carry no spec-worker hooks.
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                self.draft_worker.note_request_finished(
+                    rid=req.rid,
+                    natural_stop=isinstance(req.finished_reason, FINISH_MATCHED_TOKEN),
+                )
+
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()

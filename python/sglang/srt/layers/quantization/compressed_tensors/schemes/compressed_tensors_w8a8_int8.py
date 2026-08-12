@@ -8,6 +8,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
 )
@@ -21,13 +22,18 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_ppu
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_ppu = is_ppu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+if _is_ppu:
+    from acext import int8_gemm as acext_int8_gemm
+
+    from sglang.srt.layers.quantization.w8a8_int8 import gemm_nt_i8i8bf16
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -173,6 +179,20 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
+
+        if envs.SGLANG_SAIL_DEEPGEMM_DENSE.get() and _is_ppu and bias is None:
+            out = torch.empty(
+                (x_q.shape[0], layer.weight.t().shape[0]),
+                dtype=torch.bfloat16,
+                device=x_q.device,
+            )
+            gemm_nt_i8i8bf16(x_q, x_scale, layer.weight.t(), layer.weight_scale, out)
+            return out.to(x.dtype)
+
+        if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+            return acext_int8_gemm(
+                x_q, layer.weight.t(), layer.weight_scale, x_scale, bias, x.dtype
+            )
 
         return int8_scaled_mm(
             x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias

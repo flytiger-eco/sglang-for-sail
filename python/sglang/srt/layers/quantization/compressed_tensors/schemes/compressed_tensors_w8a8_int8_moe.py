@@ -13,6 +13,10 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    W8A8Int8Config,
+    W8A8Int8MoEMethod,
+)
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -21,7 +25,10 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-__all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
+__all__ = [
+    "NPUCompressedTensorsW8A8Int8DynamicMoE",
+    "PPUCompressedTensorsW8A8Int8DynamicMoE",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -152,3 +159,63 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
             group_list,
             output_dtype,
         )
+
+
+class PPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
+
+    def __init__(self, weight_quant, input_quant):
+        self.weight_quant = weight_quant
+        self.input_quant = input_quant
+        self.kernel = W8A8Int8MoEMethod(W8A8Int8Config())
+
+        self.static_input_scales = not self.input_quant.dynamic
+        per_channel = (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and self.input_quant.strategy == QuantizationStrategy.TOKEN
+        )
+        if not per_channel:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found "
+                f"{self.weight_quant}, {self.input_quant}"
+            )
+        if self.static_input_scales:
+            raise ValueError(
+                "For INT8 Fused MoE layers, we require channelwise, "
+                "dynamic per token quantization. Found static input scales."
+            )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+
+        self.kernel.create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.kernel.create_moe_runner(layer, moe_runner_config)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+
+        return self.kernel.apply(layer, dispatch_output)

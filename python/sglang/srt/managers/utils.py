@@ -22,6 +22,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _async_d2h(t: torch.Tensor) -> torch.Tensor:
+    """Async D2H copy for overlap scheduling."""
+    if not t.is_cuda:
+        return t.to("cpu", non_blocking=True)
+    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    cpu_t.copy_(t, non_blocking=True)
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return cpu_t
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -29,6 +39,11 @@ class GenerationBatchResult:
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    num_block_accept_tokens: int = 0
+    num_cap_tokens: int = 0
+    # FDFO dLLM batching: per-request accepted block length and carried algo state.
+    accept_length_per_req_cpu: Optional[List[int]] = None
+    dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
@@ -49,6 +64,10 @@ class GenerationBatchResult:
     # FIXME(lsyin): maybe move to a better place?
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
+
+    block_accept_lens: Optional[torch.Tensor] = None
+
+    cap_lens: Optional[torch.Tensor] = None
 
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
@@ -108,16 +127,24 @@ class GenerationBatchResult:
         self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _async_d2h(self.accept_lens)
 
-        if self.routed_experts_output is not None:
-            self.routed_experts_output.copy_to_cpu()
+        if self.block_accept_lens is not None:
+            self.block_accept_lens = _async_d2h(self.block_accept_lens)
 
-        if self.indexer_topk_output is not None:
-            self.indexer_topk_output.copy_to_cpu()
+        if self.cap_lens is not None:
+            self.cap_lens = _async_d2h(self.cap_lens)
 
-        if (x := self.expert_distribution_metrics) is not None:
-            x.copy_to_cpu()
+        # Sub-objects only declare their device fields; the single copy+safety
+        # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
+        # all device->host copying and lifetime safety lives in one place.
+        for holder in (
+            self.routed_experts_output,
+            self.indexer_topk_output,
+            self.expert_distribution_metrics,
+        ):
+            if holder is not None:
+                holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
 

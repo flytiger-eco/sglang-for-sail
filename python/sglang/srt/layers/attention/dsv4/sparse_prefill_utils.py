@@ -50,6 +50,31 @@ SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
 
 
+class SparsePrefillWorkspace:
+    """Backend-owned scratch storage for sparse prefill KV dequantization.
+
+    The workspace contents are fully overwritten before every attention call,
+    so token buckets and compression ratios can safely share one buffer. Sparse
+    prefill executes eagerly and serially on the supported paths, which makes it
+    safe to replace the scratch allocation when a larger extent is needed.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self._buffer: Optional[torch.Tensor] = None
+
+    def get(self, num_tokens: int) -> torch.Tensor:
+        assert num_tokens > 0
+        current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
+        if num_tokens > current_capacity:
+            self._buffer = torch.empty(
+                (num_tokens, 1, WORKSPACE_DIM),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        return self._buffer[:num_tokens]
+
+
 def combined_topk_width(topk: int, window_size: int) -> int:
     """Width of the padded combined_indices last dim that
     ``combine_topk_swa_indices`` would produce for these args."""

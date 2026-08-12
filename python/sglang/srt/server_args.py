@@ -1449,7 +1449,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1485,6 +1485,37 @@ class ServerArgs:
         Optional[int],
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
     ] = None
+    speculative_dspark_block_size: A[
+        Optional[int],
+        "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
+    ] = None
+    speculative_dspark_sps_table_path: A[
+        Optional[str],
+        "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "
+        "sglang.benchmark.dspark_sps_profiler, consumed by the ragged-verify "
+        "scheduler (cap-accept / compact). Omit for an uninitialized flat "
+        "constant-SPS table: the budget degenerates to verify-all (zero throughput "
+        "gain by itself).",
+    ] = None
+    speculative_dspark_confidence_sts_path: A[
+        Optional[str],
+        "DSPARK only. Optional path to a per-position STS (sequential temperature "
+        "scaling) calibration JSON, fit offline with sglang.benchmark.dspark_sts_fit. "
+        "Calibrates the confidence-head survival probabilities the ragged-verify "
+        "scheduler consumes. Omit to use identity (no calibration); losslessness is "
+        "unaffected either way.",
+    ] = None
+    speculative_dspark_align_verify_tokens_to_graph_tier: A[
+        bool,
+        "DSPARK compact ragged-verify only. Fill the per-request verify lengths so "
+        "the total verify-token count reaches the cuda-graph tier the forward is "
+        "already padded to: round the dp-max scheduled total up to the captured "
+        "token bucket and let the top-k allocator admit that many real draft tokens "
+        "(confidence-ordered). This recovers the padding the forward pays for anyway "
+        "-- both the cuda-graph bucket round-up and the dp cross-rank max -- turning "
+        "it into extra real verification at the same step time. Off by default; when "
+        "off the schedule is byte-for-byte unchanged.",
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -2151,6 +2182,22 @@ class ServerArgs:
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
     ] = False
+
+    # -------------------------------------------------------------------------
+    # Min free slots delay (prefill refill batching)
+    # -------------------------------------------------------------------------
+    min_free_slots_delay: A[
+        Optional[int],
+        (
+            "Hold new prefills until at least N running-request slots have freed "
+            "up, so they are admitted in one batch instead of one at a time. "
+            "Useful when each admission is disproportionately expensive, e.g. "
+            "speculative decoding with a separate draft prefill pass. Capped to "
+            "the DFlash formula (disabled when max-running-requests < 8; "
+            "min(4, max(2, (max-run + 5) // 6))). DFlash workloads auto-enable "
+            "this with the formula when unset; other workloads stay disabled."
+        ),
+    ] = None
 
     # -------------------------------------------------------------------------
     # Deterministic inference
@@ -3619,7 +3666,7 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "interleave DSA CP does not support DP attention."
-                        #* Assume that Non-810e machine has 8 cards
+                        # * Assume that Non-810e machine has 8 cards
                         if not "810E" in current_platform.get_device_name():
                             assert (
                                 self.tp_size <= 8

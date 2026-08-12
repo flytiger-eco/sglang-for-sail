@@ -181,9 +181,9 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
+    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
+    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
         return False
     return not server_args.enable_multi_layer_eagle
 
@@ -650,3 +650,15 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             model=model_runner.model,
         )
+
+
+def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+    """eagle/ngram share a stateless free function; dflash keeps stateful
+    prep on its draft input -- the dispatcher routes.
+    """
+    if batch.spec_algorithm.is_dflash_family():
+        batch.spec_info.prepare_for_decode(batch)
+    else:
+        from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
+
+        eagle_prepare_for_decode(batch)
