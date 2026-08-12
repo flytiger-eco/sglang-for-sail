@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.utils import (
     pack_cols,
     unpack_cols,
 )
-from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils import get_device_capability, is_cuda, is_ppu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -42,6 +42,7 @@ except ImportError:
 
 
 _is_cuda = is_cuda()
+_is_ppu = is_ppu()
 
 if _is_cuda:
     from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
@@ -455,6 +456,16 @@ def should_use_atomic_add_reduce(
     # the performance of atomicAdd is better than global reduce
     # only when m*n is small and k is large
     if n >= 2048 or k < 2048 or device.type != "cuda":
+        return False
+
+    # PPU: the marlin atomic-add path deadlocks the kernel at small m — the same
+    # unbounded lock spin that hangs the MoE variant (GPU stuck at 100%, only a
+    # container-root SIGKILL frees it). Note PPU reports device.type == "cuda", so the
+    # check above does not filter it out. The bf16 bail-out below covers bf16 but not
+    # fp16, and this predicate is most permissive exactly at small m, so a PPU user
+    # running --dtype float16 with a gptq/awq/fp8-marlin model would hang at decode.
+    # See docs/ppu_marlin_hang_sdk_report.md.
+    if _is_ppu:
         return False
 
     # disable atomicAdd reduce by default,
