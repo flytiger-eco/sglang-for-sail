@@ -72,7 +72,7 @@ jobs:
   stage-a-test-1-gpu-ppu:
     needs: [check-changes]
     if: needs.check-changes.outputs.changes_exist == 'true'
-    runs-on: ppu
+    runs-on: [ self-hosted, ppu ]
     timeout-minutes: 60
     steps:
       - name: Clean workspace (root-owned files from prior Docker runs)
