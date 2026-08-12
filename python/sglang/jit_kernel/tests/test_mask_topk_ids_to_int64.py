@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_ppu
+from sglang.test.ci.ci_register import register_ppu_ci
+register_ppu_ci(est_time=60, suite="stage-a-test-1-gpu-ppu", disabled="pending PPU CI migration")
 
 pytestmark = pytest.mark.skipif(not is_ppu(), reason="PPU-only kernel")
 
