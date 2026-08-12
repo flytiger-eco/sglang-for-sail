@@ -125,11 +125,10 @@ def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -
     return ragged_verify_compact_enabled()
 
 
-
 SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
 if SGLANG_PROFILE_NVTX:
     try:
-        from model_prof import prof_iter
+        # from model_prof import prof_iter
 
         use_model_prof = True
 
@@ -137,7 +136,7 @@ if SGLANG_PROFILE_NVTX:
         use_model_prof = False
 
     try:
-        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        # from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
         from torch.cuda.nvtx import range_push as th_nvtx_range_push
 
     except ImportError as e:

@@ -14,6 +14,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -24,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import _is_ppu
 from sglang.srt.models.deepseek_v4 import (
+    _FP8_WO_A_GEMM,
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
@@ -273,11 +279,48 @@ class DSparkAttention(MqaAttentionBase):
             self.n_local_groups,
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
+
+        if _FP8_WO_A_GEMM:
+            import deep_gemm
+
+            T, G, D = o.shape
+            R = self.o_lora_rank
+            if isinstance(self.quant_config, Fp8Config):
+                o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                    o.reshape(T * G, D).contiguous(),
+                    group_size=128,
+                    scale_ue8m0=True,
+                )
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                    (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                    output,
+                    recipe=(1, 1, 128),
+                )
+            else:
+                wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                    self._get_wo_a_channel_einsum_args(G, R, D)
+                )
+                o_fp8, o_s = sglang_per_token_quant_fp8(
+                    o.reshape(T * G, D).contiguous()
+                )
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                    (wo_a_weight_3d, wo_a_scale),
+                    output,
+                    recipe=wo_a_recipe,
+                )
+            o = output
         else:
-            o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            if self._use_fast_kernel:
+                o = torch.einsum("bgd,grd->bgr", o, wo_a)
+            else:
+                o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
         return out
 
@@ -800,8 +843,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            if any(name.endswith(".wo_a.scale") for name, _ in weights):
+                weights = list(_dequant_fp8_wo_a(weights))
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

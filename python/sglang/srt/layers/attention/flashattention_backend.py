@@ -544,7 +544,8 @@ class FlashAttentionBackend(AttentionBackend):
                     ).to(torch.int32)
                     metadata.max_seq_len_q = self.speculative_num_draft_tokens
                     metadata.max_seq_len_k = (
-                        forward_batch.seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                        forward_batch.seq_lens_cpu.max().item()
+                        + self.speculative_num_draft_tokens
                     )
                     metadata.cu_seqlens_q = torch.arange(
                         0,
