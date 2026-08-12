@@ -28,7 +28,7 @@ permissions:
   pull-requests: read
 
 env:
-  PPU_BASE_IMAGE: reg.docker.alibaba-inc.com/aisw/llm:v2.1.0-pytorch2.10.0-ubuntu24.04-cuda13.0-sglang0.5.10-py312
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
 
 jobs:
   # ==================== Check Changes ==================== #
