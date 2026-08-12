@@ -13,7 +13,7 @@ fi
 
 git config --global --add safe.directory "${REPO_ROOT}"
 
-${PIP_INSTALL} --upgrade pip setuptools wheel
+${PIP_INSTALL} --upgrade pip setuptools wheel dill
 
 # ==================== PPU Dependencies ==================== #
 # Install/upgrade PPU-specific packages from T-HEAD Artifactory
@@ -32,7 +32,7 @@ ${PIP_INSTALL} sglang==0.5.12+v0.1.0.ppu2.1.0 -i ${PPU_PIP_INDEX} --no-deps --fo
 # ==================== Install SGLang from source ==================== #
 rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
-cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu]"
+cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu]" --no-build-isolation
 
 # sgl-kernel is already installed from Artifactory (PPU Dependencies step above).
 # Source build from setup_ppu.py requires internal GitLab access for cutlass;
