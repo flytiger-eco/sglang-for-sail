@@ -281,7 +281,7 @@ class FutureMap:
             pool=req_to_token_pool,
         )
 
-    def _lazy_init_forward_buf(self, payload: RelayPayload):
+    def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
         from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 
@@ -342,11 +342,12 @@ class FutureMap:
             )
 
         self.dsa_topk_indices_buf = None
-        if payload.dsa_topk_indices is not None:
-            seed0 = payload.dsa_topk_indices[0]
+        dsa_topk_indices = getattr(draft_input, "dsa_topk_indices", None)
+        if dsa_topk_indices is not None:
+            seed0 = dsa_topk_indices[0]
             self.dsa_topk_indices_buf = torch.empty(
                 (self.req_pool_size, *seed0.shape),
-                dtype=payload.dsa_topk_indices.dtype,
+                dtype=dsa_topk_indices.dtype,
                 device=self.device,
             )
 
@@ -398,13 +399,24 @@ class FutureMap:
                 hidden_states_buf,
             )
             if self.need_bonus_tokens:
-                draft_input.bonus_tokens = bonus_tokens
+                # DFlash/DSpark expose bonus_tokens as a read-only property
+                # aliasing verified_id, so the per-iter bonus must be written to
+                # verified_id. EAGLE instead has a writable bonus_tokens field
+                # (and no verified_id); writing verified_id there would leave
+                # bonus_tokens stale and mismatch draft_tokens in the tree build.
+                if self.spec_algo.is_dflash_family():
+                    draft_input.verified_id = bonus_tokens
+                else:
+                    draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
             if self.draft_probs_buf is not None and draft_input.draft_probs is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
         elif self.need_bonus_tokens:
-            draft_input.bonus_tokens = self.output_tokens_buf[indices]
+            if self.spec_algo.is_dflash_family():
+                draft_input.verified_id = self.output_tokens_buf[indices]
+            else:
+                draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
             draft_input.hidden_states = self.hidden_states_buf[indices]
         if _DEBUG_ASSERT:

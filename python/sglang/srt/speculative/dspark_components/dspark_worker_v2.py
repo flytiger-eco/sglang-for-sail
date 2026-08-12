@@ -89,7 +89,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_dp_context_enabled = (
             server_args.enable_dp_attention and not self._draft_is_moe
         )
-        attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
+        # Effective attention-TP under the resolved parallel layout; under
+        # DSA/NSA prefill CP the hook pins attn_cp == tp so attn_tp collapses
+        # to 1 (replicated attention) even on multi-node TP32 deployments.
+        attn_tp_size = (
+            server_args.tp_size
+            // max(server_args.dp_size, 1)
+            // max(server_args.attn_cp_size, 1)
+        )
         if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "

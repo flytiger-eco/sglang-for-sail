@@ -10,7 +10,9 @@ from torch import nn
 
 from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import attn_tp_all_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -322,6 +324,8 @@ class DSparkAttention(MqaAttentionBase):
             else:
                 o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            out = attn_tp_all_reduce(out)
         return out
 
 

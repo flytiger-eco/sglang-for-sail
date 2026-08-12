@@ -1927,12 +1927,6 @@ class DeepseekV4Model(nn.Module):
                 delattr(forward_batch, _attr)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
-            raise NotImplementedError(
-                "DSpark aux hidden-state capture is not supported together with "
-                "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
-                "of them: DSpark static-verify is CP-off for v1."
-            )
         dspark_aux_hidden_states: List[torch.Tensor] = []
 
         use_fused = self.use_fused_mhc_post_pre
@@ -1978,6 +1972,21 @@ class DeepseekV4Model(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+            # DSpark aux hidden states are captured in the CP (round-robin) split
+            # layout during the layer loop; gather + rerange them back to the full
+            # token layout so the DSpark draft worker receives the same layout as
+            # the non-CP path. NOTE: assumes the captured layers live on the last
+            # PP rank (always true for pp_size == 1).
+            if capture_dspark and dspark_aux_hidden_states:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux,
+                        self.cp_size,
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
