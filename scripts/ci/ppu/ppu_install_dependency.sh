@@ -37,9 +37,28 @@ rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
 cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu]"
 
-# sgl-kernel is already installed from Artifactory (PPU Dependencies step above).
-# Source build from setup_ppu.py requires internal GitLab access for cutlass;
-# skip it in CI until the runner has connectivity to gitlab.alibaba-inc.com.
+# ==================== sgl-kernel: source build when needed ==================== #
+# Default: use the Artifactory wheel installed above.
+# If this PR touches sgl-kernel source, rebuild from source so CI actually tests
+# the new code. Detect by checking git diff against the merge base.
+# Force with SGL_KERNEL_BUILD_FROM_SOURCE=1.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_kernel_source_changed() {
+    # In CI: compare PR head against merge base
+    if git -C "${REPO_ROOT}" rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+        git -C "${REPO_ROOT}" diff --name-only HEAD~1 -- sgl-kernel/ | grep -qE '\.(py|cc|cu|cpp|h|cuh|toml)$'
+    else
+        return 1
+    fi
+}
+
+if [[ "${SGL_KERNEL_BUILD_FROM_SOURCE:-0}" == "1" ]] || _kernel_source_changed; then
+    echo "sgl-kernel source changed (or SGL_KERNEL_BUILD_FROM_SOURCE=1) — building from source..."
+    bash "${SCRIPT_DIR}/ppu_build_kernel.sh"
+else
+    echo "sgl-kernel source unchanged — using Artifactory wheel."
+fi
 
 # ==================== EIC SDK + mooncake-barex (for disaggregation tests) ==================== #
 # Install AcclBarex RDMA library and fic2 user-space driver from NAS cache.
