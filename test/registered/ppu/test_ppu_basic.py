@@ -32,6 +32,7 @@ class TestPPUBasic(CustomTestCase):
             "0.6",
             "--batch-size",
             "1",
+            "--attention-backend", "torch",
         ]
         if is_in_ci():
             args += ["--input", "64", "--output", "4"]
