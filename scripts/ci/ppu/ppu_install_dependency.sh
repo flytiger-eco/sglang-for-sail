@@ -4,7 +4,8 @@ set -euo pipefail
 REPO_ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 PIP_INSTALL="python3 -m pip install --no-cache-dir"
 
-PPU_PIP_INDEX="https://art-pub.eng.t-head.cn/artifactory/api/pypi/pypi_index/simple"
+# PPU_PIP_INDEX="https://art-pub.eng.t-head.cn/artifactory/api/pypi/pypi_index/simple"
+PPU_PIP_INDEX="https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
 
 if [[ -n "${PPU_ARTIFACTORY_USER:-}" && -n "${PPU_ARTIFACTORY_PASSWORD:-}" ]]; then
     echo "machine art-pub.eng.t-head.cn login ${PPU_ARTIFACTORY_USER} password ${PPU_ARTIFACTORY_PASSWORD}" > ~/.netrc
