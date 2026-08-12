@@ -38,10 +38,17 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
-from sglang.srt.distributed import get_attn_tensor_model_parallel_rank, get_attn_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -1823,18 +1830,52 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+            cp_positions = None
+            max_seq_len = int(
+                seq_lens_cpu.max().item()
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else max(seq_lens_cpu)
+            )
+            if can_dsa_prefill_cp_round_robin_split(forward_batch):
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if isinstance(extend_seq_lens_cpu, torch.Tensor):
+                    extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu.tolist()]
+                (
+                    cp_extend_seq_lens_cpu,
+                    extend_seq_lens,
+                    cp_bs_idx_cpu,
+                    cp_bs_idx,
+                ) = dsa_cp_round_robin_split_q_seqs(
+                    extend_seq_lens_cpu,
+                    extend_seq_lens,
+                )
+                seq_lens = seq_lens[cp_bs_idx].contiguous()
+                req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+                max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
+                cp_positions = core_attn_metadata.positions_casual[
+                    : q_flat.shape[0]
+                ].contiguous()
+                assert sum(cp_extend_seq_lens_cpu) <= q_flat.shape[0], (
+                    f"CP-local extend sum {sum(cp_extend_seq_lens_cpu)} exceeds "
+                    f"q token count {q_flat.shape[0]}"
+                )
+
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
+                max_seq_len=max_seq_len,
+                cp_positions=cp_positions,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
