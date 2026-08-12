@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 
 register_ppu_ci(est_time=300, suite="stage-a-test-1-gpu-ppu")
 
-PPU_CI_MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/"
+PPU_CI_MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B/"
 
 
 class TestPPUBasic(CustomTestCase):
