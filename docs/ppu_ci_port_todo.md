@@ -115,7 +115,61 @@ This repo's `test/run_suite.py` predates that feature, so the workflows were tak
 from the pre-`results.json` baseline to keep the CLI in sync. Port
 `sglang-for-test` PR #55 first if the machine-readable results artifact is wanted.
 
-## 6. Untested here
+## 6. If you re-run the port scripts
+
+Both refuse to write anything they cannot prove correct, and report it instead.
+Two buckets to expect, and what they mean:
+
+- **`no anchor` / `no plain ci_register import to extend`** — the file binds its
+  registrar through a `try/except ImportError` stub or `importlib`, so there is no
+  import list to add a name to. Bind `register_ppu_ci` by hand the same way the file
+  already binds `register_cpu_ci`. Three files needed this.
+- **`unresolved symbol`** — the guard is parameterised by a constant
+  (`@skip_if_model_missing(DEFAULT_MODEL_NAME_FOR_TEST)`) that the target file does
+  not import. Add the import, then re-run; the script is idempotent.
+
+Both were real bugs in the first pass: the scripts wrote the call/decorator without
+the name, producing a `NameError` at import. Because the affected files also register
+to CPU/CUDA/AMD suites, that broke **existing** CI, not just PPU. Always run
+`ruff check --select=F401,F821` over the changed set afterwards — it catches exactly
+this, and the repo's pre-commit gate enforces it anyway.
+
+One more failure mode has no lint signal: if a guard lands on a **base/mixin class**,
+every subclass inherits `__unittest_skip__`, including subclasses in other files that
+need a *different* model. Those tests then skip silently rather than fail.
+`test_hicache_storage_3fs_backend.py` needs an explicit
+`__unittest_skip__ = False` reset for this reason. Check inheritance whenever a guard
+lands on a class other subclasses derive from.
+
+## 7. Known PPU-side over-skip from base-class guards (4 classes)
+
+`ppu_skip_utils` guards are now gated on `PPU_SDK` (`_on_ppu()`), so on CUDA/AMD/CPU
+runners they are inert and those pipelines behave exactly as before. **On PPU** four
+classes still inherit a guard for a model they do not use, and so skip when that
+unrelated model is absent:
+
+| Subclass | Actually needs | Inherits guard for | Base |
+|---|---|---|---|
+| `quant/test_w8a8_quantization.py` `TestW8A8Int8` | `neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8` | `RedHatAI/Qwen3-30B-A3B-FP8-dynamic` | `BaseW8A8Test` |
+| same file `TestW8A8Fp8` | `neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic` | same | same |
+| `openai_server/features/test_openai_server_hidden_states.py` `TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled` | `meta-llama/Llama-3.1-8B-Instruct` | `jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B` | `BaseTestOpenAIServerWithHiddenStates` (an `ABC`) |
+| `hicache/test_hicache_storage_mooncake_backend.py` `TestMooncakeBackendQwen330BCP2` | `Qwen/Qwen3-30B-A3B-FP8` | `lmsys/sglang-ci-dsv3-test` | `HiCacheStorageMooncakeBackendBaseMixin` |
+
+In each case the base is abstract (`model: str = None`, an `ABC`, or a mixin) yet is
+guarded with one particular subclass's model.
+
+**This was deliberately not "fixed" here**: `sglang-for-test@v0.5.12_dev` has the
+identical guard placement with no reset, so changing it would silently diverge this
+repo's PPU behaviour from the reference config. It is a pre-existing issue in that
+config, worth fixing there first. Contrast `test_hicache_storage_3fs_backend.py`,
+where upstream *does* have an `__unittest_skip__ = False` reset — omitting that was a
+genuine port gap and has been restored.
+
+Fix, when wanted: either drop the guard from the abstract base (each concrete class
+already guards itself) or add `__unittest_skip__ = False` / `__unittest_skip_why__ = None`
+to the four subclasses, following the 3FS precedent.
+
+## 8. Untested here
 
 The first real run is the actual verification. Locally confirmed: AST collection
 (365 registrations across the 5 suites), `validate_all_suites` passes, workflow YAML

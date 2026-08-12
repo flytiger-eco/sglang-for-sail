@@ -25,6 +25,23 @@ NAS_MODEL_BASE = os.environ.get(
 )
 
 
+def _on_ppu() -> bool:
+    """Whether we are running on PPU.
+
+    Every guard below is scoped to PPU: each answers a question that only makes
+    sense there (is the model on the PPU CI's NAS share, does this PPU part have
+    FP8/FP4). Off PPU the answers are meaningless and, worse, wrong in the
+    skip direction — the NAS path does not exist on a CUDA/AMD runner, and
+    PPU_SUPPORTS_FP8/FP4 default to "0" because only the PPU workflows set them.
+    Without this gate every guarded class silently skips on those runners, and a
+    skip is not a failure, so CI stays green with no signal at all.
+
+    Mirrors sglang.srt.utils.is_ppu() inline rather than importing it, to keep
+    this module importable without torch.
+    """
+    return "PPU_SDK" in os.environ
+
+
 def model_exists(model_name: str) -> bool:
     """Check if a model exists on NAS or via environment variable override.
 
@@ -82,7 +99,7 @@ def skip_if_model_missing(model_name: str, reason: str = None):
     skip_reason = reason or f"Model {model_name} not available on NAS"
 
     def decorator(obj):
-        if model_exists(model_name):
+        if not _on_ppu() or model_exists(model_name):
             return obj
         if isinstance(obj, type):
             # Class decorator
@@ -114,7 +131,7 @@ def skip_if_no_fp8(reason: str = None):
     fp8_supported = os.environ.get("PPU_SUPPORTS_FP8", "0") == "1"
 
     def decorator(obj):
-        if fp8_supported:
+        if not _on_ppu() or fp8_supported:
             return obj
         if isinstance(obj, type):
             return unittest.skip(skip_reason)(obj)
@@ -145,7 +162,7 @@ def skip_if_no_fp4(reason: str = None):
     fp4_supported = os.environ.get("PPU_SUPPORTS_FP4", "0") == "1"
 
     def decorator(obj):
-        if fp4_supported:
+        if not _on_ppu() or fp4_supported:
             return obj
         if isinstance(obj, type):
             return unittest.skip(skip_reason)(obj)
