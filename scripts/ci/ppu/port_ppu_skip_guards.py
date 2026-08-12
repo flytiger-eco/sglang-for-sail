@@ -42,7 +42,60 @@ class Report:
     already_present: List[str] = field(default_factory=list)
     file_missing: List[str] = field(default_factory=list)
     name_missing: List[str] = field(default_factory=list)
+    unresolved_symbol: List[str] = field(default_factory=list)
     parse_error: List[str] = field(default_factory=list)
+
+
+def decorator_free_symbols(deco_src: str) -> set:
+    """Bare names a decorator expression depends on, minus the guard itself.
+
+    Guards are often parameterised by a constant rather than a literal, e.g.
+    `@skip_if_model_missing(DEFAULT_MODEL_NAME_FOR_TEST)`. Copying that text into a
+    file that does not import the constant is a NameError at class-definition time,
+    which takes down every suite the file belongs to. Callers use this to check
+    resolvability before writing.
+    """
+    try:
+        expr = ast.parse(deco_src, mode="eval")
+    except SyntaxError:
+        return set()
+    return {
+        n.id
+        for n in ast.walk(expr)
+        if isinstance(n, ast.Name) and n.id not in SKIP_NAMES
+    }
+
+
+def module_bound_names(tree: ast.AST) -> set:
+    """Names a module defines or imports at top level (plus builtins)."""
+    names = set(dir(__builtins__)) if isinstance(__builtins__, type) else set()
+    import builtins
+
+    names |= set(dir(builtins))
+    for stmt in getattr(tree, "body", []):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            for a in stmt.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+        elif isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(stmt.name)
+        elif isinstance(stmt, ast.Try):
+            for sub in stmt.body + [s for h in stmt.handlers for s in h.body]:
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    for a in sub.names:
+                        names.add((a.asname or a.name).split(".")[0])
+                elif isinstance(
+                    sub, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    names.add(sub.name)
+                elif isinstance(sub, ast.Assign):
+                    for t in sub.targets:
+                        if isinstance(t, ast.Name):
+                            names.add(t.id)
+    return names
 
 
 def decorator_name(node: ast.AST) -> Optional[str]:
@@ -110,14 +163,19 @@ def last_import_line(tree: ast.AST) -> int:
 
 def port_file(
     target_path: str, guards: Dict[str, List[str]]
-) -> Tuple[Optional[str], List[str], List[str]]:
-    """Add guards to target_path. Returns (new_text|None, applied, name_missing)."""
+) -> Tuple[Optional[str], List[str], List[str], List[str]]:
+    """Add guards to target_path.
+
+    Returns (new_text|None, applied, name_missing, unresolved).
+    """
     src = open(target_path, encoding="utf-8").read()
     tree = ast.parse(src)
     defs = find_defs(tree)
+    bound = module_bound_names(tree)
 
     applied: List[str] = []
     missing: List[str] = []
+    unresolved: List[str] = []
     needed_names: set = set()
     # (line_to_insert_before, indent, text) — collected then applied bottom-up so
     # earlier insertions do not shift the line numbers of later ones.
@@ -133,6 +191,10 @@ def port_file(
             fn = deco.split("(")[0].strip()
             if fn in have:
                 continue
+            absent = decorator_free_symbols(deco) - bound
+            if absent:
+                unresolved.append(f"{name}: {deco} needs {sorted(absent)}")
+                continue
             needed_names.add(fn)
             # node.lineno is the `class`/`def` keyword line, below any decorators,
             # so this lands the guard innermost. Skip decorators are order-independent.
@@ -140,7 +202,7 @@ def port_file(
             applied.append(name)
 
     if not edits:
-        return None, [], missing
+        return None, [], missing, unresolved
 
     lines = src.splitlines(keepends=True)
     for lineno, indent, text in sorted(edits, key=lambda e: -e[0]):
@@ -158,7 +220,7 @@ def port_file(
         anchor = last_import_line(tree)
         lines.insert(anchor, render_import(sorted(needed_names)) + "\n")
 
-    return "".join(lines), applied, missing
+    return "".join(lines), applied, missing, unresolved
 
 
 def main() -> int:
@@ -195,12 +257,13 @@ def main() -> int:
 
         tpath = os.path.join(target, trel)
         try:
-            new_text, applied, missing = port_file(tpath, guards)
+            new_text, applied, missing, unresolved = port_file(tpath, guards)
         except (OSError, SyntaxError) as exc:
             rep.parse_error.append(f"{trel}: {exc}")
             continue
 
         rep.name_missing += [f"{trel}::{n}" for n in missing]
+        rep.unresolved_symbol += [f"{trel}::{u}" for u in unresolved]
         if new_text is None:
             rep.already_present += [f"{trel}::{n}" for n in guards if n not in missing]
             continue
@@ -219,9 +282,11 @@ def main() -> int:
     out.append(f"already present           : {len(rep.already_present)}")
     out.append(f"file missing in target    : {len(rep.file_missing)}")
     out.append(f"class/func name not found : {len(rep.name_missing)}")
+    out.append(f"unresolved symbol         : {len(rep.unresolved_symbol)}")
     out.append(f"parse errors              : {len(rep.parse_error)}")
     for title, items in (
         ("Class/func name not found (add manually)", rep.name_missing),
+        ("Unresolved symbol — import it, then re-run", rep.unresolved_symbol),
         ("File missing in target", rep.file_missing),
         ("Parse errors", rep.parse_error),
     ):

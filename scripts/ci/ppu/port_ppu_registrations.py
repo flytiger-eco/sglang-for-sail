@@ -135,7 +135,11 @@ def port_one(target_path: str, ppu_call: str) -> str:
     """Return the new file text with the PPU registration + import added.
 
     Raises LookupError if the file has no `register_*_ci` call to anchor against
-    — inserting at a guessed position risks landing above an import it needs.
+    — inserting at a guessed position risks landing above an import it needs — or
+    if it has no plain `from ... import` to extend. A handful of files bind the
+    registrar through a try/except stub or importlib instead; there we cannot add
+    the name, and writing the call anyway yields a NameError at import that takes
+    down every suite the file belongs to, not just PPU.
     """
     src = open(target_path, encoding="utf-8").read()
     tree = ast.parse(src)
@@ -145,6 +149,8 @@ def port_one(target_path: str, ppu_call: str) -> str:
         raise LookupError("no register_*_ci anchor")
 
     imp, names = find_ci_import(src, tree)
+    if imp is None:
+        raise LookupError("no plain ci_register import to extend")
     lines = src.splitlines(keepends=True)
 
     # Insert the call first, then rewrite the import. Doing it in this order means
@@ -152,7 +158,7 @@ def port_one(target_path: str, ppu_call: str) -> str:
     call_text = ppu_call if ppu_call.endswith("\n") else ppu_call + "\n"
     lines.insert(anchor, call_text)
 
-    if imp is not None and PPU_FUNC not in names:
+    if PPU_FUNC not in names:
         new_import = render_import(names + [PPU_FUNC])
         # imp line numbers are 1-based and unaffected: the call went in below them.
         start, end = imp.lineno - 1, imp.end_lineno

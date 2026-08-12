@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import (
     register_ppu_ci,
 )
 from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
@@ -25,6 +25,14 @@ register_ppu_ci(est_time=150, suite="nightly-2-ppu", nightly=True)
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
+
+    # HiCacheStorageBaseMixin has @skip_if_model_missing("lmsys/sglang-ci-dsv3-test")
+    # which sets __unittest_skip__ = True on the parent when dsv3 is absent.
+    # 3FS tests only need DEFAULT_MODEL_NAME_FOR_TEST (Llama-3.1-8B-Instruct),
+    # so reset the inherited skip here; @skip_if_model_missing on each concrete
+    # class provides the correct guard for the model 3FS tests actually use.
+    __unittest_skip__ = False
+    __unittest_skip_why__ = None
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
