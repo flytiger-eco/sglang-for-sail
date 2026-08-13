@@ -1,6 +1,10 @@
 name: Nightly Test (PPU)
 
 on:
+  # TEMP: remove after nightly verification
+  push:
+    branches: [ feat/ppu-pr-test ]
+  # 
   schedule:
     - cron: '0 16 * * *'  # 0:00 AM Beijing Time (UTC+8) every day
   workflow_dispatch:
