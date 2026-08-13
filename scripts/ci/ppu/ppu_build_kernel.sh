@@ -40,10 +40,17 @@ echo "Building wheel (MAX_JOBS=${MAX_JOBS})..."
 BUILD_START=$(date +%s)
 
 python3 setup_ppu.py bdist_wheel 2>&1 | tee /tmp/sgl_kernel_build.log | \
-    grep -E "^(Building|running|creating|Cloning|copying|nvcc|error:|warning:.*error)" || true
+    grep -E "^(Building|running|creating|Cloning|copying|nvcc|error:|warning:.*error)" || :
+BUILD_RC=${PIPESTATUS[0]}
 
 BUILD_END=$(date +%s)
 BUILD_ELAPSED=$((BUILD_END - BUILD_START))
+
+if [ "${BUILD_RC}" -ne 0 ]; then
+    echo "ERROR: setup_ppu.py failed (exit ${BUILD_RC}) after ${BUILD_ELAPSED}s. Full log:"
+    cat /tmp/sgl_kernel_build.log
+    exit "${BUILD_RC}"
+fi
 echo "Build completed in ${BUILD_ELAPSED}s"
 
 # Find and install the wheel
