@@ -12,9 +12,10 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.speculative.spec_utils import traverse_tree
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_ppu_ci(est_time=4, suite="per-commit-1-ppu")
 
 
 class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):

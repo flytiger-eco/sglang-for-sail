@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 try:
-    from sglang.test.ci.ci_register import register_cpu_ci
+    from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
     from sglang.test.test_utils import CustomTestCase
 except ModuleNotFoundError:
     CustomTestCase = unittest.TestCase
@@ -14,8 +14,12 @@ except ModuleNotFoundError:
     def register_cpu_ci(*args, **kwargs):
         pass
 
+    def register_ppu_ci(*args, **kwargs):
+        pass
+
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 
 def _load_mmmu_eval_utils():

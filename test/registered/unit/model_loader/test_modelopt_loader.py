@@ -21,7 +21,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Note: PYTHONPATH=python should be set when running tests
@@ -32,6 +32,7 @@ CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_ppu_ci(est_time=11, suite="per-commit-1-ppu")
 
 
 class TestModelOptModelLoader(CustomTestCase):

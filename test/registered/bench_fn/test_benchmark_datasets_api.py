@@ -33,10 +33,11 @@ from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_ppu_ci(est_time=6, suite="per-commit-1-ppu")
 
 
 class _DummyTokenTensor:

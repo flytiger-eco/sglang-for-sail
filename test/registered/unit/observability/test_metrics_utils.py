@@ -4,10 +4,11 @@ from sglang.srt.observability.utils import (
     generate_buckets,
     two_sides_exponential_buckets,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_ppu_ci(est_time=6, suite="per-commit-1-ppu")
 
 
 class TestMetricsUtils(unittest.TestCase):
