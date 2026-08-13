@@ -17,16 +17,35 @@ git config --global --add safe.directory "${REPO_ROOT}"
 ${PIP_INSTALL} --upgrade pip setuptools wheel dill
 
 # ==================== PPU Dependencies (SAIL SDK v2.1.1) ==================== #
-# Versions per SGLang-for-SAIL v0.5.13 user guide (2026-08-12).
-# No more +v0.1.0.ppu2.1.0 suffixes — the new PyPI index has clean versions.
-${PIP_INSTALL} sglang_kernel==0.4.3 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} flashinfer_python==0.6.8.post1 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} deep_ep==1.0.0 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} deep_gemm==1.0.0 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} tilelang==0.1.8 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} flash_mla==2.0.0 -i ${PPU_PIP_INDEX} --no-deps --force-reinstall
-${PIP_INSTALL} sglang_router==0.3.2 -i ${PPU_PIP_INDEX}
+# The v2.1.1 base image already ships the whole PPU stack, and at versions NEWER
+# than the v0.5.13 user guide's PyPI section lists. Verified in-image 2026-08-13:
+#
+#   torch              2.11.0+v0.1.0.ppu2.1.1
+#   sglang             0.5.13+v0.1.0.ppu2.1.1
+#   sglang-kernel      0.4.3+v0.1.0.ppu2.1.1     <- has the `fwd` op
+#   flashinfer-python  0.6.12+v0.1.0.ppu2.1.1
+#   triton             3.6.0+v0.2.0.ppu2.1.1
+#   apache-tvm-ffi     0.1.9
+#   transformers       5.8.1
+#
+# So we deliberately do NOT reinstall them. Two reasons this matters:
+#
+#  1. The guide's PyPI list pins flashinfer_python==0.6.8.post1, which would
+#     DOWNGRADE the image's 0.6.12 — and contradicts the guide's own stated
+#     requirement of flashinfer>=0.6.11.post1 (section 2). The image is right.
+#  2. Those wheels carry a +v0.1.0.ppu2.1.1 local version. A bare `==0.4.3`
+#     --force-reinstall could pull a differently-built artifact for the same
+#     public version. Leaving the image's stack alone avoids the whole question.
+#
+# Only install what the image genuinely lacks.
 ${PIP_INSTALL} z3-solver==4.13.0
+
+# sglang-router is not in the image; per the guide PPU makes no changes to it.
+${PIP_INSTALL} sglang_router==0.3.2 -i ${PPU_PIP_INDEX}
+
+# uvicorn: image ships 0.29.0, sglang's multi-worker path needs
+# timeout_worker_healthcheck (added in 0.37.0).
+${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --force-reinstall --no-deps
 
 # ==================== Install SGLang from source ==================== #
 rm -f "${REPO_ROOT}/python/pyproject.toml"
