@@ -7,7 +7,7 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 try:
     from flashinfer import CuteDslMoEWrapper
@@ -17,6 +17,7 @@ except ImportError:
     convert_sf_to_mma_layout = None
 
 register_cuda_ci(est_time=24, stage="extra-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=24, suite="nightly-4-ppu", nightly=True)
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -16,11 +17,13 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=340, stage="base-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=340, suite="nightly-4-ppu", nightly=True)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
 
+@skip_if_no_fp4()
 class TestDeepseekV3FP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -1,8 +1,14 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 # Generation model tests (CUDA only)
 register_cuda_ci(est_time=150, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=150, suite="nightly-1-ppu", nightly=True)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -128,6 +134,7 @@ MAMBA_MODEL_PATHS = [
 TORCH_DTYPES = [torch.float16]
 
 
+@skip_if_model_missing("HuggingFaceTB/SmolLM-135M-Instruct")
 class TestGenerationModels(CustomTestCase):
 
     @classmethod

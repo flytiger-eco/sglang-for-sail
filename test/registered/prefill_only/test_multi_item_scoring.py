@@ -21,13 +21,14 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
 register_cuda_ci(est_time=211, stage="base-b", runner_config="1-gpu-small")
+register_ppu_ci(est_time=250, suite="nightly-1-ppu", nightly=True, disabled="flashinfer 0.6.7.post2 < required 0.6.11.post1 (MIS requires flashinfer)")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(

@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing, skip_if_no_fp8
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,8 +27,11 @@ from sglang.test.test_utils import (
 # Compressed-tensors per-expert FP8 MoE checkpoint that exercises the
 # loader path (gated repo + ~27 GB download + 4 GPUs at TP=4).
 register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-h100")
+register_ppu_ci(est_time=120, suite="nightly-4-ppu", nightly=True)
 
 
+@skip_if_no_fp8()
+@skip_if_model_missing("RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestGemma4FP8PerExpertLoading(CustomTestCase):
     """Three-stage check that catches the silent-skip failure mode:

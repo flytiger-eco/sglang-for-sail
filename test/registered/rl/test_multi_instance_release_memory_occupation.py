@@ -12,7 +12,12 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -26,6 +31,7 @@ register_amd_ci(
     suite="stage-c-test-4-gpu-amd",
     disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
 )
+register_ppu_ci(est_time=57, suite="nightly-4-ppu", nightly=True)
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -119,6 +125,7 @@ def assert_memory_increased(before_mb, after_mb, step_name):
     )
 
 
+@skip_if_model_missing("meta-llama/Llama-3.2-1B")
 class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
     @classmethod
     def setUpClass(cls):

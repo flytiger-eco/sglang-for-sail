@@ -18,7 +18,12 @@ import requests
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -36,6 +41,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
+register_ppu_ci(est_time=554, suite="nightly-4-ppu", nightly=True)
 
 
 class TestPPAccuracy(unittest.TestCase):
@@ -105,6 +111,7 @@ class TestPPAccuracy(unittest.TestCase):
         assert len(output_top_logprobs) == 16
 
 
+@skip_if_model_missing("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
 @unittest.skipIf(is_in_amd_ci(), "MLA model with DP attention not yet supported on AMD")
 class TestDPAttentionDP2PP2(CustomTestCase):
     @classmethod

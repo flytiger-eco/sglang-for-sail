@@ -6,7 +6,8 @@ import torch
 
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -15,6 +16,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
+register_ppu_ci(est_time=100, suite="nightly-1-ppu", nightly=True)
 
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
@@ -96,6 +98,9 @@ def check_quant_method(model_path: str, use_marlin_kernel: bool):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test GPTQ fallback kernel that is not Marlin
+@skip_if_model_missing(
+    "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
+)
 class TestGPTQModelDynamic(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symFalse"
@@ -151,6 +156,9 @@ class TestGPTQModelDynamic(CustomTestCase):
 # GPTQ with Dynamic Per/Module Quantization Control
 # Leverages GPTQModel (pypi) to produce the `dynamic` models
 # Test Marlin kernel
+@skip_if_model_missing(
+    "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"
+)
 class TestGPTQModelDynamicWithMarlin(CustomTestCase):
     MODEL_PATH = (
         "ModelCloud/Qwen1.5-1.8B-Chat-GPTQ-4bits-dynamic-cfg-with-lm_head-symTrue"

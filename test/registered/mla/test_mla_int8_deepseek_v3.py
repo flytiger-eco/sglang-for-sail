@@ -5,7 +5,8 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,8 +18,10 @@ from sglang.test.test_utils import (
 
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
 register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=160, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("lmsys/sglang-ci-dsv3-channel-int8-test")
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -81,6 +84,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+@skip_if_model_missing("lmsys/sglang-ci-dsv3-block-int8-test")
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestDeepseekV3MTPBlockInt8(CustomTestCase):
     @classmethod

@@ -9,7 +9,12 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
@@ -18,8 +23,10 @@ from sglang.test.test_utils import is_in_amd_ci
 
 register_cuda_ci(est_time=207, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=207, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
@@ -35,6 +42,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
         return args
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
@@ -50,6 +58,7 @@ class TestFa3Deterministic(TestDeterministicBase):
         return args
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 class TestTritonDeterministic(TestDeterministicBase):
     # Test with triton attention backend
     @classmethod

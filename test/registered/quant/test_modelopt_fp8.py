@@ -3,7 +3,8 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing, skip_if_no_fp8
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,8 +14,11 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=62, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=62, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_no_fp8()
+@skip_if_model_missing("nvidia/Llama-3.1-8B-Instruct-FP8")
 class TestModeloptFP8(CustomTestCase):
 
     @classmethod

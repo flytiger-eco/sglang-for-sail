@@ -5,7 +5,12 @@ import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -22,8 +27,10 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
+register_ppu_ci(est_time=222, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B")
 class BaseTestOpenAIServerWithHiddenStates(ABC):
 
     @classmethod
@@ -307,6 +314,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
         kill_process_tree(cls.process.pid)
 
 
+@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
     CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):

@@ -1,7 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -13,8 +14,10 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
+register_ppu_ci(est_time=310, suite="nightly-8-ppu", nightly=True)
 
 
+@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
     @classmethod
@@ -88,6 +91,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.93)
 
 
+@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -165,6 +169,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
         self.assertGreater(metrics["score"], 0.90)
 
 
+@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
     """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
 
@@ -244,6 +249,7 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.90)
 
 
+@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -316,6 +322,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.87)
 
 
+@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

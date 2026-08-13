@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,8 +15,10 @@ from sglang.test.test_utils import (
 
 # FlashAttention4 integration test (requires SM 100+ / Blackwell B200)
 register_cuda_ci(est_time=260, stage="base-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=260, suite="nightly-4-ppu", nightly=True)
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFlashAttention4(unittest.TestCase):
     @classmethod
@@ -54,6 +57,7 @@ class TestFlashAttention4(unittest.TestCase):
         self.assertGreater(metrics["score"], 0.89)
 
 
+@skip_if_model_missing("Qwen/Qwen3-30B-A3B-Instruct-2507")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestFlashAttention4SpeculativeDecodeTopk(unittest.TestCase):
     """Test FlashAttention4 with EAGLE3 speculative decoding (topk > 1).

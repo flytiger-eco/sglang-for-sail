@@ -1,6 +1,8 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=320, suite="nightly-4-ppu", nightly=True)
 
 import unittest
 
@@ -156,6 +158,7 @@ class UpdateWeightsFromDiskBase:
                     kill_process_tree(process.pid)
 
 
+@skip_if_model_missing("zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16")
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
     backend_test_suites = (
@@ -175,6 +178,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
     )
 
 
+@skip_if_model_missing("nvidia/Qwen3-30B-A3B-NVFP4")
 class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
     backend_test_suites = (

@@ -12,7 +12,8 @@ import unittest
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 
 # CI Registration — large suite to fit the integration test's server startup.
 register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=79, suite="nightly-1-ppu", nightly=True)
 
 
 def _skip_if_no_cuda(test_func):
@@ -249,6 +251,7 @@ class TestCopyOutput(CustomTestCase):
         self.assertEqual(result, 99)
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 class TestBreakGraphHelper(CustomTestCase):
     """Test the break_graph() convenience function."""
 
@@ -291,6 +294,7 @@ class TestBreakGraphHelper(CustomTestCase):
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
 
 
+@skip_if_model_missing("Qwen/Qwen3-8B")
 class TestBreakableCudaGraph(CustomTestCase):
     """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
 
