@@ -76,6 +76,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -764,6 +765,9 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    # Idempotent; needed here because tp_size > 1 spawns this as a fresh process.
+    load_plugins()
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -975,6 +979,9 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
+    # Idempotent; needed here because tp_size > 1 spawns this as a fresh process.
+    load_plugins()
+
     initialize_moe_config(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
@@ -1083,6 +1090,12 @@ def latency_test(
 
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+
+    # Platform plugins install hardware-specific ops (e.g. PPU replaces the FA3
+    # entry points with its own). Without this the generic CUDA path is taken and
+    # fails on non-CUDA hardware. Also called in the work funcs below, since
+    # tp_size > 1 spawns fresh processes that do not inherit applied hooks.
+    load_plugins()
 
     _set_envs_and_config(server_args)
 

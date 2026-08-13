@@ -14,7 +14,11 @@ fi
 
 git config --global --add safe.directory "${REPO_ROOT}"
 
-${PIP_INSTALL} --upgrade pip setuptools wheel dill
+# Only pip/wheel. Deliberately NOT setuptools or dill: the v2.1.1 image pins them
+# to satisfy constraints that an --upgrade breaks (observed in run 31663500015):
+#   setuptools 84.0.0 -> torch 2.11.0 requires setuptools<82
+#   dill 0.4.1        -> datasets 3.1.0 requires dill<0.3.9 (image ships 0.3.6)
+${PIP_INSTALL} --upgrade pip wheel
 
 # ==================== PPU Dependencies (SAIL SDK v2.1.1) ==================== #
 # The v2.1.1 base image already ships the whole PPU stack, and at versions NEWER
@@ -37,13 +41,13 @@ ${PIP_INSTALL} --upgrade pip setuptools wheel dill
 #     --force-reinstall could pull a differently-built artifact for the same
 #     public version. Leaving the image's stack alone avoids the whole question.
 #
-# Only install what the image genuinely lacks.
-${PIP_INSTALL} z3-solver==4.13.0
-
-# sglang-router is not in the image; per the guide PPU makes no changes to it.
-${PIP_INSTALL} sglang_router==0.3.2 -i ${PPU_PIP_INDEX}
-
-# uvicorn: image ships 0.29.0, sglang's multi-worker path needs
+# Only install what the image genuinely lacks. Verified in-image 2026-08-13 that
+# these are already present and need no action:
+#   z3-solver     4.13.0.0                  (note: `==4.13.0` would force a reinstall)
+#   sglang-router 0.3.2+v0.1.0.ppu2.1.1     (PPU build; the guide's bare ==0.3.2
+#                                            could replace it with a generic one)
+#
+# uvicorn is the one real gap: image ships 0.29.0, sglang's multi-worker path needs
 # timeout_worker_healthcheck (added in 0.37.0).
 ${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --force-reinstall --no-deps
 
