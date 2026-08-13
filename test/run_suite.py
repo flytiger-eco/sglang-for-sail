@@ -87,7 +87,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-xpu",
     ],
     HWBackend.PPU: [
-        "stage-a-test-1-gpu-ppu",
+        "per-commit-1-ppu",
     ],
 }
 
@@ -145,7 +145,12 @@ NIGHTLY_SUITES = {
         "full-16-npu-a3",
     ],
     HWBackend.XPU: [],
-    HWBackend.PPU: [],
+    HWBackend.PPU: [
+        "nightly-1-ppu",
+        "nightly-2-ppu",
+        "nightly-4-ppu",
+        "nightly-8-ppu",
+    ],
 }
 
 

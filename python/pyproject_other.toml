@@ -188,7 +188,7 @@ all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
-all_ppu = ["sglang[srt_ppu]"]
+all_ppu = ["sglang[srt_ppu]", "sglang[tracing]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]

@@ -48,8 +48,15 @@ from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
 # General test models
-DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_MODEL", "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_SMALL_MODEL", "meta-llama/Llama-3.2-1B-Instruct"
+)
+DEFAULT_TINY_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_TINY_MODEL", "Qwen/Qwen3-0.6B"
+)
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = "meta-llama/Llama-3.2-1B"
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE = "Qwen/Qwen3-Reranker-0.6B"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -57,9 +64,15 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
-DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_SMALL_EMBEDDING_MODEL", "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+)
+DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2"
+)
+DEFAULT_MLA_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_MLA_MODEL", "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+)
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
@@ -106,8 +119,12 @@ DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 
 # EAGLE3 model
-DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+DEFAULT_TARGET_MODEL_EAGLE3 = os.environ.get(
+    "SGLANG_TEST_TARGET_MODEL_EAGLE3", "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_DRAFT_MODEL_EAGLE3 = os.environ.get(
+    "SGLANG_TEST_DRAFT_MODEL_EAGLE3", "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+)
 
 # DFLASH model
 DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
@@ -118,8 +135,12 @@ DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
 DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
 
 # Standalone speculative decoding models
-DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_TARGET_MODEL_STANDALONE = os.environ.get(
+    "SGLANG_TEST_MODEL", "meta-llama/Llama-3.1-8B-Instruct"
+)
+DEFAULT_DRAFT_MODEL_STANDALONE = os.environ.get(
+    "SGLANG_TEST_SMALL_MODEL", "meta-llama/Llama-3.2-1B-Instruct"
+)
 
 # N-gram speculative decoding models
 DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
@@ -132,14 +153,18 @@ DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
-DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_SMALL_EMBEDDING_MODEL", "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+)
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
-DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST = os.environ.get(
+    "SGLANG_TEST_ENABLE_THINKING_MODEL", "Qwen/Qwen3-30B-A3B"
+)
 DEFAULT_DEEPSEEK_W4AFP8_MODEL_FOR_TEST = "Barrrrry/DeepSeek-R1-W4AFP8"
 DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-30B-A3B"
 
@@ -184,6 +209,15 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
+def is_ppu_platform():
+    """Return whether we are running on PPU hardware (PPU_SDK env set by T-HEAD driver)."""
+    return os.environ.get("PPU_SDK") is not None
+
+
+# Backward-compatible alias; prefer is_ppu_platform() in new code
+is_in_ppu_ci = is_ppu_platform
+
+
 def is_blackwell_system():
     """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
     return is_blackwell()
@@ -221,6 +255,9 @@ if is_blackwell_system():
 
 if is_h200_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+
+if is_in_ppu_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1200  # PPU host-side memory allocation is slower
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):

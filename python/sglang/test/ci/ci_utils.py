@@ -85,11 +85,19 @@ def run_with_timeout(
     kwargs: Optional[dict] = None,
     timeout: float = None,
 ):
-    """Run a function with timeout."""
-    ret_value = []
+    """Run a function with timeout.
+
+    Raises TimeoutError if `func` doesn't finish within `timeout`. If `func`
+    itself raises, that exception (with its original traceback) propagates
+    to the caller instead of being silently swallowed.
+    """
+    result = {}
 
     def _target_func():
-        ret_value.append(func(*args, **(kwargs or {})))
+        try:
+            result["value"] = func(*args, **(kwargs or {}))
+        except BaseException as e:
+            result["exc"] = e
 
     t = threading.Thread(target=_target_func)
     t.start()
@@ -97,10 +105,14 @@ def run_with_timeout(
     if t.is_alive():
         raise TimeoutError()
 
-    if not ret_value:
-        raise RuntimeError()
+    if "exc" in result:
+        raise result["exc"]
+    if "value" not in result:
+        # Defensive: _target_func always sets "value" or "exc" once the
+        # thread finishes, so this should be unreachable.
+        raise RuntimeError("run_with_timeout: worker thread produced no result")
 
-    return ret_value[0]
+    return result["value"]
 
 
 def write_github_step_summary(content: str):
@@ -225,8 +237,12 @@ def run_unittest_files(
                     timeout=timeout_per_file,
                 )
 
-                if ret_code == 0:
+                if ret_code == 0 or ret_code == 5:
                     file_passed = True
+                    if ret_code == 5:
+                        logger.info(
+                            f"\n⊘ SKIPPED (no tests collected): {filename}\n"
+                        )
                     if was_retried:
                         logger.info(
                             f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"
@@ -263,7 +279,8 @@ def run_unittest_files(
                     break
 
             except TimeoutError:
-                kill_process_tree(process.pid)
+                if process is not None:
+                    kill_process_tree(process.pid)
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
@@ -275,6 +292,23 @@ def run_unittest_files(
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
                 failed_tests.append((filename, f"timeout after {timeout_per_file}s"))
+                break
+
+            except Exception as e:
+                # run_one_file itself raised (e.g. os.getcwd() failing because
+                # the cwd was deleted mid-run, or any other harness-level
+                # error) rather than the subprocess returning a bad exit
+                # code. Treat it as this file failing instead of letting it
+                # crash the whole suite, so continue_on_error holds for
+                # every failure mode, not just bad exit codes and timeouts.
+                if process is not None:
+                    kill_process_tree(process.pid)
+                logger.info(
+                    f"\n✗ ERROR running {filename}: {type(e).__name__}: {e}\n"
+                )
+                if was_retried:
+                    retried_tests.append((filename, attempt, "error"))
+                failed_tests.append((filename, f"{type(e).__name__}: {e}"))
                 break
 
         if not file_passed:
