@@ -131,7 +131,7 @@ jobs:
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite per-commit-1-ppu
+              python3 run_suite.py --hw ppu --suite per-commit-1-ppu --continue-on-error
             "
 
   # ==================== Finish ==================== #
