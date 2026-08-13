@@ -51,6 +51,11 @@ ${PIP_INSTALL} --upgrade pip wheel
 # timeout_worker_healthcheck (added in 0.37.0).
 ${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --force-reinstall --no-deps
 
+# dill: image ships 0.3.6, but Python 3.12's ABC implementation makes
+# _abc._abc_data unpicklable with dill<0.3.8, crashing custom_logit_processor
+# tests. Upgrade to 0.3.8 (still satisfies datasets' dill<0.3.9 constraint).
+${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
+
 # ==================== Install SGLang from source ==================== #
 rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"

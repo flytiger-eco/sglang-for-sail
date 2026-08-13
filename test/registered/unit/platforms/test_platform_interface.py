@@ -108,6 +108,7 @@ class TestPlatformEnum(CustomTestCase):
             "XPU",
             "MUSA",
             "NPU",
+            "PPU",
             "TPU",
             "MPS",
             "OOT",
