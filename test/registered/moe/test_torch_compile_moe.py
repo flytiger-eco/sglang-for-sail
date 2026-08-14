@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import is_cuda, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
@@ -18,8 +23,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=130, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=130, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("Qwen/Qwen1.5-MoE-A2.7B")
 class TestTorchCompileMoe(CustomTestCase):
     @classmethod
     def setUpClass(cls):

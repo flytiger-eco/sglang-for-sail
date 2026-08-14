@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -19,6 +20,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=76, suite="nightly-1-ppu", nightly=True)
 
 HIGH_ACCEPT_PROMPT = (
     "Output exactly 128 new lines. "
@@ -35,6 +37,8 @@ MAX_UPSHIFT_ATTEMPTS = 4
 MAX_DOWNSHIFT_ATTEMPTS = 6
 
 
+@skip_if_model_missing("lmsys/sglang-EAGLE-llama2-chat-7B")
+@skip_if_model_missing("meta-llama/Llama-2-7b-chat-hf")
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
 

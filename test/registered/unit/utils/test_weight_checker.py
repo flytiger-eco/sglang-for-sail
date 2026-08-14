@@ -35,10 +35,12 @@ from sglang.srt.utils.weight_checker import (
     _postprocess_tensors,
     _random_like,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_ppu_ci(est_time=30, suite="nightly-1-ppu", nightly=True)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +240,7 @@ class TestPostprocessTensors(CustomTestCase):
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
+    @skip_if_no_fp8()
     def test_fp8_quant_pair_with_int32_scale_dequants_via_ue8m0(self):
         qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
@@ -256,6 +259,7 @@ class TestPostprocessTensors(CustomTestCase):
             ],
         )
 
+    @skip_if_no_fp8()
     def test_fp8_quant_pair_with_fp32_scale_dequants_directly(self):
         qweight, sf_fp32, _ = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
@@ -272,6 +276,7 @@ class TestPostprocessTensors(CustomTestCase):
             ],
         )
 
+    @skip_if_no_fp8()
     def test_fp8_quant_pair_yield_order_alongside_other_entries(self):
         qweight, sf_fp32, _ = _build_fp8_quant_pair()
         bias = torch.ones(4, device="cuda")

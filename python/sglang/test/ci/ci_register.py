@@ -37,6 +37,7 @@ class HWBackend(Enum):
     XPU = auto()
     PPU = auto()
     MUSA = auto()
+    PPU = auto()
 
 
 @dataclass

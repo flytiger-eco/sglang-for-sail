@@ -12,7 +12,7 @@ import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -21,6 +21,15 @@ if TYPE_CHECKING:
     )
 
 _is_cuda = is_cuda()
+
+# PPU: the marlin atomic-add reduction path deadlocks the kernel at small M (GPU spins
+# at 100% forever, only a container-root SIGKILL frees it) — see
+# docs/ppu_marlin_hang_sdk_report.md. Defense-in-depth: run_from_dispatch below asserts
+# compute capability >= 9 and PPU is SM 8.0a, so these GEMMs are unreachable on PPU
+# today. But unlike fused_marlin_moe they hardcode atomic=True with no dtype/SM gate,
+# so if that assert is ever relaxed they would hang for bf16 as well as fp16. The
+# non-atomic fallback is the lock-barrier + fp32 global-reduce path.
+_MARLIN_USE_ATOMIC_ADD = not is_ppu()
 
 if _is_cuda:
     from sgl_kernel import silu_and_mul
@@ -135,7 +144,7 @@ class MarlinLoraRunnerCore:
             size_n=2 * N,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=_MARLIN_USE_ATOMIC_ADD,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
@@ -184,7 +193,7 @@ class MarlinLoraRunnerCore:
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=_MARLIN_USE_ATOMIC_ADD,
             use_fp32_reduce=True,
             is_zp_float=False,
         )

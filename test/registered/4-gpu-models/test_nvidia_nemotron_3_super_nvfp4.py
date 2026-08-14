@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,6 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=540, suite="nightly-4-gpu-b200", nightly=True)
+register_ppu_ci(est_time=540, suite="nightly-4-ppu", nightly=True)
 
 NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
@@ -65,6 +67,7 @@ def _run_gsm8k(test_case):
     test_case.assertGreaterEqual(metrics["score"], 0.96)
 
 
+@skip_if_no_fp4()
 class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -86,6 +89,7 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
         _run_gsm8k(self)
 
 
+@skip_if_no_fp4()
 class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

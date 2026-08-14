@@ -2,7 +2,7 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 
 # Note: AMD registration removed - test_cpp_radix_cache fails on AMD due to C++ radix tree issues
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
+register_ppu_ci(est_time=60, suite="nightly-1-ppu", nightly=True)
 
 
 class TestCppRadixCache(CustomTestCase, MMLUMixin):

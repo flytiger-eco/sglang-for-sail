@@ -8,10 +8,16 @@ import unittest
 import torch
 
 from sglang.srt.utils import get_cuda_driver_bindings, is_flashinfer_available
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
+register_ppu_ci(
+    est_time=30,
+    suite="nightly-2-ppu",
+    nightly=True,
+    disabled="PPU does not support cuMemCreate multicast API (hgapiMulticastGetGranularity not implemented)",
+)
 
 WORLD_SIZE = 2
 

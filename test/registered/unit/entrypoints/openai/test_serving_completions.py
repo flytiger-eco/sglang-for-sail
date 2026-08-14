@@ -20,9 +20,10 @@ from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.utils import get_or_create_event_loop
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_ppu_ci(est_time=11, suite="per-commit-1-ppu")
 
 
 class _MockTemplateManager:

@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,6 +13,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=200, stage="extra-b", runner_config="8-gpu-h200")
+register_ppu_ci(est_time=370, suite="nightly-8-ppu", nightly=True)
 
 NEMOTRON_3_SUPER_BF16_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 
@@ -29,6 +31,7 @@ NEMOTRON_3_SUPER_BF16_ARGS = [
 ]
 
 
+@skip_if_model_missing("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
 class TestNvidiaNemotron3SuperBF16(CustomTestCase):
     @classmethod
     def setUpClass(cls):
