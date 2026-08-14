@@ -540,7 +540,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_quant_fp8,
+        )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -1088,7 +1090,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output = torch.empty(
                 (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
             )
-        
+
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
         if down_gemm_overlap_args is None or not _is_ppu:
             gemm_overlap_args_dict = {}
@@ -1125,13 +1127,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_8bit,
         )
+        from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -1279,13 +1281,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
         from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_8bit,
         )
+        from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -1540,8 +1542,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
+        from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
 
         assert self.swiglu_limit is None
 
