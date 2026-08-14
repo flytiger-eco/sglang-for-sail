@@ -14,11 +14,17 @@ fi
 
 git config --global --add safe.directory "${REPO_ROOT}"
 
-# Only pip/wheel. Deliberately NOT setuptools or dill: the v2.1.1 image pins them
-# to satisfy constraints that an --upgrade breaks (observed in run 31663500015):
+# Only pip/wheel. Deliberately NOT setuptools: the v2.1.1 image pins it to
+# satisfy constraints that an --upgrade breaks (observed in run 31663500015):
 #   setuptools 84.0.0 -> torch 2.11.0 requires setuptools<82
-#   dill 0.4.1        -> datasets 3.1.0 requires dill<0.3.9 (image ships 0.3.6)
 ${PIP_INSTALL} --upgrade pip wheel
+
+# dill: the image ships 0.3.6, whose save_type cannot pickle ABC subclasses
+# (`TypeError: cannot pickle '_abc._abc_data' object`, hits the local
+# CustomLogitProcessor subclasses in test_openai_server / test_srt_endpoint).
+# Fixed upstream in 0.3.8 (save_type pops `_abc_impl` from class __dict__).
+# Pin exactly 0.3.8, NOT --upgrade: 0.4.1 breaks datasets 3.1.0 (dill<0.3.9).
+${PIP_INSTALL} dill==0.3.8
 
 # ==================== PPU Dependencies (SAIL SDK v2.1.1) ==================== #
 # The v2.1.1 base image already ships the whole PPU stack, and at versions NEWER

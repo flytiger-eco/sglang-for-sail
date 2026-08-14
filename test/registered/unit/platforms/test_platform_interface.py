@@ -111,6 +111,7 @@ class TestPlatformEnum(CustomTestCase):
             "NPU",
             "TPU",
             "MPS",
+            "PPU",
             "OOT",
             "UNSPECIFIED",
         }
