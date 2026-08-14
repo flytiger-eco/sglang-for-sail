@@ -104,16 +104,39 @@ jobs:
             --ulimit stack=67108864 \
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
+            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
+            -e CUDA_VISIBLE_DEVICES=0 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e HF_HUB_OFFLINE=1 \
+            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
+            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
+            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
+            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
+            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
+            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
+            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
+            -e PPU_SUPPORTS_FP8=0 \
+            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              git config --global --add safe.directory /workspace && \
+              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
+              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite per-commit-1-ppu
+              python3 run_suite.py --hw ppu --suite per-commit-1-ppu --continue-on-error
             "
 
   # ==================== Finish ==================== #
