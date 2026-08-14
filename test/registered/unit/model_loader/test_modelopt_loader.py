@@ -32,7 +32,7 @@ CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(est_time=11, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=11, suite="per-commit-1-ppu", disabled="model TinyLlama not on NAS")
 
 
 class TestModelOptModelLoader(CustomTestCase):

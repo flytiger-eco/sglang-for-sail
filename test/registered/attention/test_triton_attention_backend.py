@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
+    is_in_ppu_ci,
     popen_launch_server,
     run_bench_offline_throughput,
 )
@@ -45,7 +46,8 @@ class TestTritonAttnBackend(CustomTestCase):
         print(f"{output_throughput=}")
 
         if is_in_ci():
-            self.assertGreater(output_throughput, 153)
+            threshold = 100 if is_in_ppu_ci() else 153
+            self.assertGreater(output_throughput, threshold)
 
     def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST

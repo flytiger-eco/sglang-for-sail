@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_ppu_ci(est_time=300, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=300, suite="per-commit-1-ppu")
 
 PPU_CI_MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/"
 

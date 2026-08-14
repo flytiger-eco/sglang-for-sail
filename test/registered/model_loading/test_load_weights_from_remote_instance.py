@@ -44,7 +44,7 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
-register_ppu_ci(est_time=145, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=145, suite="nightly-2-ppu", nightly=True, disabled="EIC weight block >64MB MR limit; BAREX only covers KV cache")
 
 
 def verify_params_close(params1, params2, error_msg):

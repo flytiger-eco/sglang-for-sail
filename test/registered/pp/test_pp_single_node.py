@@ -156,6 +156,7 @@ class TestDPAttentionDP2PP2(CustomTestCase):
     is_in_amd_ci(),
     "Gemma4 PP not yet validated on AMD",
 )
+@skip_if_model_missing("google/gemma-4-26B-A4B-it")
 class TestGemma4PPAccuracy(unittest.TestCase):
     """End-to-end PP=2 accuracy gate for Gemma4 multimodal.
 
@@ -234,6 +235,7 @@ class TestGemma4PPAccuracy(unittest.TestCase):
     is_in_amd_ci(),
     "Gemma4 PP not yet validated on AMD",
 )
+@skip_if_model_missing("google/gemma-4-26B-A4B-it-PLE-PP")
 class TestGemma4PLEPPAccuracy(unittest.TestCase):
     """PP=2 coverage for Gemma4 PLE variants (per_layer_inputs proxy path).
 

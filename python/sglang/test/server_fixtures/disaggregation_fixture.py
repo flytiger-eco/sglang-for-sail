@@ -22,6 +22,30 @@ from sglang.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
 
+_EIC_BAREX_MC_MIN_REG_SIZE = str(8 * 1024 * 1024 * 1024)  # 8 GB
+
+_PPU_BAREX_ENV = {
+    "USE_BAREX": "1",
+    "SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "BAREX",
+    "PASS_ALLOC": "1",
+    "MC_MIN_REG_SIZE": _EIC_BAREX_MC_MIN_REG_SIZE,
+    "ACCL_POST_RECV_SIZE": "4",
+    "ACCL_WRITEBATCH_OPT": "2",
+    "FIC2_OOO_DISABLE_0115": "1",
+    "SGLANG_CI_RDMA_ALL_DEVICES": "fic2_soe_bond0,fic2_soe_bond1,fic2_soe_bond2,fic2_soe_bond3",
+}
+
+
+def apply_ppu_barex_env(tracker: list) -> None:
+    """Inject AcclBarex env vars on PPU/EIC machines; append newly-set keys to tracker."""
+    if not os.path.exists("/sys/class/infiniband/fic2_soe_bond0"):
+        return
+    for k, v in _PPU_BAREX_ENV.items():
+        if k not in os.environ:
+            os.environ[k] = v
+            tracker.append(k)
+    logger.info("PPU/EIC detected: configured AcclBarex RDMA transport for disaggregation")
+
 
 class PDDisaggregationServerBase(CustomTestCase):
     capture_per_side_logs: ClassVar[bool] = False
@@ -32,9 +56,24 @@ class PDDisaggregationServerBase(CustomTestCase):
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stderr_buf: ClassVar[Optional[io.StringIO]] = None
 
+    _env_vars_set_by_setup: list = []
+
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
+
+        cls._env_vars_set_by_setup = []
+        if not os.environ.get("MC_LOCAL_HOSTNAME"):
+            from sglang.srt.utils.network import get_local_ip_auto
+
+            try:
+                rdma_ip = get_local_ip_auto()
+                os.environ["MC_LOCAL_HOSTNAME"] = rdma_ip
+                cls._env_vars_set_by_setup.append("MC_LOCAL_HOSTNAME")
+            except ValueError:
+                pass
+        apply_ppu_barex_env(cls._env_vars_set_by_setup)
+
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
@@ -182,7 +221,9 @@ class PDDisaggregationServerBase(CustomTestCase):
         # otherwise trip the watcher and os._exit out of pytest mid-teardown.
         if cls._fail_fast_stop is not None:
             cls._fail_fast_stop.set()
-        os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL", None)
+        for k in cls._env_vars_set_by_setup:
+            os.environ.pop(k, None)
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:

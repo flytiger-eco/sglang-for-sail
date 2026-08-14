@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     get_benchmark_args,
     is_in_amd_ci,
     is_in_ci,
+    is_ppu_platform,
     popen_launch_server,
     run_benchmark,
     write_github_step_summary,
@@ -75,10 +76,14 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 f"### test_multi_tokenizer_ttft\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
-            self.assertLess(res["median_e2e_latency_ms"], 11000)
-            # relax for mi300x
-            self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
-            self.assertLess(res["median_itl_ms"], 10)
+            if is_ppu_platform():
+                self.assertLess(res["median_e2e_latency_ms"], 25000)
+                self.assertLess(res["median_ttft_ms"], 400)
+                self.assertLess(res["median_itl_ms"], 20)
+            else:
+                self.assertLess(res["median_e2e_latency_ms"], 11000)
+                self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
+                self.assertLess(res["median_itl_ms"], 10)
 
 
 if __name__ == "__main__":

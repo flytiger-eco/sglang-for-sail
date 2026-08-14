@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-4-gpu-b200")
-register_ppu_ci(est_time=900, suite="nightly-4-ppu", nightly=True)
+register_ppu_ci(est_time=900, suite="nightly-4-ppu", nightly=True, disabled="model deepseek-ai/DeepSeek-V4-Flash not on NAS; requires FP4")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600

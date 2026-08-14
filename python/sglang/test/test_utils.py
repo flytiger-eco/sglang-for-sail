@@ -184,6 +184,14 @@ def is_in_amd_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
 
 
+def is_ppu_platform():
+    """Return whether we are running on PPU hardware (PPU_SDK env set by T-HEAD driver)."""
+    return os.environ.get("PPU_SDK") is not None
+
+
+is_in_ppu_ci = is_ppu_platform
+
+
 def is_blackwell_system():
     """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
     return is_blackwell()
