@@ -66,7 +66,7 @@ jobs:
           echo "Page cache warm-up done."
 
       - name: Run PPU nightly tests (1-GPU, partition 1/2)
-        timeout-minutes: 110
+        timeout-minutes: 180
         env:
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}

@@ -41,7 +41,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
-register_ppu_ci(est_time=554, suite="nightly-4-ppu", nightly=True)
+register_ppu_ci(est_time=554, suite="nightly-4-ppu", nightly=True, disabled="model google/gemma-4-E4B-it not on NAS")
 
 
 class TestPPAccuracy(unittest.TestCase):

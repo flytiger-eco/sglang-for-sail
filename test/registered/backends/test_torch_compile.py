@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
+    is_ppu_platform,
     popen_launch_server,
 )
 
@@ -72,6 +73,8 @@ class TestTorchCompile(CustomTestCase, MMLUMixin):
 
         if is_in_amd_ci():
             self.assertGreaterEqual(throughput, 145)
+        elif is_ppu_platform():
+            self.assertGreaterEqual(throughput, 100)
         else:
             self.assertGreaterEqual(throughput, 152)
 

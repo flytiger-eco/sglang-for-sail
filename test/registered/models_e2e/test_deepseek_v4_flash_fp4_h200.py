@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=370, stage="base-c", runner_config="deepep-8-gpu-h200")
-register_ppu_ci(est_time=370, suite="nightly-8-ppu", nightly=True)
+register_ppu_ci(est_time=370, suite="nightly-8-ppu", nightly=True, disabled="model deepseek-ai/DeepSeek-V4-Flash not on NAS")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:

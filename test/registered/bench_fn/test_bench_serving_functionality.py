@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=300, suite="nightly-amd-1-gpu", nightly=True)
-register_ppu_ci(est_time=300, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=300, suite="nightly-1-ppu", nightly=True, disabled="gpt2 tokenizer not in offline HF cache (HF_HUB_OFFLINE=1)")
 
 MODEL = "Qwen/Qwen3-0.6B"
 NUM_CONVERSATIONS, NUM_TURNS = 4, 3
