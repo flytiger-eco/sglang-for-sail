@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import (
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=11, suite="nightly-1-ppu", nightly=True, disabled="ppu-llc crashes (SIGABRT) on causal_conv1d triton kernel compilation")
+register_ppu_ci(est_time=11, suite="nightly-1-ppu", nightly=True, disabled="ppu-llc SIGABRT on causal_conv1d_update_with_batch_gather itype0 (float32); SDK 2.1.1 bug")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
 
