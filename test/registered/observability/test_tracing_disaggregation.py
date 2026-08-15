@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
 register_cuda_ci(est_time=65, stage="base-b", runner_config="2-gpu-large")
-register_ppu_ci(est_time=65, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=65, suite="nightly-2-ppu", nightly=True, disabled="flaky: KVTransfer fails intermittently under tracing+BAREX (pass on run 31869614343, fail on 31881203384)")
 
 
 class TestTraceDisaggregation(CustomTestCase):
