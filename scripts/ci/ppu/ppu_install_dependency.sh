@@ -59,7 +59,9 @@ ${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
 # ==================== Install SGLang from source ==================== #
 rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
-cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu]" --no-build-isolation
+# tracing: the v2.1.1 image dropped opentelemetry (v2.1.0 shipped it), and
+# all_ppu doesn't pull it in. test_tracing needs it to exercise the OTLP path.
+cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu,tracing]" --no-build-isolation
 
 # ==================== sgl-kernel: source build when needed ==================== #
 # Default: use the PyPI wheel installed above.

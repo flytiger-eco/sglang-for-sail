@@ -17,6 +17,8 @@ register_ppu_ci(
     est_time=140,
     suite="nightly-1-ppu",
     nightly=True,
+    disabled="Marlin MoE produces NaN on PPU (34% of elements) at larger m; "
+    "workspace-reduce fallback path. sgl-kernel 0.4.3 + SDK 2.1.1",
 )
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
