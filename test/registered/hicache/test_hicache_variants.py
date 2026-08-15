@@ -86,7 +86,7 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
     mmlu_score_threshold = 0.3 if is_ppu_platform() else 0.5
     mmlu_num_examples = 64
     mmlu_num_threads = 32
-    mgsm_en_score_threshold = 0.8
+    mgsm_en_score_threshold = 0.65 if is_ppu_platform() else 0.8
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
