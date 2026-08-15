@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
-register_ppu_ci(est_time=310, suite="nightly-8-ppu", nightly=True)
+register_ppu_ci(est_time=310, suite="nightly-8-ppu", nightly=True, disabled="model Qwen/Qwen3-Next-80B-A3B-Instruct not on NAS")
 
 
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")

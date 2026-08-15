@@ -20,7 +20,7 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
-register_ppu_ci(est_time=150, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=150, suite="nightly-2-ppu", nightly=True, disabled="3fs backend not available on PPU runner; server startup timeout")
 
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
