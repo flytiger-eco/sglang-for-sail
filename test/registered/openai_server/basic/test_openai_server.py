@@ -794,9 +794,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+def _has_model_weights(path):
+    if not os.path.isdir(path):
+        return True  # not a local path, let HF handle it
+    return any(
+        f.endswith((".safetensors", ".bin", ".pt"))
+        for f in os.listdir(path)
+    )
+
+
 @unittest.skipIf(
-    os.environ.get("PPU_SDK") is not None,
-    "model ms-marco-MiniLM-L-6-v2 on NAS has config/tokenizer but no weight files (*.safetensors/*.bin)",
+    not _has_model_weights(DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST),
+    "Cross-encoder model weights not available at local path",
 )
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
