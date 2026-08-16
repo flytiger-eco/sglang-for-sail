@@ -2,11 +2,12 @@
 
 **Branch**: `feat/ppu-ci-smoke`  
 **Image**: `pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312`  
-**Date**: 2026-08-15  
+**Date**: 2026-08-16  
+**Baseline**: ✅ 全绿 — https://github.com/flytiger-eco/sglang-for-sail/actions/runs/31893777418  
 
 ---
 
-## 1. Disabled Tests (24 total)
+## 1. Disabled Tests (26 total)
 
 ### 1.1 模型/资源缺失 (10 tests) — 上传模型到 NAS 后可直接解禁
 
@@ -52,7 +53,14 @@
 | `scheduler/test_routing_key_scheduling.py` | nightly-1 | PPU 调度行为差异导致 routing-key 延迟信号不可测 |
 | `scheduler/test_priority_scheduling.py` | nightly-1 | PPU concurrent batching 使优先级排序不可测（assertion flaky） |
 
-### 1.5 Docker 镜像依赖缺失 (已修复，不再 disabled)
+### 1.5 环境交互 / 资源限制 (2 tests)
+
+| 测试文件 | Suite | Disabled 原因 |
+|----------|-------|---------------|
+| `observability/test_tracing_disaggregation.py` | nightly-2 | tracing overhead 使 BAREX RDMA KV transfer 超时被 decode abort |
+| `disaggregation/test_disaggregation_decode_radix_cache.py` | nightly-8 | OOM: prefill TP4 + decode TP4 同时 CUDA graph capture 超出 ppu1 单卡 96GB |
+
+### 1.6 Docker 镜像依赖缺失 (已修复，不再 disabled)
 
 | 问题 | 修复方式 |
 |------|---------|
