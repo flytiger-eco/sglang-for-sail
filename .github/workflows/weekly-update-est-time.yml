@@ -1,10 +1,12 @@
 name: Weekly Update Est Time
 
 on:
-  schedule:
-    - cron: '0 0 * * 1'  # Monday 00:00 UTC
-  workflow_dispatch: {}
-
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 permissions:
   contents: write
   pull-requests: write

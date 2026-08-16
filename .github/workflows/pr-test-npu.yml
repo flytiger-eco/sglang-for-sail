@@ -1,24 +1,12 @@
 name: PR Test (NPU)
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
-  workflow_call:
     inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
         type: string
-        default: ''
-      run_all_tests:
-        description: "Run all tests (for releasing or testing purpose)"
-        required: false
-        type: boolean
-        default: false
-
 concurrency:
   group: pr-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}

@@ -1,20 +1,12 @@
 name: Release PyPI Nightly Wheels
 
 on:
-  # Run daily at 2 AM UTC
-  schedule:
-    - cron: '0 2 * * *'
-  # Triggered by nightly Docker workflow to use same commit
-  repository_dispatch:
-    types: [nightly-release]
-  # Manual trigger for testing
   workflow_dispatch:
     inputs:
-      commit_sha:
-        description: 'Specific commit SHA to build (leave empty for latest)'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
         type: string
-
 concurrency:
   group: release-pypi-nightly-${{ github.ref }}
   cancel-in-progress: true

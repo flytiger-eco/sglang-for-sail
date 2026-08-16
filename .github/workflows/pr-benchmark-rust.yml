@@ -1,16 +1,12 @@
 name: PR Benchmark (SMG Components)
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - "sgl-model-gateway/**"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "sgl-model-gateway/**"
   workflow_dispatch:
-
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 concurrency:
   group: pr-benchmark-rust-${{ github.ref }}
   cancel-in-progress: true

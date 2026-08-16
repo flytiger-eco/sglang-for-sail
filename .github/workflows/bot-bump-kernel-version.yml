@@ -3,11 +3,10 @@ name: Bot Bump Kernel Version
 on:
   workflow_dispatch:
     inputs:
-      new_version:
-        description: 'New sgl-kernel version (e.g., 0.3.12)'
-        required: true
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
         type: string
-
 permissions:
   contents: write
   pull-requests: write

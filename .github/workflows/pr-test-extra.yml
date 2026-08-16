@@ -14,47 +14,12 @@ name: PR Test Extra
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
 
 on:
-  pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push — otherwise GHA leaves the stale
-    # skipped run in place and there's no way to enable extra without
-    # another push. See check-changes.if below for the matching guard.
-    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
-      force_continue_on_error:
-        description: "Force continue-on-error (test scheduled CI behavior)"
-        required: false
-        type: boolean
-        default: false
-      test_parallel_dispatch:
-        description: "Test parallel dispatch behavior (simulates scheduled run)"
-        required: false
-        type: boolean
-        default: false
-      run_all_tests:
-        description: "Run all tests — bypasses paths-filter (needed when dispatching against long-lived branches whose diff against main can't resolve a merge-base in a shallow clone)"
-        required: false
-        type: boolean
-        default: false
-  workflow_call:
-    inputs:
-      git_ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
         type: string
-        default: ''
-      run_all_tests:
-        description: "Run all tests (for releasing or testing purpose)"
-        required: false
-        type: boolean
-        default: false
-      skip_pr_test_health_check:
-        description: "Skip PR test health check fast-fail (e.g. for release branch cuts)"
-        required: false
-        type: boolean
-        default: false
-
 concurrency:
   group: pr-test-extra-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}-${{ inputs.git_ref || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}

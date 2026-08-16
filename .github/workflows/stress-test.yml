@@ -3,17 +3,10 @@ name: Stress Test
 on:
   workflow_dispatch:
     inputs:
-      num_prompts:
-        description: 'Number of prompts per model'
-        required: true
-        default: '50000'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
         type: string
-      duration_minutes:
-        description: 'Timeout per model in minutes'
-        required: true
-        default: '45'
-        type: string
-
 jobs:
   stress-test:
     if: github.repository == 'sgl-project/sglang'

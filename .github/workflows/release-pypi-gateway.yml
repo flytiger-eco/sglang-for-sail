@@ -1,13 +1,12 @@
 name: Release SGLang Model Gateway to PyPI
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - sgl-model-gateway/bindings/python/pyproject.toml
   workflow_dispatch:
-
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 jobs:
   build:
     name: build on ${{ matrix.platform || matrix.os }} (${{ matrix.target }} - ${{ matrix.manylinux || 'auto' }})

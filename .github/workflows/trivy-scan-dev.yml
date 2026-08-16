@@ -1,16 +1,12 @@
 name: Trivy Scan Dev Docker Images
 
 on:
-  # Run daily after nightly dev builds (which run at midnight UTC)
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Image tag to scan (e.g., dev, dev-cu13, latest)"
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        default: ""
-
+        type: string
 jobs:
   scan:
     if: github.repository == 'sgl-project/sglang'

@@ -3,14 +3,10 @@ name: Patch Docker Image
 on:
   workflow_dispatch:
     inputs:
-      pr_numbers:
-        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        default: ""
-      image_tag:
-        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
-        required: true
-
+        type: string
 concurrency:
   group: patch-docker-${{ inputs.image_tag }}
   cancel-in-progress: true
