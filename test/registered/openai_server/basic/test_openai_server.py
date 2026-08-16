@@ -796,8 +796,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 
 @unittest.skipIf(
     os.environ.get("PPU_SDK") is not None,
-    "OOM: per-commit runs 20 server classes sequentially; by the time Rerank "
-    "starts, GPU memory fragmentation causes SIGKILL. Covered by nightly.",
+    "model ms-marco-MiniLM-L-6-v2 on NAS has config/tokenizer but no weight files (*.safetensors/*.bin)",
 )
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
