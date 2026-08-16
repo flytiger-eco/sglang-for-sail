@@ -6,6 +6,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 """
 
 import json
+import os
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
