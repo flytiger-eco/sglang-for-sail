@@ -794,6 +794,11 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+@unittest.skipIf(
+    os.environ.get("PPU_SDK") is not None,
+    "OOM: per-commit runs 20 server classes sequentially; by the time Rerank "
+    "starts, GPU memory fragmentation causes SIGKILL. Covered by nightly.",
+)
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
