@@ -1,10 +1,8 @@
 name: PR Test (PPU)
 
 on:
-  push:
-    branches: [ feat/ppu-ci-smoke ]
-  # pull_request:
-  #   branches: [ v0.5.13 ]
+  pull_request:
+    branches: [ v0.5.13 ]
   workflow_dispatch:
   workflow_call:
     inputs:
