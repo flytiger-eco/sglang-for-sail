@@ -22,6 +22,7 @@ HW_MAPPING = {
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -85,6 +86,9 @@ PER_COMMIT_SUITES = {
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
     ],
+    HWBackend.PPU: [
+        "per-commit-1-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -141,6 +145,12 @@ NIGHTLY_SUITES = {
         "full-16-npu-a3",
     ],
     HWBackend.XPU: [],
+    HWBackend.PPU: [
+        "nightly-1-ppu",
+        "nightly-2-ppu",
+        "nightly-4-ppu",
+        "nightly-8-ppu",
+    ],
 }
 
 
@@ -311,7 +321,7 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
-    validate_all_suites(all_tests)
+    validate_all_suites([t for t in all_tests if t.backend == hw])
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:

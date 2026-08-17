@@ -27,7 +27,8 @@ import torch
 from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
@@ -41,8 +42,10 @@ register_cuda_ci(
     est_time=150,
     suite="nightly-1-gpu",
 )
+register_ppu_ci(est_time=150, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("meta-llama/Llama-2-7b-hf")
 class TestEmbeddingLoraSupport(unittest.TestCase):
     """Test LoRA support in embedding request structures."""
 
@@ -99,6 +102,7 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
         )
 
 
+@skip_if_model_missing("meta-llama/Llama-2-7b-hf")
 class TestEmbeddingLoraHFComparison(CustomTestCase):
     """Compare HF+LoRA vs SGLang+LoRA embedding outputs."""
 

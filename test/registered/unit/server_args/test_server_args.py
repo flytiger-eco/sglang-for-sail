@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=12, suite="base-b-test-cpu")
+register_ppu_ci(est_time=10, suite="per-commit-1-ppu", disabled="model Qwen2.5-1.5B-Instruct not on NAS")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")

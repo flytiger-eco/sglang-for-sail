@@ -1,17 +1,12 @@
 name: Release Documentation
 
 on:
-  release:
-    types: [published]
-  push:
-    branches:
-      - main
-    paths:
-      - "docs/**"
-      - "python/sglang/version.py"
-      - "python/sglang/**"
   workflow_dispatch:
-
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 concurrency:
   group: release-docs-${{ github.ref }}
   cancel-in-progress: true

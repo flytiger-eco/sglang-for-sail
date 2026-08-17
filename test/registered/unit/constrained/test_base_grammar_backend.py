@@ -28,9 +28,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
     register_grammar_backend,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
+register_ppu_ci(est_time=2, suite="per-commit-1-ppu")
 
 
 class TestGrammarStats(unittest.TestCase):

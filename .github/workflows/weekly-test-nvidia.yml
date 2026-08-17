@@ -1,19 +1,12 @@
 name: Weekly Test (Nvidia)
 
 on:
-  schedule:
-    - cron: '0 0 * * 0'  # Run every Sunday at midnight UTC
   workflow_dispatch:
     inputs:
-      job_filter:
-        description: 'Select which job to run (leave empty or "all" to run all jobs)'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        type: choice
-        default: 'all'
-        options:
-          - 'all'
-          - 'weekly-test-8-gpu-h200'
-
+        type: string
 concurrency:
   group: weekly-test-nvidia-${{ github.ref }}
   cancel-in-progress: true

@@ -3,28 +3,10 @@ name: Diffusion CI Ground Truth Generation (NPU)
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Git ref to checkout'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        default: ''
         type: string
-      case_ids:
-        description: 'Specific case IDs to run (space-separated, optional)'
-        required: false
-        default: ''
-        type: string
-      output_name:
-        description: 'Custom local output/artifact folder name. Leave empty to use defaults.'
-        required: false
-        default: ''
-        type: string
-      publish_target_dir:
-        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated/ascend.'
-        required: false
-        default: ''
-        type: string
-
-
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || 'default' }}
   cancel-in-progress: true

@@ -4,7 +4,8 @@ import warnings
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -20,6 +21,7 @@ from sglang.test.test_utils import (
 NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
+register_ppu_ci(est_time=7200, suite="nightly-2-ppu", nightly=True)
 
 MODEL_THRESHOLDS = {
     # Conservative thresholds on 100 MMMU samples, especially for latency thresholds
@@ -63,6 +65,7 @@ MODEL_THRESHOLDS = {
 }
 
 
+@skip_if_model_missing("deepseek-ai/deepseek-vl2-small")
 class TestNightlyVLMMmmuEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

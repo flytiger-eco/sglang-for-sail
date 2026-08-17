@@ -4,7 +4,12 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.kits.mmmu_vlm_kit import (
     MMMUMultiModelTestBase,
 )
@@ -15,6 +20,7 @@ from sglang.test.test_utils import is_in_amd_ci, is_in_ci
 
 register_cuda_ci(est_time=317, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=850, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
+register_ppu_ci(est_time=317, suite="nightly-1-ppu", nightly=True)
 
 _is_hip = is_hip()
 # VLM models for testing
@@ -28,6 +34,7 @@ else:
     ]
 
 
+@skip_if_model_missing("openbmb/MiniCPM-V-2_6")
 class TestVLMModels(MMMUMultiModelTestBase):
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""

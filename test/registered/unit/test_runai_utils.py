@@ -3,11 +3,12 @@ from pathlib import Path
 
 from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_ppu_ci(est_time=7, suite="per-commit-1-ppu")
 
 
 class TestRunaiUtils(CustomTestCase):

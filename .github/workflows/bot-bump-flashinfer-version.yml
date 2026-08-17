@@ -3,11 +3,10 @@ name: Bot Bump Flashinfer Version
 on:
   workflow_dispatch:
     inputs:
-      new_version:
-        description: 'New flashinfer version (e.g., 0.6.4)'
-        required: true
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
         type: string
-
 permissions:
   contents: write
   pull-requests: write

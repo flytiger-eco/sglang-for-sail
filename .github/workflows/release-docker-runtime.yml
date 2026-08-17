@@ -5,19 +5,12 @@ name: Release Docker Runtime Images
 #   - lmsysorg/sglang:v{version}-cu129-runtime, lmsysorg/sglang:latest-cu129-runtime
 #
 on:
-  push:
-    tags:
-      - "v[0-9]+.*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to build (without v prefix, e.g., 0.5.7)"
-        required: true
-      image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        default: "lmsysorg/sglang"
-
+        type: string
 jobs:
   resolve-version:
     if: github.repository == 'sgl-project/sglang'

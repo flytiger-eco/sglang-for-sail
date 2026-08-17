@@ -14,11 +14,14 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_ppu_ci,
 )
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 
 register_cuda_ci(est_time=30, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=30, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_ppu_ci(est_time=30, suite="nightly-1-ppu", nightly=True)
 
 
 class MockTokenizerManager:
@@ -43,6 +46,7 @@ class ConcreteServingBase(OpenAIServingBase):
         pass
 
 
+@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestParseModelParameter(unittest.TestCase):
     """Test _parse_model_parameter method."""
 
@@ -147,6 +151,7 @@ class TestResolveLoraPath(unittest.TestCase):
         self.assertEqual(result, "adapter-name")
 
 
+@skip_if_model_missing("meta-llama/Llama-3.1-8B")
 class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for common usage scenarios."""
 

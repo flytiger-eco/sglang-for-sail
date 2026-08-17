@@ -3,11 +3,10 @@ name: Release PyPI PR Wheels
 on:
   workflow_dispatch:
     inputs:
-      pr_number:
-        description: 'PR number to build wheel for (works with both internal and fork PRs)'
-        required: true
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
         type: string
-
 concurrency:
   group: build-pr-wheel-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true

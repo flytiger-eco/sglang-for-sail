@@ -1,14 +1,11 @@
 name: Release Docker Xeon Images
 on:
-  push:
-    tags:
-      - 'v[0-9]+.*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to build (without v prefix, e.g., 0.5.7)'
-        required: true
-
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'

@@ -2,7 +2,11 @@ name: Auto tune
 
 on:
   workflow_dispatch:
-
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 jobs:
   auto-tune-lint:
     runs-on: ubuntu-latest

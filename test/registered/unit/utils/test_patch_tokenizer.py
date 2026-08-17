@@ -9,10 +9,11 @@ from sglang.srt.utils.patch_tokenizer import (
     decode_without_hf_kwargs,
     unpatch_tokenizer,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu", nightly=True)
 register_cpu_ci(est_time=53, suite="base-b-test-cpu")
+register_ppu_ci(est_time=30, suite="per-commit-1-ppu", disabled="tokenizer nvidia/Kimi-K2-Thinking-NVFP4 not on NAS")
 
 
 class TestPatchTokenizerEndToEndTest(unittest.TestCase):

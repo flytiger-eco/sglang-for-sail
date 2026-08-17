@@ -1,35 +1,12 @@
 name: Nightly Test (MUSA)
 
 on:
-  schedule:
-    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
-      job_filter:
-        description: "Select which job to run (empty/all to run all jobs)"
-        required: false
-        type: choice
-        default: 'all'
-        options:
-          - 'all'
-          - 'nightly-test-musa-general-kernel'
-          - 'nightly-test-musa-general-multimodal-layer'
-          - 'nightly-test-llm-server-1-gpu-musa'
-          - 'nightly-test-multimodal-server-1-gpu-musa'
-          - 'nightly-test-multimodal-server-2-gpu-musa'
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
         type: string
-        default: ''
-      job_filter:
-        description: 'Select which job to run (empty or "all" to run all jobs)'
-        required: false
-        type: string
-        default: 'all'
-
 concurrency:
   group: nightly-test-musa-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}

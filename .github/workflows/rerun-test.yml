@@ -4,59 +4,10 @@ run-name: ${{ inputs.pr_head_sha && format('[rerun-test] {0} {1}', inputs.test_c
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Dispatch mode: cuda | multimodal_gen | cpu"
-        required: true
-        type: choice
-        options:
-          - cuda
-          - multimodal_gen
-          - cpu
-      test_command:
-        description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
-        required: true
-        type: string
-      runs_on:
-        description: "GHA runner label (cuda/multimodal_gen only; ignored for cpu)"
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
         type: string
-        default: ""
-      install_script:
-        description: "Install script path (cuda only). E.g. scripts/ci/cuda/ci_install_dependency.sh"
-        required: false
-        type: string
-        default: ""
-      install_timeout:
-        description: "Install-step timeout minutes (cuda only)"
-        required: false
-        type: string
-        default: "20"
-      grace_blackwell:
-        description: "Set GRACE_BLACKWELL for the install step (cuda only)"
-        required: false
-        type: string
-        default: "0"
-      rdma_devices:
-        description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
-        required: false
-        type: string
-        default: ""
-      pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
-        required: false
-        type: string
-        default: ""
-      reply_comment_id:
-        description: "Reply comment ID to write back result to"
-        required: false
-        type: string
-        default: ""
-      reply_marker:
-        description: "Per-batch marker for locating the line in reply comment"
-        required: false
-        type: string
-        default: ""
-
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_ENABLE_ASYNC_ASSERT: true

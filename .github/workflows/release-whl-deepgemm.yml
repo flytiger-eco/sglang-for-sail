@@ -3,25 +3,10 @@ name: Release sgl-deep-gemm
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Wheel version (e.g. 0.1.0, 0.1.1rc0)"
-        type: string
-        required: true
-      target:
-        type: choice
-        description: "Build target (default: all)"
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
         required: false
-        default: 'all'
-        options:
-          - 'all'
-          - 'cu129'
-          - 'cu130'
-      branch:
-        description: "DeepGEMM branch to build from (default: dev)"
         type: string
-        required: false
-        default: 'dev'
-
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
   cancel-in-progress: true

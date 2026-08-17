@@ -9,7 +9,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
@@ -20,11 +21,13 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=960, stage="extra-b", runner_config="4-gpu-b200")
+register_ppu_ci(est_time=960, suite="nightly-4-ppu", nightly=True)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
 
+@skip_if_no_fp4()
 class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):

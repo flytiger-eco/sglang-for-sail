@@ -2,9 +2,11 @@ name: Open A PR to Copy Code From OSS
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '0 10 * * *'
-
+    inputs:
+      note:
+        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+        required: false
+        type: string
 permissions:
   contents: write
 
