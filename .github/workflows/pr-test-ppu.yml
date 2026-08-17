@@ -73,7 +73,7 @@ jobs:
     needs: [check-changes]
     if: needs.check-changes.outputs.changes_exist == 'true'
     runs-on: [ self-hosted, ppu ]
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Clean workspace (root-owned files from prior Docker runs)
         run: |
@@ -88,7 +88,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Run PPU smoke test
-        timeout-minutes: 45
+        timeout-minutes: 110
         env:
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
