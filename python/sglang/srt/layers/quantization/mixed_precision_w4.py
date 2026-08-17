@@ -24,10 +24,6 @@ from sglang.srt.utils import is_ppu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
-# `is_silu_after_clamp` was introduced in acext 2.1.1(i.e. 2010100)
-# pass it unconditionally would break on older runtimes.
-_ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION = 2010100
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -247,6 +243,9 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.acext import (
+            _acext_supports_silu_after_clamp,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -297,14 +296,21 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
         else:
             act_limit = swiglu_limit
 
-        # act_limit + is_silu_after_clamp are only used together since 2010100,
-        # so add them conditionally to stay compatible with older acext runtimes.
+        # act_limit + is_silu_after_clamp must only be passed when the acext
+        # whl supports them (>= 1.1.0), so gate on the pip metadata version to
+        # stay compatible with older acext runtimes.
         fused_kwargs = dict(
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
-        if acext.get_version() >= _ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION:
+        if _acext_supports_silu_after_clamp():
             fused_kwargs["act_limit"] = act_limit
             fused_kwargs["is_silu_after_clamp"] = is_silu_after_clamp
+        elif act_limit is not None:
+            logger.warning(
+                f"Current acext version does not support SwiGLU clamp (act_limit={act_limit}). "
+                f"Clamping is skipped. Please upgrade acext to v1.1.0 or later "
+                f"to avoid potential precision issues."
+            )
 
         acext.fusedmoe_wrapper(
             x,
