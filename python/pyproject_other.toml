@@ -171,7 +171,8 @@ srt_ppu = [
     "deep_gemm",
     "flash-attn-3",
     "flash_mla",
-    "flashinfer"
+    "flashinfer",
+    "acext>=1.1.0",
 ]
 
 test = [
