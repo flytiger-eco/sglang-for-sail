@@ -1,0 +1,116 @@
+name: SAIL PR Test - Build sglang Wheels
+
+on:
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Specific commit SHA to build (leave empty for latest)'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      job_display_name:
+        description: 'Display name shown in the Actions UI (e.g. "Build Wheel", "Build Wheel Arm")'
+        type: string
+        default: 'Build Wheel'
+      git_ref:
+        type: string
+        default: ''
+
+jobs:
+  build-sglang-wheel:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - python-version: "3.10"
+          - python-version: "3.12"
+    name: ${{ inputs.job_display_name }} (py${{ matrix.python-version }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use commit from: 1) Docker workflow, 2) manual input, 3) latest main
+          ref: ${{ inputs.git_ref || inputs.commit_sha || github.sha }}
+          fetch-depth: 0  # Need full history for setuptools-scm
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools setuptools-scm
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      # ubuntu-latest preinstalls Rust today, but pin it explicitly (same as
+      # release-pypi.yml) so image updates can't silently break the build.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          TAG=$(python3 ../python/tools/get_version_tag.py)
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          # TAG may be an exact tag (0.5.13+v0.1.0) or a describe string
+          # (0.5.13+v0.1.0-5-gabcdef0). Strip the describe suffix first.
+          BASE_TAG=$(echo "$TAG" | sed 's/-[0-9]\{1,\}-g[0-9a-f]\{1,\}$//')
+
+          # SAIL fork tag format: {upstream}+v{sail}, e.g. 0.5.13+v0.2.0.
+          # Split the two parts; plain upstream tags (v0.5.13) have no sail part.
+          UPSTREAM_VERSION=${BASE_TAG%%+*}
+          UPSTREAM_VERSION=${UPSTREAM_VERSION#v}
+          SAIL_VERSION=""
+          case "$BASE_TAG" in
+            *+v*) SAIL_VERSION=${BASE_TAG##*+v} ;;
+          esac
+
+          # Increment upstream patch version (e.g., 0.5.13 -> 0.5.14) so dev
+          # builds sort above the latest tag per PEP 440 ordering:
+          #   X.Y.Z.devN < X.Y.Z.rcN < X.Y.Z < X.Y.(Z+1).devN
+          MAJOR=$(echo "$UPSTREAM_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$UPSTREAM_VERSION" | cut -d. -f2)
+          PATCH_RAW=$(echo "$UPSTREAM_VERSION" | cut -d. -f3)
+          # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
+          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+          # Use date-based dev number for correct chronological sorting, and
+          # carry the sail version in the PEP 440 local segment, e.g.
+          #   0.5.14.dev20260817+v0.2.0.g4cf4f0859
+          if [ -n "$SAIL_VERSION" ]; then
+            FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+v${SAIL_VERSION}.${HASH}"
+          else
+            FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+${HASH}"
+          fi
+          echo "Resolved TAG=${TAG} -> upstream=${UPSTREAM_VERSION}, sail=${SAIL_VERSION:-none}"
+          echo "Forcing wheel version to: $FORCE_VERSION"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+
+          # Build wheel
+          python3 -m build --wheel
+
+      - name: Verify wheel artifacts
+        run: |
+          ls -alh python/dist
+          ls -alh python/dist/*.whl
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+          retention-days: 7

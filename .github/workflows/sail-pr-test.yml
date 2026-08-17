@@ -1,0 +1,88 @@
+name: SAIL PR Test (Slim)
+# Slim variant of pr-test.yml for the SAIL fork:
+#   - Triggered by push on the feature branch (no PR / label gate)
+#   - Keeps only check-changes + sgl-kernel wheel build + sglang wheel build
+#   - No call-gate, no wait jobs, no GPU test stages
+
+on:
+  push:
+    branches:
+      - feat/ppu-ci-build-sgl-kernel
+  workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: "Force all change filters to true"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sail-pr-test-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # =============================================== check changes ====================================================
+  # On push events dorny/paths-filter diffs against the repo default branch,
+  # so any sgl-kernel/** change on this feature branch flips sgl_kernel=true.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      run_all_tests: ${{ inputs.run_all_tests == true }}
+    secrets: inherit
+
+  # =============================================== sglang ====================================================
+  sglang-build-wheels:
+    needs: check-changes
+    if: |
+      true
+    uses: ./.github/workflows/_sail-pr-test-sglang-build.yml
+    with:
+      job_display_name: Build Wheel For Sglang
+    secrets: inherit
+
+  # =============================================== sgl-kernel ====================================================
+  # NOTE: x64-kernel-build-node is an sgl-project self-hosted runner label.
+  # In this fork it must exist as a self-hosted runner with the same label,
+  # or be changed to a label of our own build machine.
+  sgl-kernel-build-wheels:
+    needs: check-changes
+    if: |
+      true || needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true'
+    uses: ./.github/workflows/_sail-pr-test-sgl-kernel-build.yml
+    with:
+      # runs_on: x64-kernel-build-node
+      job_display_name: Build Wheel
+    secrets: inherit
+
+  # =============================================== finish ====================================================
+  # Single aggregation point (mirrors pr-test-finish): fails if any kept job
+  # failed or was cancelled; a skipped build (no sgl-kernel changes) is OK.
+  sail-pr-test-finish:
+    needs: [check-changes, sglang-build-wheels, sgl-kernel-build-wheels]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
