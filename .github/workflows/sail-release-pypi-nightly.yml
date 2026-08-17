@@ -1,0 +1,126 @@
+name: SAIL Release PyPI Nightly Wheels
+
+on:
+  # Temporary trigger for testing on the feature branch
+  push:
+    branches:
+      - feat/ppu-ci-pypi-nightly
+  # Run daily at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+  # Triggered by nightly Docker workflow to use same commit
+  repository_dispatch:
+    types: [nightly-release]
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Specific commit SHA to build (leave empty for latest)'
+        required: false
+        type: string
+
+concurrency:
+  group: release-pypi-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-nightly-wheel:
+    if: github.repository == 'flytiger-eco/sglang-for-sail'
+    runs-on: ubuntu-latest
+    outputs:
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use commit from: 1) Docker workflow, 2) manual input, 3) latest main
+          ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+          fetch-depth: 0  # Need full history for setuptools-scm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools setuptools-scm
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          TAG=$(python3 ../python/tools/get_version_tag.py)
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          # TAG may be an exact tag (0.5.13+v0.1.0) or a describe string
+          # (0.5.13+v0.1.0-5-gabcdef0). Strip the describe suffix first.
+          BASE_TAG=$(echo "$TAG" | sed 's/-[0-9]\{1,\}-g[0-9a-f]\{1,\}$//')
+
+          # SAIL fork tag format: {upstream}+v{sail}, e.g. 0.5.13+v0.2.0.
+          # Split the two parts; plain upstream tags (v0.5.13) have no sail part.
+          UPSTREAM_VERSION=${BASE_TAG%%+*}
+          UPSTREAM_VERSION=${UPSTREAM_VERSION#v}
+          SAIL_VERSION=""
+          case "$BASE_TAG" in
+            *+v*) SAIL_VERSION=${BASE_TAG##*+v} ;;
+          esac
+
+          # Increment upstream patch version for nightlies (e.g., 0.5.13 -> 0.5.14)
+          # Must always increment so nightly > latest tag per PEP 440 ordering:
+          #   X.Y.Z.devN < X.Y.Z.rcN < X.Y.Z < X.Y.(Z+1).devN
+          MAJOR=$(echo "$UPSTREAM_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$UPSTREAM_VERSION" | cut -d. -f2)
+          PATCH_RAW=$(echo "$UPSTREAM_VERSION" | cut -d. -f3)
+          # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
+          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+          NEXT_PATCH=$((PATCH + 1))
+          NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+          # Use date-based dev number for correct chronological sorting, and
+          # carry the sail version in the PEP 440 local segment, e.g.
+          #   0.5.14.dev20260817+v0.2.0.g4cf4f0859
+          if [ -n "$SAIL_VERSION" ]; then
+            FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+v${SAIL_VERSION}.${HASH}"
+          else
+            FORCE_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+${HASH}"
+          fi
+          echo "Resolved TAG=${TAG} -> upstream=${UPSTREAM_VERSION}, sail=${SAIL_VERSION:-none}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+
+          # Build wheel
+          python3 -m build --wheel
+
+          # Extract version from built wheel filename
+          WHEEL_FILE=$(ls dist/*.whl)
+          NIGHTLY_VERSION=$(echo "$WHEEL_FILE" | sed 's/.*sglang-\(.*\)-py3.*/\1/')
+
+          # Get commit info
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+
+          echo "Built wheel: $WHEEL_FILE"
+          echo "Nightly version: ${NIGHTLY_VERSION}"
+          echo "Commit: ${COMMIT_HASH}"
+          echo "Build date: ${BUILD_DATE}"
+
+          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheel
+          path: python/dist/*.whl
+          retention-days: 90
