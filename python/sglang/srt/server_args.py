@@ -70,6 +70,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    ceil_align,
     check_acext_version_compatibility,
     configure_media_url_security,
     get_device,
@@ -4506,6 +4507,7 @@ class ServerArgs:
         disable_kimi_k3_symm_mem(self)
         self._apply_cuda_graph_compatibility()
         self._apply_deepep_adjustments()
+        self._apply_dp_attn_capture_alignment()
         self._apply_cuda_graph_disaggregation_roles()
         self._validate_cuda_graph_config()
         # Warn on the final resolved config (not inside the compat cascade —
@@ -4540,6 +4542,45 @@ class ServerArgs:
                 )
                 self.cuda_graph_config.prefill.bs = aligned
                 self.cuda_graph_config.prefill.max_bs = aligned[-1]
+
+    def _apply_dp_attn_capture_alignment(self):
+        """Align prefill CUDA graph capture sizes to attn_tp_size.
+
+        Under DP attention with attn_tp_size > 1, the DP gather path
+        (_dp_gather_via_all_gather) calls reduce_scatter_tensor on the
+        attn_tp_group, which requires the per-rank token count to be
+        divisible by attn_tp_size. The eager path (prepare_mlp_sync_batch)
+        applies ceil_align, but the prefill CUDA graph capture path
+        (capture_prepare) does not. Align the capture bucket sizes here
+        so that capture and replay both use attn_tp_size-aligned counts.
+        """
+        view = self._resolved()
+        if not view.enable_dp_attention:
+            return
+
+        attn_dp_size = self.dp_size if view.enable_dp_attention else 1
+        if attn_dp_size == 0:
+            return
+        attn_tp_size = self.tp_size // attn_dp_size
+        if attn_tp_size <= 1:
+            return
+
+        bs = self.cuda_graph_config.prefill.bs
+        if bs is None:
+            max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+            bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
+        aligned = sorted({ceil_align(b, attn_tp_size) for b in bs})
+        if aligned != sorted(bs):
+            logger.info(
+                "Prefill CUDA graph with DP attention (attn_tp_size=%d) "
+                "requires bucket sizes divisible by %d; aligning %s -> %s.",
+                attn_tp_size,
+                attn_tp_size,
+                sorted(bs),
+                aligned,
+            )
+            self.cuda_graph_config.prefill.bs = aligned
+            self.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
