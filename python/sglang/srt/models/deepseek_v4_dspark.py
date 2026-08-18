@@ -48,12 +48,13 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_blackwell_supported
+from sglang.srt.utils import add_prefix, is_blackwell_supported, is_ppu
 from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+_is_ppu = is_ppu()
 
 
 def apply_rotary_emb(
@@ -196,7 +197,9 @@ class DSparkAttention(MqaAttentionBase):
 
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
-        if self.n_local_heads < _PAD_NUM_HEADS:
+        # On PPU q is not padded: the backend slices the full attn_sink per TP
+        # rank to n_local_heads, so q must keep its local head count.
+        if not _is_ppu and self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
