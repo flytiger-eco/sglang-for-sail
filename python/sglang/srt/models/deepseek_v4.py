@@ -522,7 +522,7 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
             **({} if fp8 else {"params_dtype": torch.bfloat16}),
         )
-        if _FP8_WO_A_GEMM:
+        if fp8:
             if isinstance(self.quant_config, Fp8Config):
                 from sglang.srt.layers import deep_gemm_wrapper
 
@@ -536,7 +536,7 @@ class MqaAttentionBase(nn.Module):
                 # channelwise
                 assert hasattr(
                     self.wo_a, "weight_scale"
-                ), "FP8 quant_config must create weight_scale_inv"
+                ), "FP8 quant_config must create weight_scale"
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
