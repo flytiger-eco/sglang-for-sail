@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -171,8 +172,10 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         """
         Perform topk selection on the logits.
         For testing, just return the topk indices.
+        Cast to int32 to match the production topk backends, since callers
+        write the result back into pre-allocated int32 buffers.
         """
-        return torch.topk(logits, k=topk, dim=-1).indices
+        return torch.topk(logits, k=topk, dim=-1).indices.to(torch.int32)
 
 
 class MockModelRunner:
@@ -211,6 +214,7 @@ class MockModelRunner:
                 "kv_lora_rank": self.config["kv_lora_rank"],
                 "qk_rope_head_dim": self.config["qk_rope_head_dim"],
                 "qk_nope_head_dim": self.config["qk_nope_head_dim"],
+                "index_head_dim": self.config["index_head_dim"],
                 "hf_config": hf_config,
             },
         )()
@@ -993,6 +997,169 @@ class TestDSAIndexer(CustomTestCase):
                         with_row_starts=False,
                         query_lens=[1, 2, 3, 1, 2, 1, 3, 2],
                     )
+
+    def test_pad_heads_for_deep_gemm_tensor_q(self):
+        """Tensor branch: q and weights are padded along the head dim to 32."""
+        num_heads = 8
+        q = torch.randn(4, num_heads, 128, dtype=torch.bfloat16, device=self.device)
+        weights = torch.randn(4, num_heads, dtype=torch.float32, device=self.device)
+
+        q_padded, w_padded, returned_heads = Indexer._pad_heads_for_deep_gemm(
+            q, weights
+        )
+
+        self.assertEqual(returned_heads, num_heads)
+        self.assertEqual(q_padded.shape, (4, 32, 128))
+        self.assertEqual(w_padded.shape, (4, 32))
+        # Original heads are preserved; padded heads are zeros.
+        torch.testing.assert_close(q_padded[:, :num_heads], q)
+        torch.testing.assert_close(w_padded[:, :num_heads], weights)
+        self.assertTrue((q_padded[:, num_heads:] == 0).all())
+        self.assertTrue((w_padded[:, num_heads:] == 0).all())
+
+    def test_pad_heads_for_deep_gemm_mxfp4_tuple_q(self):
+        """MXFP4 branch: (q_packed, q_sf) tuple has both components padded."""
+        num_heads = 8
+        q_packed = torch.randint(
+            0, 255, (4, num_heads, 64), dtype=torch.uint8, device=self.device
+        )
+        q_sf = torch.randint(
+            -127, 127, (4, num_heads, 4), dtype=torch.int32, device=self.device
+        )
+        weights = torch.randn(4, num_heads, dtype=torch.float32, device=self.device)
+
+        q_out, w_padded, returned_heads = Indexer._pad_heads_for_deep_gemm(
+            (q_packed, q_sf), weights
+        )
+
+        self.assertEqual(returned_heads, num_heads)
+        self.assertIsInstance(q_out, tuple)
+        q_padded, q_sf_padded = q_out
+        self.assertEqual(q_padded.shape, (4, 32, 64))
+        self.assertEqual(q_sf_padded.shape, (4, 32, 4))
+        self.assertEqual(w_padded.shape, (4, 32))
+        # Original heads are preserved; padded heads are zeros.
+        torch.testing.assert_close(q_padded[:, :num_heads], q_packed)
+        torch.testing.assert_close(q_sf_padded[:, :num_heads], q_sf)
+        torch.testing.assert_close(w_padded[:, :num_heads], weights)
+        self.assertTrue((q_padded[:, num_heads:] == 0).all())
+        self.assertTrue((q_sf_padded[:, num_heads:] == 0).all())
+
+    def test_pad_heads_for_deep_gemm_skips_padding_at_32_heads(self):
+        """Both branches pass through untouched when num_heads >= 32."""
+        q = torch.randn(2, 32, 128, dtype=torch.bfloat16, device=self.device)
+        weights = torch.randn(2, 32, dtype=torch.float32, device=self.device)
+        q_out, w_out, returned_heads = Indexer._pad_heads_for_deep_gemm(q, weights)
+        self.assertIs(q_out, q)
+        self.assertIs(w_out, weights)
+        self.assertEqual(returned_heads, 32)
+
+        q_packed = torch.zeros(2, 32, 64, dtype=torch.uint8, device=self.device)
+        q_sf = torch.zeros(2, 32, 4, dtype=torch.int32, device=self.device)
+        q_tuple = (q_packed, q_sf)
+        q_out, w_out, returned_heads = Indexer._pad_heads_for_deep_gemm(
+            q_tuple, weights
+        )
+        self.assertIs(q_out, q_tuple)
+        self.assertIs(w_out, weights)
+        self.assertEqual(returned_heads, 32)
+
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    def test_get_topk_ragged_fp4_tuple_q(self, mock_deep_gemm):
+        """Regression: FP4 tuple q must be row-sliced then head-padded on the
+        MQA logits path instead of being treated as an FP8 tensor.
+        Covers both the non-chunked and the chunked loops."""
+        mock_deep_gemm.get_num_sms.return_value = 132
+        self._init_model_runner()
+
+        indexer = self._create_indexer()
+        indexer.use_fp4 = True
+
+        batch_size, seq_len = self.batch_size, self.seq_len
+        token_nums = batch_size * seq_len
+        num_heads = 8  # < 32 forces the head-padding branch
+
+        q_packed = torch.randint(
+            0, 255, (token_nums, num_heads, 64), dtype=torch.uint8, device=self.device
+        )
+        q_sf = torch.randint(
+            -127, 127, (token_nums, num_heads, 4), dtype=torch.int32, device=self.device
+        )
+        weights = torch.randn(
+            token_nums, num_heads, 1, dtype=torch.float32, device=self.device
+        )
+
+        metadata = MockIndexerMetadata(batch_size, [seq_len] * batch_size)
+        # Accessed only on the chunked path (PAGED variant: offset is None).
+        metadata.attn_metadata = SimpleNamespace(topk_indices_offset=None)
+
+        fake_pool = MagicMock()
+        fake_pool.page_size = 64
+        k_bytes = torch.zeros(token_nums, 68, dtype=torch.uint8, device=self.device)
+        k_scale_bytes = torch.zeros(
+            token_nums, 4, dtype=torch.uint8, device=self.device
+        )
+        fake_pool.get_index_k_scale_buffer.return_value = (k_bytes, k_scale_bytes)
+
+        captured = []
+
+        def fake_dispatch(q, kv, w, ks, ke, clean_logits=True):
+            captured.append(q)
+            num_rows = q[0].shape[0] if isinstance(q, tuple) else q.shape[0]
+            return torch.randn(
+                num_rows, token_nums, dtype=torch.float32, device=self.device
+            )
+
+        forward_batch = self._create_forward_batch(ForwardMode.EXTEND)
+
+        for need_chunk in (False, True):
+            with self.subTest(need_chunk=need_chunk):
+                captured.clear()
+                # budget => max_rows = budget / (k_offset * 4 bytes) = 100 rows
+                budget = 100 * token_nums * 4 if need_chunk else 0
+                with patch(
+                    "sglang.srt.layers.attention.dsa.dsa_indexer.get_token_to_kv_pool",
+                    return_value=fake_pool,
+                ), patch.object(
+                    indexer,
+                    "_should_chunk_mqa_logits",
+                    return_value=(need_chunk, budget),
+                ), patch.object(
+                    indexer, "_get_mqa_logits_dispatch", side_effect=fake_dispatch
+                ):
+                    topk_result = indexer._get_topk_ragged(
+                        enable_dual_stream=False,
+                        forward_batch=forward_batch,
+                        layer_id=self.config["layer_id"],
+                        q_fp8=(q_packed, q_sf),
+                        weights=weights,
+                        metadata=metadata,
+                    )
+
+                self.assertEqual(topk_result.shape, (token_nums, indexer.index_topk))
+                self.assertGreater(len(captured), 1 if need_chunk else 0)
+                if need_chunk:
+                    self.assertEqual(len(captured), 3)  # 100 + 100 + 56 rows
+
+                # Every dispatch call receives a head-padded MXFP4 tuple whose
+                # rows partition the original q in order.
+                total_rows = 0
+                for q in captured:
+                    self.assertIsInstance(q, tuple)
+                    q_p, q_s = q
+                    self.assertEqual(q_p.shape[1], 32)
+                    self.assertEqual(q_s.shape[1], 32)
+                    self.assertEqual(q_p.shape[2], 64)
+                    self.assertEqual(q_s.shape[2], 4)
+                    torch.testing.assert_close(
+                        q_p[:, :num_heads],
+                        q_packed[total_rows : total_rows + q_p.shape[0]],
+                    )
+                    torch.testing.assert_close(
+                        q_s[:, :num_heads], q_sf[total_rows : total_rows + q_s.shape[0]]
+                    )
+                    total_rows += q_p.shape[0]
+                self.assertEqual(total_rows, token_nums)
 
     # TODO: enable this test after indexer accuracy aligned
     # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")

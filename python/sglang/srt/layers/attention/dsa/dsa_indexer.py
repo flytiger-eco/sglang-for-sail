@@ -15,6 +15,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_mxfp4_cache,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
@@ -28,7 +29,6 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -53,8 +53,8 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_xpu,
     is_ppu,
+    is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -1118,7 +1118,23 @@ class Indexer(MultiPlatformOp):
     @staticmethod
     def _pad_heads_for_deep_gemm(q_fp8, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
-        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
+        so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4).
+
+        Supports both tensor (FP8/INT8/BF16) and tuple (MXFP4) q_fp8.
+        For MXFP4, q_fp8 is (q_packed, q_sf) and both components are padded
+        along the head dimension.
+        """
+        if isinstance(q_fp8, tuple):
+            q_packed, q_sf = q_fp8
+            num_heads = q_packed.shape[1]
+            if num_heads >= 32:
+                return q_fp8, weights, num_heads
+            target_heads = 32
+            pad_spec = (0, 0, 0, target_heads - num_heads)
+            q_padded = torch.nn.functional.pad(q_packed, pad_spec)
+            q_sf_padded = torch.nn.functional.pad(q_sf, pad_spec)
+            weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
+            return (q_padded, q_sf_padded), weights, num_heads
         num_heads = q_fp8.shape[1]
         if num_heads >= 32:
             return q_fp8, weights, num_heads
@@ -1609,7 +1625,7 @@ class Indexer(MultiPlatformOp):
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
+                        q_first, weights[:q_offset]
                     )
                     logits = self._get_mqa_logits_dispatch(
                         q_padded,
@@ -1666,7 +1682,7 @@ class Indexer(MultiPlatformOp):
                     )
                 else:
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
+                        q_chunk, weights[start:end]
                     )
                     logits_chunk = self._get_mqa_logits_dispatch(
                         q_padded,
@@ -1793,7 +1809,7 @@ class Indexer(MultiPlatformOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q_fp8: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
         kv_len: int,
