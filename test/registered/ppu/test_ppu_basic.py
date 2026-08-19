@@ -6,6 +6,8 @@ Assigned to stage-a so it gates stage-b before the heavier tests run.
 
 Usage:
 python3 -m unittest test_ppu_basic.TestPPUBasic.test_basic_generation
+
+Dry-run change to validate the run-ci label gate (no functional change).
 """
 
 import unittest
