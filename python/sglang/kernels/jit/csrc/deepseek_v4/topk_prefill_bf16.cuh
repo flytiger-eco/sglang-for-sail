@@ -158,6 +158,15 @@ SGL_DEVICE uint32_t cdiv_pf(uint32_t a, uint32_t b) {
   return (a + b - 1u) / b;
 }
 
+// Element-granularity misalignment of a bf16 pointer w.r.t. 16B vector access.
+// `scores + row_id * score_stride + row_start` carries arbitrary parity because
+// both score_stride and row_start (== ks) are plain token counts, so the row
+// base is only 2B aligned in general. cp.async / uint4 loads require 16B, so
+// callers align the base down by this amount and shift the scan window instead.
+SGL_DEVICE uint32_t bf16_misalign_elems_pf(const __nv_bfloat16* p) {
+  return static_cast<uint32_t>((reinterpret_cast<uintptr_t>(p) >> 1) & (prefill_bf16::kElemPerStage - 1u));
+}
+
 SGL_DEVICE uint32_t warp_inclusive_sum_pf(uint32_t lane_id, uint32_t val) {
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
@@ -174,17 +183,23 @@ SGL_DEVICE uint32_t warp_inclusive_sum_pf(uint32_t lane_id, uint32_t val) {
 // only accumulates the 12-bit histogram. When kIsScatter == true,
 // elements with bin > thr_bin are emitted into s_topk_indices and
 // equal-bin elements are deferred to the tie buffer.
+//
+// `scores_bf16` must be 16B aligned; the logical row lives in the
+// window [base_offset, base_offset + length) so that an arbitrarily
+// aligned row start can still be served by 16B cp.async.
 // ============================================================
 template <bool kIsScatter>
 SGL_DEVICE static void stream_pass_bf16(
     const __nv_bfloat16* __restrict__ scores_bf16,
+    const uint32_t base_offset,
     const uint32_t length,
     const uint32_t thr_bin,
     int32_t* __restrict__ s_topk_indices,
     PrefillBF16Smem* smem) {
   using namespace prefill_bf16;
   const auto tx = threadIdx.x;
-  const auto num_iters = cdiv_pf(length, kSizePerStage);
+  const auto total = base_offset + length;
+  const auto num_iters = cdiv_pf(total, kSizePerStage);
 
   auto issue_stage = [&](uint32_t s) {
     // Always issues a commit even when out of range, so callers can
@@ -195,17 +210,17 @@ SGL_DEVICE static void stream_pass_bf16(
     const uint32_t local = tx * kElemPerStage;
     const uint32_t global_base = base + local;
 
-    if (global_base + kElemPerStage <= length) {
+    if (global_base + kElemPerStage <= total) {
       // Fast path: full 16-byte cp.async copy of 8 bf16s.
       __pipeline_memcpy_async(&smem->bf16_buffer[buf][local], scores_bf16 + global_base, kCpAsyncBytes);
-    } else if (global_base < length) {
+    } else if (global_base < total) {
       // Tail path: do an aligned full-size copy if the remaining tile
       // is still entirely valid; otherwise fall back to per-element
       // synchronous loads with sentinel padding.
 #pragma unroll
       for (uint32_t e = 0; e < kElemPerStage; ++e) {
         const uint32_t g = global_base + e;
-        smem->bf16_buffer[buf][local + e] = (g < length) ? scores_bf16[g] : __float2bfloat16(-FLT_MAX);
+        smem->bf16_buffer[buf][local + e] = (g < total) ? scores_bf16[g] : __float2bfloat16(-FLT_MAX);
       }
     } else {
       // Entire chunk is OOB: prefill sentinel so processing never
@@ -239,8 +254,12 @@ SGL_DEVICE static void stream_pass_bf16(
 #pragma unroll
     for (uint32_t e = 0; e < kElemPerStage; ++e) {
       const uint32_t local = tx * kElemPerStage + e;
-      const uint32_t global_idx = base + local;
-      if (global_idx >= length) break;
+      const uint32_t w = base + local;
+      if (w >= total) break;
+      // Unsigned wrap makes the `base_offset` head elements compare as huge,
+      // so this single check drops both the head padding and the tail.
+      const uint32_t global_idx = w - base_offset;
+      if (global_idx >= length) continue;
 
       const float val = __bfloat162float(smem->bf16_buffer[buf][local]);
       const uint32_t bin = extract_coarse_bin_pf<kHistBits>(val);
@@ -282,9 +301,13 @@ SGL_DEVICE static void stream_pass_bf16(
 // loads data directly from HBM via vectorized loads (uint4).
 // No block-level __syncthreads() in the main loop -- warps that
 // miss topk hits immediately steal the next unscanned tile.
+//
+// Same aligned-base + [base_offset, base_offset + length) window
+// contract as stream_pass_bf16, required by the uint4 loads.
 // ============================================================
 SGL_DEVICE static void scatter_pass_bf16_warp_steal(
     const __nv_bfloat16* __restrict__ scores_bf16,
+    const uint32_t base_offset,
     const uint32_t length,
     const uint32_t thr_bin,
     int32_t* __restrict__ s_topk_indices,
@@ -296,7 +319,8 @@ SGL_DEVICE static void scatter_pass_bf16_warp_steal(
 
   // Warp-tile granularity: 32 lanes * 8 elements = 256 BF16 values.
   constexpr uint32_t kWarpTileElems = 32u * kElemPerStage;  // 256
-  const uint32_t num_warp_tiles = cdiv_pf(length, kWarpTileElems);
+  const uint32_t total = base_offset + length;
+  const uint32_t num_warp_tiles = cdiv_pf(total, kWarpTileElems);
 
   // Reuse warp_sum[0] as shared work-steal counter.
   // Pre-assign first kNumWarps tiles statically to avoid initial stampede.
@@ -312,16 +336,19 @@ SGL_DEVICE static void scatter_pass_bf16_warp_steal(
     const uint32_t base = my_tile * kWarpTileElems;
     const uint32_t global_base = base + lane_id * kElemPerStage;
 
-    if (global_base + kElemPerStage <= length) {
+    if (global_base + kElemPerStage <= total) {
       // Fast path: vectorized 16-byte load (8 bf16 = uint4).
       const uint4 data = *reinterpret_cast<const uint4*>(scores_bf16 + global_base);
       const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&data);
 
 #pragma unroll
       for (uint32_t e = 0; e < kElemPerStage; ++e) {
+        // Unsigned wrap drops the `base_offset` head elements.
+        const uint32_t global_idx = global_base + e - base_offset;
+        if (global_idx >= length) continue;
+
         const float fval = __bfloat162float(vals[e]);
         const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
-        const uint32_t global_idx = global_base + e;
 
         if (bin > thr_bin) {
           const auto pos = atomicAdd(&smem->counter_gt, 1u);
@@ -335,13 +362,15 @@ SGL_DEVICE static void scatter_pass_bf16_warp_steal(
           }
         }
       }
-    } else if (global_base < length) {
+    } else if (global_base < total) {
       // Tail path: element-by-element for partial tile.
       for (uint32_t e = 0; e < kElemPerStage; ++e) {
-        const uint32_t global_idx = global_base + e;
-        if (global_idx >= length) break;
+        const uint32_t w = global_base + e;
+        if (w >= total) break;
+        const uint32_t global_idx = w - base_offset;
+        if (global_idx >= length) continue;
 
-        const float fval = __bfloat162float(scores_bf16[global_idx]);
+        const float fval = __bfloat162float(scores_bf16[w]);
         const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
 
         if (bin > thr_bin) {
@@ -365,6 +394,12 @@ SGL_DEVICE static void scatter_pass_bf16_warp_steal(
     }
     my_tile = __shfl_sync(0xFFFFFFFF, my_tile, 0);
   }
+
+  // Block-level barrier: all warps must complete the scatter phase before
+  // the caller reads counter_eq / tie_buffer in tie_handle_and_transform.
+  // Without this, fast-finishing warps race ahead into tie-handling while
+  // slow warps are still writing atomics → stale reads → garbage indices → crash.
+  __syncthreads();
 }
 
 // ============================================================
@@ -606,23 +641,33 @@ SGL_DEVICE void register_topk_bf16_pf(
     const uint32_t extra_length = length - prefill_bf16::kMax1PassLength;
     const __nv_bfloat16* src = scores + prefill_bf16::kMax1PassLength;
 
-    // Issue async copies: each thread copies kElemPerStage (8) bf16 elements per round.
-    // extra_length is at most kMax1PassLength (16384) and kSizePerStage = 8192, so at most 2 rounds.
+    // `src` inherits the row base alignment, which is only 2B in general because
+    // score_stride / row_start are plain token counts. A 16B cp.async on a
+    // misaligned source faults, so use a plain strided copy in that case.
+    if ((reinterpret_cast<uintptr_t>(src) & 15u) != 0u) {
+      for (uint32_t i = tx; i < extra_length; i += prefill_bf16::kBlockSize) {
+        smem->bf16_stage[i] = src[i];
+      }
+      __pipeline_commit();  // keep the commit/wait pairing below intact
+    } else {
+      // Issue async copies: each thread copies kElemPerStage (8) bf16 elements per round.
+      // extra_length is at most kMax1PassLength (16384) and kSizePerStage = 8192, so at most 2 rounds.
 #pragma unroll 2
-    for (uint32_t r = 0; r < 2; ++r) {
-      const uint32_t global_base = r * prefill_bf16::kSizePerStage + tx * prefill_bf16::kElemPerStage;
-      if (global_base + prefill_bf16::kElemPerStage <= extra_length) {
-        __pipeline_memcpy_async(&smem->bf16_stage[global_base], &src[global_base], prefill_bf16::kCpAsyncBytes);
-      } else if (global_base < extra_length) {
+      for (uint32_t r = 0; r < 2; ++r) {
+        const uint32_t global_base = r * prefill_bf16::kSizePerStage + tx * prefill_bf16::kElemPerStage;
+        if (global_base + prefill_bf16::kElemPerStage <= extra_length) {
+          __pipeline_memcpy_async(&smem->bf16_stage[global_base], &src[global_base], prefill_bf16::kCpAsyncBytes);
+        } else if (global_base < extra_length) {
 #pragma unroll
-        for (uint32_t e = 0; e < prefill_bf16::kElemPerStage; ++e) {
-          if (global_base + e < extra_length) {
-            smem->bf16_stage[global_base + e] = src[global_base + e];
+          for (uint32_t e = 0; e < prefill_bf16::kElemPerStage; ++e) {
+            if (global_base + e < extra_length) {
+              smem->bf16_stage[global_base + e] = src[global_base + e];
+            }
           }
         }
       }
+      __pipeline_commit();
     }
-    __pipeline_commit();
   }
 
   // Accumulate histogram via shared-memory atomics
@@ -874,11 +919,16 @@ SGL_DEVICE static void register_transform_bf16(
 //   B. find threshold
 //   C. scatter pass    (cp.async double buffered)
 //
+// `scores_bf16` is the 16B-aligned-down row base and `base_offset`
+// (< kElemPerStage) is how many elements the real row start sits
+// past it; both passes mask the head elements out.
+//
 // The caller is responsible for calling tie_handle_and_transform_bf16
 // afterwards.
 // ============================================================
 SGL_DEVICE static void streaming_topk_bf16(
     const __nv_bfloat16* __restrict__ scores_bf16,
+    const uint32_t base_offset,
     const uint32_t length,
     int32_t* __restrict__ s_topk_indices,
     PrefillBF16Smem* smem) {
@@ -902,7 +952,7 @@ SGL_DEVICE static void streaming_topk_bf16(
   }
 
   // Phase A: build histogram via streaming cp.async pipeline.
-  stream_pass_bf16<false>(scores_bf16, length, /*thr_bin=*/0u, /*topk=*/nullptr, smem);
+  stream_pass_bf16<false>(scores_bf16, base_offset, length, /*thr_bin=*/0u, /*topk=*/nullptr, smem);
 
   // Phase B: locate threshold bin.
   find_threshold_bf16(length, smem);
@@ -917,7 +967,7 @@ SGL_DEVICE static void streaming_topk_bf16(
 
   // Phase C: scatter pass.
   const auto thr_bin = smem->match.bin;
-  scatter_pass_bf16_warp_steal(scores_bf16, length, thr_bin, s_topk_indices, smem);
+  scatter_pass_bf16_warp_steal(scores_bf16, base_offset, length, thr_bin, s_topk_indices, smem);
 }
 
 // ============================================================
@@ -1025,7 +1075,7 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
   const auto row_end = params.row_ends[row_id];
   const auto length = row_end > row_start ? static_cast<uint32_t>(row_end - row_start) : 0u;
 
-  const auto scores_ptr = params.scores + static_cast<int64_t>(row_id) * params.score_stride + row_start;
+  const auto scores_raw = params.scores + static_cast<int64_t>(row_id) * params.score_stride + row_start;
   const auto page_ptr = params.page_table + static_cast<int64_t>(row_id) * params.page_table_stride;
   auto page_indices_ptr = params.page_indices + static_cast<int64_t>(row_id) * kTopK;
   auto raw_indices_ptr =
@@ -1036,9 +1086,17 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
     return;
   }
 
+  // `score_stride` and `row_start` are plain token counts, so the row base can
+  // land on any 2B boundary while cp.async / uint4 need 16B. Align the base down
+  // and let the passes skip the resulting head elements. Aligning down never
+  // leaves the tensor: the allocator guarantees a 16B-aligned `params.scores`,
+  // so the misalignment is always <= the row's element offset.
+  const uint32_t base_offset = bf16_misalign_elems_pf(scores_raw);
+  const auto scores_ptr = scores_raw - base_offset;
+
   // All rows with length > kTopK use the streaming path in this kernel,
   // since smem is already sized for PrefillBF16Smem.
-  streaming_topk_bf16(scores_ptr, length, s_topk_indices, smem);
+  streaming_topk_bf16(scores_ptr, base_offset, length, s_topk_indices, smem);
   tie_handle_and_transform_bf16(params, s_topk_indices, page_indices_ptr, raw_indices_ptr, page_ptr, smem);
 }
 
