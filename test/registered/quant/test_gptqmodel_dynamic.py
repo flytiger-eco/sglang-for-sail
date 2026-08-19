@@ -16,7 +16,13 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=100, stage="extra-a", runner_config="1-gpu-large")
-register_ppu_ci(est_time=100, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(
+    est_time=100,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="Marlin atomic-add reduce deadlocks the kernel on PPU at small m "
+    "(fp16 GPTQ-Marlin path); in-code workaround reverted, reported to PPU SDK team",
+)
 
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):

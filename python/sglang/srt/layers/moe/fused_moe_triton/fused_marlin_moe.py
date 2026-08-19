@@ -3,11 +3,10 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import is_cuda, is_ppu
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
-_is_ppu = is_ppu()
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -204,14 +203,6 @@ def fused_marlin_moe(
         hidden_states.dtype == torch.half
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
-
-    # PPU: the atomic-add reduction path deadlocks the marlin kernel at small M
-    # (GPU spins at 100% forever; only a container-root SIGKILL frees it). Verified
-    # by isolation: same config with use_atomic_add=False completes in 0.3s, and
-    # bf16 hangs too once atomic is forced on — so the trigger is the atomic path
-    # plus small M, not the dtype. Fall back to the workspace-reduce path here.
-    if _is_ppu:
-        use_atomic_add = False
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
