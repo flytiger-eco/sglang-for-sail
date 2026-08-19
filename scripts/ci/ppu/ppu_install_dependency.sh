@@ -63,11 +63,14 @@ cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.tom
 # all_ppu doesn't pull it in. test_tracing needs it to exercise the OTLP path.
 cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu,tracing]" --no-build-isolation
 
-# ==================== sgl-kernel: source build when needed ==================== #
-# Default: use the PyPI wheel installed above.
-# If this PR touches sgl-kernel source, rebuild from source so CI actually tests
-# the new code. Detect by checking git diff against the merge base.
-# Force with SGL_KERNEL_BUILD_FROM_SOURCE=1.
+# ==================== sgl-kernel: PR wheel / source build / PyPI ==================== #
+# Priority 1: install the PR-built wheel downloaded by the build-sgl-kernel
+#   CI job (SGL_KERNEL_WHEEL_DIR points at the artifact directory), so tests
+#   exercise kernels built from the PR's own code.
+# Priority 2: if this PR touches sgl-kernel source but no wheel is available,
+#   rebuild from source. Detect by checking git diff against the previous
+#   commit. Force with SGL_KERNEL_BUILD_FROM_SOURCE=1.
+# Priority 3: the PyPI wheel installed above.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _kernel_source_changed() {
@@ -78,7 +81,10 @@ _kernel_source_changed() {
     fi
 }
 
-if [[ "${SGL_KERNEL_BUILD_FROM_SOURCE:-0}" == "1" ]] || _kernel_source_changed; then
+if [[ -n "${SGL_KERNEL_WHEEL_DIR:-}" ]] && ls "${SGL_KERNEL_WHEEL_DIR}"/sgl_kernel*.whl >/dev/null 2>&1; then
+    echo "Installing PR-built sgl-kernel wheel from ${SGL_KERNEL_WHEEL_DIR}..."
+    ${PIP_INSTALL} --force-reinstall "${SGL_KERNEL_WHEEL_DIR}"/sgl_kernel*.whl
+elif [[ "${SGL_KERNEL_BUILD_FROM_SOURCE:-0}" == "1" ]] || _kernel_source_changed; then
     echo "sgl-kernel source changed (or SGL_KERNEL_BUILD_FROM_SOURCE=1) — building from source..."
     bash "${SCRIPT_DIR}/ppu_build_kernel.sh"
 else
