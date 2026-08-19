@@ -81,9 +81,11 @@ _kernel_source_changed() {
     fi
 }
 
-if [[ -n "${SGL_KERNEL_WHEEL_DIR:-}" ]] && ls "${SGL_KERNEL_WHEEL_DIR}"/sgl_kernel*.whl >/dev/null 2>&1; then
+# Note: the PR build names its wheel sglang_kernel-* (setup_ppu.py dist name).
+# Install with --no-deps, mirroring ppu_build_kernel.sh for source builds.
+if [[ -n "${SGL_KERNEL_WHEEL_DIR:-}" ]] && ls "${SGL_KERNEL_WHEEL_DIR}"/sglang_kernel*.whl >/dev/null 2>&1; then
     echo "Installing PR-built sgl-kernel wheel from ${SGL_KERNEL_WHEEL_DIR}..."
-    ${PIP_INSTALL} --force-reinstall "${SGL_KERNEL_WHEEL_DIR}"/sgl_kernel*.whl
+    ${PIP_INSTALL} --force-reinstall --no-deps "${SGL_KERNEL_WHEEL_DIR}"/sglang_kernel*.whl
 elif [[ "${SGL_KERNEL_BUILD_FROM_SOURCE:-0}" == "1" ]] || _kernel_source_changed; then
     echo "sgl-kernel source changed (or SGL_KERNEL_BUILD_FROM_SOURCE=1) — building from source..."
     bash "${SCRIPT_DIR}/ppu_build_kernel.sh"
