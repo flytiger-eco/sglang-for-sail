@@ -1,12 +1,10 @@
 name: Nightly Link Check
 
 on:
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+
 concurrency:
   group: nightly-link-check-${{ github.ref }}
   cancel-in-progress: true

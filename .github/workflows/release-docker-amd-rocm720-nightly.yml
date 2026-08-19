@@ -2,10 +2,18 @@ name: Release Docker Images Nightly ROCm7.2 (AMD)
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      job_select:
+        description: 'Select which release job to run'
         required: false
-        type: string
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
+          - publish_dsv4
+  schedule:
+    - cron: '0 12 * * *'
+
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
   # queued and in-progress runs for the same PR (presubmit) or commit

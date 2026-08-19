@@ -3,10 +3,11 @@ name: Open A PR to Copy Diff To OSS
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      commit_sha:
+        description: 'The commit SHA to copy. Defaults to LAST to copy the latest commit.'
         required: false
-        type: string
+        default: 'LAST'
+
 permissions:
   contents: write
 

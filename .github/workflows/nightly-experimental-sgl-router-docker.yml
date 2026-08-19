@@ -1,12 +1,10 @@
 name: Nightly Experimental sgl-router Docker Image
 
 on:
+  schedule:
+    - cron: '0 2 * * *'
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true

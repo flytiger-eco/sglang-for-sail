@@ -1,11 +1,9 @@
 name: Release Docker Images Nightly (Intel XPU)
 on:
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+  schedule:
+    - cron: '0 12 * * *'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
   cancel-in-progress: true

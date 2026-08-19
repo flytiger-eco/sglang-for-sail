@@ -1,12 +1,6 @@
 name: Full Test (NPU)
 
 on:
-  workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
 #  pull_request:
 #    branches:
 #      - main

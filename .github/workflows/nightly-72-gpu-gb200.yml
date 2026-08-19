@@ -4,12 +4,27 @@ name: Nightly Test (GB200 72GPU)
 # Manual (workflow_dispatch) runs are gated by the gb200-ci environment
 # to prevent individuals from queuing arbitrary jobs on the shared GB200 cluster.
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
+  workflow_dispatch:  # allow manual trigger; gated by gb200-ci environment
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      image:
+        description: 'Optional. SGLang Docker image to benchmark. Leave empty for the default nightly image. Mutually exclusive with pr_number and sglang_branch.'
         required: false
-        type: string
+        default: ''
+      pr_number:
+        description: 'Optional. PR number to build from (works for PRs from forks too, via refs/pull/<N>/head). Preferred over sglang_branch when a PR exists. Mutually exclusive with image and sglang_branch.'
+        required: false
+        default: ''
+      sglang_branch:
+        description: 'Optional. Branch name on sgl-project/sglang to build from (use when no PR is open yet). For fork branches, open a PR and use pr_number instead. Mutually exclusive with image and pr_number.'
+        required: false
+        default: ''
+      configs:
+        description: 'Optional. Comma-separated names to run only a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. E.g. "dsr1-fp8-1k1k-max-tpt" or "dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve". Leave empty to run all. Available names are listed in the setup job log.'
+        required: false
+        default: ''
+
 concurrency:
   group: nightly-test-gb200
   cancel-in-progress: false

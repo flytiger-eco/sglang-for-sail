@@ -1,12 +1,10 @@
 name: CI Failure Monitor
 
 on:
+  schedule:
+    - cron: '0 */12 * * *' # Every 12 hour
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+
 concurrency:
   group: ci-failure-monitor-${{ github.ref }}
   cancel-in-progress: true

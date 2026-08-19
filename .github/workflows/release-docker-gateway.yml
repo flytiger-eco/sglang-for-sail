@@ -1,11 +1,12 @@
 name: Release SGLang Model Gateway Docker Image
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - sgl-model-gateway/bindings/python/pyproject.toml
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang'

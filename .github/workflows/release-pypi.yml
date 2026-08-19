@@ -1,11 +1,15 @@
 name: Release PyPI
 on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
+      version:
+        description: 'Release version to publish (e.g. v0.5.11). Overrides setuptools-scm.'
+        required: true
         type: string
+
 jobs:
   build:
     if: github.repository == 'sgl-project/sglang'

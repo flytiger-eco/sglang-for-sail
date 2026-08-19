@@ -1,12 +1,24 @@
 name: PR Test (Arm64)
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+  workflow_call:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         required: false
         type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests (for releasing or testing purpose)"
+        required: false
+        type: boolean
+        default: false
+
 concurrency:
   group: pr-test-arm64-${{ inputs.ref || github.ref }}
   cancel-in-progress: false

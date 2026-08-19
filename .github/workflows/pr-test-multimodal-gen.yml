@@ -1,12 +1,41 @@
 name: PR Test - Multimodal Gen
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      multimodal_gen:
+        required: true
+        type: string
+      sgl_kernel:
+        required: true
+        type: string
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
+        required: true
+        type: string
+      continue_on_error:
         required: false
         type: string
+        default: 'false'
+      git_ref:
+        required: false
+        type: string
+        default: ''
+      test_parallel_dispatch:
+        required: false
+        type: string
+        default: 'false'
+      caller_needs_failure:
+        required: false
+        type: string
+        default: 'false'
+      skip_pr_test_health_check:
+        required: false
+        type: string
+        default: 'false'
+
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 # The github context (including github.event_name) IS inherited from the caller.
 env:

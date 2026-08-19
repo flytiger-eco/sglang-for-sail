@@ -3,10 +3,13 @@ name: Retag Docker Image
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+      source_tag:
+        description: "Existing image tag (e.g., v0.4.7-cu129-amd64)"
+        required: true
+      target_tag:
+        description: "New tag to apply (e.g., latest)"
+        required: true
+
 jobs:
   retag:
     if: github.repository == 'sgl-project/sglang'

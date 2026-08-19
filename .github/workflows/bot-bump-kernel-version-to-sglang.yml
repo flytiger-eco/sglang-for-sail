@@ -2,11 +2,7 @@ name: Bot Bump Kernel Version to SGLang
 
 on:
   workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+
 permissions:
   contents: write
   pull-requests: write

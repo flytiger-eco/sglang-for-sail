@@ -3,10 +3,16 @@ name: Release Branch Cut
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      branch_name:
+        description: 'Branch name to create (e.g., release/v0.5.7)'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit SHA from main to cut the release branch from (defaults to latest main)'
         required: false
         type: string
+        default: ''
+
 permissions:
   actions: write
   contents: write

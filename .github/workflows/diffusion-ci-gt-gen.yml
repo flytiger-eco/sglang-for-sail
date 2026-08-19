@@ -3,10 +3,52 @@ name: Diffusion CI Ground Truth Generation
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      ref:
+        description: 'Git ref to checkout'
         required: false
+        default: ''
         type: string
+      case_ids:
+        description: 'Specific case IDs to run (space-separated, optional)'
+        required: false
+        default: ''
+        type: string
+      output_name:
+        description: 'Custom local output/artifact folder name. Leave empty to use defaults.'
+        required: false
+        default: ''
+        type: string
+      publish_target_dir:
+        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use sglang_generated, or official_generated when run_official_cases is true.'
+        required: false
+        default: ''
+        type: string
+      kernel_artifact_run_id:
+        description: "Optional sgl-kernel wheel source: GitHub Actions run ID of a pr-test.yml run on the SAME commit as 'ref' that uploaded wheel-python3.10-cuda13.0. Use only when this branch's torch/ABI change makes the PyPI sglang-kernel wheel incompatible. Find it under Actions > pr-test; artifacts expire after 90 days."
+        required: false
+        default: ''
+        type: string
+      run_official_cases:
+        description: 'Run official comparable GT cases instead of native SGLang GT cases.'
+        required: false
+        default: false
+        type: boolean
+      official_case_ids:
+        description: 'Specific official case IDs to run (space-separated). Leave empty to run all official comparable cases.'
+        required: false
+        default: ''
+        type: string
+      official_source_group:
+        description: 'Official GT source group filter: all, diffusers, wan21, ltx, or ltx23. Used only when run_official_cases is true.'
+        required: false
+        default: ''
+        type: string
+      ci_data_ref:
+        description: 'ci-data ref to use for repro scripts when running official GT cases.'
+        required: false
+        default: 'main'
+        type: string
+
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
   cancel-in-progress: true

@@ -1,12 +1,33 @@
 name: PR Test - JIT Kernel
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      jit_kernel:
+        required: true
+        type: string
+      sgl_kernel:
+        required: true
+        type: string
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
+        required: true
+        type: string
+      git_ref:
         required: false
         type: string
+        default: ''
+      test_parallel_dispatch:
+        required: false
+        type: string
+        default: 'false'
+      skip_pr_test_health_check:
+        required: false
+        type: boolean
+        default: false
+
 # Workflow-level env is NOT inherited from the caller in reusable workflows (verified by CI test).
 # The github context (including github.event_name) IS inherited from the caller.
 env:

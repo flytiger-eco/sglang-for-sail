@@ -3,10 +3,11 @@ name: Bot Bump SGLang Version
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
+      new_version:
+        description: 'New SGLang version (e.g., 0.5.3 or 0.5.3rc0)'
+        required: true
         type: string
+
 permissions:
   contents: write
   pull-requests: write

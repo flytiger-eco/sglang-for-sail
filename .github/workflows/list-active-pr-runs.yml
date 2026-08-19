@@ -3,10 +3,12 @@ name: List Active Runs
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      workflows:
+        description: 'Space-separated list of workflow filenames to check'
         required: false
         type: string
+        default: 'pr-test.yml'
+
 permissions:
   actions: read
   contents: read

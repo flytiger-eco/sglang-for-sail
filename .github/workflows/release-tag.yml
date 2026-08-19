@@ -4,10 +4,16 @@ name: Release Tag
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
+      version:
+        description: 'Version to tag (without v prefix, e.g., 0.5.7)'
+        required: true
         type: string
+      ref:
+        description: 'Branch or commit to tag (e.g., release/v0.5.7, main, or commit SHA)'
+        required: false
+        default: 'main'
+        type: string
+
 permissions:
   contents: write
 

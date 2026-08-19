@@ -1,12 +1,12 @@
 name: CI Auto Bisect
 
 on:
-  workflow_dispatch:
-    inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
-        required: false
-        type: string
+  workflow_run:
+    workflows: ["PR Test Base"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+
 concurrency:
   group: ci-auto-bisect
   cancel-in-progress: true

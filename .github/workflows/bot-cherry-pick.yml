@@ -3,10 +3,19 @@ name: Bot Cherry Pick to Release Branch
 on:
   workflow_dispatch:
     inputs:
-      note:
-        description: 'Disabled for PPU-only fork. Manual dispatch only.'
+      pr_number:
+        description: 'PR number to cherry-pick (preferred). Provide either pr_number OR commit_sha, not both.'
         required: false
         type: string
+      commit_sha:
+        description: 'Commit SHA to cherry-pick (alternative to pr_number; full or short hash).'
+        required: false
+        type: string
+      target_branch:
+        description: 'Target release branch (e.g., release/v0.5.7)'
+        required: true
+        type: string
+
 permissions:
   contents: write
   pull-requests: write
