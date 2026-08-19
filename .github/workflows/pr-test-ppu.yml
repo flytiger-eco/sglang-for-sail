@@ -3,7 +3,7 @@ name: PR Test (PPU)
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    branches: [ v0.5.13 ]
+    branches: [ v0.5.13, feat/ppu-ci-clean2 ]
   workflow_dispatch:
   workflow_call:
     inputs:
