@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import tabulate
@@ -308,14 +309,22 @@ def run_a_suite(args):
         and not f.endswith("/cpu/utils.py")
     ]
 
-    # JIT kernel tests and benchmarks (live alongside kernel source)
+    # JIT kernel tests and benchmarks (live alongside kernel source).
+    # For PPU, keep only files carrying a register_ppu_ci call: upstream
+    # ships jit_kernel files without any CI registration (or with
+    # register_cuda_ci only), which would fail the sanity check below.
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
+    jit_files = glob.glob(
         os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
     )
-    files += glob.glob(
+    jit_files += glob.glob(
         os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
     )
+    if args.hw == "ppu":
+        jit_files = [
+            f for f in jit_files if "register_ppu_ci(" in Path(f).read_text()
+        ]
+    files += jit_files
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
