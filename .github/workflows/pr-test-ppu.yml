@@ -2,6 +2,7 @@ name: PR Test (PPU)
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     branches: [ v0.5.13 ]
   workflow_dispatch:
   workflow_call:
@@ -31,6 +32,12 @@ env:
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
+    # Per-commit PPU CI is gated behind the `run-ci` label to save
+    # self-hosted PPU runner capacity. Maintainers add the label via the
+    # `/run-ci` slash command (or manually); the `labeled` event above
+    # dispatches a fresh run once the label is present. Manual runs
+    # (workflow_dispatch / workflow_call) bypass the gate.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
