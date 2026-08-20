@@ -25,11 +25,10 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
-register_ppu_ci(est_time=2, suite="per-commit-1-ppu")
 
 
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):

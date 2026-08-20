@@ -22,10 +22,9 @@ from sglang.srt.utils.hf_transformers.common import (
 )
 from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_ppu_ci(est_time=6, suite="per-commit-1-ppu")
 
 
 # ---------------------------------------------------------------------------

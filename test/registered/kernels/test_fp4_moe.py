@@ -12,15 +12,9 @@ from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
-register_ppu_ci(
-    est_time=300,
-    suite="nightly-4-ppu",
-    nightly=True,
-    disabled="FP4 not supported on PPU",
-)
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(

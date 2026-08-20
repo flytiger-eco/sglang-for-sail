@@ -1,20 +1,17 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on B200 via nightly-4-gpu-b200 suite
 register_cuda_ci(est_time=2000, suite="nightly-4-gpu-b200", nightly=True)
-register_ppu_ci(est_time=2000, suite="nightly-4-ppu", nightly=True)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 
 
-@skip_if_no_fp4()
 class TestDeepseekR1FP4Unified(unittest.TestCase):
     """Unified test class for DeepSeek-V3-0324-FP4 performance and accuracy.
 

@@ -1,11 +1,10 @@
 """Unit tests for srt/sampling/sampling_params.py — no server, no model loading."""
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
-register_ppu_ci(est_time=7, suite="per-commit-1-ppu")
 
 import unittest
 from unittest.mock import MagicMock
