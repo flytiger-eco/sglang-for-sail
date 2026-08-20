@@ -435,9 +435,6 @@ def deep_moe_impl_fused(
     out1 = torch.empty(
         (num_tokens_padded, N), device=hidden_states.device, dtype=torch.bfloat16
     )
-    out3 = torch.empty(
-        (num_tokens_padded, K), device=hidden_states.device, dtype=torch.bfloat16
-    )
 
     a, a_scale, expert_ids, inv_perm, num_recv_tokens_per_expert = deepgemm_moe_permute(
         aq=hidden_states,
@@ -507,6 +504,9 @@ def deep_moe_impl_fused(
             a, w1, out1, expert_ids, num_recv_tokens_per_expert
         )
 
+    if use_w4a16:
+        del a
+
     if (
         activation != "situ"
         and gemm1_alpha is None
@@ -554,6 +554,13 @@ def deep_moe_impl_fused(
         else:
             a = out2
             a_scale = None
+
+    if use_w4a16:
+        del out1
+
+    out3 = torch.empty(
+        (num_tokens_padded, K), device=hidden_states.device, dtype=torch.bfloat16
+    )
 
     if use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(
