@@ -71,7 +71,7 @@ jobs:
               - "python/sglang/srt/hardware_backend/ppu/**"
               - "python/sglang/srt/platforms/ppu.py"
               - "sgl-kernel/**"
-              - "test/registered/ppu/**"
+              - "test/registered/**"
               - "scripts/ci/ppu/**"
             sgl_kernel:
               - "sgl-kernel/**"
@@ -110,6 +110,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`; the default shallow fetch (depth 1)
+          # leaves HEAD~1 nonexistent, so detection always failed.
+          fetch-depth: 2
 
       - name: Download prebuilt sgl-kernel wheel
         if: needs.build-sgl-kernel.result == 'success'
@@ -160,6 +164,7 @@ jobs:
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             -e SGL_KERNEL_WHEEL_DIR=/workspace/sgl-kernel-wheel \
+            -e SGL_KERNEL_BUILD_FROM_SOURCE \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
