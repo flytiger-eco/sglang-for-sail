@@ -168,6 +168,14 @@ class SchedulerPPMixin:
                                 msg_type="proxy",
                             )
 
+                # Order the last stage's next-slot communication after this forward.
+                if (
+                    self.enable_pp_last_stage_stream_ordering
+                    and self.pp_group.is_last_rank
+                    and cur_batch
+                ):
+                    self.device_module.current_stream().wait_event(self.launch_event)
+
                 self.pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
@@ -580,6 +588,10 @@ class SchedulerPPMixin:
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
+        )
+
+        self.enable_pp_last_stage_stream_ordering = (
+            envs.SGLANG_PP_LAST_STAGE_STREAM_ORDERING.get()
         )
 
     def profile_and_init_predictor(self: Scheduler):
