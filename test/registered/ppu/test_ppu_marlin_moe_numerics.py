@@ -17,9 +17,12 @@ Design constraints (decision doc section 8.1, W6-1):
    showed a 0.2% precision drift and would not have caught it.
 
 The corresponding upstream test registered/quant/test_marlin_moe.py is
-``disabled=`` on PPU. This native test turns the failure into a loud
-assertion: it FAILS while the SDK bug is present (instead of corrupting
-outputs silently) and keeps guarding against re-regression after the fix.
+``disabled=`` on PPU. This native test turns the silent corruption into a
+loud assertion. Both tests are marked xfail(strict=True): while the SDK
+bug is present they report xfail (the suite stays green, nightly keeps
+running the surrounding tests); the strict marker turns XPASS into a
+failure once the SDK fix lands -- that XPASS is the signal to delete the
+marker and re-enable registered/quant/test_marlin_moe.py on PPU.
 
 Usage:
 python3 -m pytest test/registered/ppu/test_ppu_marlin_moe_numerics.py -v
@@ -27,6 +30,7 @@ python3 -m pytest test/registered/ppu/test_ppu_marlin_moe_numerics.py -v
 
 import unittest
 
+import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
@@ -179,6 +183,17 @@ class TestPPUMarlinMoeNumerics(CustomTestCase):
         # that cleared the small-config drift in the original investigation.
         torch.testing.assert_close(marlin_output, torch_output, atol=0.15, rtol=0)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "SDK 2.1.1 regression #2: fused_marlin_moe emits NaN on the "
+            "PPU workspace-reduce path (sgl-kernel 0.4.3 + SDK 2.1.1; "
+            "86008/251904 NaN at m=123). Strict xfail: when this starts "
+            "passing (XPASS), the SDK fix has landed -- delete this "
+            "marker and re-enable registered/quant/test_marlin_moe.py "
+            "on PPU."
+        ),
+    )
     def test_no_nan_at_bug_scale(self):
         """(m=123, k=2048) -> 251904 output elements: the exact scale where
         34% of elements were NaN in the original report."""
@@ -186,6 +201,17 @@ class TestPPUMarlinMoeNumerics(CustomTestCase):
             with self.subTest(dtype=dtype):
                 self._run_once(m=123, n=1024, k=2048, e=4, topk=2, dtype=dtype)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "SDK 2.1.1 regression #2: fused_marlin_moe emits NaN on the "
+            "PPU workspace-reduce path (sgl-kernel 0.4.3 + SDK 2.1.1; "
+            "86008/251904 NaN at m=123). Strict xfail: when this starts "
+            "passing (XPASS), the SDK fix has landed -- delete this "
+            "marker and re-enable registered/quant/test_marlin_moe.py "
+            "on PPU."
+        ),
+    )
     def test_no_nan_at_larger_m(self):
         """Larger m at the same k, in case the workspace-buffer sizing bug is
         m-dependent (the original report suspected zero-init / sizing)."""

@@ -11,10 +11,13 @@ combination. Scope measured at RCA time:
 
 The upstream test registered/layers/mamba/test_causal_conv1d.py is
 ``disabled=`` on PPU. This native guard parametrizes the dtype x variant
-matrix so the exact crash cell is pinned: it fails loudly while the SDK
-bug exists, and if the crash scope ever widens (new dtype or the plain
-variant) the new cells fail immediately instead of being discovered by
-accident in nightly.
+matrix so the exact crash cell is pinned: the (float32, batch_gather)
+cell carries xfail(strict=True), so it reports xfail while the SDK bug
+exists and XPASS becomes a failure once the fix lands -- that XPASS is
+the signal to delete the marker and re-enable the upstream test on PPU.
+The other five cells must still PASS: if the crash scope ever widens
+(new dtype or the plain variant) the suite fails immediately instead of
+being discovered by accident in nightly.
 
 This is a COMPILE-TIME test: a cell passes when the kernel compiles and
 returns a tensor of the expected shape. No numerical assertion is needed
@@ -47,10 +50,31 @@ WIDTH = 3
 SEQLEN = 1
 
 
-@pytest.mark.parametrize(
-    "itype", [torch.float32, torch.float16, torch.bfloat16], ids=["f32", "f16", "bf16"]
+_CRASH_CELL_REASON = (
+    "SDK 2.1.1 regression #1: ppu-llc SIGABRT (return code 134) compiling "
+    "the float32 batch_gather kernel. Strict xfail: when this cell starts "
+    "passing (XPASS), the SDK fix has landed -- delete this marker and "
+    "re-enable registered/layers/mamba/test_causal_conv1d.py on PPU."
 )
-@pytest.mark.parametrize("variant", ["plain", "batch_gather"])
+
+# The 3x2 dtype x variant matrix as explicit cells, so the xfail marker
+# can be pinned to the single crash cell (float32, batch_gather).
+_CELLS = [
+    pytest.param("plain", torch.float32, id="plain-f32"),
+    pytest.param("plain", torch.float16, id="plain-f16"),
+    pytest.param("plain", torch.bfloat16, id="plain-bf16"),
+    pytest.param("batch_gather", torch.float16, id="batch_gather-f16"),
+    pytest.param("batch_gather", torch.bfloat16, id="batch_gather-bf16"),
+    pytest.param(
+        "batch_gather",
+        torch.float32,
+        id="batch_gather-f32",
+        marks=pytest.mark.xfail(strict=True, reason=_CRASH_CELL_REASON),
+    ),
+]
+
+
+@pytest.mark.parametrize("variant,itype", _CELLS)
 def test_causal_conv1d_update_compiles(variant, itype):
     """Every (dtype, variant) cell must compile and produce a shaped output.
 
