@@ -79,6 +79,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -208,6 +209,57 @@ def build_minimax_fused_qkv_index(model: nn.Module) -> None:
             module.maybe_build_fused_qkv_index()
 
 
+def get_shared_expert_intermediate_size(config: PretrainedConfig) -> Optional[int]:
+    """Intermediate size of the shared experts defined by ``config``, if any.
+
+    MiniMax-M3 declares the shared expert width via
+    ``shared_intermediate_size`` (routed experts use ``intermediate_size``,
+    dense MLPs use ``dense_intermediate_size``). When the shared expert is
+    wider than the routed experts, the fused-MoE path (which allocates
+    homogeneous expert tensors) cannot hold it. Prefer the explicit config
+    field, then fall back to the DeepSeek convention of stacking
+    ``n_shared_experts`` sub-experts of ``intermediate_size`` each.
+    """
+    n_shared = getattr(config, "n_shared_experts", None)
+    if not n_shared:
+        return None
+    for attr in (
+        "shared_intermediate_size",
+        "shared_expert_intermediate_size",
+        "moe_shared_expert_intermediate_size",
+    ):
+        value = getattr(config, attr, None)
+        if value:
+            return int(value)
+    routed_intermediate = getattr(config, "intermediate_size", None)
+    if not routed_intermediate:
+        return None
+    return int(routed_intermediate * n_shared)
+
+
+def get_non_moe_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """Quant config for the non-MoE modules (attention, dense MLP, shared
+    experts, lm_head).
+
+    MiniMax MXFP4 checkpoints quantize only the routed experts
+    (``block_sparse_moe.experts.*``). In the plain MXFP4 variant the other
+    modules stay BF16, so they must be created unquantized. The MXFP4-FP8
+    variant additionally stores them as FP8 channelwise (declared under
+    ``quantization_config.fp8_channelwise_layers``); there the Mxfp4Config
+    must be kept so ``get_quant_method`` builds those modules as W8A8Fp8 --
+    stripping it would silently cast FP8 weights into BF16 parameters and
+    drop their weight_scale tensors. Other quantization methods (e.g.
+    MXFP8) quantize the whole model and pass through unchanged.
+    """
+    if quant_config is not None and quant_config.get_name() == "mxfp4":
+        if getattr(quant_config, "fp8_channelwise_layers", None):
+            return quant_config
+        return None
+    return quant_config
+
+
 class MiniMaxM3MLP(nn.Module):
     def __init__(
         self,
@@ -283,6 +335,9 @@ class MiniMaxM3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        self.prefix = prefix
         self.tp_size = get_parallel().tp_size
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
@@ -336,14 +391,22 @@ class MiniMaxM3MoE(nn.Module):
             apply_routed_scaling_factor_on_output=True,
         )
 
+        # The standalone shared MLP is used whenever fusion is disabled (see
+        # determine_num_fused_shared_experts): MXFP4 checkpoints do not store
+        # the shared expert in MXFP4, and some configs declare a shared
+        # expert wider than the homogeneous fused-MoE expert tensors.
+        self.shared_expert_intermediate_size = None
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
-            intermediate_size = config.intermediate_size * self.n_shared_experts
+            intermediate_size = get_shared_expert_intermediate_size(config)
+            self.shared_expert_intermediate_size = intermediate_size
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
             shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
-                quant_config=quant_config,
+                # BF16 for the plain MXFP4 variant; W8A8Fp8 for MXFP4-FP8,
+                # whose fp8_channelwise_layers covers the shared experts.
+                quant_config=get_non_moe_quant_config(quant_config),
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
                 intermediate_size=intermediate_size,
@@ -1158,7 +1221,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.self_attn = MiniMaxM3Attention(
             config=config,
             layer_id=layer_id,
-            quant_config=quant_config,
+            quant_config=get_non_moe_quant_config(quant_config),
             prefix=add_prefix("self_attn", prefix),
             is_sparse_attention_layer=is_sparse_attention_layer,
             disable_index_value=disable_index_value,
@@ -1185,7 +1248,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = MiniMaxM3MLP(
                 config=config,
-                quant_config=quant_config,
+                quant_config=get_non_moe_quant_config(quant_config),
                 prefix=add_prefix("mlp", prefix),
                 intermediate_size=config.dense_intermediate_size,
                 tp_rank=mlp_tp_rank,
@@ -1416,6 +1479,20 @@ class MiniMaxM3Model(nn.Module):
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    # Tell the quantization system how MiniMax fuses separate checkpoint
+    # weights (q_proj/k_proj/v_proj, gate_proj/up_proj) into single fused
+    # parameters (qkv_proj, gate_up_proj).  Without this mapping the quant
+    # methods create parameters with shapes that may not match the
+    # manually-remapped checkpoint weights in load_weights.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1428,6 +1505,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
+        # Propagate the fused-module mapping into the quant config so
+        # quant-aware weight creation can honour the fusion layout.
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
 
@@ -1439,7 +1521,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=quant_config,
+                quant_config=get_non_moe_quant_config(quant_config),
                 prefix=add_prefix("lm_head", prefix),
                 use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
@@ -1460,6 +1542,14 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         disable_reason = None
         if not getattr(self.config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
+        elif (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_mixed"
+        ):
+            disable_reason = (
+                "Shared and routed experts may use different quantization formats "
+                "in ModelOpt mixed-precision checkpoints."
+            )
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
@@ -1468,6 +1558,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
         elif get_moe_a2a_backend().is_deepep():
             disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        elif self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+            disable_reason = (
+                "The MiniMax MXFP4 checkpoints do not store shared experts in "
+                "MXFP4 (they stay BF16, or are FP8 channelwise in the "
+                "MXFP4-FP8 variant), so they cannot be fused into the MXFP4 "
+                "expert tensors."
+            )
 
         if disable_reason is not None:
             from sglang.srt.arg_groups.overrides import declare_load_time_override
@@ -1556,7 +1653,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             stacked_params_mapping += [
                 (".index_qkv_proj", ".index_q_proj", "q"),
                 (".index_qkv_proj", ".index_k_proj", "k"),
-                (".index_qkv_proj", ".index_v_proj", "v"),
+                # (".index_qkv_proj", ".index_v_proj", "v"),
             ]
 
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
@@ -1600,6 +1697,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 # gate_up_proj -> gate_gate_up_proj double-remap breaks load.
                 if "mlp.experts." in name:
                     continue
+                original_name = name
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1608,7 +1706,21 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    weight_loader(param, loaded_weight, shard_id)
+                except AssertionError as e:
+                    raise ValueError(
+                        f"Shape mismatch loading weight '{original_name}' into "
+                        f"'{name}' (shard_id={shard_id!r}).\n"
+                        f"  param shape:  {tuple(param.shape)}  dtype: {param.dtype}\n"
+                        f"  weight shape: {tuple(loaded_weight.shape)}  dtype: {loaded_weight.dtype}\n"
+                        f"This usually happens when the checkpoint is quantised "
+                        f"(e.g. offline MXFP4) but the model was not launched with "
+                        f"a compatible --quantization flag. Try "
+                        f"'--quantization None' to disable auto-detected "
+                        f"quantisation, or check that the model config's "
+                        f"quantization_config matches the actual checkpoint format."
+                    ) from e
                 break
             else:
                 is_expert_weight = False

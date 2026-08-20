@@ -32,6 +32,7 @@ from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
     MiniMaxM3SparseForCausalLM,
     build_minimax_fused_qkv_index,
+    get_non_moe_quant_config,
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_vl_common import (
@@ -42,6 +43,7 @@ from sglang.srt.models.minimax_vl_common import (
     load_vision_weight,
     merge_vit_qkv_weights,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -54,6 +56,15 @@ _device_sm = get_device_sm()
 
 
 class MiniMaxM3SparseForConditionalGeneration(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={".block_sparse_moe.": ".mlp."}
+    )
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "index_qkv_proj": ["index_q_proj", "index_k_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(
         self,
         config,
@@ -64,6 +75,11 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+
+        # Propagate the fused-module mapping into the quant config so
+        # quant-aware weight creation can honour the fusion layout.
+        if quant_config is not None:
+            quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
@@ -108,7 +124,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             self.lm_head = ParallelLMHead(
                 text_config.vocab_size,
                 text_config.hidden_size,
-                quant_config=quant_config,
+                quant_config=get_non_moe_quant_config(quant_config),
                 prefix=add_prefix("language_model.lm_head", prefix),
                 use_attn_tp_group=get_server_args().enable_dp_lm_head,
             )
@@ -131,6 +147,14 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         disable_reason = None
         if not getattr(text_config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
+        elif (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "modelopt_mixed"
+        ):
+            disable_reason = (
+                "Shared and routed experts may use different quantization formats "
+                "in ModelOpt mixed-precision checkpoints."
+            )
         elif not _is_cuda:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif (_device_sm is not None) and (_device_sm < 80):
@@ -144,6 +168,13 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             disable_reason = (
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
+            )
+        elif self.quant_config is not None and self.quant_config.get_name() == "mxfp4":
+            disable_reason = (
+                "The MiniMax MXFP4 checkpoints do not store shared experts in "
+                "MXFP4 (they stay BF16, or are FP8 channelwise in the "
+                "MXFP4-FP8 variant), so they cannot be fused into the MXFP4 "
+                "expert tensors."
             )
 
         if disable_reason is not None:
@@ -266,7 +297,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             llm_stacked_params_mapping += [
                 (".index_qkv_proj", ".index_q_proj", "q"),
                 (".index_qkv_proj", ".index_k_proj", "k"),
-                (".index_qkv_proj", ".index_v_proj", "v"),
+                # (".index_qkv_proj", ".index_v_proj", "v"),
             ]
 
         num_experts = getattr(self.config.text_config, "num_local_experts", 0)
@@ -332,7 +363,6 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             name = name.replace("gate_proj", "w1")
             name = name.replace("down_proj", "w2")
             name = name.replace("up_proj", "w3")
-
         if (
             get_spec_layer_idx_from_weight_name(self.config.text_config, name)
             is not None
@@ -350,7 +380,21 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
-            param.weight_loader(param, loaded_weight, shard_id)
+            try:
+                param.weight_loader(param, loaded_weight, shard_id)
+            except AssertionError as e:
+                raise ValueError(
+                    f"Shape mismatch loading weight '{name}' into "
+                    f"'{new_name}' (shard_id={shard_id!r}).\n"
+                    f"  param shape:  {tuple(param.shape)}  dtype: {param.dtype}\n"
+                    f"  weight shape: {tuple(loaded_weight.shape)}  dtype: {loaded_weight.dtype}\n"
+                    f"This usually happens when the checkpoint is quantised "
+                    f"(e.g. offline MXFP4) but the model was not launched with "
+                    f"a compatible --quantization flag. Try "
+                    f"'--quantization None' to disable auto-detected "
+                    f"quantisation, or check that the model config's "
+                    f"quantization_config matches the actual checkpoint format."
+                ) from e
             return
 
         is_expert_weight = False
