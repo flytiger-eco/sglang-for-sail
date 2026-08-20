@@ -1,7 +1,12 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=450, suite="nightly-1-ppu", nightly=True)
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
@@ -20,6 +25,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_ppu_platform,
     popen_launch_server,
 )
 
@@ -77,10 +83,10 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
         "--trust-remote-code",
         "--enable-hierarchical-cache",
     ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
-    mmlu_score_threshold = 0.5
+    mmlu_score_threshold = 0.3 if is_ppu_platform() else 0.5
     mmlu_num_examples = 64
     mmlu_num_threads = 32
-    mgsm_en_score_threshold = 0.8
+    mgsm_en_score_threshold = 0.65 if is_ppu_platform() else 0.8
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")

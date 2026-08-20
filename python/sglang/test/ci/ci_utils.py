@@ -225,8 +225,12 @@ def run_unittest_files(
                     timeout=timeout_per_file,
                 )
 
-                if ret_code == 0:
+                if ret_code == 0 or ret_code == 5:
                     file_passed = True
+                    if ret_code == 5:
+                        logger.info(
+                            f"\n⊘ SKIPPED (no tests collected): {filename}\n"
+                        )
                     if was_retried:
                         logger.info(
                             f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"

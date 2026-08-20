@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,8 +16,10 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=232, stage="extra-a", runner_config="1-gpu-large")
+register_ppu_ci(est_time=232, suite="nightly-1-ppu", nightly=True)
 
 
+@skip_if_model_missing("RedHatAI/Qwen3-30B-A3B-FP8-dynamic")
 class BaseW8A8Test(CustomTestCase):
     model: str = None
     quantization: str = None
@@ -89,6 +92,7 @@ class BaseW8A8Test(CustomTestCase):
         self.assertGreaterEqual(throughput, self.throughput_threshold)
 
 
+@skip_if_model_missing("neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8")
 class TestW8A8Int8(BaseW8A8Test):
     model = "neuralmagic/Meta-Llama-3-8B-Instruct-quantized.w8a8"
     quantization = "w8a8_int8"
@@ -96,6 +100,7 @@ class TestW8A8Int8(BaseW8A8Test):
     throughput_threshold = 200
 
 
+@skip_if_model_missing("neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic")
 class TestW8A8Fp8(BaseW8A8Test):
     model = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8-dynamic"
     quantization = "w8a8_fp8"
@@ -103,6 +108,7 @@ class TestW8A8Fp8(BaseW8A8Test):
     throughput_threshold = 200
 
 
+@skip_if_model_missing("RedHatAI/Qwen3-30B-A3B-FP8-dynamic")
 class TestW8A8Fp8MoE(BaseW8A8Test):
     model = "RedHatAI/Qwen3-30B-A3B-FP8-dynamic"
     quantization = "w8a8_fp8"

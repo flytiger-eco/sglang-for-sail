@@ -8,10 +8,11 @@ from sglang.srt.utils.auth import (
     auth_level,
     decide_request_auth,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
+register_ppu_ci(est_time=1, suite="per-commit-1-ppu")
 
 
 class TestAuthDecision(CustomTestCase):

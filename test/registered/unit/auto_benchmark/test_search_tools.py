@@ -26,10 +26,15 @@ from sglang.auto_benchmark_lib import (
     rendered_launch_command,
     resolve_max_candidates,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=6, suite="per-commit-1-ppu")
 
 
 class TestAutoBenchmarkSearchTools(AutoBenchmarkTestCase):

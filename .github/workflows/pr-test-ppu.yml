@@ -1,0 +1,198 @@
+name: PR Test (PPU)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    branches: [ v0.5.13, feat/ppu-ci-clean2 ]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    # Per-commit PPU CI is gated behind the `run-ci` label to save
+    # self-hosted PPU runner capacity. Maintainers add the label via the
+    # `/run-ci` slash command (or manually); the `labeled` event above
+    # dispatches a fresh run once the label is present. Manual runs
+    # (workflow_dispatch / workflow_call) bypass the gate.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
+        || steps.run-mode.outputs.run_all_tests == 'true' }}
+      sgl_kernel_changed: ${{ steps.filter.outputs.sgl_kernel == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            ppu_code:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "python/pyproject_other.toml"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "sgl-kernel/**"
+              - "test/registered/ppu/**"
+              - "scripts/ci/ppu/**"
+            sgl_kernel:
+              - "sgl-kernel/**"
+
+  # ==================== Build sgl-kernel Wheel ==================== #
+  build-sgl-kernel:
+    # Reuses the SAIL wheel-build pipeline so a PR touching sgl-kernel
+    # sources tests a wheel built from the PR's own merge commit,
+    # without consuming self-hosted PPU runner time for the source build.
+    needs: [check-changes]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+      && needs.check-changes.outputs.sgl_kernel_changed == 'true'
+    uses: ./.github/workflows/_sail-pr-test-sgl-kernel-build.yml
+    with:
+      git_ref: ${{ inputs.ref || github.sha }}
+
+  # ==================== Stage A: Smoke Test ==================== #
+  stage-a-test-1-gpu-ppu:
+    needs: [check-changes, build-sgl-kernel]
+    # The explicit `if` overrides the default skip-on-skipped-dependency, so
+    # stage-a still runs when build-sgl-kernel was skipped (PR does not touch
+    # sgl-kernel) or failed; in both cases the wheel download step below is
+    # skipped and the install script falls back to source build / PyPI wheel.
+    if: needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: [ self-hosted, ppu ]
+    timeout-minutes: 120
+    steps:
+      - name: Clean workspace (root-owned files from prior Docker runs)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ${{ github.workspace }}/sgl-kernel-wheel
+
+      - name: Run PPU smoke test
+        timeout-minutes: 110
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          docker run --rm \
+            --privileged \
+            --network host \
+            --device=/dev/alixpu_ctl \
+            --device=/dev/alixpu \
+            --ipc=host \
+            --shm-size=8g \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            -v ${{ github.workspace }}:/workspace \
+            -v /nas_aisw:/nas_aisw \
+            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -e SGLANG_IS_IN_CI=true \
+            -e CUDA_VISIBLE_DEVICES=0 \
+            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e HF_HUB_OFFLINE=1 \
+            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
+            -e PPU_ARTIFACTORY_USER \
+            -e PPU_ARTIFACTORY_PASSWORD \
+            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
+            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
+            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
+            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
+            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
+            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
+            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
+            -e PPU_SUPPORTS_FP8=0 \
+            -e PPU_SUPPORTS_FP4=0 \
+            -e SGL_KERNEL_WHEEL_DIR=/workspace/sgl-kernel-wheel \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "
+              cd /workspace && \
+              bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              git config --global --add safe.directory /workspace && \
+              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
+              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
+              cd test && \
+              python3 run_suite.py --hw ppu --suite per-commit-1-ppu --continue-on-error
+            "
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-a-test-1-gpu-ppu,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "Job $job did not succeed (result: $result)."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"

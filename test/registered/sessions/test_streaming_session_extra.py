@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.kits.streaming_session_kit import StreamingSessionKitMixin
 from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
@@ -11,6 +11,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large")
+register_ppu_ci(
+    est_time=691,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="flashinfer 0.6.8 < required 0.6.11 (EAGLE3 streaming session path)",
+)
 
 
 class TestStreamingSessionRetractMixedChunk(

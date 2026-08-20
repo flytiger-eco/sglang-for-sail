@@ -1,6 +1,7 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
     StreamingSessionKitMixin,
@@ -13,6 +14,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
 )
 
 register_cuda_ci(est_time=519, stage="base-b", runner_config="1-gpu-large")
+register_ppu_ci(est_time=519, suite="nightly-1-ppu", nightly=True)
 
 
 SWA_MODEL = "openai/gpt-oss-20b"
@@ -25,6 +27,7 @@ SWA_COMMON_ARGS = [
 ]
 
 
+@skip_if_model_missing("openai/gpt-oss-20b")
 class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMixin):
     """Baseline streaming session on a hybrid-SWA model."""
 
@@ -32,6 +35,7 @@ class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMix
     extra_args = ["--chunked-prefill-size", "512", *SWA_COMMON_ARGS]
 
 
+@skip_if_model_missing("openai/gpt-oss-20b")
 class TestStreamingSessionSWARetractLargePage(
     StreamingSessionServerBase, StreamingSessionKitMixin
 ):
@@ -48,6 +52,7 @@ class TestStreamingSessionSWARetractLargePage(
     env_overrides = [("SGLANG_TEST_RETRACT", True)]
 
 
+@skip_if_model_missing("openai/gpt-oss-20b")
 class TestStreamingSessionSWARetractMixedChunk(
     StreamingSessionServerBase, StreamingSessionKitMixin
 ):
@@ -63,6 +68,7 @@ class TestStreamingSessionSWARetractMixedChunk(
     env_overrides = [("SGLANG_TEST_RETRACT", True)]
 
 
+@skip_if_model_missing("openai/gpt-oss-20b")
 class TestStreamingSessionSWAAbortLeakRepro(
     StreamingSessionServerBase, AbortLeakReproKitMixin
 ):

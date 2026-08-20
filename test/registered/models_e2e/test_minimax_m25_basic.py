@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -15,10 +16,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=250, stage="base-c", runner_config="8-gpu-h200")
+register_ppu_ci(est_time=290, suite="nightly-8-ppu", nightly=True)
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
 
+@skip_if_model_missing("MiniMaxAI/MiniMax-M2.5")
 class TestMiniMaxM25Basic(CustomTestCase):
     @classmethod
     def setUpClass(cls):

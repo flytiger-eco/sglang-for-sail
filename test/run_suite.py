@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import tabulate
@@ -22,6 +23,7 @@ HW_MAPPING = {
     "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -85,6 +87,9 @@ PER_COMMIT_SUITES = {
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
     ],
+    HWBackend.PPU: [
+        "per-commit-1-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -141,6 +146,12 @@ NIGHTLY_SUITES = {
         "full-16-npu-a3",
     ],
     HWBackend.XPU: [],
+    HWBackend.PPU: [
+        "nightly-1-ppu",
+        "nightly-2-ppu",
+        "nightly-4-ppu",
+        "nightly-8-ppu",
+    ],
 }
 
 
@@ -298,20 +309,28 @@ def run_a_suite(args):
         and not f.endswith("/cpu/utils.py")
     ]
 
-    # JIT kernel tests and benchmarks (live alongside kernel source)
+    # JIT kernel tests and benchmarks (live alongside kernel source).
+    # For PPU, keep only files carrying a register_ppu_ci call: upstream
+    # ships jit_kernel files without any CI registration (or with
+    # register_cuda_ci only), which would fail the sanity check below.
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
+    jit_files = glob.glob(
         os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
     )
-    files += glob.glob(
+    jit_files += glob.glob(
         os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
     )
+    if args.hw == "ppu":
+        jit_files = [
+            f for f in jit_files if "register_ppu_ci(" in Path(f).read_text()
+        ]
+    files += jit_files
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
-    validate_all_suites(all_tests)
+    validate_all_suites([t for t in all_tests if t.backend == hw])
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:

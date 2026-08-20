@@ -6,6 +6,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 """
 
 import json
+import os
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +18,11 @@ import requests
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST,
@@ -30,6 +35,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=182, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=200, suite="per-commit-1-ppu")
 
 
 class TestOpenAIServer(CustomTestCase):
@@ -789,6 +795,19 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+def _has_model_weights(path):
+    if not os.path.isdir(path):
+        return True  # not a local path, let HF handle it
+    return any(
+        f.endswith((".safetensors", ".bin", ".pt"))
+        for f in os.listdir(path)
+    )
+
+
+@unittest.skipIf(
+    not _has_model_weights(DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST),
+    "Cross-encoder model weights not available at local path",
+)
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):

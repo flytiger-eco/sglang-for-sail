@@ -9,9 +9,10 @@ from sglang.srt.managers.template_detection import (
     detect_tool_call_parser,
     resolve_auto_parsers,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
+register_ppu_ci(est_time=2, suite="per-commit-1-ppu")
 
 
 class _DummyTokenizer:

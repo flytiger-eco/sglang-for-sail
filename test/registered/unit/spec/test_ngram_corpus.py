@@ -10,10 +10,11 @@ from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
+register_ppu_ci(est_time=26, suite="per-commit-1-ppu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
