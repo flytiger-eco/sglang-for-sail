@@ -439,6 +439,9 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Order the last PP stage's next-slot schedule-stream work after the prior
+    # forward launch. This is opt-in until the ordering change is generalized.
+    SGLANG_PP_LAST_STAGE_STREAM_ORDERING = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
