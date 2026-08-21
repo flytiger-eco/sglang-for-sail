@@ -15,7 +15,7 @@ import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing, skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -32,7 +32,6 @@ register_ppu_ci(est_time=120, suite="nightly-4-ppu", nightly=True)
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 @skip_if_model_missing("RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
-@skip_if_no_fp8()
 class TestGemma4FP8PerExpertLoading(CustomTestCase):
     """Three-stage check that catches the silent-skip failure mode:
     1. server health

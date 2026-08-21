@@ -92,7 +92,7 @@ def torch_w8a8_per_column_moe(a, w1, w2, w1_s, w2_s, score, topk):
     ).sum(dim=1)
 
 
-@skip_if_no_fp8()
+@skip_if_no_fp8(reason="fp8e4nv (e4m3fn) unsupported on PPU; only fp8e4b15/fp8e5")
 class TestW8A8FP8FusedMoE(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
     M = [1, 33]

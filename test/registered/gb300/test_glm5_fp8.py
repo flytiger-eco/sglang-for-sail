@@ -8,7 +8,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
-register_ppu_ci(est_time=7200, suite="nightly-4-ppu", nightly=True)
+register_ppu_ci(
+    est_time=7200,
+    suite="nightly-4-ppu",
+    nightly=True,
+    disabled="model zai-org/GLM-5.1-FP8 not on NAS (tp=4 topology; tp=8 is the separate 8-gpu-models/test_glm_51_fp8.py)",
+)
 
 MODEL_PATH = "zai-org/GLM-5.1-FP8"
 

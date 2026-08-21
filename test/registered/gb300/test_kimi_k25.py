@@ -8,7 +8,12 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
-register_ppu_ci(est_time=7200, suite="nightly-4-ppu", nightly=True)
+register_ppu_ci(
+    est_time=7200,
+    suite="nightly-4-ppu",
+    nightly=True,
+    disabled="model moonshotai/Kimi-K2.5 not on NAS; accuracy path also needs uv, missing in the CI image",
+)
 
 MODEL_PATH = "moonshotai/Kimi-K2.5"
 

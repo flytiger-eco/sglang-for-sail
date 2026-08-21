@@ -9,7 +9,12 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
-register_ppu_ci(est_time=1800, suite="nightly-8-ppu", nightly=True)
+register_ppu_ci(
+    est_time=1800,
+    suite="nightly-8-ppu",
+    nightly=True,
+    disabled="model zai-org/GLM-5.1-FP8 not on NAS (tp=8 topology; tp=4 is the separate gb300/test_glm5_fp8.py)",
+)
 
 GLM_51_FP8_MODEL_PATH = "zai-org/GLM-5.1-FP8"
 
