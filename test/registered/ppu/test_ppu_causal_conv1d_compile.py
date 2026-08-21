@@ -29,6 +29,8 @@ Usage:
 python3 -m pytest test/registered/ppu/test_ppu_causal_conv1d_compile.py -v
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -131,3 +133,7 @@ def test_causal_conv1d_update_compiles(variant, itype):
         pad_slot_id=PAD_SLOT_ID,
     )
     assert out.shape == x.shape
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

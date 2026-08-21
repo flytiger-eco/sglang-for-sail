@@ -26,7 +26,7 @@ Usage:
 python3 -m pytest test/registered/ppu/test_ppu_triton_attn_precision.py -v
 """
 
-import unittest
+import sys
 
 import pytest
 import torch
@@ -208,5 +208,9 @@ class TestPPUTritonAttnPrecision(CustomTestCase):
         self._warm_then_assert(8, 256, 64, 8, 80)
 
 
+# CI executes this file as ``python3 <file> -f`` (ci_utils.run_unittest_files),
+# so the runner selected below decides whether the xfail(strict=True) marker
+# above is honoured -- i.e. whether the strict-xfail semantics described in the
+# module docstring actually hold.
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

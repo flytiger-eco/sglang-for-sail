@@ -28,6 +28,7 @@ Usage:
 python3 -m pytest test/registered/ppu/test_ppu_marlin_moe_numerics.py -v
 """
 
+import sys
 import unittest
 
 import pytest
@@ -220,5 +221,9 @@ class TestPPUMarlinMoeNumerics(CustomTestCase):
                 self._run_once(m=666, n=1024, k=2048, e=4, topk=2, dtype=dtype)
 
 
+# CI executes this file as ``python3 <file> -f`` (ci_utils.run_unittest_files),
+# so the runner selected below decides whether the xfail(strict=True) markers
+# above are honoured. The stdlib unittest runner silently ignores them and both
+# tests would report FAIL while the SDK bug is present.
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
