@@ -8,7 +8,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     transform_scale_ue8m0,
 )
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")

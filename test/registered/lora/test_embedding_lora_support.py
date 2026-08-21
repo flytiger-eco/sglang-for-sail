@@ -28,7 +28,7 @@ from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 

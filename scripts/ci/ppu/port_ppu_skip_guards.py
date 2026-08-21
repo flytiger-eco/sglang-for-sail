@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from port_ppu_registrations import LINE_LENGTH, resolve_moved, scan
 
-SKIP_MODULE = "sglang.test.ci.ppu_skip_utils"
+SKIP_MODULE = "sglang.test.ci.skip_utils"
 SKIP_NAMES = (
     "skip_if_model_missing",
     "skip_if_no_fp8",

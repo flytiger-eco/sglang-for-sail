@@ -7,7 +7,7 @@ test_pcg_with_speculative_decoding.py.
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing, skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_model_missing, skip_if_no_fp8
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")

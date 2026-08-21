@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

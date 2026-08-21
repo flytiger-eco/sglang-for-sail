@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
 register_cuda_ci(est_time=345, stage="extra-a", runner_config="1-gpu-small")

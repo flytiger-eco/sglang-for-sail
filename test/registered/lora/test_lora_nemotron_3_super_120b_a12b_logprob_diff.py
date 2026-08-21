@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")

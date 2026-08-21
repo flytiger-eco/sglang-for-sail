@@ -37,7 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 
 register_cuda_ci(est_time=747, stage="base-b", runner_config="1-gpu-large")
 register_ppu_ci(est_time=747, suite="nightly-1-ppu", nightly=True)

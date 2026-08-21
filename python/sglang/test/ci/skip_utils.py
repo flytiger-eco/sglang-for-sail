@@ -4,7 +4,7 @@ Provides decorators and helpers for conditionally skipping tests
 when required models are missing or hardware capabilities are unavailable.
 
 Usage:
-    from sglang.test.ci.ppu_skip_utils import skip_if_model_missing, skip_if_no_fp8
+    from sglang.test.ci.skip_utils import skip_if_model_missing, skip_if_no_fp8
 
     @skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
     class TestMyFeature(unittest.TestCase):

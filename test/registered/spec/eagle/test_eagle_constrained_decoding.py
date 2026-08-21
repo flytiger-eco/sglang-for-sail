@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (

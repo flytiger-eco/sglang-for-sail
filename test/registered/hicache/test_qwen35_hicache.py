@@ -11,7 +11,7 @@ from msgspec.msgpack import Decoder
 from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
