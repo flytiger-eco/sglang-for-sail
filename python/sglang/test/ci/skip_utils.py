@@ -13,6 +13,19 @@ Usage:
     @skip_if_no_fp8()
     class TestFP8Feature(unittest.TestCase):
         ...
+
+The module name is backend-neutral; the behaviour is not. All three
+decorators are gated on _on_ppu(), so they only ever skip when PPU_SDK is in
+the environment — on a CUDA or AMD runner each one returns the decorated
+class or function unchanged. So do not reach for them as general capability
+gates: @skip_if_no_fp8() on a CUDA-only test is silently dead code, and
+nothing warns you. Gate non-PPU tests on an explicit predicate instead
+(is_cuda(), is_hip(), a real capability probe).
+
+The gate is also not removable to make them universal. See _on_ppu() for
+why each question is only answerable on PPU; the consequence is that
+dropping it makes every guarded class here skip on CUDA/AMD runners, and
+because a skip is not a failure, CI stays green with no signal at all.
 """
 
 import functools
