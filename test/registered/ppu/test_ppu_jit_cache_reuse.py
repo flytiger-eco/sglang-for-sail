@@ -17,6 +17,15 @@ Two checks, matching the two criteria in the design doc:
 2. Runtime check (needs a device): load the same JIT kernel in two fresh
    processes; the second load must not trigger a recompile (fast).
 
+Criterion 2 carries xfail(strict=True) while SDK 2.1.1 rejects float32
+JIT kernels ('Dtype value [float32] not in the allowed options:
+[int32]', first seen in CI 2026-08-22 run 32552530166): the cache-reuse
+check cannot even load the kernel, so it reports xfail instead of
+turning every PR red. When the warm-up load starts passing (strict
+XPASS), the SDK fix has landed -- delete the marker. That XPASS is the
+sentinel; unittest's expectedFailure would report it silently, so this
+file runs under pytest.
+
 Usage:
 python3 -m pytest test/registered/ppu/test_ppu_jit_cache_reuse.py -v
 """
@@ -24,9 +33,9 @@ python3 -m pytest test/registered/ppu/test_ppu_jit_cache_reuse.py -v
 import os
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 
+import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_ppu_ci
@@ -98,6 +107,18 @@ class TestPPUJitCacheReuse(CustomTestCase):
             f"(2026-07-22 RCA). Offenders (showing up to 10): {unpinned[:10]}",
         )
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "SDK 2.1.1 rejects float32 JIT kernels: the warm-up load dies "
+            "with 'Dtype value [float32] not in the allowed options: "
+            "[int32]' (tvm_ffi Tensor match, add_constant.cuh:68), so the "
+            "cache-reuse check cannot run (CI 2026-08-22, run "
+            "32552530166). Strict xfail: once the warm-up load passes, "
+            "XPASS fails this suite -- that is the signal to delete this "
+            "marker."
+        ),
+    )
     def test_jit_cache_reused_across_processes(self):
         """Criterion 2: the second load of a JIT kernel must hit the cache."""
         if not torch.cuda.is_available():
@@ -138,4 +159,4 @@ class TestPPUJitCacheReuse(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__, "-v"]))
