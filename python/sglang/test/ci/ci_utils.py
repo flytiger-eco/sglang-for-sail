@@ -113,15 +113,21 @@ def _is_all_tests_skipped(output: str) -> bool:
     """
     lines = output.splitlines()
     # unittest: 'Ran N tests in ...' is always immediately followed by the
-    # summary line ('OK (...)' or 'FAILED (...)'), anchored at column 0 so
-    # quoted test output cannot fake it.
+    # summary line ('OK (...)' or 'FAILED (...)'), matched at column 0.
+    #
+    # Column anchoring is NOT spoof-proof: a test's own print() also starts at
+    # column 0, so a passing test that emits a fake 'Ran 1 test' + 'OK
+    # (skipped=1)' pair and flushes before unittest writes its real summary to
+    # stderr will be misread as all-skipped (demonstrated 2026-08-22). The
+    # exit code is still 0, so this only mis-reports; it cannot fail a run.
+    # Not worth guarding: it needs the counts to agree AND to win the flush
+    # race, and no real test does this.
     for idx, line in enumerate(lines):
         ran = _parse_unittest_counts(line)
         if ran is None or ran == 0:
             continue
         # The summary line follows 'Ran N tests' (possibly after blank
-        # lines) and is anchored at column 0 so quoted test output cannot
-        # fake it.
+        # lines) and is matched at column 0 (see the spoofing caveat above).
         for tail in lines[idx + 1 :]:
             if not tail.strip():
                 continue
