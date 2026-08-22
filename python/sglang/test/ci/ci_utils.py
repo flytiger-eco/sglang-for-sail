@@ -102,10 +102,11 @@ def _is_all_tests_skipped(output: str) -> bool:
     an 'N skipped' summary, both indistinguishable from a real pass by
     return code alone. Recognises both runners:
 
-    - unittest: the 'Ran N tests' line counts skipped via 'OK (skipped=N)',
-      including combined forms like 'OK (skipped=2, expected failures=1)'
-      (an xfail that ran is not a skip, so 'expected failures' alone does
-      not count)
+    - unittest: the summary line after 'Ran N tests' must be exactly
+      'OK (skipped=N)' -- a single item. Any extra item such as
+      'expected failures' or 'unexpected successes' means a test body
+      actually ran (an xfail that ran is not a skip), so combined forms
+      like 'OK (skipped=2, expected failures=1)' are NOT zero coverage
     - pytest: the last summary line carrying outcome counts, which must be
       skips only -- any passed/failed/error/xfailed/xpassed disqualifies
     """
@@ -123,8 +124,16 @@ def _is_all_tests_skipped(output: str) -> bool:
         for tail in lines[idx + 1 :]:
             if not tail.strip():
                 continue
-            if re.match(r"^OK \(", tail):
-                return "skipped=" in tail
+            m = re.match(r"^OK \(([^)]*)\)", tail)
+            if m:
+                # All-skipped only when skipped=N is the SOLE item: any
+                # other item (expected failures, unexpected successes)
+                # proves a test body ran, i.e. coverage is not zero.
+                items = [item.strip() for item in m.group(1).split(",")]
+                return (
+                    len(items) == 1
+                    and re.fullmatch(r"skipped=\d+", items[0]) is not None
+                )
             break
         return False
     # pytest: the last summary line carrying outcome counts decides; it is
