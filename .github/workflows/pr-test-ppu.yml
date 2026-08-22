@@ -222,6 +222,8 @@ jobs:
     # this stage: that fast-fail is the point of the serial chain.
     if: |
       always() &&
+      !failure() &&
+      !cancelled() &&
       needs.check-changes.outputs.changes_exist == 'true' &&
       (needs.wait-for-stage-a-ppu.result == 'success' || needs.wait-for-stage-a-ppu.result == 'skipped')
     runs-on: [ self-hosted, ppu ]
@@ -330,6 +332,8 @@ jobs:
     needs: [check-changes, build-sgl-kernel, wait-for-stage-b-ppu]
     if: |
       always() &&
+      !failure() &&
+      !cancelled() &&
       needs.check-changes.outputs.changes_exist == 'true' &&
       (needs.wait-for-stage-b-ppu.result == 'success' || needs.wait-for-stage-b-ppu.result == 'skipped')
     runs-on: [ self-hosted, ppu ]
