@@ -32,7 +32,7 @@ import torch
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=15, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=15, suite="stage-b-test-1-gpu-ppu")
 
 # test/registered/ppu/<this file> -> repo root is three levels up.
 REPO_ROOT = Path(__file__).resolve().parents[3]

@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_ppu_ci(est_time=300, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=300, suite="stage-b-test-1-gpu-ppu")
 
 PPU_SMALL_MODEL = os.environ.get(
     "PPU_SMALL_MODEL_PATH",

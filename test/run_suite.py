@@ -87,7 +87,12 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-xpu",
     ],
     HWBackend.PPU: [
-        "per-commit-1-ppu",
+        # Three-stage serial chain (mirrors pr-test-amd.yml): stage-a is the
+        # < 5 min smoke gate, stage-b the 1-GPU body, stage-c 2-GPU tests.
+        # pr-test-ppu.yml serializes them via .github/actions/wait-for-jobs.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
     ],
 }
 

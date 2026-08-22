@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import (
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=9, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=9, suite="stage-b-test-1-gpu-ppu")
 
 import types
 import unittest
