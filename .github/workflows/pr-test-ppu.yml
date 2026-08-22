@@ -97,11 +97,21 @@ jobs:
   # hardware path.
   stage-a-test-1-gpu-ppu:
     needs: [check-changes, build-sgl-kernel]
-    # The explicit `if` overrides the default skip-on-skipped-dependency, so
-    # stage-a still runs when build-sgl-kernel was skipped (PR does not touch
-    # sgl-kernel) or failed; in both cases the wheel download step below is
-    # skipped and the install script falls back to source build / PyPI wheel.
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    # A plain `if` does NOT override skip-on-skipped-dependency: only
+    # status check functions (always() / !failure() / !cancelled()) do.
+    # Without always(), a skipped build-sgl-kernel -- the normal case for
+    # PRs that don't touch sgl-kernel -- cascaded into a skipped stage-a
+    # while finish still reported success, so the PPU per-commit suite
+    # silently never ran on test-only PRs (gap-review §3.1b, PR #7
+    # run 32552530166). With always() && !failure() && !cancelled(), a
+    # skipped build no longer kills stage-a while a failed build still
+    # does; the wheel download step below is then skipped and the install
+    # script falls back to source build / PyPI wheel.
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
     runs-on: [ self-hosted, ppu ]
     timeout-minutes: 120
     steps:
