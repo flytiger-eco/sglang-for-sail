@@ -14,7 +14,7 @@ register_ppu_ci(
     est_time=10,
     suite="nightly-1-ppu",
     nightly=True,
-    disabled="test body early-returns on PPU (capability gate); zero coverage",
+    disabled="@skip_if_no_fp8() on all 3 test classes; PPU 810E has no FP8, so zero coverage",
 )
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu

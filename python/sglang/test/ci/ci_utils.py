@@ -204,6 +204,7 @@ def run_unittest_files(
     enable_retry: bool = False,
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
+    report_all_skipped: bool = False,
 ):
     """
     Run a list of test files.
@@ -217,6 +218,10 @@ def run_unittest_files(
                      assertion failures (not code errors).
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
+        report_all_skipped: If True, files that exit 0 after skipping every collected
+                     test are reported as a third state instead of counting as passes.
+                     Off by default because it forces output capture (see below), which
+                     is not free; opting in is per-backend, currently PPU only.
     """
     coredump_enabled = cuda_coredump.is_enabled()
     if coredump_enabled:
@@ -230,10 +235,23 @@ def run_unittest_files(
     # Third state: the file exited successfully but every collected test
     # skipped, so it contributed zero coverage. Kept out of both
     # passed_tests and failed_tests and reported on its own at the end.
+    # Stays empty unless report_all_skipped, which keeps every summary
+    # block below unchanged for backends that did not opt in.
     all_skipped_tests = []
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
+
+    # Detecting all-skipped needs the child's output, and reading it through a
+    # pipe is not free: the read loop below only gets EOF once *every* writer
+    # closes, so a grandchild that inherited the pipe keeps it blocked long
+    # after the child exited (probe: 8.1s vs 0.0s for the inherited-stdout
+    # path, and up to timeout_per_file in the worst case -- which would record
+    # a passing file as a TIMEOUT). Tests here routinely leave server
+    # subprocesses behind, so only callers that asked for the feature pay for
+    # it; retry already did, since it has to read the output to classify a
+    # failure.
+    capture_output = enable_retry or report_all_skipped
 
     for i, file in enumerate(files):
         if isinstance(file, CIRegistry):
@@ -245,7 +263,7 @@ def run_unittest_files(
         process = None
         output_lines = []
 
-        def run_one_file(filename, capture_output=True):
+        def run_one_file(filename, capture_output=False):
             nonlocal process, output_lines
 
             full_path = os.path.join(os.getcwd(), filename)
@@ -257,10 +275,10 @@ def run_unittest_files(
             cmd = ["python3", full_path, "-f"]
 
             if capture_output:
-                # Capture output for the retry decision and for
-                # all-skipped detection. The capture branch tees every line
-                # to the logger as it arrives, so CI-log visibility is the
-                # same as the inherited passthrough mode.
+                # Capture output for the retry decision and, when
+                # report_all_skipped is on, for all-skipped detection. Every
+                # line is tee'd to the logger as it arrives, so CI-log
+                # visibility matches the inherited passthrough mode.
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -298,12 +316,10 @@ def run_unittest_files(
                 was_retried = True
 
             try:
-                # Output is always captured (tee'd to the logger live) so
-                # the all-skipped state can be detected even without retry.
                 ret_code = run_with_timeout(
                     run_one_file,
                     args=(filename,),
-                    kwargs={"capture_output": True},
+                    kwargs={"capture_output": capture_output},
                     timeout=timeout_per_file,
                 )
 
@@ -313,7 +329,9 @@ def run_unittest_files(
                         logger.info(
                             f"\n⊘ SKIPPED (no tests collected): {filename}\n"
                         )
-                    elif _is_all_tests_skipped("".join(output_lines)):
+                    elif report_all_skipped and _is_all_tests_skipped(
+                        "".join(output_lines)
+                    ):
                         # Exited 0 but contributed zero coverage. Not a
                         # failure (exit-code semantics unchanged), not a
                         # pass either: third state, reported at the end.
@@ -427,24 +445,26 @@ def run_unittest_files(
     all_skipped_set = set(all_skipped_tests)
     logger.info("========== TIMINGS BEGIN ==========")
     for fname, elapsed in file_elapsed.items():
-        if fname in passed_set:
-            status = "passed"
-        elif fname in all_skipped_set:
-            status = "all_skipped"
-        else:
-            status = "failed"
-        logger.info(
-            json.dumps(
-                {
-                    "file": _repo_relative_path(fname),
-                    "passed": fname in passed_set,
-                    # Third state for scrapers; "passed" stays false for
-                    # all-skipped files while the run itself is not failed.
-                    "status": status,
-                    "elapsed": round(elapsed),
-                }
-            )
-        )
+        record = {
+            "file": _repo_relative_path(fname),
+            "passed": fname in passed_set,
+            "elapsed": round(elapsed),
+        }
+        if report_all_skipped:
+            # Third state for scrapers; "passed" stays false for all-skipped
+            # files while the run itself is not failed. Added only behind the
+            # flag: out-of-tree scrapers consume this block (sglang-ci-stats'
+            # model.json, read back by run_suite's --partition-model-file, is
+            # very likely generated from it) and we cannot check how strict
+            # their schemas are, so backends that did not opt in keep the
+            # exact two-state record.
+            if fname in passed_set:
+                record["status"] = "passed"
+            elif fname in all_skipped_set:
+                record["status"] = "all_skipped"
+            else:
+                record["status"] = "failed"
+        logger.info(json.dumps(record))
     logger.info("========== TIMINGS END ==========")
 
     # Write GitHub Step Summary when retries occurred or zero-coverage

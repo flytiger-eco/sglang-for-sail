@@ -359,6 +359,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        report_all_skipped=args.report_all_skipped,
     )
 
 
@@ -424,6 +425,12 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--report-all-skipped",
+        action="store_true",
+        default=False,
+        help="Report files that exit 0 after skipping every collected test as a third state instead of a pass. Opt-in per backend: it requires capturing each file's output, which can stall on leaked grandchild processes.",
     )
     parser.add_argument(
         "--partition-model-file",
