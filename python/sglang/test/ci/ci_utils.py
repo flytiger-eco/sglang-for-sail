@@ -103,10 +103,11 @@ def _is_all_tests_skipped(output: str) -> bool:
     return code alone. Recognises both runners:
 
     - unittest: the summary line after 'Ran N tests' must be exactly
-      'OK (skipped=N)' -- a single item. Any extra item such as
-      'expected failures' or 'unexpected successes' means a test body
-      actually ran (an xfail that ran is not a skip), so combined forms
-      like 'OK (skipped=2, expected failures=1)' are NOT zero coverage
+      'OK (skipped=M)' with M == N -- a single item whose count covers
+      every executed test. Any extra item such as 'expected failures' or
+      'unexpected successes' means a test body actually ran (an xfail
+      that ran is not a skip), and skipped < ran means the remaining
+      tests passed for real; neither form is zero coverage
     - pytest: the last summary line carrying outcome counts, which must be
       skips only -- any passed/failed/error/xfailed/xpassed disqualifies
     """
@@ -126,14 +127,17 @@ def _is_all_tests_skipped(output: str) -> bool:
                 continue
             m = re.match(r"^OK \(([^)]*)\)", tail)
             if m:
-                # All-skipped only when skipped=N is the SOLE item: any
-                # other item (expected failures, unexpected successes)
-                # proves a test body ran, i.e. coverage is not zero.
+                # All-skipped only when skipped=N is the SOLE item AND N
+                # equals the 'Ran N tests' count: any other item
+                # (expected failures, unexpected successes) proves a test
+                # body ran, and skipped < ran means the remaining tests
+                # passed for real (e.g. 'Ran 52 / OK (skipped=3)'
+                # contributed 49 true passes -- not zero coverage).
                 items = [item.strip() for item in m.group(1).split(",")]
-                return (
-                    len(items) == 1
-                    and re.fullmatch(r"skipped=\d+", items[0]) is not None
-                )
+                if len(items) != 1:
+                    return False
+                sk = re.fullmatch(r"skipped=(\d+)", items[0])
+                return sk is not None and int(sk.group(1)) == ran
             break
         return False
     # pytest: the last summary line carrying outcome counts decides; it is
