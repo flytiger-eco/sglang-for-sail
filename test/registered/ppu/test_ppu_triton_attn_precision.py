@@ -40,7 +40,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=90, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=30, suite="nightly-1-ppu", nightly=True)
 
 _ATOL = 0.15
 _RTOL = 0.15

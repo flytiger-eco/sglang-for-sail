@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_marlin_utils import marlin_quantize
 from sglang.test.test_utils import CustomTestCase
 
-register_ppu_ci(est_time=300, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=1100, suite="nightly-1-ppu", nightly=True)
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 
