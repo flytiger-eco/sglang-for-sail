@@ -79,6 +79,66 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     return False, "unknown failure type"
 
 
+def _parse_unittest_counts(line: str) -> Optional[int]:
+    """Number of tests executed from a unittest 'Ran N test(s) in ...' line."""
+    m = re.search(r"\bRan (\d+) tests?\b", line)
+    return int(m.group(1)) if m else None
+
+
+def _parse_pytest_counts(line: str) -> dict:
+    """Counts from a pytest terminal summary line ('= 2 passed, 3 skipped in 1s =')."""
+    counts = {}
+    for m in re.finditer(r"(\d+) (passed|failed|error|errors|skipped|xfailed|xpassed)", line):
+        key = "error" if m.group(2) == "errors" else m.group(2)
+        counts[key] = counts.get(key, 0) + int(m.group(1))
+    return counts
+
+
+def _is_all_tests_skipped(output: str) -> bool:
+    """Detect 'tests were collected but every one of them skipped'.
+
+    The third state between pass and fail that exit codes cannot express:
+    unittest.main() exits 0 with 'OK (skipped=N)' and pytest exits 0 with
+    an 'N skipped' summary, both indistinguishable from a real pass by
+    return code alone. Recognises both runners:
+
+    - unittest: the 'Ran N tests' line counts skipped via 'OK (skipped=N)',
+      including combined forms like 'OK (skipped=2, expected failures=1)'
+      (an xfail that ran is not a skip, so 'expected failures' alone does
+      not count)
+    - pytest: the last summary line carrying outcome counts, which must be
+      skips only -- any passed/failed/error/xfailed/xpassed disqualifies
+    """
+    lines = output.splitlines()
+    # unittest: 'Ran N tests in ...' is always immediately followed by the
+    # summary line ('OK (...)' or 'FAILED (...)'), anchored at column 0 so
+    # quoted test output cannot fake it.
+    for idx, line in enumerate(lines):
+        ran = _parse_unittest_counts(line)
+        if ran is None or ran == 0:
+            continue
+        # The summary line follows 'Ran N tests' (possibly after blank
+        # lines) and is anchored at column 0 so quoted test output cannot
+        # fake it.
+        for tail in lines[idx + 1 :]:
+            if not tail.strip():
+                continue
+            if re.match(r"^OK \(", tail):
+                return "skipped=" in tail
+            break
+        return False
+    # pytest: the last summary line carrying outcome counts decides; it is
+    # all-skipped only when that line reports skips and nothing else.
+    for line in reversed(lines):
+        counts = _parse_pytest_counts(line)
+        if counts:
+            return (
+                counts.get("skipped", 0) > 0
+                and sum(v for k, v in counts.items() if k != "skipped") == 0
+            )
+    return False
+
+
 def run_with_timeout(
     func: Callable,
     args: tuple = (),
@@ -154,6 +214,10 @@ def run_unittest_files(
     passed_tests = []
     failed_tests = []
     retried_tests = []  # Track which tests were retried
+    # Third state: the file exited successfully but every collected test
+    # skipped, so it contributed zero coverage. Kept out of both
+    # passed_tests and failed_tests and reported on its own at the end.
+    all_skipped_tests = []
     # Per-file elapsed seconds, latest attempt wins. Consumed by the
     # TIMINGS block emitted at the end of this function.
     file_elapsed: Dict[str, float] = {}
@@ -168,7 +232,7 @@ def run_unittest_files(
         process = None
         output_lines = []
 
-        def run_one_file(filename, capture_output=False):
+        def run_one_file(filename, capture_output=True):
             nonlocal process, output_lines
 
             full_path = os.path.join(os.getcwd(), filename)
@@ -180,7 +244,10 @@ def run_unittest_files(
             cmd = ["python3", full_path, "-f"]
 
             if capture_output:
-                # Capture output for retry decision
+                # Capture output for the retry decision and for
+                # all-skipped detection. The capture branch tees every line
+                # to the logger as it arrives, so CI-log visibility is the
+                # same as the inherited passthrough mode.
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -218,10 +285,12 @@ def run_unittest_files(
                 was_retried = True
 
             try:
+                # Output is always captured (tee'd to the logger live) so
+                # the all-skipped state can be detected even without retry.
                 ret_code = run_with_timeout(
                     run_one_file,
                     args=(filename,),
-                    kwargs={"capture_output": enable_retry},
+                    kwargs={"capture_output": True},
                     timeout=timeout_per_file,
                 )
 
@@ -231,6 +300,15 @@ def run_unittest_files(
                         logger.info(
                             f"\n⊘ SKIPPED (no tests collected): {filename}\n"
                         )
+                    elif _is_all_tests_skipped("".join(output_lines)):
+                        # Exited 0 but contributed zero coverage. Not a
+                        # failure (exit-code semantics unchanged), not a
+                        # pass either: third state, reported at the end.
+                        logger.info(
+                            f"\n⊘ ALL SKIPPED (zero coverage): {filename}\n"
+                        )
+                        all_skipped_tests.append(filename)
+                        break
                     if was_retried:
                         logger.info(
                             f"\n✓ PASSED on retry (attempt {attempt}): {filename}\n"
@@ -298,7 +376,10 @@ def run_unittest_files(
 
     # Print summary
     logger.info(f"\n{'='*60}")
-    logger.info(f"Test Summary: {len(passed_tests)}/{len(files)} passed")
+    logger.info(
+        f"Test Summary: {len(passed_tests)}/{len(files)} passed"
+        + (f", {len(all_skipped_tests)} all-skipped" if all_skipped_tests else "")
+    )
     if enable_retry and retried_tests:
         logger.info(f"Retries: {len(retried_tests)} test(s) were retried")
     logger.info(f"{'='*60}")
@@ -314,6 +395,13 @@ def run_unittest_files(
         logger.info("\n↻ RETRIED:")
         for test, attempts, result in retried_tests:
             logger.info(f"  {test} ({attempts} attempts, {result})")
+    if all_skipped_tests:
+        logger.info(
+            f"\n⊘ ALL SKIPPED ({len(all_skipped_tests)} file(s) ran but every "
+            f"collected test skipped -- zero coverage, not counted as passed):"
+        )
+        for test in all_skipped_tests:
+            logger.info(f"  {test}")
     logger.info(f"{'='*60}\n")
 
     # Machine-readable timings block for downstream scrapers/dashboards.
@@ -323,20 +411,36 @@ def run_unittest_files(
     # separately from the GitHub Actions API by consumers, so we don't
     # emit any aggregate fields here.
     passed_set = set(passed_tests)
+    all_skipped_set = set(all_skipped_tests)
     logger.info("========== TIMINGS BEGIN ==========")
     for fname, elapsed in file_elapsed.items():
+        if fname in passed_set:
+            status = "passed"
+        elif fname in all_skipped_set:
+            status = "all_skipped"
+        else:
+            status = "failed"
         logger.info(
             json.dumps(
                 {
                     "file": _repo_relative_path(fname),
                     "passed": fname in passed_set,
+                    # Third state for scrapers; "passed" stays false for
+                    # all-skipped files while the run itself is not failed.
+                    "status": status,
                     "elapsed": round(elapsed),
                 }
             )
         )
     logger.info("========== TIMINGS END ==========")
 
-    # Write GitHub Step Summary only if retries occurred
+    # Write GitHub Step Summary when retries occurred or zero-coverage
+    # files were detected
+    if all_skipped_tests:
+        write_github_step_summary(
+            f"**⊘ {len(all_skipped_tests)} file(s) all-skipped (zero coverage):**\n"
+            + "".join(f"- {t}\n" for t in all_skipped_tests)
+        )
     if retried_tests:
         passed_on_retry = [t for t, _, r in retried_tests if r == "passed"]
         failed_after_retry = [t for t, _, r in retried_tests if r != "passed"]
