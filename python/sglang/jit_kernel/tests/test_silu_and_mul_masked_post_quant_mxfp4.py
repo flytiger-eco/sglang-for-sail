@@ -6,8 +6,16 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_ppu
+from sglang.test.ci.ci_register import register_ppu_ci
 
 pytestmark = pytest.mark.skipif(not is_ppu(), reason="PPU-only kernel")
+
+register_ppu_ci(
+    est_time=25,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="MXFP4 needs cvt instruction unsupported on PPU 810E (arch ppu0010)",
+)
 
 
 _EP_SHAPES = [

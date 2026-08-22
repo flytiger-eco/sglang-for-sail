@@ -112,7 +112,7 @@ jobs:
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo \"Pinned JIT source mtimes to HEAD commit @\$JIT_MTIME so ninja reuses the NAS-persisted JIT cache across runs (a fresh checkout otherwise resets mtimes and forces a full recompile every night)\" || echo 'Skipped JIT mtime pinning (git unavailable); JIT will recompile'; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 0 --auto-partition-size 2
+              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 0 --auto-partition-size 2 --report-all-skipped
             "
 
   nightly-1b-ppu:
@@ -209,7 +209,7 @@ jobs:
               echo 'Preloading Marlin JIT outside the per-test watchdog (instant on a NAS cache hit; ~16min two-dtype ppu-llc compile on a miss, which would otherwise eat most of test_marlin_moe 1200s budget)...' && \
               { timeout -k 30 1500 python3 -c 'import torch; from sglang.jit_kernel.moe_wna16_marlin import _jit_moe_wna16_marlin_module; _jit_moe_wna16_marlin_module(torch.float16); _jit_moe_wna16_marlin_module(torch.bfloat16); print(\"Marlin JIT ready\")' || echo 'Marlin JIT preload did not finish; test_marlin_moe may hit its own 1200s timeout'; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 1 --auto-partition-size 2
+              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 1 --auto-partition-size 2 --report-all-skipped
             "
 
   nightly-2-ppu:
@@ -293,7 +293,7 @@ jobs:
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --continue-on-error
+              python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --continue-on-error --report-all-skipped
             "
 
   nightly-4-ppu:
@@ -376,7 +376,7 @@ jobs:
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --continue-on-error
+              python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --continue-on-error --report-all-skipped
             "
 
   nightly-8-ppu:
@@ -459,7 +459,7 @@ jobs:
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-8-ppu --nightly --continue-on-error
+              python3 run_suite.py --hw ppu --suite nightly-8-ppu --nightly --continue-on-error --report-all-skipped
             "
 
   nightly-test-ppu-finish:

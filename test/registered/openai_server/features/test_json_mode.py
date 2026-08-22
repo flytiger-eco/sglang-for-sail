@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=118, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=118, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=118, suite="stage-b-test-1-gpu-ppu")
 
 
 class JSONModeMixin:

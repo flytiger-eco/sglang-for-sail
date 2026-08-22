@@ -3,8 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,7 +13,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=109, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(est_time=109, suite="nightly-1-ppu", nightly=True)
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
@@ -65,7 +63,6 @@ class FP4GemmSM120Base:
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-@skip_if_no_fp4()
 class TestFP4GemmSM120Auto(FP4GemmSM120Base, unittest.TestCase):
     backend = "auto"
 

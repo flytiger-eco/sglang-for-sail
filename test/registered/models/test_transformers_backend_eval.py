@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 

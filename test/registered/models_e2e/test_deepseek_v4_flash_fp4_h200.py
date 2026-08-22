@@ -10,8 +10,7 @@ Registry: base-c-test-deepep-8-gpu-h200 (per-commit, 8x H200 — only 4 used by 
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
@@ -22,7 +21,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=370, stage="base-c", runner_config="deepep-8-gpu-h200")
-register_ppu_ci(est_time=370, suite="nightly-8-ppu", nightly=True, disabled="model deepseek-ai/DeepSeek-V4-Flash not on NAS; requires 8xGPU + FP4")
 
 
 def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
@@ -42,7 +40,6 @@ SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-@skip_if_no_fp4()
 class TestDSV4FlashFP4H200(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
@@ -89,7 +86,6 @@ class TestDSV4FlashFP4H200(
     _flashinfer_has_sm90_cutlass_mxfp4(),
     "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
 )
-@skip_if_no_fp4()
 class TestDSV4FlashFP4H200FlashInferCutlass(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,

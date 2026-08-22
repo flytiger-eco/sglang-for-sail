@@ -46,7 +46,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import model_exists, skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -1608,7 +1608,7 @@ class TestDumperHttp:
             from sglang.test.test_utils import is_ppu_platform
 
             if is_ppu_platform():
-                from sglang.test.ci.ppu_skip_utils import model_exists
+                from sglang.test.ci.skip_utils import model_exists
 
                 if not model_exists("Qwen/Qwen3-0.6B"):
                     pytest.skip("Qwen/Qwen3-0.6B not cached on PPU CI NAS")
@@ -2270,7 +2270,7 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
 
 @pytest.mark.skipif(
     os.environ.get("PPU_SDK") is not None
-    and not __import__("sglang.test.ci.ppu_skip_utils", fromlist=["model_exists"]).model_exists("Qwen/Qwen3-0.6B"),
+    and not model_exists("Qwen/Qwen3-0.6B"),
     reason="Qwen/Qwen3-0.6B not cached on PPU CI NAS",
 )
 class TestDumperE2E:

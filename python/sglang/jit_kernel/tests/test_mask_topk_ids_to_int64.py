@@ -6,8 +6,16 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_ppu
+from sglang.test.ci.ci_register import register_ppu_ci
 
 pytestmark = pytest.mark.skipif(not is_ppu(), reason="PPU-only kernel")
+
+register_ppu_ci(
+    est_time=10,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="imports sglang.jit_kernel.deepseek_v4 which does not exist in v0.5.13",
+)
 
 
 def _ref_mask(

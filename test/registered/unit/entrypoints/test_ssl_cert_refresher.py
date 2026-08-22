@@ -5,11 +5,10 @@ import unittest
 from unittest.mock import MagicMock
 
 from sglang.srt.entrypoints.ssl_utils import SSLCertRefresher
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
-register_ppu_ci(est_time=14, suite="per-commit-1-ppu")
 
 
 def _make_temp_pem(content: bytes) -> str:

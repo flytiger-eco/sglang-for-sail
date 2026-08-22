@@ -10,11 +10,10 @@ from sglang.srt.speculative.spec_registry import (
     _assert_custom_spec_algo_conforms,
     _reserved_names,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 
 class _RegistryIsolated(CustomTestCase):

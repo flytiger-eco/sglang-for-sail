@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
@@ -17,7 +17,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
-register_ppu_ci(est_time=6, suite="per-commit-1-ppu")
 
 
 def _make_req(

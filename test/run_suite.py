@@ -3,7 +3,6 @@ import glob
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import tabulate
@@ -88,7 +87,12 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-xpu",
     ],
     HWBackend.PPU: [
-        "per-commit-1-ppu",
+        # Three-stage serial chain (mirrors pr-test-amd.yml): stage-a is the
+        # < 5 min smoke gate, stage-b the 1-GPU body, stage-c 2-GPU tests.
+        # pr-test-ppu.yml serializes them via .github/actions/wait-for-jobs.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
     ],
 }
 
@@ -309,22 +313,14 @@ def run_a_suite(args):
         and not f.endswith("/cpu/utils.py")
     ]
 
-    # JIT kernel tests and benchmarks (live alongside kernel source).
-    # For PPU, keep only files carrying a register_ppu_ci call: upstream
-    # ships jit_kernel files without any CI registration (or with
-    # register_cuda_ci only), which would fail the sanity check below.
+    # JIT kernel tests and benchmarks (live alongside kernel source)
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    jit_files = glob.glob(
+    files += glob.glob(
         os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
     )
-    jit_files += glob.glob(
+    files += glob.glob(
         os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
     )
-    if args.hw == "ppu":
-        jit_files = [
-            f for f in jit_files if "register_ppu_ci(" in Path(f).read_text()
-        ]
-    files += jit_files
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
@@ -363,6 +359,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        report_all_skipped=args.report_all_skipped,
     )
 
 
@@ -428,6 +425,12 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--report-all-skipped",
+        action="store_true",
+        default=False,
+        help="Report files that exit 0 after skipping every collected test as a third state instead of a pass. Opt-in per backend: it requires capturing each file's output, which can stall on leaked grandchild processes.",
     )
     parser.add_argument(
         "--partition-model-file",

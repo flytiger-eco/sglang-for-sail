@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,

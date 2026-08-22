@@ -6,7 +6,7 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
 from sglang.test.test_utils import (
     DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST,
@@ -20,7 +20,12 @@ from sglang.test.test_utils import (
 # MLA FP8 KV cache test with MGSM evaluation
 register_cuda_ci(est_time=104, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=800, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=104, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(
+    est_time=104,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="model neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8 not on NAS",
+)
 
 
 @skip_if_no_fp8()

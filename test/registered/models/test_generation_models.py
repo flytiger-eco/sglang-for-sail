@@ -41,7 +41,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.runners import (
     DEFAULT_PROMPTS,
     HFRunner,

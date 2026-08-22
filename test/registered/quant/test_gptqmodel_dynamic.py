@@ -7,7 +7,7 @@ import torch
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,

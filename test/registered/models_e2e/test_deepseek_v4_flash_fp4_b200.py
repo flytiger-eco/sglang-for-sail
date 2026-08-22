@@ -10,8 +10,7 @@ Registry: base-c-test-deepep-4-gpu-b200 (per-commit, 4x B200)
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
@@ -22,7 +21,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=465, stage="base-c", runner_config="deepep-4-gpu-b200")
-register_ppu_ci(est_time=700, suite="nightly-4-ppu", nightly=True, disabled="model deepseek-ai/DeepSeek-V4-Flash not on NAS; requires FP4")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -33,7 +31,6 @@ _DEEPEP_ENV = {
 }
 
 
-@skip_if_no_fp4()
 class TestDSV4FlashFP4B200(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
@@ -77,7 +74,6 @@ class TestDSV4FlashFP4B200(
             kill_process_tree(cls.process.pid)
 
 
-@skip_if_no_fp4()
 class TestDSV4FlashFP4B200Balanced(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,

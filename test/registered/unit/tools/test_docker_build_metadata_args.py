@@ -20,9 +20,7 @@ def _load_module(name, path):
 
 _ci_register = _load_module("ci_register", CI_REGISTER_PATH)
 register_cpu_ci = _ci_register.register_cpu_ci
-register_ppu_ci = _ci_register.register_ppu_ci
 register_cpu_ci(est_time=0, suite="base-a-test-cpu")
-register_ppu_ci(est_time=0, suite="per-commit-1-ppu")
 
 
 class TestDockerBuildMetadataArgs(unittest.TestCase):

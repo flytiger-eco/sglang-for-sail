@@ -71,7 +71,7 @@ jobs:
               - "python/sglang/srt/hardware_backend/ppu/**"
               - "python/sglang/srt/platforms/ppu.py"
               - "sgl-kernel/**"
-              - "test/registered/ppu/**"
+              - "test/registered/**"
               - "scripts/ci/ppu/**"
             sgl_kernel:
               - "sgl-kernel/**"
@@ -88,14 +88,30 @@ jobs:
     with:
       git_ref: ${{ inputs.ref || github.sha }}
 
-  # ==================== Stage A: Smoke Test ==================== #
+  # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
+  # Covers the two independent boot failure surfaces measured on ppu1
+  # (ci-mechanism-gap-review §10.3): test_ppu_basic.py proves the offline
+  # engine initializes and decodes (~194s), test_anthropic_server.py proves
+  # a real HTTP server comes up (~40s). The 27 no-runtime unit/mock files
+  # were deliberately left out: all-green there says nothing about the PPU
+  # hardware path.
   stage-a-test-1-gpu-ppu:
     needs: [check-changes, build-sgl-kernel]
-    # The explicit `if` overrides the default skip-on-skipped-dependency, so
-    # stage-a still runs when build-sgl-kernel was skipped (PR does not touch
-    # sgl-kernel) or failed; in both cases the wheel download step below is
-    # skipped and the install script falls back to source build / PyPI wheel.
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    # A plain `if` does NOT override skip-on-skipped-dependency: only
+    # status check functions (always() / !failure() / !cancelled()) do.
+    # Without always(), a skipped build-sgl-kernel -- the normal case for
+    # PRs that don't touch sgl-kernel -- cascaded into a skipped stage-a
+    # while finish still reported success, so the PPU per-commit suite
+    # silently never ran on test-only PRs (gap-review §3.1b, PR #7
+    # run 32552530166). With always() && !failure() && !cancelled(), a
+    # skipped build no longer kills stage-a while a failed build still
+    # does; the wheel download step below is then skipped and the install
+    # script falls back to source build / PyPI wheel.
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
     runs-on: [ self-hosted, ppu ]
     timeout-minutes: 120
     steps:
@@ -110,6 +126,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`; the default shallow fetch (depth 1)
+          # leaves HEAD~1 nonexistent, so detection always failed.
+          fetch-depth: 2
 
       - name: Download prebuilt sgl-kernel wheel
         if: needs.build-sgl-kernel.result == 'success'
@@ -118,7 +138,145 @@ jobs:
           name: wheel-python3.12-cuda13.0
           path: ${{ github.workspace }}/sgl-kernel-wheel
 
-      - name: Run PPU smoke test
+      - name: Run PPU smoke test (stage-a)
+        timeout-minutes: 110
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          docker run --rm \
+            --privileged \
+            --network host \
+            --device=/dev/alixpu_ctl \
+            --device=/dev/alixpu \
+            --ipc=host \
+            --shm-size=8g \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            -v ${{ github.workspace }}:/workspace \
+            -v /nas_aisw:/nas_aisw \
+            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -e SGLANG_IS_IN_CI=true \
+            -e SGLANG_TEST_MAX_RETRY=0 \
+            -e CUDA_VISIBLE_DEVICES=0 \
+            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e HF_HUB_OFFLINE=1 \
+            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
+            -e PPU_ARTIFACTORY_USER \
+            -e PPU_ARTIFACTORY_PASSWORD \
+            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
+            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
+            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
+            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
+            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
+            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
+            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
+            -e PPU_SUPPORTS_FP8=0 \
+            -e PPU_SUPPORTS_FP4=0 \
+            -e SGL_KERNEL_WHEEL_DIR=/workspace/sgl-kernel-wheel \
+            -e SGL_KERNEL_BUILD_FROM_SOURCE \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "
+              cd /workspace && \
+              bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              git config --global --add safe.directory /workspace && \
+              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
+              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
+              cd test && \
+              python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error --report-all-skipped
+            "
+        # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
+        # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
+        # budget). A smoke gate must fail fast and retries would mask flakiness
+        # (ci-mechanism-gap-review §10.3 fact 1).
+
+  # ==================== Wait for Stage A ==================== #
+  # Mirrors wait-for-stage-a-amd (pr-test-amd.yml): hardware-neutral GitHub
+  # API polling on ubuntu-latest, so no PPU runner is occupied while waiting.
+  # Only pull_request runs serialize; workflow_dispatch/workflow_call runs
+  # skip the wait and dispatch the stages without queuing, matching how AMD
+  # handles scheduled runs.
+  wait-for-stage-a-ppu:
+    needs: [check-changes, build-sgl-kernel]
+    if: |
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      stage_a_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
+        id: wait
+        with:
+          stage-name: stage-a-ppu
+          jobs: '[{"prefix": "stage-a-test-1-gpu-ppu", "expected_count": 1}]'
+          max-wait-minutes: '240'
+
+  # ==================== Stage B: 1-GPU body ==================== #
+  stage-b-test-1-gpu-ppu:
+    # Deliberate deviation from pr-test-amd.yml: the previous stage job is
+    # listed in needs directly, in addition to the wait-for-* job. AMD keeps
+    # stage jobs out of needs so workflow_dispatch with target_stage can run
+    # a single stage in isolation; PPU has no target_stage input, so that
+    # decoupling buys nothing here, while job-level failure() only sees the
+    # needs graph -- without stage-a in needs, a stage-a failure was
+    # invisible on workflow_dispatch / workflow_call (the wait jobs skip
+    # there) and stage-b/c ran anyway. With stage-a in needs, !failure()
+    # fast-fails deterministically on every trigger. A skipped (not failed)
+    # stage-a still lets this job evaluate, via always() && !failure().
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-a-test-1-gpu-ppu,
+        wait-for-stage-a-ppu,
+      ]
+    # `always()` overrides skip-on-skipped-dependency so this job still
+    # evaluates when build-sgl-kernel or stage-a was skipped, or when the
+    # wait job was skipped (non-pull_request triggers). A failed wait job
+    # (stage-a red on the PR path) yields result == 'failure' and skips
+    # this stage; on non-PR triggers !failure() above provides the same
+    # fast-fail. That fast-fail is the point of the serial chain.
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.wait-for-stage-a-ppu.result == 'success' || needs.wait-for-stage-a-ppu.result == 'skipped')
+    runs-on: [ self-hosted, ppu ]
+    timeout-minutes: 120
+    steps:
+      - name: Clean workspace (root-owned files from prior Docker runs)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ${{ github.workspace }}/sgl-kernel-wheel
+
+      - name: Run PPU 1-GPU tests (stage-b)
         timeout-minutes: 110
         env:
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
@@ -160,6 +318,7 @@ jobs:
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             -e SGL_KERNEL_WHEEL_DIR=/workspace/sgl-kernel-wheel \
+            -e SGL_KERNEL_BUILD_FROM_SOURCE \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -168,7 +327,127 @@ jobs:
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite per-commit-1-ppu --continue-on-error
+              python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error --report-all-skipped
+            "
+
+  # ==================== Wait for Stage B ==================== #
+  wait-for-stage-b-ppu:
+    needs: [check-changes, build-sgl-kernel, wait-for-stage-a-ppu]
+    if: |
+      always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.wait-for-stage-a-ppu.result == 'success' || needs.wait-for-stage-a-ppu.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      stage_b_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/wait-for-jobs
+        id: wait
+        with:
+          stage-name: stage-b-ppu
+          jobs: '[{"prefix": "stage-b-test-1-gpu-ppu", "expected_count": 1}]'
+          max-wait-minutes: '240'
+
+  # ==================== Stage C: 2-GPU ==================== #
+  # Container flags (including --add-host for hostname resolution) are
+  # copied from the nightly-2-ppu job in nightly-test-ppu.yml, which runs
+  # the same 2-GPU configuration.
+  stage-c-test-2-gpu-ppu:
+    # Same deliberate deviation as stage-b: stage-b-test-1-gpu-ppu is in
+    # needs directly so !failure() fast-fails on every trigger, not only
+    # where the wait job runs (pull_request).
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-b-test-1-gpu-ppu,
+        wait-for-stage-b-ppu,
+      ]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.wait-for-stage-b-ppu.result == 'success' || needs.wait-for-stage-b-ppu.result == 'skipped')
+    runs-on: [ self-hosted, ppu ]
+    timeout-minutes: 120
+    steps:
+      - name: Clean workspace (root-owned files from prior Docker runs)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ${{ github.workspace }}/sgl-kernel-wheel
+
+      - name: Run PPU 2-GPU tests (stage-c)
+        timeout-minutes: 110
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          docker run --rm \
+            --privileged \
+            --network host \
+            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
+            --device=/dev/alixpu_ctl \
+            --device=/dev/alixpu \
+            --ipc=host \
+            --shm-size=8g \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            -v ${{ github.workspace }}:/workspace \
+            -v /nas_aisw:/nas_aisw \
+            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -e SGLANG_IS_IN_CI=true \
+            -e CUDA_VISIBLE_DEVICES=0,1 \
+            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e HF_HUB_OFFLINE=1 \
+            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
+            -e PPU_ARTIFACTORY_USER \
+            -e PPU_ARTIFACTORY_PASSWORD \
+            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
+            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
+            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
+            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
+            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
+            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
+            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
+            -e PPU_SUPPORTS_FP8=0 \
+            -e PPU_SUPPORTS_FP4=0 \
+            -e SGL_KERNEL_WHEEL_DIR=/workspace/sgl-kernel-wheel \
+            -e SGL_KERNEL_BUILD_FROM_SOURCE \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "
+              cd /workspace && \
+              bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              git config --global --add safe.directory /workspace && \
+              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
+              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
+              cd test && \
+              python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error --report-all-skipped
             "
 
   # ==================== Finish ==================== #
@@ -178,6 +457,10 @@ jobs:
         check-changes,
         build-sgl-kernel,
         stage-a-test-1-gpu-ppu,
+        wait-for-stage-a-ppu,
+        stage-b-test-1-gpu-ppu,
+        wait-for-stage-b-ppu,
+        stage-c-test-2-gpu-ppu,
       ]
     if: always()
     runs-on: ubuntu-latest

@@ -17,8 +17,13 @@ register_ppu_ci(
     est_time=140,
     suite="nightly-1-ppu",
     nightly=True,
-    disabled="Marlin MoE produces NaN on PPU (34% of elements) at larger m; "
-    "workspace-reduce fallback path. sgl-kernel 0.4.3 + SDK 2.1.1",
+    disabled="Hangs on PPU: EXIT=124 at the hard 1800s timeout (ppu1 "
+    "2026-08-21), py-spy pinned at config #1 (m=1, n=128, k=256, "
+    "act_order=True, float16 -> use_atomic_add=True), matching the hang "
+    "condition recorded by 5aa674aa05. The NaN-at-larger-m report is "
+    "UNDETERMINED: the hang hits config #1 and the NaN configs are "
+    "#224+, never reached in this run -- neither confirmed nor refuted. "
+    "sgl-kernel 0.4.3 + SDK 2.1.1",
 )
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))

@@ -2,13 +2,18 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
-register_ppu_ci(est_time=7200, suite="nightly-4-ppu", nightly=True)
+register_ppu_ci(
+    est_time=7200,
+    suite="nightly-4-ppu",
+    nightly=True,
+    disabled="model Qwen/Qwen3.5-397B-A17B-FP8 not on NAS; accuracy path also needs uv, missing in the CI image",
+)
 
 MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
 
