@@ -214,12 +214,29 @@ jobs:
 
   # ==================== Stage B: 1-GPU body ==================== #
   stage-b-test-1-gpu-ppu:
-    needs: [check-changes, build-sgl-kernel, wait-for-stage-a-ppu]
+    # Deliberate deviation from pr-test-amd.yml: the previous stage job is
+    # listed in needs directly, in addition to the wait-for-* job. AMD keeps
+    # stage jobs out of needs so workflow_dispatch with target_stage can run
+    # a single stage in isolation; PPU has no target_stage input, so that
+    # decoupling buys nothing here, while job-level failure() only sees the
+    # needs graph -- without stage-a in needs, a stage-a failure was
+    # invisible on workflow_dispatch / workflow_call (the wait jobs skip
+    # there) and stage-b/c ran anyway. With stage-a in needs, !failure()
+    # fast-fails deterministically on every trigger. A skipped (not failed)
+    # stage-a still lets this job evaluate, via always() && !failure().
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-a-test-1-gpu-ppu,
+        wait-for-stage-a-ppu,
+      ]
     # `always()` overrides skip-on-skipped-dependency so this job still
-    # evaluates when build-sgl-kernel was skipped, or when the wait job was
-    # skipped (non-pull_request runs dispatch stages without serializing).
-    # A failed wait job (stage-a red) yields result == 'failure' and skips
-    # this stage: that fast-fail is the point of the serial chain.
+    # evaluates when build-sgl-kernel or stage-a was skipped, or when the
+    # wait job was skipped (non-pull_request triggers). A failed wait job
+    # (stage-a red on the PR path) yields result == 'failure' and skips
+    # this stage; on non-PR triggers !failure() above provides the same
+    # fast-fail. That fast-fail is the point of the serial chain.
     if: |
       always() &&
       !failure() &&
@@ -329,7 +346,16 @@ jobs:
   # copied from the nightly-2-ppu job in nightly-test-ppu.yml, which runs
   # the same 2-GPU configuration.
   stage-c-test-2-gpu-ppu:
-    needs: [check-changes, build-sgl-kernel, wait-for-stage-b-ppu]
+    # Same deliberate deviation as stage-b: stage-b-test-1-gpu-ppu is in
+    # needs directly so !failure() fast-fails on every trigger, not only
+    # where the wait job runs (pull_request).
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-b-test-1-gpu-ppu,
+        wait-for-stage-b-ppu,
+      ]
     if: |
       always() &&
       !failure() &&
