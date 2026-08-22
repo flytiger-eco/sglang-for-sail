@@ -29,7 +29,7 @@ register_ppu_ci(
 )
 
 
-@skip_if_model_missing("QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
+@skip_if_model_missing(DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST)
 class TestAWQ(CustomTestCase):
     @classmethod
     def setUpClass(cls):
