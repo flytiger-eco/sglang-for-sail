@@ -234,8 +234,14 @@ class TestPPUMarlinMoeNumerics(CustomTestCase):
 # are gone and no pytest feature remains (no parametrize / skipif / module-level
 # test_* functions), so the stdlib unittest runner is correct again -- and it
 # restores real self.subTest() semantics: under pytest, subTest degrades to a
-# plain statement (result_supports_subtests is False), so the first failing
-# dtype aborts the loop and the failing dtype is never reported. With
-# unittest.main() every dtype is reported independently.
+# plain statement (result_supports_subtests is False), so a failure does not
+# even say which dtype it came from. unittest.main() names the failing dtype
+# in the report.
+#
+# It does NOT report every dtype: CI passes -f (failfast), which stops at the
+# first failing subTest, so the second dtype is not run. Measured:
+#   without -f  ->  FAIL (dtype='half'), FAIL (dtype='bfloat16')   Ran 2 tests
+#   with -f     ->  FAIL (dtype='half')                            Ran 1 test
+# The gain over pytest is the dtype identity, not full coverage of the loop.
 if __name__ == "__main__":
     unittest.main()
