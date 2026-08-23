@@ -9,9 +9,22 @@ History:
 
 - Original bug criterion (sgl-kernel 0.4.3 + SDK 2.1.1, internal bug report,
   regression #2): fused_marlin_moe emitted NaN on 34% of output elements
-  (86008/251904) at m=123. PPU forces ``use_atomic_add=False``
-  (fused_marlin_moe.py), so only the workspace-reduce path is exercised --
-  the exact path where the bug lived.
+  (86008/251904) at m=123, on the workspace-reduce path. That criterion was
+  recorded while PPU still forced ``use_atomic_add=False``, i.e. while EVERY
+  dtype went through workspace-reduce.
+- 5aa674aa05 (2026-08-19) reverted that forcing, so the claim "on PPU only
+  the workspace-reduce path is exercised" is no longer true. There is no PPU
+  branch left::
+
+      use_atomic_add = (
+          hidden_states.dtype == torch.half
+          or torch.cuda.get_device_capability(...)[0] >= 9
+      ) and (not is_mxfp4_marlin)
+
+  PPU reports capability (8, 0), so within THIS file: the float16 subTests
+  take atomic-add, and only the bfloat16 subTests still exercise the
+  workspace-reduce path where the NaN lived. Do not read a green float16
+  subTest as evidence about the NaN.
 - This file was first written as an xfail(strict=True) sentinel: xfail while
   the bug reproduces, XPASS failure as the "SDK fix landed" signal.
 - 2026-08-21 (three preflight rounds on ppu1) and 2026-08-22 (nightly run
