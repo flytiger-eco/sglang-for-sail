@@ -26,6 +26,13 @@ XPASS), the SDK fix has landed -- delete the marker. That XPASS is the
 sentinel; unittest's expectedFailure would report it silently, so this
 file runs under pytest.
 
+Caution: XPASS alone is NOT proof the SDK was fixed. Two sibling XPASS
+sentinels (causal_conv1d_compile, marlin_moe atomic-add) turned XPASS
+with no SDK or image change at all. Before deleting this marker, verify
+in the CI run log that the ``Dtype value [float32] not in the allowed
+options: [int32]`` error has actually disappeared -- the error going
+away, not the XPASS, is the real fix signal.
+
 Usage:
 python3 -m pytest test/registered/ppu/test_ppu_jit_cache_reuse.py -v
 """

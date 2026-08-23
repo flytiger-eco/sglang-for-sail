@@ -102,6 +102,12 @@ jobs:
             -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
             -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
             -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_FP8=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-FP8 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_INSTRUCT_2507=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-Instruct-2507 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-Next-80B-A3B-Instruct \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3.5_27B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B \
+            -e SGLANG_TEST_MODEL_META_LLAMA_LLAMA_3.2_1B=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B \
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
@@ -197,6 +203,12 @@ jobs:
             -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
             -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
             -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_FP8=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-FP8 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_INSTRUCT_2507=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-Instruct-2507 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-Next-80B-A3B-Instruct \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3.5_27B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B \
+            -e SGLANG_TEST_MODEL_META_LLAMA_LLAMA_3.2_1B=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B \
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
@@ -286,6 +298,12 @@ jobs:
             -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
             -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
             -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_FP8=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-FP8 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_INSTRUCT_2507=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-Instruct-2507 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-Next-80B-A3B-Instruct \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3.5_27B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B \
+            -e SGLANG_TEST_MODEL_META_LLAMA_LLAMA_3.2_1B=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B \
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
@@ -369,6 +387,12 @@ jobs:
             -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
             -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
             -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_FP8=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-FP8 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_INSTRUCT_2507=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-Instruct-2507 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-Next-80B-A3B-Instruct \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3.5_27B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B \
+            -e SGLANG_TEST_MODEL_META_LLAMA_LLAMA_3.2_1B=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B \
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
@@ -452,6 +476,12 @@ jobs:
             -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
             -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
             -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_FP8=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-FP8 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_30B_A3B_INSTRUCT_2507=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B-Instruct-2507 \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3_NEXT_80B_A3B_INSTRUCT=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-Next-80B-A3B-Instruct \
+            -e SGLANG_TEST_MODEL_QWEN_QWEN3.5_27B=/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-27B \
+            -e SGLANG_TEST_MODEL_META_LLAMA_LLAMA_3.2_1B=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B \
             -e PPU_SUPPORTS_FP8=0 \
             -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
