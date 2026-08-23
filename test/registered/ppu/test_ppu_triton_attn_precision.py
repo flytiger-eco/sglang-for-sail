@@ -1,34 +1,46 @@
-"""PPU Triton attention non-power-of-2 head dim precision guard.
+"""PPU Triton attention non-power-of-2 head dim precision regression guard.
 
-Guards SDK 2.1.1 regression #3 (internal bug report): the unified extend
-attention kernel diverges from the 2-stage kernel beyond atol=0.15 at
-config (B=8, N_CTX=256, H_Q=64, H_KV=8, D=80) -- a non-power-of-2 head
-dim. D=128 configs pass. The regression has history: failed on sgl-kernel
-0.4.1, fixed in 0.4.2.post2 (verified 7/7), regressed again in 0.4.3.
+Regression guard (NOT a bug sentinel -- see the history below). Asserts that
+the unified extend attention kernel stays within atol=0.15 of the 2-stage
+kernel at D=80, a non-power-of-2 head dim, on a warm Triton cache.
 
-The shared test registered/attention/test_triton_attention_kernels.py
-handles this by REMOVING the D=80 config from its list when
-is_ppu_platform(). That hides the issue: nobody notices when the fix
-lands, and nothing guards against another regression. Per decision doc
-section 8.1 (W6-3), this native test instead runs D=80 EXPLICITLY:
+History:
 
-- test_d80_* is marked xfail(strict=True) with the reason documented.
-  While the bug exists it reports xfail; once the SDK fixes it, the test
-  passes -> strict xfail turns that into an XPASS failure, which is the
-  signal to delete the marker and restore the config upstream.
-- The comparison is always done on a WARM Triton cache: a cold cache
-  takes a different codegen path on first compile, which made the
-  original measurements look flaky (3 consecutive runs: 2/1/1 failed).
-  Each test therefore runs the kernel pair once to warm up, seeds, and
-  only then asserts.
+- Original bug criterion (SDK 2.1.1, internal bug report, regression #3):
+  the unified kernel diverged from the 2-stage kernel beyond atol=0.15 at
+  (B=8, N_CTX=256, H_Q=64, H_KV=8, D=80). D=128 configs pass. The regression
+  has history: failed on sgl-kernel 0.4.1, fixed in 0.4.2.post2 (verified
+  7/7), regressed again in 0.4.3.
+- This file was first written as an xfail(strict=True) sentinel on the D=80
+  test: xfail while the bug reproduces, XPASS failure as the "SDK fix
+  landed" signal.
+- 2026-08-21 (three preflight rounds on ppu1) and 2026-08-22 (nightly run
+  32578521498, image llm:v2.1.1-... / SDK 2.1.1-a5c56e unchanged): the D=80
+  config PASSES. The sentinel premise never held here and XPASS proved
+  unreliable as a signal (it appeared with no SDK/image change at all). A
+  strict-xfail that always XPASSes makes nightly permanently red, so on
+  2026-08-23 the marker was removed and the file became a regression guard:
+  green today, red only if the D=80 divergence comes back.
 
-Usage:
-python3 -m pytest test/registered/ppu/test_ppu_triton_attn_precision.py -v
+The shared test registered/attention/test_triton_attention_kernels.py still
+handles D=80 by REMOVING the config from its list when is_ppu_platform().
+This native test runs D=80 EXPLICITLY instead (decision doc section 8.1,
+W6-3), so a recurring regression is noticed even though the upstream config
+list hides it. If a future SDK upgrade is verified to fix D=80 for real,
+restore the config upstream and this guard keeps watching in the meantime.
+
+The comparison is always done on a WARM Triton cache: a cold cache takes a
+different codegen path on first compile, which made the original
+measurements look flaky (3 consecutive runs: 2/1/1 failed). Each test
+therefore runs the kernel pair once to warm up, seeds, and only then
+asserts.
+
+Usage (CI runs it as ``python3 <file> -f``):
+python3 test/registered/ppu/test_ppu_triton_attn_precision.py -f
 """
 
-import sys
+import unittest
 
-import pytest
 import torch
 
 from sglang.srt.layers.attention.triton_ops.extend_attention import (
@@ -191,17 +203,6 @@ class TestPPUTritonAttnPrecision(CustomTestCase):
         the control that the comparison harness itself works."""
         self._warm_then_assert(4, 512, 32, 8, 128)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "SDK 2.1.1 regression #3: unified vs 2-stage kernel exceeds "
-            "atol=0.15 at D=80 (non-power-of-2 head dim) on PPU. Failed on "
-            "sgl-kernel 0.4.1, fixed in 0.4.2.post2, regressed in 0.4.3. "
-            "Strict xfail: when this starts passing (XPASS), the SDK fix "
-            "has landed -- delete this marker and restore the D=80 config "
-            "in test_triton_attention_kernels.py."
-        ),
-    )
     def test_d80_non_power_of_two(self):
         """The exact regression config (B=8, N_CTX=256, H_Q=64, H_KV=8, D=80),
         run explicitly instead of being removed from the shared config list."""
@@ -209,8 +210,8 @@ class TestPPUTritonAttnPrecision(CustomTestCase):
 
 
 # CI executes this file as ``python3 <file> -f`` (ci_utils.run_unittest_files),
-# so the runner selected below decides whether the xfail(strict=True) marker
-# above is honoured -- i.e. whether the strict-xfail semantics described in the
-# module docstring actually hold.
+# so the runner selected below decides what gets executed. The xfail marker is
+# gone and no pytest feature remains (no parametrize / skipif / module-level
+# test_* functions), so the stdlib unittest runner is correct again.
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    unittest.main()
