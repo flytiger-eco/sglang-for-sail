@@ -18,7 +18,7 @@ from sglang.srt.utils.common import get_device
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
-register_ppu_ci(est_time=12, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=112, suite="nightly-1-ppu", nightly=True)
 
 
 @unittest.skipIf(

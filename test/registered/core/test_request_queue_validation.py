@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=53, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=70, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=53, suite="stage-b-test-1-gpu-ppu")
+register_ppu_ci(est_time=82, suite="stage-b-test-1-gpu-ppu")
 
 
 class TestMaxQueuedRequests(CustomTestCase):

@@ -32,7 +32,7 @@ register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=200, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=6, suite="base-b-test-cpu")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
-register_ppu_ci(est_time=200, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=10, suite="nightly-1-ppu", nightly=True)
 
 
 class TestLoRAEvictionPolicy(unittest.TestCase):

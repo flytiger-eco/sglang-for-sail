@@ -22,7 +22,7 @@ register_cuda_ci(
     stage="base-b",
     runner_config="2-gpu-large",
 )
-register_ppu_ci(est_time=700, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=300, suite="nightly-2-ppu", nightly=True)
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):

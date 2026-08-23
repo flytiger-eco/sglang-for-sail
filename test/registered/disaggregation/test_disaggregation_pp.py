@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=216, stage="base-c", runner_config="8-gpu-h20")
-register_ppu_ci(est_time=216, suite="nightly-8-ppu", nightly=True)
+register_ppu_ci(est_time=352, suite="nightly-8-ppu", nightly=True)
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):

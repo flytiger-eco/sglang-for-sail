@@ -57,7 +57,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
-register_ppu_ci(est_time=30, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=323, suite="nightly-2-ppu", nightly=True)
 
 
 @contextmanager

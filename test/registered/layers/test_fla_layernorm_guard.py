@@ -23,7 +23,7 @@ register_cuda_ci(
     runner_config="2-gpu-large",
     disabled="Temporarily disabled",
 )
-register_ppu_ci(est_time=80, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(est_time=147, suite="nightly-2-ppu", nightly=True)
 
 # Optional dependency in sglang repo; skip collection cleanly if absent.
 custom_all_reduce_utils = pytest.importorskip(

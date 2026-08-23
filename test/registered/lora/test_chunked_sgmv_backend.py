@@ -26,7 +26,7 @@ from sglang.test.lora_utils import (
 CHUNK_SIZE = 16
 
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
-register_ppu_ci(est_time=60, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=25, suite="nightly-1-ppu", nightly=True)
 
 
 def reset_kernel_cache():
