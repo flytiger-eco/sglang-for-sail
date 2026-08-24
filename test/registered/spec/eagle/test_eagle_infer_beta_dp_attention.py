@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
@@ -17,12 +17,6 @@ from sglang.test.test_utils import (
 
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
 register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
-register_ppu_ci(
-    est_time=90,
-    suite="nightly-4-ppu",
-    nightly=True,
-    disabled="dsv3-test model requires FP8 (F8_E4M3), PPU 810E does not support FP8",
-)
 
 
 def test_gsm8k(base_url: str, model: str):

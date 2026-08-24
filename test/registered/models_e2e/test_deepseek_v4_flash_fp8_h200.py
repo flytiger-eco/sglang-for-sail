@@ -11,7 +11,7 @@ Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used b
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=280, stage="extra-b", runner_config="deepep-8-gpu-h200")
-register_ppu_ci(est_time=280, suite="nightly-8-ppu", nightly=True, disabled="model deepseek-ai/DeepSeek-V4-Flash not on NAS; requires 8xGPU + FP8")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600

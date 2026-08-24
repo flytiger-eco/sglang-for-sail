@@ -8,23 +8,11 @@ from sgl_kernel.scalar_type import scalar_types
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=108, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(
-    est_time=140,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="Hangs on PPU: EXIT=124 at the hard 1800s timeout (ppu1 "
-    "2026-08-21), py-spy pinned at config #1 (m=1, n=128, k=256, "
-    "act_order=True, float16 -> use_atomic_add=True), matching the hang "
-    "condition recorded by 5aa674aa05. The NaN-at-larger-m report is "
-    "UNDETERMINED: the hang hits config #1 and the NaN configs are "
-    "#224+, never reached in this run -- neither confirmed nor refuted. "
-    "sgl-kernel 0.4.3 + SDK 2.1.1",
-)
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 

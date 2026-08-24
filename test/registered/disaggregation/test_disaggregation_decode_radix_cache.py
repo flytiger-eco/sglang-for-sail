@@ -10,7 +10,7 @@ import requests
 
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.cache_hit_kit import (
     async_request_sglang_generate,
     gen_payload,
@@ -27,7 +27,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h20")
-register_ppu_ci(est_time=300, suite="nightly-8-ppu", nightly=True, disabled="OOM: prefill TP4 + decode TP4 CUDA graph capture exceeds per-GPU memory on ppu1 (96GB cards)")
 
 
 def _has_nixl():

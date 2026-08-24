@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,12 +13,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=430, stage="extra-b", runner_config="4-gpu-b200")
-register_ppu_ci(
-    est_time=430,
-    suite="nightly-4-ppu",
-    nightly=True,
-    disabled="model Qwen/Qwen3-4B-Instruct-2507-FP8 not on NAS",
-)
 
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"

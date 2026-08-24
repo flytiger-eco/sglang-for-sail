@@ -1,18 +1,12 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
-register_ppu_ci(
-    est_time=7200,
-    suite="nightly-4-ppu",
-    nightly=True,
-    disabled="model deepseek-ai/DeepSeek-V3.2 not on NAS",
-)
 
 MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 

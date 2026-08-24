@@ -12,7 +12,7 @@ import unittest
 import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -22,12 +22,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=236, stage="base-b", runner_config="2-gpu-large")
-register_ppu_ci(
-    est_time=236,
-    suite="nightly-2-ppu",
-    nightly=True,
-    disabled="mooncake backend not available on PPU",
-)
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):

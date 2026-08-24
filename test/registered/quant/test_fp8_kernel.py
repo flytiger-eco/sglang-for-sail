@@ -6,16 +6,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
-register_ppu_ci(
-    est_time=10,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="@skip_if_no_fp8() on all 3 test classes; PPU 810E has no FP8, so zero coverage",
-)
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
 
