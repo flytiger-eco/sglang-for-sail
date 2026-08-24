@@ -185,17 +185,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
