@@ -283,11 +283,3 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
-.qoder/
-
-# Internal-only PPU docs (bug reports, disabled-test inventories, CI analyses).
-# These reference internal hostnames, NAS paths, SDK bug details and vendor
-# tickets, so they must never reach a remote. The docs themselves now live
-# outside this repo at ../ppu-internal-docs/; this rule is a tripwire so that
-# anything dropped back into docs/ppu/ stays untracked by default.
-docs/ppu/

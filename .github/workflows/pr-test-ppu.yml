@@ -179,7 +179,7 @@ jobs:
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error --report-all-skipped
+              python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
             "
         # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
         # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
@@ -301,7 +301,7 @@ jobs:
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error --report-all-skipped
+              python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
             "
 
   # ==================== Wait for Stage B ==================== #
@@ -406,7 +406,7 @@ jobs:
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
               cd test && \
-              python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error --report-all-skipped
+              python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error
             "
 
   # ==================== Finish ==================== #

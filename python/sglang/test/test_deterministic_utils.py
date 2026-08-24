@@ -1,4 +1,3 @@
-import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -10,7 +9,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-DEFAULT_MODEL = os.environ.get("SGLANG_TEST_DETERMINISTIC_MODEL", "Qwen/Qwen3-8B")
+DEFAULT_MODEL = "Qwen/Qwen3-8B"
 COMMON_SERVER_ARGS = [
     "--trust-remote-code",
     "--cuda-graph-max-bs",

@@ -1,5 +1,4 @@
 import dataclasses
-import os
 import random
 from typing import List, Optional
 
@@ -75,9 +74,7 @@ MOE_LORA_TEST_PROMPTS = [
     "Write a one-sentence story about a brave detective on Mars.",
 ]
 
-MOE_BASE_MODEL_PATH = os.environ.get(
-    "SGLANG_TEST_MOE_LORA_BASE_MODEL", "Qwen/Qwen1.5-MoE-A2.7B"
-)
+MOE_BASE_MODEL_PATH = "Qwen/Qwen1.5-MoE-A2.7B"
 MOE_LORA_PATH = "jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"
 
 
@@ -114,9 +111,7 @@ ALL_OTHER_LORA_MODELS = [
 CI_MULTI_LORA_MODELS = [
     # multi-rank case
     LoRAModelCase(
-        base=os.environ.get(
-            "SGLANG_TEST_CI_MULTI_LORA_BASE_MODEL", "meta-llama/Llama-2-7b-hf"
-        ),
+        base="meta-llama/Llama-2-7b-hf",
         adaptors=[
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
@@ -136,10 +131,7 @@ CI_MULTI_LORA_MODELS = [
 
 ALL_OTHER_MULTI_LORA_MODELS = [
     LoRAModelCase(
-        base=os.environ.get(
-            "SGLANG_TEST_ALL_OTHER_MULTI_LORA_BASE_MODEL",
-            "meta-llama/Llama-3.1-8B-Instruct",
-        ),
+        base="meta-llama/Llama-3.1-8B-Instruct",
         adaptors=[
             LoRAAdaptor(
                 name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",

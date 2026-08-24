@@ -14,8 +14,6 @@ except ModuleNotFoundError:
     def register_cpu_ci(*args, **kwargs):
         pass
 
-        pass
-
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
