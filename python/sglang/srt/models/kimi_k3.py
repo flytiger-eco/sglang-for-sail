@@ -106,7 +106,7 @@ from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import is_blackwell_supported, is_hip, make_layers
+from sglang.srt.utils import is_blackwell_supported, is_hip, is_ppu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -1554,13 +1554,17 @@ class KimiK3DeltaAttention(nn.Module):
         layer = self.attn
         w = layer.conv_weights
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        num_heads = 12
+        if is_ppu():
+            num_heads = layer.num_v_heads
+            seg = num_heads * 128
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != num_heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -1591,6 +1595,10 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        if is_ppu():
+            layer._k3_fused_decode_weight = torch.stack(
+                layer._k3_fused_decode_args[:3]
+            ).contiguous()
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
