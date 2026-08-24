@@ -23,7 +23,7 @@ History:
   green today, red only if the D=80 divergence comes back.
 
 The shared test registered/attention/test_triton_attention_kernels.py still
-handles D=80 by REMOVING the config from its list when is_ppu_platform().
+handles D=80 by REMOVING the config from its list when is_ppu().
 This native test runs D=80 EXPLICITLY instead (decision doc section 8.1,
 W6-3), so a recurring regression is noticed even though the upstream config
 list hides it. If a future SDK upgrade is verified to fix D=80 for real,
@@ -49,6 +49,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd_unified,
 )
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -19,12 +19,13 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_amd_ci, is_ppu_platform
+from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
@@ -803,7 +804,7 @@ class TestTritonAttention(CustomTestCase):
             (4, 512, 32, 8, 128),  # Standard config
             (2, 2048, 32, 8, 128),  # Long sequence (test 2048 specifically)
         ]
-        if not is_ppu_platform():
+        if not is_ppu():
             # D=80 (non-power-of-2) triggers precision regression on PPU with
             # sgl-kernel 0.4.3 (unified vs 2-stage max diff exceeds atol=0.15).
             # Was fixed in 0.4.2.post2 but regressed in 0.4.3.

@@ -10,6 +10,7 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -17,7 +18,6 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
-    is_ppu_platform,
 )
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
@@ -84,7 +84,7 @@ class TestHf3fsBackendLayerFirstLayout(
 
 
 @unittest.skipIf(
-    is_ppu_platform(),
+    is_ppu(),
     "page_first_direct layout requires cudaMemcpyBatchAsync which is not implemented in PPU HGGC runtime",
 )
 class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase):

@@ -1604,7 +1604,6 @@ class TestDumperHttp:
                 stop_event.set()
                 thread.join(timeout=10)
         else:
-            from sglang.test.test_utils import is_ppu_platform
 
             base_url = DEFAULT_URL_FOR_TEST
             env = {**os.environ, "DUMPER_SERVER_PORT": "reuse"}

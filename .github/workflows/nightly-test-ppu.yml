@@ -87,6 +87,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
             -e PPU_SUPPORTS_FP8=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
@@ -166,6 +167,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
             -e PPU_SUPPORTS_FP8=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
@@ -240,6 +242,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
             -e PPU_SUPPORTS_FP8=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
@@ -308,6 +311,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
             -e PPU_SUPPORTS_FP8=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
@@ -376,6 +380,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
+            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
             -e PPU_SUPPORTS_FP8=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "

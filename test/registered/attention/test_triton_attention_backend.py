@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -19,7 +20,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    is_in_ppu_ci,
     popen_launch_server,
     run_bench_offline_throughput,
 )
@@ -46,7 +46,7 @@ class TestTritonAttnBackend(CustomTestCase):
         print(f"{output_throughput=}")
 
         if is_in_ci():
-            threshold = 100 if is_in_ppu_ci() else 153
+            threshold = 100 if is_ppu() else 153
             self.assertGreater(output_throughput, threshold)
 
     def test_mmlu(self):

@@ -4,6 +4,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -16,7 +17,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_amd_ci,
-    is_in_ppu_ci,
     popen_launch_server,
 )
 
@@ -73,7 +73,7 @@ class TestTorchCompile(CustomTestCase, MMLUMixin):
 
         if is_in_amd_ci():
             self.assertGreaterEqual(throughput, 145)
-        elif is_in_ppu_ci():
+        elif is_ppu():
             self.assertGreaterEqual(throughput, 110)
         else:
             self.assertGreaterEqual(throughput, 152)

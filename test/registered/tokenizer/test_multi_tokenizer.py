@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -16,7 +17,6 @@ from sglang.test.test_utils import (
     get_benchmark_args,
     is_in_amd_ci,
     is_in_ci,
-    is_ppu_platform,
     popen_launch_server,
     run_benchmark,
     write_github_step_summary,
@@ -76,7 +76,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 f"### test_multi_tokenizer_ttft\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
-            if is_ppu_platform():
+            if is_ppu():
                 self.assertLess(res["median_e2e_latency_ms"], 25000)
                 self.assertLess(res["median_ttft_ms"], 400)
                 self.assertLess(res["median_itl_ms"], 20)
