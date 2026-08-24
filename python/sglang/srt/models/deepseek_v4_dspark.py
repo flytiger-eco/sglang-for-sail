@@ -880,6 +880,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        if _is_ppu:
+            if self.quant_config and self.quant_config.get_name() == "fp8":
+                if self.quant_config.is_fp4_experts and "mlp.experts" in mapped_rest:
+                    mapped_rest = mapped_rest.replace(
+                        ".weight_scale_inv", ".weight_scale"
+                    )
+            else:
+                mapped_rest = mapped_rest.replace(".weight_scale_inv", ".weight_scale")
         return f"stages.{stage_id}.{mapped_rest}"
 
 
