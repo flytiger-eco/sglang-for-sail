@@ -120,14 +120,56 @@ def _is_all_tests_skipped(output: str) -> bool:
     # (skipped=1)' pair and flushes before unittest writes its real summary to
     # stderr will be misread as all-skipped (demonstrated 2026-08-22). The
     # exit code is still 0, so this only mis-reports; it cannot fail a run.
-    # Not worth guarding: it needs the counts to agree AND to win the flush
-    # race, and no real test does this.
+    # Not worth guarding beyond what is already here: any real 'Ran N tests'
+    # with N > 0, or any pytest summary line, decides on its own and overrides
+    # a zero-coverage verdict (see `zero_coverage` below), so a forgery has to
+    # be the only summary in the output AND win the flush race.
+    #
+    # `zero_coverage` is deliberately not an early return: the 'Ran 0 tests'
+    # shape is the weakest signal here (it needs no count agreement, unlike
+    # the equality rule below), so it must lose to any authoritative summary
+    # that appears elsewhere in the output rather than short-circuit past it.
+    zero_coverage = False
+    # 'Ran 0 tests' + 'FAILED (...)' is a setup-phase failure, not zero
+    # coverage: nothing ran AND something errored. Sticky and checked last,
+    # so a skip summary appearing before OR after it cannot resurrect the
+    # all-skipped verdict -- unlike `zero_coverage`, getting this one wrong
+    # would hide a failure rather than lose coverage.
+    setup_failed = False
     for idx, line in enumerate(lines):
         ran = _parse_unittest_counts(line)
-        if ran is None or ran == 0:
+        if ran is None:
             continue
         # The summary line follows 'Ran N tests' (possibly after blank
         # lines) and is matched at column 0 (see the spoofing caveat above).
+        if ran == 0:
+            # setUpClass/setUpModule-level skip shape: 'Ran 0 tests'
+            # immediately followed by 'OK (skipped=N)' with N >= 1. unittest
+            # records ONE skip for the whole class, not one per test method
+            # (suite._addClassOrModuleLevelException adds a single
+            # _ErrorHolder), so a 5-method class still prints 'skipped=1'.
+            # Either way the equality rule below cannot match here, because
+            # skipped >= 1 > 0 == ran. Any skipped >= 1 with no other summary
+            # item is zero coverage. Anything else at ran == 0 stays
+            # undecided and scanning continues, as before.
+            for tail in lines[idx + 1 :]:
+                if not tail.strip():
+                    continue
+                if re.match(r"^FAILED \(", tail):
+                    setup_failed = True
+                    break
+                m = re.match(r"^OK \(([^)]*)\)", tail)
+                if m:
+                    items = [item.strip() for item in m.group(1).split(",")]
+                    sk = (
+                        re.fullmatch(r"skipped=(\d+)", items[0])
+                        if len(items) == 1
+                        else None
+                    )
+                    if sk is not None and int(sk.group(1)) >= 1:
+                        zero_coverage = True
+                break
+            continue
         for tail in lines[idx + 1 :]:
             if not tail.strip():
                 continue
@@ -147,7 +189,9 @@ def _is_all_tests_skipped(output: str) -> bool:
             break
         return False
     # pytest: the last summary line carrying outcome counts decides; it is
-    # all-skipped only when that line reports skips and nothing else.
+    # all-skipped only when that line reports skips and nothing else. Checked
+    # before `zero_coverage` for the same reason: a real pytest summary beats a
+    # bare 'Ran 0 tests' shape.
     for line in reversed(lines):
         counts = _parse_pytest_counts(line)
         if counts:
@@ -155,7 +199,7 @@ def _is_all_tests_skipped(output: str) -> bool:
                 counts.get("skipped", 0) > 0
                 and sum(v for k, v in counts.items() if k != "skipped") == 0
             )
-    return False
+    return zero_coverage and not setup_failed
 
 
 def run_with_timeout(
@@ -329,13 +373,9 @@ def run_unittest_files(
                     timeout=timeout_per_file,
                 )
 
-                if ret_code == 0 or ret_code == 5:
+                if ret_code == 0:
                     file_passed = True
-                    if ret_code == 5:
-                        logger.info(
-                            f"\n⊘ SKIPPED (no tests collected): {filename}\n"
-                        )
-                    elif report_all_skipped and _is_all_tests_skipped(
+                    if report_all_skipped and _is_all_tests_skipped(
                         "".join(output_lines)
                     ):
                         # Exited 0 but contributed zero coverage. Not a
