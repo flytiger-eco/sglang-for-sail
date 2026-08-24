@@ -17,7 +17,6 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -125,7 +124,6 @@ def assert_memory_increased(before_mb, after_mb, step_name):
     )
 
 
-@skip_if_model_missing("meta-llama/Llama-3.2-1B")
 class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
     @classmethod
     def setUpClass(cls):

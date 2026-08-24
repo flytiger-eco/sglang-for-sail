@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -246,7 +245,6 @@ class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.90)
 
 
-@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -319,7 +317,6 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.87)
 
 
-@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

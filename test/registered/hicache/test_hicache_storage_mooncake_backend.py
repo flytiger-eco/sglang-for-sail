@@ -13,7 +13,6 @@ import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -31,7 +30,6 @@ register_ppu_ci(
 )
 
 
-@skip_if_model_missing("lmsys/sglang-ci-dsv3-test")
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
 
@@ -270,7 +268,6 @@ class TestMooncakeBackendMLAModel(
 
 
 @unittest.skipUnless(get_gpu_count() >= 2, "Requires at least 2 CUDA GPUs for TP2+CP2")
-@skip_if_model_missing("Qwen/Qwen3-30B-A3B-FP8")
 class TestMooncakeBackendQwen330BCP2(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):

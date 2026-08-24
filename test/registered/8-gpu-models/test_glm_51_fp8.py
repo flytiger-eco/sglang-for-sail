@@ -2,7 +2,6 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
@@ -34,7 +33,6 @@ MTP_ARGS = [
 ]
 
 
-@skip_if_no_fp8()
 class TestGlm51Fp8(unittest.TestCase):
     """GLM-5.1 FP8 on H200/B200 (8-GPU, tp=8)."""
 

@@ -6,7 +6,6 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.skip_utils import skip_if_no_fp8
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
 from sglang.test.test_utils import (
     DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST,
@@ -28,7 +27,6 @@ register_ppu_ci(
 )
 
 
-@skip_if_no_fp8()
 class TestMLA(CustomTestCase, MGSMEnMixin):
     mgsm_en_score_threshold = 0.8
 

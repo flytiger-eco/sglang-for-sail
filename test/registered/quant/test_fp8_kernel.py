@@ -18,7 +18,6 @@ register_ppu_ci(
 )
 
 from sglang.srt.utils import get_device, is_cuda, is_xpu
-from sglang.test.ci.skip_utils import skip_if_no_fp8
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
@@ -26,7 +25,6 @@ _is_xpu = is_xpu()
 device = get_device()
 
 
-@skip_if_no_fp8()
 class TestFP8Base(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -104,7 +102,6 @@ class TestFP8Base(CustomTestCase):
         return B, quant_B, scale
 
 
-@skip_if_no_fp8()
 class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
         if _is_cuda and torch.cuda.get_device_capability()[0] < 9:
@@ -122,7 +119,6 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
         assert diff_count / diff.numel() < 1e-4
 
 
-@skip_if_no_fp8()
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
         if _is_cuda and torch.cuda.get_device_capability()[0] < 9:

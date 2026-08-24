@@ -46,7 +46,6 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_ppu_ci,
 )
-from sglang.test.ci.skip_utils import model_exists, skip_if_model_missing
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -1607,11 +1606,6 @@ class TestDumperHttp:
         else:
             from sglang.test.test_utils import is_ppu_platform
 
-            if is_ppu_platform():
-                from sglang.test.ci.skip_utils import model_exists
-
-                if not model_exists("Qwen/Qwen3-0.6B"):
-                    pytest.skip("Qwen/Qwen3-0.6B not cached on PPU CI NAS")
             base_url = DEFAULT_URL_FOR_TEST
             env = {**os.environ, "DUMPER_SERVER_PORT": "reuse"}
             proc = popen_launch_server(
@@ -2155,7 +2149,6 @@ class _LayerWithNumber(torch.nn.Module):
         return self.linear(x)
 
 
-@skip_if_model_missing("Qwen/Qwen3-0.6B")
 class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
     """Tests for automatic layer_id context injection via set_ctx."""
 
@@ -2268,11 +2261,6 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
         assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
 
 
-@pytest.mark.skipif(
-    os.environ.get("PPU_SDK") is not None
-    and not model_exists("Qwen/Qwen3-0.6B"),
-    reason="Qwen/Qwen3-0.6B not cached on PPU CI NAS",
-)
 class TestDumperE2E:
     def test_step_and_non_intrusive_hooks(self, tmp_path):
         base_url = DEFAULT_URL_FOR_TEST
