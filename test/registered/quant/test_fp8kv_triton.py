@@ -3,8 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,10 +13,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=73, stage="extra-a", runner_config="1-gpu-large")
-register_ppu_ci(est_time=73, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV")
 class TestFP8KVCacheTritonBackend(CustomTestCase):
     @classmethod
     def setUpClass(cls):

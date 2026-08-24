@@ -8,8 +8,7 @@ import unittest
 
 import openai
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import *
 from sglang.test.vlm_utils import (
     AudioOpenAITestMixin,
@@ -21,20 +20,16 @@ from sglang.test.vlm_utils import (
 )
 
 register_cuda_ci(est_time=780, stage="base-b", runner_config="1-gpu-large")
-register_ppu_ci(est_time=780, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("lmms-lab/llava-onevision-qwen2-0.5b-ov")
 class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
 
 
-@skip_if_model_missing("LiquidAI/LFM2.5-VL-1.6B")
 class TestLfm2VlServer(ImageOpenAITestMixin):
     model = "LiquidAI/LFM2.5-VL-1.6B"
 
 
-@skip_if_model_missing("Qwen/Qwen2.5-VL-7B-Instruct")
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
     extra_args = [
@@ -42,13 +37,11 @@ class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("Qwen/Qwen3-VL-30B-A3B-Instruct")
 class TestQwen3VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     extra_args = ["--cuda-graph-max-bs=4"]
 
 
-@skip_if_model_missing("Qwen/Qwen3-Omni-30B-A3B-Instruct")
 class TestQwen3OmniServer(OmniOpenAITestMixin):
     model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     extra_args = [  # workaround to fit into H100
@@ -59,7 +52,6 @@ class TestQwen3OmniServer(OmniOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("Qwen/Qwen2-VL-7B-Instruct")
 class TestQwen2VLContextLengthServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -121,7 +113,6 @@ class TestQwen2VLContextLengthServer(CustomTestCase):
 #     model = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 
 
-@skip_if_model_missing("OpenGVLab/InternVL2_5-2B")
 class TestInternVL25Server(ImageOpenAITestMixin):
     model = "OpenGVLab/InternVL2_5-2B"
     extra_args = [
@@ -129,7 +120,6 @@ class TestInternVL25Server(ImageOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("openbmb/MiniCPM-V-4")
 class TestMiniCPMV4Server(ImageOpenAITestMixin):
     model = "openbmb/MiniCPM-V-4"
     extra_args = [
@@ -137,7 +127,6 @@ class TestMiniCPMV4Server(ImageOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("openbmb/MiniCPM-o-2_6")
 class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     model = "openbmb/MiniCPM-o-2_6"
     extra_args = [
@@ -145,7 +134,6 @@ class TestMiniCPMo26Server(ImageOpenAITestMixin, AudioOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("google/gemma-3-4b-it")
 class TestGemma3itServer(ImageOpenAITestMixin):
     model = "google/gemma-3-4b-it"
     extra_args = [
@@ -153,7 +141,6 @@ class TestGemma3itServer(ImageOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("moonshotai/Kimi-VL-A3B-Instruct")
 class TestKimiVLServer(ImageOpenAITestMixin):
     model = "moonshotai/Kimi-VL-A3B-Instruct"
     extra_args = [
@@ -169,7 +156,6 @@ class TestKimiVLServer(ImageOpenAITestMixin):
 @unittest.skip(
     "Disabling this test to speed up CI. Prefer to test it within nightly test."
 )
-@skip_if_model_missing("zai-org/GLM-4.1V-9B-Thinking")
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [
@@ -177,12 +163,10 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     ]
 
 
-@skip_if_model_missing("Qwen/Qwen2-Audio-7B-Instruct")
 class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
 
 
-@skip_if_model_missing("deepseek-ai/DeepSeek-OCR")
 class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
     model = "deepseek-ai/DeepSeek-OCR"
     trust_remote_code = False

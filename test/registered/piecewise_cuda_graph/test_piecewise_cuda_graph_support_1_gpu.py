@@ -5,12 +5,7 @@ import torch
 from sglang import Engine
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
@@ -24,10 +19,8 @@ from sglang.test.test_utils import (
 # CI Registration
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-large-amd")
-register_ppu_ci(est_time=180, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("Qwen/Qwen2.5-VL-7B-Instruct")
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     """Test piecewise CUDA graph with Qwen2.5-VL-7B-Instruct model"""
 
@@ -64,7 +57,6 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.80)
 
 
-@skip_if_model_missing("Qwen/Qwen2.5-VL-3B-Instruct")
 class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
     """Test piecewise CUDA graph with Qwen2.5-VL-3B-Instruct embedding model"""
 

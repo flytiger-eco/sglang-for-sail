@@ -3,15 +3,12 @@ import unittest
 from huggingface_hub import hf_hub_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(est_time=76, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("Qwen/Qwen2-1.5B-Instruct-GGUF")
 class TestGGUF(CustomTestCase):
     def test_models(self):
         prompt = "Today is a sunny day and I like"

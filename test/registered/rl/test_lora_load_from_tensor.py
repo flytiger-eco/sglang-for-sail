@@ -7,17 +7,11 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 import sglang as sgl
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=102, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=102, suite="nightly-1-ppu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LORA_REPO = "charent/self_cognition_Alice"
@@ -28,7 +22,6 @@ EXPECTED_OUTPUT = (
 MAX_NEW_TOKENS = 16
 
 
-@skip_if_model_missing("charent/self_cognition_Alice")
 class TestLoRALoadFromTensor(CustomTestCase):
     @classmethod
     def setUpClass(cls):

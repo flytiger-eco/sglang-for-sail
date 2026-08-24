@@ -4,12 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,10 +18,8 @@ from sglang.test.test_utils import (
 # Sliding window attention with Triton backend (Gemma-3 model)
 register_cuda_ci(est_time=93, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=93, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("google/gemma-3-4b-it")
 class TestSlidingWindowAttentionTriton(CustomTestCase):
     """Test sliding window attention functionality with triton backend."""
 

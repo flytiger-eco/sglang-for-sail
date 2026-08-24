@@ -6,15 +6,12 @@ test_pcg_with_speculative_decoding.py.
 
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.pcg_spec_fixture import PCGSpecBase
 
 register_cuda_ci(est_time=531, stage="extra-a", runner_config="2-gpu-large")
-register_ppu_ci(est_time=531, suite="nightly-2-ppu", nightly=True)
 
 
-@skip_if_model_missing("Qwen/Qwen3.5-35B-A3B")
 class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
     """PCG + MTP (NEXTN) on Qwen3.5-35B-A3B with FP8."""
 
@@ -39,7 +36,6 @@ class TestPCGWithMTP(PCGSpecBase, unittest.TestCase):
     accuracy_threshold = 0.75
 
 
-@skip_if_model_missing("meta-llama/Llama-3.2-1B-Instruct")
 class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):
     """PCG + STANDALONE on Llama-3.1-8B-Instruct + Llama-3.2-1B-Instruct."""
 
@@ -63,7 +59,6 @@ class TestPCGWithSTANDALONE(PCGSpecBase, unittest.TestCase):
     accuracy_threshold = 0.50
 
 
-@skip_if_model_missing("Qwen/Qwen2.5-Coder-7B-Instruct")
 class TestPCGWithNGRAM(PCGSpecBase, unittest.TestCase):
     """PCG + NGRAM on Qwen2.5-Coder-7B-Instruct."""
 

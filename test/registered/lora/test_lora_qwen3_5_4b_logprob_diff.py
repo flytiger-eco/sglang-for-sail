@@ -31,12 +31,10 @@ import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="extra-a", runner_config="1-gpu-large")
-register_ppu_ci(est_time=90, suite="nightly-1-ppu", nightly=True)
 
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 LORA_HF_REPO = "opherlie/lora-test-case-Qwen3.5-4B"
@@ -70,7 +68,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
-@skip_if_model_missing("Qwen/Qwen3.5-4B")
 class TestLoRAQwen3_5_4BLogprobDiff(CustomTestCase):
 
     def test_lora_qwen3_5_4b_logprob_accuracy(self):

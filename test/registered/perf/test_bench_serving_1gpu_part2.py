@@ -5,12 +5,7 @@ Works on 5090 (32GB).
 
 import unittest
 
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE,
@@ -26,11 +21,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=968, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=900, suite="stage-b-test-1-gpu-large-amd")
-register_ppu_ci(est_time=968, suite="nightly-1-ppu", nightly=True)
 
 
 class TestBenchServing1GPUPart2(CustomTestCase):
-    @skip_if_model_missing(DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST)
     def test_vlm_offline_throughput(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
@@ -54,7 +47,6 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
-    @skip_if_model_missing(DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST)
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
@@ -79,7 +71,6 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
 
-    @skip_if_model_missing(DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE)
     def test_score_api_latency_throughput(self):
         """Test score API latency and throughput performance"""
         res = run_score_benchmark(
@@ -104,7 +95,6 @@ class TestBenchServing1GPUPart2(CustomTestCase):
         self.assertLess(res["p95_latency_ms"], 50)
         self.assertGreater(res["throughput"], 20)
 
-    @skip_if_model_missing(DEFAULT_SMALL_MODEL_NAME_FOR_TEST_SCORE)
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
         batch_sizes = [10, 25, 50]

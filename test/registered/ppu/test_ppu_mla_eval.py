@@ -18,7 +18,13 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_ppu_ci(est_time=480, suite="nightly-2-ppu", nightly=True)
+register_ppu_ci(
+    est_time=480,
+    suite="nightly-2-ppu",
+    nightly=True,
+    disabled="setUpClass ERROR: server killed by SIGKILL (code -9), most likely OOM. "
+    "Model DEFAULT_MLA_MODEL_NAME_FOR_TEST, TP=2.",
+)
 
 PPU_MLA_MODEL = os.environ.get(
     "PPU_MLA_MODEL_PATH",

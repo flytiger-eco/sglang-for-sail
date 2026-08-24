@@ -31,12 +31,10 @@ import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")
-register_ppu_ci(est_time=100, suite="nightly-4-ppu", nightly=True)
 
 BASE_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 LORA_HF_REPO = "opherlie/lora-test-case-NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -74,7 +72,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
-@skip_if_model_missing("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16")
 class TestLoRANemotron3Super120B_A12B_LogprobDiff(CustomTestCase):
 
     def test_lora_nemotron_3_super_120b_a12b_logprob_accuracy(self):

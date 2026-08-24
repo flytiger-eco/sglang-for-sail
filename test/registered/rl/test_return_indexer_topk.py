@@ -9,8 +9,7 @@ from sglang.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -19,7 +18,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=270, stage="extra-b", runner_config="8-gpu-h200")
-register_ppu_ci(est_time=270, suite="nightly-8-ppu", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -34,7 +32,6 @@ INDEX_TOPK_FREQ = 2
 logger = logging.getLogger(__name__)
 
 
-@skip_if_model_missing("deepseek-ai/DeepSeek-V3.2")
 class TestReturnIndexerTopk(CustomTestCase):
     """Indexer-topk capture e2e test for DSv3.2 (DSA).
 

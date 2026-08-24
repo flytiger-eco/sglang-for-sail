@@ -3,9 +3,8 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.ci.ci_stress_utils import StressTestRunner
-from sglang.test.ci.skip_utils import skip_if_model_missing
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "zai-org/GLM-4.6"
@@ -15,10 +14,8 @@ OUTPUT_FILE = "stress_test_glm_4_6.jsonl"
 
 # Register for CI - estimated 45 minutes
 register_cuda_ci(est_time=2700, suite="stress")
-register_ppu_ci(est_time=2700, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("zai-org/GLM-4.6")
 class TestStressGLM46(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

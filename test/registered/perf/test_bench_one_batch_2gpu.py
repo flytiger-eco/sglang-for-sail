@@ -1,11 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
@@ -18,10 +13,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=209, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=630, suite="stage-b-test-2-gpu-large-amd")
-register_ppu_ci(est_time=209, suite="nightly-2-ppu", nightly=True)
 
 
-@skip_if_model_missing("mistralai/Mixtral-8x7B-Instruct-v0.1")
 class TestBenchOneBatch2GPU(CustomTestCase):
 
     def test_moe_tp2_bs1(self):

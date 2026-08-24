@@ -31,12 +31,10 @@ import torch
 from huggingface_hub import snapshot_download
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
-register_ppu_ci(est_time=90, suite="nightly-4-ppu", nightly=True)
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
@@ -68,7 +66,6 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
-@skip_if_model_missing("lmsys/gpt-oss-20b-bf16")
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
 
     def test_lora_gpt_oss_20b_logprob_accuracy(self):

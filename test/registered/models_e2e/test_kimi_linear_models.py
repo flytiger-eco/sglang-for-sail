@@ -2,8 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,10 +12,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=178, stage="base-b", runner_config="2-gpu-large")
-register_ppu_ci(est_time=178, suite="nightly-2-ppu", nightly=True)
 
 
-@skip_if_model_missing("moonshotai/Kimi-Linear-48B-A3B-Instruct")
 class TestKimiLinear(CustomTestCase):
     @classmethod
     def setUpClass(cls):

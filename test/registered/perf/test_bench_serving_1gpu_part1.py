@@ -9,12 +9,7 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -26,10 +21,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=1210, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-large-amd")
-register_ppu_ci(est_time=1210, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("faridlazuarda/valadapt-llama-3.1-8B-it-chinese")
 class TestBenchServing1GPUPart1(CustomTestCase):
     def test_offline_throughput_default(self):
         res = run_bench_serving(

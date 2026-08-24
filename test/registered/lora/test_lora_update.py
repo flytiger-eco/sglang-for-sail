@@ -23,8 +23,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -40,7 +39,6 @@ register_cuda_ci(
     stage="base-b",
     runner_config="1-gpu-large",
 )
-register_ppu_ci(est_time=487, suite="nightly-1-ppu", nightly=True)
 
 PROMPTS = [
     "SGL is a",
@@ -1096,7 +1094,6 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         return output
 
 
-@skip_if_model_missing("nvidia/llama-3.1-nemoguard-8b-topic-control")
 class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
     """
     Context manager for testing LoRA adapters with standalone server.
@@ -1292,7 +1289,6 @@ def LoRAUpdateTestSession(
         raise ValueError(f"Unrecognized mode: {mode!r}")
 
 
-@skip_if_model_missing("nvidia/llama-3.1-nemoguard-8b-topic-control")
 class TestLoRADynamicUpdate(CustomTestCase):
     """
     This test case verifies that the SRT runner can dynamically load and unload LoRA adapters

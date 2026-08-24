@@ -5,8 +5,7 @@ import openai
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import gen_radix_tree
@@ -20,11 +19,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(est_time=302, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat")
-@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64
     attention_backend = "flashinfer"

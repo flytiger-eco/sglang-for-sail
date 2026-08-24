@@ -46,13 +46,11 @@ except ImportError:
 
 from transformers import AutoModelForCausalLM
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
-register_ppu_ci(est_time=120, suite="nightly-1-ppu", nightly=True)
 
 # Use a small model with tie_word_embeddings=True
 BASE_MODEL = "Qwen/Qwen2.5-0.5B"
@@ -128,7 +126,6 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
     torch.cuda.empty_cache()
 
 
-@skip_if_model_missing("Qwen/Qwen2.5-0.5B")
 class TestLoRATiedLMHead(CustomTestCase):
     """
     Test that LoRA works correctly on models with tied lm_head.

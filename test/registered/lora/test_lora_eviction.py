@@ -19,18 +19,12 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=263, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=263, suite="nightly-1-ppu", nightly=True)
 
 PROMPTS = [
     "AI is a field of computer science focused on",
@@ -60,7 +54,6 @@ def dynamically_loaded_adapter(runner, lora_path: str, lora_name: str):
         runner.unload_lora_adapter(lora_name=lora_name)
 
 
-@skip_if_model_missing("meta-llama/Meta-Llama-3.1-8B-Instruct")
 class TestLoRAEviction(CustomTestCase):
     def test_lora_eviction_with_different_target_modules(self):
         """

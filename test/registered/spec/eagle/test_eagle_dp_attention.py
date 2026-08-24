@@ -4,12 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -31,10 +26,8 @@ from sglang.test.test_utils import (
 # is gated to extra-b only.
 register_cuda_ci(est_time=99, stage="extra-b", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
-register_ppu_ci(est_time=99, suite="nightly-4-ppu", nightly=True)
 
 
-@skip_if_model_missing("Qwen/Qwen3-30B-A3B")
 class TestEAGLE3EngineDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
