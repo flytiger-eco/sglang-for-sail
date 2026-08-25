@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import acext
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
@@ -247,6 +246,10 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        # acext is a PPU-only extension; import lazily so that importing this
+        # module (e.g. on CPU CI runners) does not require it.
+        import acext
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
