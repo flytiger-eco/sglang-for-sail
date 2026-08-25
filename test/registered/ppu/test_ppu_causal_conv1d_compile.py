@@ -106,9 +106,7 @@ def test_causal_conv1d_update_compiles(variant, itype):
 
     if variant == "plain":
         x = torch.randn(BATCH_SIZE, DIM, SEQLEN, device=device, dtype=itype)
-        conv_state = torch.randn(
-            BATCH_SIZE, DIM, WIDTH - 1, device=device, dtype=itype
-        )
+        conv_state = torch.randn(BATCH_SIZE, DIM, WIDTH - 1, device=device, dtype=itype)
         out = causal_conv1d_update(x, conv_state, weight, None, activation=None)
         assert out.shape == x.shape
         return
@@ -132,9 +130,7 @@ def test_causal_conv1d_update_compiles(variant, itype):
     padded_state_indices = torch.concat(
         [
             conv_state_indices,
-            torch.as_tensor(
-                [PAD_SLOT_ID] * padding, dtype=torch.int32, device=device
-            ),
+            torch.as_tensor([PAD_SLOT_ID] * padding, dtype=torch.int32, device=device),
         ],
         dim=0,
     )

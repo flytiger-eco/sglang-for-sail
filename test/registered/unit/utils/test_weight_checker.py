@@ -1,4 +1,5 @@
 import os
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -239,7 +240,10 @@ class TestPostprocessTensors(CustomTestCase):
 
     # --- fp8 quant pair (real dequant on real fp8 tensors) ---
 
-    @unittest.skipIf(os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1", "PPU does not support fp8")
+    @unittest.skipIf(
+        os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1",
+        "PPU does not support fp8",
+    )
     def test_fp8_quant_pair_with_int32_scale_dequants_via_ue8m0(self):
         qweight, sf_fp32, sf_packed_int32 = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_packed_int32}
@@ -258,7 +262,10 @@ class TestPostprocessTensors(CustomTestCase):
             ],
         )
 
-    @unittest.skipIf(os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1", "PPU does not support fp8")
+    @unittest.skipIf(
+        os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1",
+        "PPU does not support fp8",
+    )
     def test_fp8_quant_pair_with_fp32_scale_dequants_directly(self):
         qweight, sf_fp32, _ = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
@@ -275,7 +282,10 @@ class TestPostprocessTensors(CustomTestCase):
             ],
         )
 
-    @unittest.skipIf(os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1", "PPU does not support fp8")
+    @unittest.skipIf(
+        os.environ.get("PPU_SDK") and os.environ.get("PPU_SUPPORTS_FP8", "0") != "1",
+        "PPU does not support fp8",
+    )
     def test_fp8_quant_pair_yield_order_alongside_other_entries(self):
         qweight, sf_fp32, _ = _build_fp8_quant_pair()
         bias = torch.ones(4, device="cuda")

@@ -2,7 +2,12 @@
 
 from sglang.test.ci.ci_register import register_ppu_ci
 
-register_ppu_ci(est_time=10, suite="nightly-1-ppu", nightly=True, disabled="PPU-only kernel test; not yet enabled in CI")
+register_ppu_ci(
+    est_time=10,
+    suite="nightly-1-ppu",
+    nightly=True,
+    disabled="PPU-only kernel test; not yet enabled in CI",
+)
 
 import sys
 

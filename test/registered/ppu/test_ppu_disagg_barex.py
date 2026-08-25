@@ -33,7 +33,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 register_ppu_ci(est_time=115, suite="nightly-2-ppu", nightly=True)
 
 # Same small model as test_ppu_basic.py: known to load on the PPU runners.
-PPU_CI_MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/"
+PPU_CI_MODEL_PATH = (
+    "/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/"
+)
 
 _FIC2_NIC_SYSFS = "/sys/class/infiniband/fic2_soe_bond0"
 

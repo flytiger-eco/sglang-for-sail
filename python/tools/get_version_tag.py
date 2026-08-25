@@ -92,7 +92,12 @@ def get_exact_version_tag() -> str:
     """Return the version tag name if HEAD has an exact version tag, or empty string."""
     return run_git(
         # "describe", "--tags", "--exact-match", "--match", "v*", allow_failure=True
-        "describe", "--tags", "--exact-match", "--match", "*", allow_failure=True
+        "describe",
+        "--tags",
+        "--exact-match",
+        "--match",
+        "*",
+        allow_failure=True,
     )
 
 

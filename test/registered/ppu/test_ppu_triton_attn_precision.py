@@ -49,7 +49,6 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd_unified,
 )
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
