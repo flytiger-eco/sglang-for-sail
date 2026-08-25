@@ -45,21 +45,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
 
       - name: Run PPU nightly tests (1-GPU, partition 1/2)
         timeout-minutes: 110
@@ -121,21 +113,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
 
       - name: Run PPU nightly tests (1-GPU, partition 2/2)
         # 125 rather than 110: observed 95min warm-cache, and the worst case (1500s
@@ -198,21 +182,12 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct
 
       - name: Run 2-GPU PPU nightly tests
         timeout-minutes: 140
@@ -267,21 +242,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
 
       - name: Run 4-GPU PPU nightly tests
         timeout-minutes: 170
@@ -335,21 +299,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct
 
       - name: Run 8-GPU PPU nightly tests
         timeout-minutes: 280
