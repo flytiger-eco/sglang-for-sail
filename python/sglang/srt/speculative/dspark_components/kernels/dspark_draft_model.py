@@ -252,7 +252,11 @@ def commit_kv_proj_fused(
             input=main_x,
             weight=stacked.weight,
             block_size=quant_method.quant_config.weight_block_size,
-            weight_scale=stacked.fp8_scale,
+            weight_scale=(
+                stacked.fp8_scale.contiguous()
+                if stacked.fp8_scale is not None
+                else None
+            ),
             input_scale=None,
             bias=None,
         )
