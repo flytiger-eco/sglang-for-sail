@@ -1446,27 +1446,13 @@
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
-    },
-    "tianleMTL": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
-    },
-    "seeuswk": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
+        "reason": "PPU CI maintainer"
     },
     "Vinsmoke86": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "PPU CI trial developer"
+        "cooldown_interval_minutes": 60,
+        "reason": "PPU CI trial user"
     }
 }
