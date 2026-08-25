@@ -161,7 +161,7 @@ class TestDefaultExpName:
 
     def test_suffix_format(self):
         name = _get_default_exp_name(timeout_seconds=5)
-        suffix = name[len("dump_"):]
+        suffix = name[len("dump_") :]
         assert len(suffix) == 22
         assert suffix[8] == "_"
 
@@ -261,8 +261,7 @@ class TestDumperPureFunctions:
     def test_get_truncated_value(self):
         assert get_truncated_value(None) is None
         assert get_truncated_value(42) == 42
-        assert len(get_truncated_value(
-            (torch.randn(10), torch.randn(20)))) == 2
+        assert len(get_truncated_value((torch.randn(10), torch.randn(20)))) == 2
         assert get_truncated_value(torch.randn(10, 10)).shape == (10, 10)
         assert get_truncated_value(torch.randn(100, 100)).shape == (5, 5)
 
@@ -332,8 +331,7 @@ class TestMapTensor:
 
     def test_nested_dict(self):
         inner_t = torch.randn(3)
-        value = {"outer": {"inner": inner_t,
-                           "label": "ok"}, "top": torch.randn(2)}
+        value = {"outer": {"inner": inner_t, "label": "ok"}, "top": torch.randn(2)}
         result = _map_tensor(value, lambda x: x.clone())
         assert torch.equal(result["outer"]["inner"], inner_t)
         assert result["outer"]["inner"] is not inner_t
@@ -488,16 +486,14 @@ class TestDumperDistributed:
         dumper.configure(filter=None)
         dumper.step()
 
-        dumper.dump_dict("obj", {"a": torch.randn(
-            3, device=f"cuda:{rank}"), "b": 42})
+        dumper.dump_dict("obj", {"a": torch.randn(3, device=f"cuda:{rank}"), "b": 42})
         dumper.step()
 
         dist.barrier()
         filenames = _get_filenames(tmpdir)
         _assert_files(
             filenames,
-            exist=["tensor_a", "tensor_b", "arg=100",
-                   "ctx_arg=200", "obj_a", "obj_b"],
+            exist=["tensor_a", "tensor_b", "arg=100", "ctx_arg=200", "obj_a", "obj_b"],
             not_exist=["tensor_skip"],
         )
 
@@ -531,8 +527,7 @@ class TestDumperDistributed:
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
-            run_distributed_test(
-                self._test_file_content_func, tmpdir=str(tmp_path))
+            run_distributed_test(self._test_file_content_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_file_content_func(rank, tmpdir):
@@ -580,13 +575,11 @@ class TestDumperFileWriteControl:
             DUMPER_ENABLE="1",
             DUMPER_DIR=str(tmp_path),
         ):
-            run_distributed_test(
-                self._test_save_false_func, tmpdir=str(tmp_path))
+            run_distributed_test(self._test_save_false_func, tmpdir=str(tmp_path))
 
     @staticmethod
     def _test_save_false_func(rank, tmpdir):
-        dumper.dump("no_save_tensor", torch.randn(
-            5, device=f"cuda:{rank}"), save=False)
+        dumper.dump("no_save_tensor", torch.randn(5, device=f"cuda:{rank}"), save=False)
         dumper.step()
 
         dist.barrier()
@@ -847,8 +840,7 @@ class TestDumpGrad:
         y.backward()
 
         filenames = _get_filenames(tmp_path)
-        assert any(
-            "name=test_tensor" in f and "grad__" not in f for f in filenames)
+        assert any("name=test_tensor" in f and "grad__" not in f for f in filenames)
         _assert_files(filenames, exist=["grad__test_tensor"])
 
     def test_dump_grad_non_tensor_skipped(self, tmp_path):
@@ -954,19 +946,16 @@ class TestKvFilter:
         _assert_files(filenames, exist=["keep_this"], not_exist=["skip_this"])
 
     def test_filter_expr_range(self, tmp_path):
-        d = _make_test_dumper(
-            tmp_path, filter="layer_id is not None and layer_id < 3")
+        d = _make_test_dumper(tmp_path, filter="layer_id is not None and layer_id < 3")
         d.dump("t0", torch.randn(3), layer_id=0)
         d.dump("t1", torch.randn(3), layer_id=1)
         d.dump("t5", torch.randn(3), layer_id=5)
 
         filenames = _get_filenames(tmp_path)
-        _assert_files(filenames, exist=[
-                      "name=t0", "name=t1"], not_exist=["name=t5"])
+        _assert_files(filenames, exist=["name=t0", "name=t1"], not_exist=["name=t5"])
 
     def test_filter_expr_with_none(self, tmp_path):
-        d = _make_test_dumper(
-            tmp_path, filter="layer_id is None or layer_id < 3")
+        d = _make_test_dumper(tmp_path, filter="layer_id is None or layer_id < 3")
         d.dump("no_layer", torch.randn(3))
         d.dump("layer0", torch.randn(3), layer_id=0)
         d.dump("layer5", torch.randn(3), layer_id=5)
@@ -1148,8 +1137,7 @@ class TestParallelRankInFilename:
 
     def test_config_from_kv_pairs(self):
         """include_parallel_rank_in_filename is parsed as a bool from kv pairs."""
-        cfg = DumperConfig.from_kv_pairs(
-            ["include_parallel_rank_in_filename=true"])
+        cfg = DumperConfig.from_kv_pairs(["include_parallel_rank_in_filename=true"])
         assert cfg.include_parallel_rank_in_filename is True
 
     def test_collect_tags_merges_keys_across_plugins(self, monkeypatch):
@@ -1174,12 +1162,10 @@ class TestParallelRankInFilename:
     def test_collect_tags_first_plugin_wins_on_conflict(self, monkeypatch):
         """When two plugins report the same rank key, the first plugin wins."""
         plugin_a = type(
-            "PluginA", (), {
-                "collect_parallel_info": lambda self: {"pp_rank": 1}}
+            "PluginA", (), {"collect_parallel_info": lambda self: {"pp_rank": 1}}
         )()
         plugin_b = type(
-            "PluginB", (), {
-                "collect_parallel_info": lambda self: {"pp_rank": 7}}
+            "PluginB", (), {"collect_parallel_info": lambda self: {"pp_rank": 7}}
         )()
         monkeypatch.setattr(
             "sglang.srt.debug_utils.dumper._plugins", [plugin_a, plugin_b]
@@ -1193,12 +1179,10 @@ class TestParallelRankInFilename:
             "PluginEmpty", (), {"collect_parallel_info": lambda self: {}}
         )()
         plugin_real = type(
-            "PluginReal", (), {
-                "collect_parallel_info": lambda self: {"tp_rank": 4}}
+            "PluginReal", (), {"collect_parallel_info": lambda self: {"tp_rank": 4}}
         )()
         monkeypatch.setattr(
-            "sglang.srt.debug_utils.dumper._plugins", [
-                plugin_empty, plugin_real]
+            "sglang.srt.debug_utils.dumper._plugins", [plugin_empty, plugin_real]
         )
 
         assert _collect_parallel_rank_tags() == {"tp_rank": 4}
@@ -1211,8 +1195,7 @@ class TestParallelRankInFilename:
             lambda self: {"pp_rank": 2, "tp_rank": 3},
         )
 
-        d = _make_test_dumper(
-            tmp_path, include_parallel_rank_in_filename=False)
+        d = _make_test_dumper(tmp_path, include_parallel_rank_in_filename=False)
         d.dump("hidden", torch.randn(3))
 
         filenames = _get_filenames(tmp_path)
@@ -1239,8 +1222,7 @@ class TestTransformModelParamName:
         """The default plugin hook keeps the original name (returns None)."""
         plugin = _SGLangPlugin()
         assert (
-            plugin.transform_model_param_name(
-                torch.nn.Linear(2, 2), "layers.0.weight")
+            plugin.transform_model_param_name(torch.nn.Linear(2, 2), "layers.0.weight")
             is None
         )
 
@@ -1264,8 +1246,7 @@ class TestTransformModelParamName:
                 r"layers\.(\d+)", lambda m: f"layers.{int(m.group(1)) + 4}", param_name
             )
 
-        monkeypatch.setattr(
-            _SGLangPlugin, "transform_model_param_name", _shift_layers)
+        monkeypatch.setattr(_SGLangPlugin, "transform_model_param_name", _shift_layers)
 
         model = torch.nn.Module()
         model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2, bias=False)])
@@ -1285,8 +1266,7 @@ class TestTransformModelParamName:
         """_get_model_config peels nested .module wrappers to find .config."""
         config = object()
         leaf = type("Leaf", (), {"config": config})()
-        wrapped = type("W", (), {"module": type(
-            "W2", (), {"module": leaf})()})()
+        wrapped = type("W", (), {"module": type("W2", (), {"module": leaf})()})()
         assert _MegatronPlugin._get_model_config(wrapped) is config
 
     def test_get_model_config_returns_none_when_absent(self):
@@ -1321,30 +1301,26 @@ class TestMegatronTransformModelParamName:
     def test_remaps_local_layer_index_to_global(self):
         """layers.N is shifted by the PP-stage offset; other tokens untouched."""
         plugin = _MegatronPlugin()
-        result = plugin.transform_model_param_name(
-            object(), "decoder.layers.0.weight")
+        result = plugin.transform_model_param_name(object(), "decoder.layers.0.weight")
         assert result == "decoder.layers.4.weight"
 
     def test_remaps_all_layer_occurrences(self):
         """Every ``layers.N`` occurrence in the name is shifted."""
         plugin = _MegatronPlugin()
-        result = plugin.transform_model_param_name(
-            object(), "layers.1.x.layers.2.y")
+        result = plugin.transform_model_param_name(object(), "layers.1.x.layers.2.y")
         assert result == "layers.5.x.layers.6.y"
 
     def test_returns_none_when_not_available(self, monkeypatch):
         """No transform when megatron is unavailable."""
         monkeypatch.setattr(_MegatronPlugin, "_available", False)
         plugin = _MegatronPlugin()
-        assert plugin.transform_model_param_name(
-            object(), "layers.0.weight") is None
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
 
     def test_returns_none_when_pp_size_one(self, monkeypatch):
         """No transform without pipeline parallelism (pp_size == 1)."""
         monkeypatch.setattr(_FakeMpu, "_pp_size", 1)
         plugin = _MegatronPlugin()
-        assert plugin.transform_model_param_name(
-            object(), "layers.0.weight") is None
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
         monkeypatch.setattr(_FakeMpu, "_pp_size", 2)
 
     def test_returns_none_when_offset_zero(self, monkeypatch):
@@ -1355,8 +1331,7 @@ class TestMegatronTransformModelParamName:
             staticmethod(lambda config: 0),
         )
         plugin = _MegatronPlugin()
-        assert plugin.transform_model_param_name(
-            object(), "layers.0.weight") is None
+        assert plugin.transform_model_param_name(object(), "layers.0.weight") is None
 
 
 class TestCleanup:
@@ -1377,8 +1352,7 @@ class TestCleanup:
         old_exp_dir.mkdir()
         (old_exp_dir / "old_data.pt").touch()
 
-        dumper = _make_test_dumper(
-            tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
         dumper.dump("new_tensor", torch.randn(3, 3))
 
         assert not (tmp_path / exp_name / "old_data.pt").exists()
@@ -1394,8 +1368,7 @@ class TestCleanup:
         old_exp.mkdir()
         (old_exp / "stale.pt").touch()
 
-        dumper = _make_test_dumper(
-            tmp_path, exp_name=exp_name, cleanup_previous=True)
+        dumper = _make_test_dumper(tmp_path, exp_name=exp_name, cleanup_previous=True)
         dumper.dump("new_tensor", torch.randn(3, 3))
 
         assert not old_dump.exists()
@@ -1448,8 +1421,7 @@ class TestReset:
         (tmp_path / exp_beta).mkdir()
         (tmp_path / exp_beta / "stale.pt").touch()
 
-        d = _make_test_dumper(
-            tmp_path, exp_name=exp_alpha, cleanup_previous=True)
+        d = _make_test_dumper(tmp_path, exp_name=exp_alpha, cleanup_previous=True)
         d.dump("phase1", torch.randn(2, 2))
 
         d.reset()
@@ -1647,8 +1619,7 @@ class TestDumperHttp:
 
     @staticmethod
     def _post(base_url: str, method: str, **kwargs) -> list[dict]:
-        resp = requests.post(
-            f"{base_url}/dumper/{method}", json=kwargs or None)
+        resp = requests.post(f"{base_url}/dumper/{method}", json=kwargs or None)
         resp.raise_for_status()
         states = resp.json()
         assert isinstance(states, list) and len(states) >= 1
@@ -2025,8 +1996,7 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
             model(x)
 
         for key in captured:
-            assert not key.startswith(
-                "non_intrusive__."), f"malformed key: {key}"
+            assert not key.startswith("non_intrusive__."), f"malformed key: {key}"
             assert ".." not in key, f"double dot in key: {key}"
 
         assert "non_intrusive__output" in captured
@@ -2280,14 +2250,12 @@ class TestNonIntrusiveLayerIdCtx(_NonIntrusiveTestBase):
                     x = layer(x)
                 return x
 
-        captured, x, output = self._run(
-            tmp_path, Inner, filter="layer_id == 0")
+        captured, x, output = self._run(tmp_path, Inner, filter="layer_id == 0")
 
         layer0_keys = [k for k in captured if "layers.0" in k]
         layer1_keys = [k for k in captured if "layers.1" in k]
         assert len(layer0_keys) > 0, "layer 0 dumps should be kept"
-        assert len(
-            layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
+        assert len(layer1_keys) == 0, f"layer 1 dumps should be filtered: {layer1_keys}"
 
 
 class TestDumperE2E:
@@ -2306,10 +2274,8 @@ class TestDumperE2E:
             env=env,
         )
         try:
-            states = requests.post(
-                f"{base_url}/dumper/get_state", json={}).json()
-            assert len(
-                states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
+            assert len(states) == 2, f"Expected 2 ranks (tp=2), got {len(states)}"
             for state in states:
                 assert state["config"]["enable"] is False
                 assert state["step"] == 0
@@ -2319,8 +2285,7 @@ class TestDumperE2E:
                 json={"enable": True, "dir": dump_dir},
             ).raise_for_status()
 
-            states = requests.post(
-                f"{base_url}/dumper/get_state", json={}).json()
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2
             for rank, state in enumerate(states):
                 assert (
@@ -2334,8 +2299,7 @@ class TestDumperE2E:
             )
             assert resp.status_code == 200, f"Generate failed: {resp.text}"
 
-            states = requests.post(
-                f"{base_url}/dumper/get_state", json={}).json()
+            states = requests.post(f"{base_url}/dumper/get_state", json={}).json()
             assert len(states) == 2
             steps = [s["step"] for s in states]
             for rank, step in enumerate(steps):
@@ -2358,10 +2322,8 @@ class TestDumperE2E:
                 ), f"No dump files for rank {rank}"
 
             sample_file = dump_files[0]
-            loaded = torch.load(
-                sample_file, map_location="cpu", weights_only=False)
-            assert isinstance(
-                loaded, dict), f"Expected dict, got {type(loaded)}"
+            loaded = torch.load(sample_file, map_location="cpu", weights_only=False)
+            assert isinstance(loaded, dict), f"Expected dict, got {type(loaded)}"
             assert (
                 "value" in loaded and "meta" in loaded
             ), f"Missing value/meta keys: {loaded.keys()}"
@@ -2507,8 +2469,7 @@ class TestPluginCoreFields:
     def test_megatron_core_fields(self):
         plugin = _MegatronPlugin()
         assert plugin.core_fields() == frozenset(
-            {"input_ids", "position_ids", "cu_seqlens_q",
-                "cu_seqlens_kv", "qkv_format"}
+            {"input_ids", "position_ids", "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
         )
 
 
@@ -2535,16 +2496,14 @@ class TestMegatronConvertValue:
         )
 
         result = plugin.convert_value(value, skip_forward_batch=False)
-        assert set(result.keys()) == {
-            "cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
+        assert set(result.keys()) == {"cu_seqlens_q", "cu_seqlens_kv", "qkv_format"}
         assert torch.equal(result["cu_seqlens_q"], cu_q)
         assert torch.equal(result["cu_seqlens_kv"], cu_kv)
         assert result["qkv_format"] == "thd"
 
     def test_non_packed_returns_none(self):
         plugin = _MegatronPlugin()
-        assert plugin.convert_value(torch.randn(
-            4), skip_forward_batch=False) is None
+        assert plugin.convert_value(torch.randn(4), skip_forward_batch=False) is None
         assert plugin.convert_value("hello", skip_forward_batch=False) is None
 
 
@@ -2673,8 +2632,7 @@ class TestDumperDims:
         )
 
         tensor = torch.randn(4, 8, requires_grad=True)
-        dumper.dump("hidden", tensor, dims="b h(tp)",
-                    dims_grad="b h(tp:partial)")
+        dumper.dump("hidden", tensor, dims="b h(tp)", dims_grad="b h(tp:partial)")
         dumper.step()
 
         tensor.backward(torch.ones_like(tensor))
@@ -2849,8 +2807,7 @@ class TestRecomputeStatus:
         d.dump("test_tensor", x)
         y.backward()
 
-        grad_files = [f for f in _get_filenames(
-            tmp_path) if "grad__test_tensor" in f]
+        grad_files = [f for f in _get_filenames(tmp_path) if "grad__test_tensor" in f]
         assert len(grad_files) == 1
         assert "recompute_status" not in grad_files[0]
 
@@ -2954,8 +2911,7 @@ class TestGrafterConfig:
 
     def test_env_name_for_grafter_field(self):
         assert (
-            DumperConfig._env_name(
-                "grafter_b2t_filter") == "DUMPER_GRAFTER_B2T_FILTER"
+            DumperConfig._env_name("grafter_b2t_filter") == "DUMPER_GRAFTER_B2T_FILTER"
         )
 
 
@@ -3050,8 +3006,7 @@ class TestGrafterFilterMatching:
         dict/list at some call sites) without silently masking the issue."""
         grafter = _Grafter(config=_unit_grafter_config())
         with _capture_stdout() as captured:
-            grafter.maybe_intercept(
-                value={"not": "a tensor"}, tags={"name": "x"})
+            grafter.maybe_intercept(value={"not": "a tensor"}, tags={"name": "x"})
         output = captured.getvalue()
         assert grafter._pg is None  # still no PG init
         assert "value is not a torch.Tensor" in output, output
@@ -3092,8 +3047,7 @@ class TestGrafterFilterMatching:
                 tags={"name": "x", "layer_id": 1},
             )
         # layer_id=5 → neither filter matches → silent skip.
-        grafter.maybe_intercept(value=torch.zeros(
-            2), tags={"name": "x", "layer_id": 5})
+        grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x", "layer_id": 5})
         assert grafter._pg is None
 
     def test_load_function_bad_module(self):
@@ -3181,8 +3135,7 @@ class TestGrafterFilterMatching:
         # name='attn_input' matches /attn.*/ → tries to init group (hits
         # the no-default-PG assertion, proving the regex matched).
         with pytest.raises(AssertionError, match="default torch.distributed"):
-            grafter.maybe_intercept(value=torch.zeros(
-                2), tags={"name": "attn_input"})
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "attn_input"})
         # name='other' does not match → silent skip.
         grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "other"})
         assert grafter._pg is None
@@ -3266,8 +3219,7 @@ def _run_graft_test_split(worker_baseline, worker_target, **kwargs) -> dict:
     ):
         p = ctx.Process(
             target=_graft_split_worker_entry,
-            args=(global_rank, role,
-                  role_ports[role], worker, result_queue, kwargs),
+            args=(global_rank, role, role_ports[role], worker, result_queue, kwargs),
         )
         p.start()
         processes.append(p)
@@ -3475,8 +3427,7 @@ class TestGrafterDistributed:
                 target = torch.zeros(3, device="cuda:1")
                 with _capture_stdout() as captured:
                     grafter.maybe_intercept(value=target, tags={"name": "x"})
-                assert target.tolist() == [
-                    1.0, 2.0, 3.0], f"got {target.tolist()}"
+                assert target.tolist() == [1.0, 2.0, 3.0], f"got {target.tolist()}"
                 # Success log must include the pre/new diff summary.
                 assert "diff_pre_vs_new=" in captured.getvalue(), captured.getvalue()
         finally:
@@ -3508,8 +3459,7 @@ class TestGrafterDistributed:
             else:
                 target = torch.zeros(3, device="cuda:0")
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
-                assert target.tolist() == [
-                    4.0, 5.0, 6.0], f"got {target.tolist()}"
+                assert target.tolist() == [4.0, 5.0, 6.0], f"got {target.tolist()}"
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
@@ -3551,8 +3501,7 @@ class TestGrafterDistributed:
             else:
                 target = torch.zeros(3, device="cuda:1")
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
-                assert target.tolist() == [
-                    2.0, 4.0, 6.0], f"got {target.tolist()}"
+                assert target.tolist() == [2.0, 4.0, 6.0], f"got {target.tolist()}"
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
@@ -3575,8 +3524,7 @@ class TestGrafterDistributed:
         try:
             target = torch.tensor([7.0, 7.0, 7.0], device=f"cuda:{rank}")
             grafter.maybe_intercept(value=target, tags={"name": "other"})
-            assert target.tolist() == [
-                7.0, 7.0, 7.0], "tensor must not be modified"
+            assert target.tolist() == [7.0, 7.0, 7.0], "tensor must not be modified"
             assert grafter._pg is None, "group must not init for unmatched name"
         finally:
             if grafter._pg is not None:
@@ -3947,8 +3895,7 @@ class TestGrafterMultiRankCpu:
                 # Target's local tensor (will be overwritten with 999s by transform).
                 target = torch.full((3,), 99.0)
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
-                assert target.tolist() == [
-                    999.0, 999.0, 999.0], target.tolist()
+                assert target.tolist() == [999.0, 999.0, 999.0], target.tolist()
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
@@ -4223,8 +4170,7 @@ class TestGrafterE2eExample:
             DUMPER_GRAFTER_TIMEOUT="30",
             DUMPER_GRAFTER_TRANSFORM_PATH=f"{__name__}._e2e_transform",
         ):
-            outputs = _run_graft_test_split(
-                self._worker_baseline, self._worker_target)
+            outputs = _run_graft_test_split(self._worker_baseline, self._worker_target)
 
         self._assert_e2e_snapshot(outputs)
 
