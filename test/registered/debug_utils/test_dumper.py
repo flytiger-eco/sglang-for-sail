@@ -44,7 +44,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
-    register_ppu_ci,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -56,7 +55,12 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=30, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
-register_ppu_ci(est_time=323, suite="nightly-2-ppu", nightly=True)
+# No PPU registration: the E2E server runs with piecewise CUDA graph enabled
+# by default; enabling the dumper hooks at runtime triggers a torch 2.11
+# Dynamo SourcelessBuilder failure ("does not know how to wrap <class
+# 'method'>" at dumper.py:_dump_inner -> to_pseudo_parallel_meta) that crashes
+# the scheduler. Upstream CUDA CI passes on torch 2.13. Re-register once the
+# PPU base image torch is upgraded.
 
 
 @contextmanager
