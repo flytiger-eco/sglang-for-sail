@@ -20,7 +20,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
-from sgl_kernel import gptq_dequantize
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -465,6 +464,10 @@ class DeepseekV2WeightLoaderMixin:
                         and self.quant_config.linear_quant_method == "gptq"
                     )
                 ):
+                    # sgl_kernel is not loadable on CPU-only environments; import
+                    # lazily inside the PPU-specific branch.
+                    from sgl_kernel import gptq_dequantize
+
                     w = None
                     w = gptq_dequantize(
                         self_attn.kv_b_proj.qweight,
