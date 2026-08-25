@@ -44,7 +44,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
             self.assertFalse(method.use_marlin)
             self.assertTrue(method.is_deepgemm_moe_runner_backend_enabled())
 
-    def test_ppu_w4a16_rejects_non_none_a2a(self):
+    def test_ppu_w4a16_accepts_deepep_a2a(self):
         with (
             patch.object(
                 mxfp4,
@@ -56,13 +56,37 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
                 mxfp4, "get_moe_a2a_backend", return_value=MoeA2ABackend.DEEPEP
             ),
             patch.object(mxfp4, "_is_ppu", True),
+            patch.object(mxfp4, "get_device_sm", return_value=89),
+            patch.object(
+                mxfp4.envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16,
+                "get",
+                return_value=True,
+            ),
+            patch.object(mxfp4.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+        ):
+            method = mxfp4.Mxfp4MoEMethod("model.layers.0.mlp.experts")
+
+        self.assertTrue(method.use_deepgemm_mxfp4_w4a16)
+
+    def test_ppu_w4a16_rejects_unsupported_a2a(self):
+        with (
+            patch.object(
+                mxfp4,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.DEEP_GEMM,
+            ),
+            patch.object(mxfp4, "get_exec", return_value=self._exec()),
+            patch.object(
+                mxfp4, "get_moe_a2a_backend", return_value=MoeA2ABackend.MOONCAKE
+            ),
+            patch.object(mxfp4, "_is_ppu", True),
             patch.object(
                 mxfp4.envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16,
                 "get",
                 return_value=True,
             ),
         ):
-            with self.assertRaisesRegex(ValueError, "moe-a2a-backend none"):
+            with self.assertRaisesRegex(ValueError, "none or deepep"):
                 mxfp4.Mxfp4MoEMethod("model.layers.0.mlp.experts")
 
     def test_ppu_w4a16_requires_explicit_deepgemm_backend(self):
@@ -105,7 +129,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
             self.assertFalse(method.use_deepgemm_mxfp4_w4a16)
             self.assertTrue(method.is_deepgemm_moe_runner_backend_enabled())
 
-    def test_ppu_converts_marlin_e8m0_scales_to_bf16(self):
+    def test_ppu_preserves_marlin_e8m0_scales_as_uint8(self):
         method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
         method.use_marlin = False
         method.use_deepgemm_mxfp4_w4a16 = True
@@ -138,14 +162,14 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
         ):
             method.process_weights_after_loading(layer)
 
-        expected = torch.tensor([[[1.0, 2.0]]], dtype=torch.bfloat16)
-        self.assertEqual(layer.w13_weight_scale.dtype, torch.bfloat16)
-        self.assertEqual(layer.w2_weight_scale.dtype, torch.bfloat16)
+        expected = torch.tensor([[[127, 128]]], dtype=torch.uint8)
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight_scale.dtype, torch.uint8)
         self.assertEqual(layer._mxfp4_backend, "marlin")
         self.assertTrue(torch.equal(layer.w13_weight_scale, expected))
         self.assertTrue(torch.equal(layer.w2_weight_scale, expected))
 
-    def test_ppu_w4a16_uses_bf16_scales_in_runner(self):
+    def test_ppu_w4a16_uses_e8m0_scales_in_runner(self):
         method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
         method.use_deepgemm_mxfp4_w4a16 = True
         method.runner = Mock()
@@ -153,8 +177,8 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
         layer = SimpleNamespace(
             w13_weight=sentinel.w13_weight,
             w2_weight=sentinel.w2_weight,
-            w13_weight_scale=torch.ones(1, dtype=torch.bfloat16),
-            w2_weight_scale=torch.ones(1, dtype=torch.bfloat16),
+            w13_weight_scale=torch.ones(1, dtype=torch.uint8),
+            w2_weight_scale=torch.ones(1, dtype=torch.uint8),
         )
 
         with patch.object(mxfp4, "_is_ppu", True):
@@ -164,8 +188,25 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
         quant_info = method.runner.run.call_args.args[1]
         self.assertTrue(quant_info.use_mxfp4_w4a16)
         self.assertFalse(quant_info.use_int4_w4a16)
-        self.assertEqual(quant_info.w13_scale.dtype, torch.bfloat16)
-        self.assertEqual(quant_info.w2_scale.dtype, torch.bfloat16)
+        self.assertEqual(quant_info.w13_scale.dtype, torch.uint8)
+        self.assertEqual(quant_info.w2_scale.dtype, torch.uint8)
+
+    def test_ppu_w4a16_dispatches_bf16_activations(self):
+        from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer
+
+        method = mxfp4.Mxfp4MoEMethod.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_deepgemm_mxfp4_w4a16 = True
+        layer = fused_moe_layer.FusedMoE.__new__(fused_moe_layer.FusedMoE)
+        object.__setattr__(layer, "quant_method", method)
+        object.__setattr__(layer, "quant_config", None)
+
+        with patch.object(fused_moe_layer, "_is_ppu", True):
+            quant_config = layer._build_dispatcher_quant_config()
+            method.use_deepgemm_mxfp4_w4a16 = False
+            native_quant_config = layer._build_dispatcher_quant_config()
+
+        self.assertEqual(quant_config["dispatcher_output_dtype"], "bf16")
+        self.assertEqual(native_quant_config["dispatcher_output_dtype"], "uint8")
 
 
 if __name__ == "__main__":

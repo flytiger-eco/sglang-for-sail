@@ -4230,7 +4230,6 @@ class ServerArgs:
                 envs.SGLANG_K3_SP_COLLECTIVE,
                 envs.SGLANG_K3_SP_ATTN_RES,
                 envs.SGLANG_K3_GEMM_AR,
-                envs.SGLANG_K3_FUSED_FRONT,
             ):
                 field.set(False)
             # acext init

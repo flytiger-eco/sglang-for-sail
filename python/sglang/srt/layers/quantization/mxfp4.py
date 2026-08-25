@@ -577,10 +577,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "--moe-runner-backend deep_gemm; only DeepGEMM "
                 "supports PPU MXFP4 W4A16."
             )
-        if not get_moe_a2a_backend().is_none():
+        moe_a2a_backend = get_moe_a2a_backend()
+        if not (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()):
             raise ValueError(
                 "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16=1 only supports "
-                "--moe-a2a-backend none."
+                "--moe-a2a-backend none or deepep."
             )
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(

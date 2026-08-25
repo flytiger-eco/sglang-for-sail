@@ -274,7 +274,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states = self._run_fp4_contiguous_gemm(
                     runner_input, quant_info, running_state
                 )
-            elif quant_info.use_int4_w4a16:
+            elif quant_info.use_int4_w4a16 or quant_info.use_mxfp4_w4a16:
                 hidden_states = self._run_int4_contiguous_gemm(
                     runner_input, quant_info, running_state
                 )
@@ -302,7 +302,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states = self._run_masked_fp4_gemm(
                     runner_input, quant_info, running_state
                 )
-            elif quant_info.use_int4_w4a16:
+            elif quant_info.use_int4_w4a16 or quant_info.use_mxfp4_w4a16:
                 hidden_states = self._run_masked_int4_gemm(
                     runner_input, quant_info, running_state
                 )
@@ -830,9 +830,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
-            gateup_output, swiglu_limit=self.swiglu_limit
-        )
+        if self.config.activation == "situ":
+            down_input_fp4 = torch.empty(
+                (all_tokens, N // 4),
+                device=gateup_output.device,
+                dtype=torch.uint8,
+            )
+            down_input_scale = torch.empty(
+                (N // 128, all_tokens),
+                device=gateup_output.device,
+                dtype=torch.uint16,
+            )
+            self._apply_situ_and_mul(
+                gateup_output,
+                down_input_fp4,
+                down_input_scale=down_input_scale,
+            )
+            down_input_scale = down_input_scale.t()
+        else:
+            down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
+                gateup_output, swiglu_limit=self.swiglu_limit
+            )
         del gateup_output
 
         down_output = torch.empty(
@@ -849,6 +867,58 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         return down_output
+
+    def _apply_situ_and_mul(
+        self,
+        gateup_output: torch.Tensor,
+        down_input: torch.Tensor,
+        masked_m: Optional[torch.Tensor] = None,
+        down_input_scale: Optional[torch.Tensor] = None,
+        expected_m: Optional[int] = None,
+    ) -> None:
+        from sglang.kernels.ops.kimi_k3 import situ_and_mul, situ_and_mul_masked
+
+        beta = self.config.gemm1_alpha if self.config.gemm1_alpha is not None else 4.0
+        linear_beta = self.config.gemm1_clamp_limit
+        if down_input_scale is not None:
+            from sglang.kernels.ops.kimi_k3 import (
+                situ_and_mul_masked_post_quant_mxfp4,
+                situ_and_mul_post_quant_mxfp4,
+            )
+
+            if masked_m is None:
+                situ_and_mul_post_quant_mxfp4(
+                    gateup_output,
+                    down_input,
+                    down_input_scale,
+                    beta,
+                    linear_beta,
+                )
+            else:
+                situ_and_mul_masked_post_quant_mxfp4(
+                    gateup_output,
+                    down_input,
+                    down_input_scale,
+                    masked_m,
+                    beta,
+                    linear_beta,
+                    self.config.top_k,
+                    expected_m,
+                )
+            return
+
+        if masked_m is None:
+            situ_and_mul(gateup_output, down_input, beta, linear_beta)
+        else:
+            situ_and_mul_masked(
+                gateup_output,
+                down_input,
+                masked_m,
+                beta,
+                linear_beta,
+                self.config.top_k,
+                expected_m,
+            )
 
     def _run_int4_contiguous_gemm(
         self,
@@ -895,7 +965,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=gateup_output.device,
             dtype=torch.bfloat16,
         )
-        _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+        if self.config.activation == "situ":
+            self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
+        else:
+            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_output = torch.empty(
@@ -1562,12 +1635,31 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 )
 
         # Act
-        down_input, down_input_scale = silu_and_mul_masked_post_quant_mxfp4(
-            gateup_output,
-            masked_m,
-            swiglu_limit=swiglu_limit_arg,
-            expected_m=expected_m,
-        )
+        if self.config.activation == "situ":
+            down_input = torch.empty(
+                (num_groups, m, n // 4),
+                device=hidden_states_device,
+                dtype=torch.uint8,
+            )
+            down_input_scale = torch.empty(
+                (num_groups, n // 128, m),
+                device=hidden_states_device,
+                dtype=torch.uint16,
+            )
+            self._apply_situ_and_mul(
+                gateup_output,
+                down_input,
+                masked_m=masked_m,
+                down_input_scale=down_input_scale,
+                expected_m=expected_m,
+            )
+        else:
+            down_input, down_input_scale = silu_and_mul_masked_post_quant_mxfp4(
+                gateup_output,
+                masked_m,
+                swiglu_limit=swiglu_limit_arg,
+                expected_m=expected_m,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -1657,7 +1749,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        if self.config.activation == "situ":
+            self._apply_situ_and_mul(
+                gateup_output, down_input, masked_m, expected_m=expected_m
+            )
+        else:
+            silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
         del gateup_output
 
         # GroupGemm-1
