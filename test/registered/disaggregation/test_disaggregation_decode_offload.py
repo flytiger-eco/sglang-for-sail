@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -22,7 +22,6 @@ register_cuda_ci(
     stage="base-b",
     runner_config="2-gpu-large",
 )
-register_ppu_ci(est_time=300, suite="nightly-2-ppu", nightly=True)
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):

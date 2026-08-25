@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=91, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-2-gpu-large-amd")
 register_ppu_ci(est_time=198, suite="stage-c-test-2-gpu-ppu")
+register_ppu_ci(est_time=198, suite="nightly-8-ppu", nightly=True)
 
 
 class TestDataParallelism(CustomTestCase, GSM8KMixin):

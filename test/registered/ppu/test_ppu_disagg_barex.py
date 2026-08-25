@@ -25,12 +25,10 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_ppu_ci(est_time=115, suite="nightly-2-ppu", nightly=True)
 
 # Same small model as test_ppu_basic.py: known to load on the PPU runners.
 PPU_CI_MODEL_PATH = (
