@@ -25,8 +25,19 @@ import unittest
 
 import requests
 
+from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+)
+
+# Disabled: 5c42d3f60c reverted the fixture's BAREX env injection and
+# MC_LOCAL_HOSTNAME detection, so the KV transfer dies on PPU runners.
+# Re-enable once the fixture logic is restored.
+register_ppu_ci(
+    est_time=115,
+    suite="nightly-2-ppu",
+    nightly=True,
+    disabled="fixture BAREX env/MC_LOCAL_HOSTNAME reverted by 5c42d3f60c",
 )
 
 
