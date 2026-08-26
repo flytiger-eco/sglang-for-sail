@@ -165,8 +165,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     use_int8: bool = False
     use_mxfp4: bool = False
     use_int4_w4a16: bool = False
-    # MXFP4 weights repacked for Marlin, paired with BF16 activations and
-    # BF16 numerical scales required by the PPU W4A16 kernel.
+    # PPU MXFP4 W4A16: legacy VALU or direct MMA, selected by weight layout.  # codespell:ignore
     use_mxfp4_w4a16: bool = False
     per_channel_quant: bool = False
     w13_scale: Optional[torch.Tensor] = None
@@ -935,7 +934,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if all_tokens <= 0:
             return hidden_states.bfloat16()
 
+        use_ppu_w4a16_mma = (
+            _is_ppu
+            and quant_info.use_mxfp4_w4a16
+            and quant_info.w13_weight.dtype == torch.uint8
+        )
         N = quant_info.w2_weight.size(1) * 32
+        if use_ppu_w4a16_mma:
+            N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
 
         w13_weight_quant = (quant_info.w13_weight, quant_info.w13_scale)
@@ -1725,7 +1731,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # GroupGemm-0
         num_groups, m, k = hidden_states.shape
+        use_ppu_w4a16_mma = (
+            _is_ppu and quant_info.use_mxfp4_w4a16 and w13_weight.dtype == torch.uint8
+        )
         n = w2_weight.size(1) * 32
+        if use_ppu_w4a16_mma:
+            n = w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
