@@ -4,15 +4,27 @@ T-HEAD PPU exposes a CUDA-compatible API through its torch backend, so
 ``PPUDeviceMixin`` inherits all device ops from ``CudaDeviceMixin`` and
 only overrides identity (``_enum``, ``device_name``).
 
-PPU presence is detected via the ``PPU_SDK`` environment variable.
+PPU presence is detected by matching the ``ZW`` tag in the CUDA device name,
+keeping the check consistent with ``sglang.srt.utils.is_ppu``.
 """
+
+from functools import lru_cache
+
+import torch
 
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
+_ZW_TAG = "ZW"
 _ZW810E_NAME = "ZW810E"
 _810_TAG = "810"
+
+
+@lru_cache(maxsize=1)
+def is_ppu_available() -> bool:
+    """Return True when the local device is a T-HEAD PPU (device name holds "ZW")."""
+    return bool(torch.cuda.is_available() and _ZW_TAG in torch.cuda.get_device_name())
 
 
 class PPUDeviceMixin(CudaDeviceMixin):
@@ -57,12 +69,10 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
         return super().get_device_num_tensorcores(device_id)
 
 
-# Load PPU attention hooks when running on PPU hardware.
+# Load PPU hooks when running on PPU hardware.
 # Each module registers @plugin_hook decorators that inject PPU-native ops
-# into the respective attention backends transparently.
-import os
-
-if "PPU_SDK" in os.environ:
+# into the respective backends transparently.
+if is_ppu_available():
     import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
