@@ -1,13 +1,12 @@
 name: PR Test (PPU)
 
 on:
+  # No branch whitelist: any PR may request PPU CI. Actual runner
+  # consumption is gated by the `run-ci` label (see the check-changes
+  # `if` below); unlabeled PRs produce a fully-skipped run at zero
+  # runner cost.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
-    # feat/ppu-ci-align is here for the trial period only: it lets colleagues
-    # open PRs directly against the branch that carries the three-stage CI, so
-    # their PR diff shows only their own change. Drop this entry once
-    # feat/ppu-ci-align is merged into feat/ppu-ci-clean2.
-    branches: [ v0.5.13, feat/ppu-ci-clean2, feat/ppu-ci-align ]
   workflow_dispatch:
   workflow_call:
     inputs:
