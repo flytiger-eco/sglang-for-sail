@@ -20,12 +20,9 @@ import torch
 
 from sglang.jit_kernel.deepseek_v4 import dequantize_and_gather_k_cuda
 
-try:
-    from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
-    register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
-except Exception:  # pragma: no cover - optional CI hook
-    pass
+register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
 
 
 # ─── Layout constants (match dequantize_gather.cuh) ─────────────────────────
