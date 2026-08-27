@@ -9,6 +9,10 @@ from sglang.srt.utils import is_ppu
 
 pytestmark = pytest.mark.skipif(not is_ppu(), reason="PPU-only kernel")
 
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=20, suite="stage-b-test-1-gpu-ppu")
+
 
 def _swiglu_ref(gateup: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
     last = gateup.shape[-1]
