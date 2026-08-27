@@ -87,10 +87,9 @@ elif _is_musa:
     _silu_and_mul_musa = torch.nn.SwishGLU()
 
 if _is_ppu:
-    from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import (
-        invoke_special_optimal_fused_moe_impl,
-        prepare_for_dispatch,
-    )
+    # Lazy-imported at call sites to avoid circular import:
+    # triton_utils/__init__ -> fused_moe -> fused_moe_triton/__init__ -> triton_utils
+    pass
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -544,6 +543,11 @@ def _fused_moe_kernel_sequence(
         dtype=hidden_states.dtype,
     )
     if use_ppu_optimal_fusedmoe:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import (
+            invoke_special_optimal_fused_moe_impl,
+            prepare_for_dispatch,
+        )
+
         dispatch_tuple = prepare_for_dispatch(topk_ids, config, E)
         invoke_special_optimal_fused_moe_impl(
             hidden_states,
@@ -751,6 +755,10 @@ def _fused_moe_kernel_sequence(
         out_slice.zero_()
 
     if use_ppu_optimal_fusedmoe:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe import (
+            invoke_special_optimal_fused_moe_impl,
+        )
+
         invoke_special_optimal_fused_moe_impl(
             intermediate_cache2,
             w2,

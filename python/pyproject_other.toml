@@ -169,7 +169,7 @@ srt_ppu = [
     "deep_gemm",
     "flash-attn-3",
     "flash_mla",
-    "flashinfer"
+    "flashinfer_python"
 ]
 
 test = [
