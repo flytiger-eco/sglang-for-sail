@@ -10,8 +10,14 @@ import unittest
 
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.utils.common import is_ppu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+)
+from sglang.test.test_utils import (
+    CustomTestCase,
+)
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
@@ -19,6 +25,14 @@ register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
 
 class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
+
+    # HiCacheStorageBaseMixin has @skip_if_model_missing("lmsys/sglang-ci-dsv3-test")
+    # which sets __unittest_skip__ = True on the parent when dsv3 is absent.
+    # 3FS tests only need DEFAULT_MODEL_NAME_FOR_TEST (Llama-3.1-8B-Instruct),
+    # so reset the inherited skip here; @skip_if_model_missing on each concrete
+    # class provides the correct guard for the model 3FS tests actually use.
+    __unittest_skip__ = False
+    __unittest_skip_why__ = None
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
@@ -68,6 +82,10 @@ class TestHf3fsBackendLayerFirstLayout(
         return server_args, env_vars
 
 
+@unittest.skipIf(
+    is_ppu(),
+    "page_first_direct layout requires cudaMemcpyBatchAsync which is not implemented in PPU HGGC runtime",
+)
 class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase):
     """Accuracy tests for HiCache-Hf3fs backend"""
 

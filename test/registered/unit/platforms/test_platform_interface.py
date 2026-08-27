@@ -108,6 +108,7 @@ class TestPlatformEnum(CustomTestCase):
             "XPU",
             "MUSA",
             "NPU",
+            "PPU",
             "TPU",
             "MPS",
             "OOT",
@@ -459,11 +460,18 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         self, mock_envs, mock_is_cuda_available, mock_load
     ):
         """When CUDA is available and no plugin activates, return CUDA defaults."""
+        import os
+
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
         mock_is_cuda_available.return_value = True
         mock_load.return_value = {}
-        result = _resolve_platform()
-        self.assertIsInstance(result, CudaSRTPlatform)
+        saved_ppu_sdk = os.environ.pop("PPU_SDK", None)
+        try:
+            result = _resolve_platform()
+            self.assertIsInstance(result, CudaSRTPlatform)
+        finally:
+            if saved_ppu_sdk is not None:
+                os.environ["PPU_SDK"] = saved_ppu_sdk
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms._is_cuda_available")

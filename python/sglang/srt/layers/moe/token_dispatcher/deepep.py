@@ -63,7 +63,7 @@ try:
 except ImportError:
     use_deepep = False
 
-DEEPEP_SUPPORT_TIMEOUT_CONTROL = hasattr(Buffer, "set_timeout_seconds")
+DEEPEP_SUPPORT_TIMEOUT_CONTROL = use_deepep and hasattr(Buffer, "set_timeout_seconds")
 
 from enum import Enum, IntEnum, auto
 
