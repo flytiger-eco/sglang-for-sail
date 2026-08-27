@@ -7,11 +7,17 @@ from sglang.srt.utils.numa_utils import (
     _query_numa_node_for_gpu,
     get_numa_node_if_available,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_cpu_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 register_cuda_ci(est_time=10, stage="stage-c", runner_config="4-gpu-gb200")
 register_cuda_ci(est_time=10, stage="stage-c", runner_config="8-gpu-b200")
+
+register_ppu_ci(est_time=10, suite="nightly-4-ppu", nightly=True)
 
 
 class TestIsNumaAvailable(unittest.TestCase):

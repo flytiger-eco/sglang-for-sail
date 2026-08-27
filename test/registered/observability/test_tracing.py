@@ -34,7 +34,11 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -47,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 # CI registration
 register_cuda_ci(est_time=113, stage="extra-a", runner_config="1-gpu-small")
+
+register_ppu_ci(est_time=150, suite="nightly-1-ppu", nightly=True)
 
 
 # ============================================================================

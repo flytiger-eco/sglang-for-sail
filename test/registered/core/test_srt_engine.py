@@ -14,7 +14,11 @@ import sglang as sgl
 from sglang.bench_offline_throughput import BenchArgs, throughput_test
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
@@ -24,6 +28,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=387, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
+
+register_ppu_ci(est_time=855, suite="nightly-1-ppu", nightly=True)
 
 
 class TestSRTEngine(CustomTestCase):

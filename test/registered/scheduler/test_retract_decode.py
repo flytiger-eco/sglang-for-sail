@@ -6,7 +6,11 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -19,6 +23,7 @@ from sglang.utils import is_in_ci
 
 register_cuda_ci(est_time=353, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=600, suite="nightly-1-ppu", nightly=True)
 
 
 class TestRetractDecode(CustomTestCase):
