@@ -63,14 +63,11 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import is_ppu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-
-register_ppu_ci(est_time=35, suite="stage-b-test-1-gpu-ppu")
 
 
 @dataclass(frozen=True)
@@ -539,15 +536,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNotNone(split_child.hash_value)
         self.assertEqual(len(split_child.hash_value), 1)
 
-    @unittest.skipIf(
-        is_ppu(),
-        "The HiCache host-backup path (write_backup -> "
-        "transfer_kv_all_layer_direct_lf_pf) issues cudaMemcpyBatchAsync, "
-        "which the PPU runtime has not implemented "
-        "(hggcapiMemcpyBatchAsync: function not implemented; reproduced "
-        "in PPU CI, 2026-08-28). Re-enable once the PPU runtime "
-        "implements cudaMemcpyBatchAsync.",
-    )
     def test_hicache_kv_events_track_gpu_cpu_transitions(self):
         tree, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(tree)
