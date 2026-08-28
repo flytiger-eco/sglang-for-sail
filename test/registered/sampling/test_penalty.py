@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -221,6 +222,14 @@ class TestPenalty(CustomTestCase):
         }
         self._test_penalty_effect(prompt, baseline_params, penalty_params)
 
+    @unittest.skipIf(
+        is_ppu(),
+        "The PPU sampling backend honors seed values but is not seed-"
+        "deterministic: identical seeded requests return different outputs "
+        "(verified on a PPU runner, 2026-08-28), so this fixed-seed "
+        "statistical comparison is inherently flaky on PPU. Re-enable when "
+        "PPU sampling becomes seed-deterministic.",
+    )
     def test_penalty_edge_cases_negative_penalty_values(self):
         """Test that negative penalties decrease vocabulary diversity."""
         prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."
