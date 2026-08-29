@@ -7,10 +7,12 @@ import torch
 import torch.multiprocessing as mp
 
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-2-gpu-large-amd")
+
+register_ppu_ci(est_time=15, suite="nightly-2-ppu", nightly=True)
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):

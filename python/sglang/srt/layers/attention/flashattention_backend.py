@@ -27,6 +27,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils.common import is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -272,7 +273,7 @@ class FlashAttentionBackend(AttentionBackend):
         # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
         # unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = bool(
-            getattr(server_args, "enable_dp_attention", False)
+            getattr(server_args, "enable_dp_attention", False) or is_ppu()
         )
 
     def _compute_scheduler_metadata(

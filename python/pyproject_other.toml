@@ -169,7 +169,7 @@ srt_ppu = [
     "deep_gemm",
     "flash-attn-3",
     "flash_mla",
-    "flashinfer"
+    "flashinfer_python"
 ]
 
 test = [
@@ -187,8 +187,6 @@ test = [
 
 all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
-all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
-all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
 all_ppu = ["sglang[srt_ppu]"]
