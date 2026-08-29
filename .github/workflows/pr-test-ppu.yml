@@ -85,11 +85,11 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/sglang/srt/hardware_backend/ppu/**"
               - "python/sglang/srt/platforms/ppu.py"
-              - "sgl-kernel/**"
+              - "python/sglang/kernels/aot/**"
               - "test/registered/**"
               - "scripts/ci/ppu/**"
             sgl_kernel:
-              - "sgl-kernel/**"
+              - "python/sglang/kernels/aot/**"
 
   # ==================== Build sgl-kernel Wheel ==================== #
   build-sgl-kernel:

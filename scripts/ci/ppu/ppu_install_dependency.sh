@@ -75,7 +75,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _kernel_source_changed() {
     if git -C "${REPO_ROOT}" rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-        git -C "${REPO_ROOT}" diff --name-only HEAD~1 -- sgl-kernel/ | grep -qE '\.(py|cc|cu|cpp|h|hpp|cuh|toml|cmake)$|CMakeLists\.txt$'
+        git -C "${REPO_ROOT}" diff --name-only HEAD~1 -- python/sglang/kernels/aot/ | grep -qE '\.(py|cc|cu|cpp|h|hpp|cuh|toml|cmake)$|CMakeLists\.txt$'
     else
         return 1
     fi
