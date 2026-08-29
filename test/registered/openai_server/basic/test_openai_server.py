@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=182, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=200, suite="per-commit-1-ppu")
+register_ppu_ci(est_time=200, suite="stage-b-test-1-gpu-ppu")
 
 
 class TestOpenAIServer(CustomTestCase):
@@ -798,10 +798,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 def _has_model_weights(path):
     if not os.path.isdir(path):
         return True  # not a local path, let HF handle it
-    return any(
-        f.endswith((".safetensors", ".bin", ".pt"))
-        for f in os.listdir(path)
-    )
+    return any(f.endswith((".safetensors", ".bin", ".pt")) for f in os.listdir(path))
 
 
 @unittest.skipIf(

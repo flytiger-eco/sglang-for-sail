@@ -1,8 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -13,14 +12,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=261, stage="extra-b", runner_config="4-gpu-h100")
-register_ppu_ci(est_time=261, suite="nightly-4-ppu", nightly=True)
 
 QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 GSM8K_BASELINE_ACCURACY = 0.85
 
 
-@skip_if_model_missing("Qwen/Qwen3-30B-A3B-FP8")
 class TestQwen330B(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -76,7 +73,6 @@ class TestQwen330B(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], GSM8K_BASELINE_ACCURACY)
 
 
-@skip_if_model_missing("Qwen/Qwen3-30B-A3B-FP8")
 class TestQwen330BCP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

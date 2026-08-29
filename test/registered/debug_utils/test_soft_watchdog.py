@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=622, suite="base-b-test-cpu")
-register_ppu_ci(est_time=120, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=254, suite="nightly-1-ppu", nightly=True)
 
 
 class BaseTestSoftWatchdog:

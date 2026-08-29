@@ -4,12 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,10 +15,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=65, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=42, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=65, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("RedHatAI/Meta-Llama-3.1-8B-FP8")
 class TestCompressedTensorsLlama3FP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -245,8 +245,7 @@ class FlashAttentionBackend(AttentionBackend):
         # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
         # unset uses the existing per-layer metadata path.
         self._disable_scheduler_metadata_precompute = bool(
-            getattr(server_args, "enable_dp_attention", False)
-            or is_ppu() 
+            getattr(server_args, "enable_dp_attention", False) or is_ppu()
         )
 
     def _compute_scheduler_metadata(

@@ -18,15 +18,9 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
-register_ppu_ci(
-    est_time=120,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="FP4/NVFP4 not supported on PPU",
-)
 
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
 

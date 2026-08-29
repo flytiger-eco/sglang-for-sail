@@ -16,7 +16,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=44, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=22, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=44, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=70, suite="nightly-1-ppu", nightly=True)
 
 
 # For test

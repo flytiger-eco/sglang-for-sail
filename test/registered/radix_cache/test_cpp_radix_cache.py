@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 # Note: AMD registration removed - test_cpp_radix_cache fails on AMD due to C++ radix tree issues
 register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
-register_ppu_ci(est_time=60, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=124, suite="nightly-1-ppu", nightly=True)
 
 
 class TestCppRadixCache(CustomTestCase, MMLUMixin):

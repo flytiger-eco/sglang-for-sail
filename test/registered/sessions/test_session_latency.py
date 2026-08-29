@@ -19,8 +19,7 @@ from tabulate import tabulate
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,7 +28,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=122, stage="extra-a", runner_config="1-gpu-large")
-register_ppu_ci(est_time=122, suite="nightly-1-ppu", nightly=True)
 
 NUM_TURNS = 150
 INPUT_LEN = 16
@@ -256,7 +254,6 @@ def _print_mode_table(result: ModeResult, label: str = ""):
     )
 
 
-@skip_if_model_missing("openai/gpt-oss-20b")
 class TestSessionLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):

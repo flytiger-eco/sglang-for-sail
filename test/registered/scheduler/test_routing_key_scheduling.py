@@ -10,7 +10,6 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_ppu_ci,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -24,16 +23,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=184, suite="base-b-test-cpu")
-register_ppu_ci(
-    est_time=180,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="Routing-key priority produces no measurable latency signal on PPU: "
-    "the short requests batch concurrently instead of serializing through the "
-    "limited running slots, so avg key_a vs key_b latency differ <0.3ms "
-    "(~52-76ms per request). Preflight with both max_tokens=10 and "
-    "max_tokens=50 (+20 samples) fails.",
-)
 
 
 class TestRoutingKeyScheduling(CustomTestCase):

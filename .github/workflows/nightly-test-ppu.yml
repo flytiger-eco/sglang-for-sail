@@ -45,21 +45,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
 
       - name: Run PPU nightly tests (1-GPU, partition 1/2)
         timeout-minutes: 110
@@ -87,23 +79,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e TEST_CLASSIFICATION_BASE_MODEL=/nas_aisw/datasets/checkpoints/LLM/Qwen3/v1.0/Qwen3-Reranker-0.6B-seq-cls \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
-            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -137,21 +113,13 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
 
       - name: Run PPU nightly tests (1-GPU, partition 2/2)
         # 125 rather than 110: observed 95min warm-cache, and the worst case (1500s
@@ -182,23 +150,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e TEST_CLASSIFICATION_BASE_MODEL=/nas_aisw/datasets/checkpoints/LLM/Qwen3/v1.0/Qwen3-Reranker-0.6B-seq-cls \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
-            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -230,21 +182,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
 
       - name: Run 2-GPU PPU nightly tests
         timeout-minutes: 140
@@ -272,22 +214,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
-            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -314,21 +241,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
 
       - name: Run 4-GPU PPU nightly tests
         timeout-minutes: 170
@@ -355,22 +271,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
-            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -397,21 +298,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Warm page cache for large models
+      - name: Warm page cache for partition models
         run: |
-          echo "Pre-reading Llama-3.1-8B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-30B-A3B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading DeepSeek-V2-Lite model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Pre-reading Qwen3-0.6B model files into page cache..."
-          find /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B -name "*.safetensors" \
-            -exec cat {} > /dev/null \;
-          echo "Page cache warm-up done."
+          bash scripts/ci/warm_page_cache.sh \
+            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct
 
       - name: Run 8-GPU PPU nightly tests
         timeout-minutes: 280
@@ -438,22 +328,7 @@ jobs:
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SMALL_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct/ \
-            -e SGLANG_TEST_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_MLA_MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_TEST_TINY_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B \
-            -e SGLANG_TEST_SMALL_MODEL=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct \
-            -e SGLANG_TEST_CROSS_ENCODER_MODEL=/nas_aisw/datasets/checkpoints/LLM/misc/v1.0/ms-marco-MiniLM-L-6-v2 \
-            -e SGLANG_TEST_SMALL_EMBEDDING_MODEL=/nas_aisw/datasets/checkpoints/LLM/gte_Qwen2/v1.0/gte_Qwen2-1.5B-instruct \
-            -e SGLANG_TEST_GPT2_TOKENIZER=/nas_aisw/datasets/checkpoints/tokenizers/gpt2 \
-            -e SGLANG_EVAL_MMLU_FILE=/nas_aisw/datasets/eval_data/mmlu.csv \
-            -e SGLANG_TEST_ENABLE_THINKING_MODEL=/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            -e SGLANG_TEST_TARGET_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            -e SGLANG_TEST_DRAFT_MODEL_EAGLE3=/nas_aisw/datasets/checkpoints/LLM/EAGLE3/v3/EAGLE3-LLaMA3.1-Instruct-8B \
-            -e PPU_MLA_MODEL_PATH=/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            -e SGLANG_NAS_MODEL_BASE=/nas_aisw/datasets/checkpoints/LLM \
             -e PPU_SUPPORTS_FP8=0 \
-            -e PPU_SUPPORTS_FP4=0 \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \

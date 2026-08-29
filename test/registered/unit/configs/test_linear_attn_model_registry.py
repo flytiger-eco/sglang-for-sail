@@ -10,11 +10,10 @@ from sglang.srt.configs.linear_attn_model_registry import (
     import_backend_class,
     register_linear_attn_model,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_ppu_ci(est_time=7, suite="per-commit-1-ppu")
 
 
 # Dummy config classes for testing

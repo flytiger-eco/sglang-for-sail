@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=42, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=42, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=63, suite="nightly-1-ppu", nightly=True)
 
 OUTPUT_DIR = "./profiler_dir"
 

@@ -2,8 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,12 +14,10 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=450, stage="extra-b", runner_config="8-gpu-h200")
-register_ppu_ci(est_time=450, suite="nightly-8-ppu", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
-@skip_if_model_missing("deepseek-ai/DeepSeek-V3.2")
 class TestDeepseekV32IndexTopkPattern(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -69,7 +66,6 @@ class TestDeepseekV32IndexTopkPattern(CustomTestCase):
             self.assertGreater(metrics["accuracy"], 0.935)
 
 
-@skip_if_model_missing("deepseek-ai/DeepSeek-V3.2")
 class TestDeepseekV32IndexFreq(CustomTestCase):
     @classmethod
     def setUpClass(cls):

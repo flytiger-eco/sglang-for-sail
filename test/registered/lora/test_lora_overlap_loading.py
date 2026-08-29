@@ -22,12 +22,7 @@ from torch.cuda import Stream as CudaStream
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader, LoRAOverlapLoadStatus
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
@@ -36,10 +31,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=48, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestLoRAOverlapLoading(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
         run_lora_batch_splitting_equivalence_test(
@@ -47,7 +40,6 @@ class TestLoRAOverlapLoading(CustomTestCase):
         )
 
 
-@skip_if_model_missing("meta-llama/Llama-3.1-8B-Instruct")
 class TestLoRAOverlapLoaderUnitTests(CustomTestCase):
 
     mock_lora_manager: MagicMock

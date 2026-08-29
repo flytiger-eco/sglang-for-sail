@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
-register_ppu_ci(est_time=120, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=174, suite="nightly-1-ppu", nightly=True)
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"

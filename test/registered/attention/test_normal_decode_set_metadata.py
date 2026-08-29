@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
-register_ppu_ci(est_time=11, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=17, suite="nightly-1-ppu", nightly=True)
 
 
 def reference_normal_decode_set_metadata(

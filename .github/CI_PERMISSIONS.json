@@ -321,6 +321,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "Vinsmoke86": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "PPU CI trial user"
+    },
     "Xia-Weiwen": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1336,6 +1343,13 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "yunzshi": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "PPU CI maintainer"
+    },
     "yushengsu-thu": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -1440,26 +1454,5 @@
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
-    },
-    "yunzshi": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
-    },
-    "tianleMTL": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
-    },
-    "seeuswk": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "can_rerun_stage": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "SAIL fork maintainer"
     }
 }

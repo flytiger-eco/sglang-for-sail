@@ -1,15 +1,13 @@
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp8
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
-register_ppu_ci(est_time=1800, suite="nightly-8-ppu", nightly=True)
 
 GLM_51_FP8_MODEL_PATH = "zai-org/GLM-5.1-FP8"
 
@@ -29,7 +27,6 @@ MTP_ARGS = [
 ]
 
 
-@skip_if_no_fp8()
 class TestGlm51Fp8(unittest.TestCase):
     """GLM-5.1 FP8 on H200/B200 (8-GPU, tp=8)."""
 

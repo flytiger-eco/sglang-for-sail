@@ -6,8 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -17,14 +16,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=133, stage="base-c", runner_config="4-gpu-h100")
-register_ppu_ci(est_time=133, suite="nightly-4-ppu", nightly=True)
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65
 MMMU_NUM_EXAMPLES = 32
 
 
-@skip_if_model_missing("Qwen/Qwen3.5-27B")
 class TestVLMTP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):

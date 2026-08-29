@@ -9,7 +9,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=509, stage="base-b", runner_config="2-gpu-large")
-register_ppu_ci(est_time=509, suite="nightly-2-ppu", nightly=True)
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):

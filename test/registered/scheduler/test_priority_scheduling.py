@@ -5,11 +5,7 @@ import unittest
 from typing import Any, List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,12 +19,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(
-    est_time=200,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="PPU concurrent batching makes priority latency ordering unmeasurable (assertion flaky)",
-)
 
 
 class TestPriorityScheduling(CustomTestCase):

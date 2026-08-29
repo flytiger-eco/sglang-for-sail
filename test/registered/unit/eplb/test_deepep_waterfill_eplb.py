@@ -107,7 +107,7 @@ class TestDeepEPWaterfillEPLB(CustomTestCase):
         dispatch_info = SimpleNamespace(num_physical_experts=264)
 
         def fake_eplb_postprocess(
-            ids, expert_location_dispatch_info, num_token_non_padded
+            ids, expert_location_dispatch_info, num_token_non_padded, **kwargs
         ):
             return ids + 1
 

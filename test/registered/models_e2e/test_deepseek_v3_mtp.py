@@ -1,7 +1,6 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -13,7 +12,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="8-gpu-h200")
-register_ppu_ci(est_time=300, suite="nightly-8-ppu", nightly=True)
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
 
@@ -36,7 +34,6 @@ if not is_in_amd_ci():
     _OTHER_ARGS += ["--mem-frac", "0.7"]
 
 
-@skip_if_model_missing("deepseek-ai/DeepSeek-V3-0324")
 class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):
     model = FULL_DEEPSEEK_V3_MODEL_PATH
     other_args = _OTHER_ARGS

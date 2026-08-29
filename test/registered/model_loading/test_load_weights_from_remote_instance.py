@@ -24,11 +24,7 @@ import torch
 import torch.multiprocessing as mp
 
 import sglang as sgl
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -44,7 +40,6 @@ mp.set_start_method("spawn", force=True)
 
 register_cuda_ci(est_time=145, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
-register_ppu_ci(est_time=145, suite="nightly-2-ppu", nightly=True, disabled="EIC weight block >64MB MR limit; BAREX only covers KV cache")
 
 
 def verify_params_close(params1, params2, error_msg):

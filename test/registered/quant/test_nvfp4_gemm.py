@@ -3,8 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_no_fp4
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,7 +13,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=350, stage="base-c", runner_config="4-gpu-b200")
-register_ppu_ci(est_time=350, suite="nightly-4-ppu", nightly=True)
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
@@ -64,25 +62,21 @@ class FP4GemmBase:
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-@skip_if_no_fp4()
 class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_cutlass"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-@skip_if_no_fp4()
 class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_cudnn"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-@skip_if_no_fp4()
 class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-@skip_if_no_fp4()
 class TestFP4GemmFlashinferCutedsl(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_cutedsl"
 

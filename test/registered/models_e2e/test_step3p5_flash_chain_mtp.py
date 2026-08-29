@@ -4,19 +4,16 @@ import numpy as np
 import requests
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
 register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
-register_ppu_ci(est_time=480, suite="nightly-8-ppu", nightly=True)
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 
 
-@skip_if_model_missing("stepfun-ai/Step-3.5-Flash")
 class TestStep3p5FlashChainMTP(GSM8KMixin, DefaultServerBase):
     """Chain-style multi-layer EAGLE speculative decoding on Step-3.5-Flash.
 

@@ -6,18 +6,14 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_ppu_ci,
 )
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=203, suite="base-b-test-cpu")
-register_ppu_ci(est_time=29, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("Qwen/Qwen2-VL-2B-Instruct")
 class TestExternalModels(CustomTestCase):
     def test_external_model(self):
         envs.SGLANG_EXTERNAL_MODEL_PACKAGE.set("sglang.test.external_models")

@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import (
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
-register_ppu_ci(est_time=9, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=13, suite="nightly-1-ppu", nightly=True)
 
 
 class LMHeadStub(nn.Module):

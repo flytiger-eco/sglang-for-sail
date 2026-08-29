@@ -1,19 +1,16 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=290, stage="base-c", runner_config="4-gpu-h100")
-register_ppu_ci(est_time=290, suite="nightly-4-ppu", nightly=True)
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 
-@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestQwen3NextMTPTopk(
     GSM8KMixin, KLDivergenceMixin, PrefixCacheBranchingMixin, DefaultServerBase
 ):
@@ -47,7 +44,6 @@ class TestQwen3NextMTPTopk(
     ]
 
 
-@skip_if_model_missing("Qwen/Qwen3-Next-80B-A3B-Instruct")
 class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93

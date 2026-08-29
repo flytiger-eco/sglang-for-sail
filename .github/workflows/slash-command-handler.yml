@@ -2,7 +2,8 @@ name: Slash Command Handler
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
+
 permissions:
   contents: read
   pull-requests: write # Required to add labels and reactions

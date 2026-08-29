@@ -2,12 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
@@ -20,16 +15,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=160, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-large-amd")
-register_ppu_ci(
-    est_time=160,
-    suite="nightly-1-ppu",
-    nightly=True,
-    disabled="Marlin atomic-add reduce deadlocks the kernel on PPU at small m "
-    "(fp16 AWQ path); in-code workaround reverted, reported to PPU SDK team",
-)
 
 
-@skip_if_model_missing("QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 class TestAWQ(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,7 +47,6 @@ class TestAWQ(CustomTestCase):
 
 
 @unittest.skipIf(is_in_amd_ci(), "AWQ Marlin is not supported on AMD GPUs")
-@skip_if_model_missing("QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 class TestAWQMarlinBfloat16(CustomTestCase):
     """
     Verify that the model can be loaded with bfloat16 dtype and awq_marlin quantization

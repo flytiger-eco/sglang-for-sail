@@ -3,21 +3,14 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import (
-    register_cpu_ci,
-    register_cuda_ci,
-    register_ppu_ci,
-)
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=48, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=320, suite="base-b-test-cpu")
-register_ppu_ci(est_time=48, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("HuggingFaceTB/SmolLM3-3B")
 class TestTransformersBackendEval(DefaultServerBase):
     model = "HuggingFaceTB/SmolLM3-3B"
     gsm8k_num_questions = 30

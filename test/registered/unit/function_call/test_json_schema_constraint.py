@@ -16,11 +16,10 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-b-test-cpu")
-register_ppu_ci(est_time=5, suite="per-commit-1-ppu")
 
 
 class TestJsonSchemaConstraint(unittest.TestCase):

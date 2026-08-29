@@ -3,9 +3,8 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.ci.ci_stress_utils import StressTestRunner
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
@@ -15,10 +14,8 @@ OUTPUT_FILE = "stress_test_kimi_k2.jsonl"
 
 # Register for CI - estimated 45 minutes
 register_cuda_ci(est_time=2700, suite="stress")
-register_ppu_ci(est_time=2700, suite="nightly-1-ppu", nightly=True)
 
 
-@skip_if_model_missing("moonshotai/Kimi-K2-Thinking")
 class TestStressKimiK2(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

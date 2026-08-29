@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
-register_ppu_ci(est_time=15, suite="nightly-1-ppu", nightly=True)
+register_ppu_ci(est_time=26, suite="nightly-1-ppu", nightly=True)
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):

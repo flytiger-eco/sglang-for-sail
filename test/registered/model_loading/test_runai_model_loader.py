@@ -2,12 +2,10 @@ import unittest
 
 import sglang as sgl
 from sglang.srt.environ import temp_set_env
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
-from sglang.test.ci.ppu_skip_utils import skip_if_model_missing
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=380, suite="nightly-1-gpu", nightly=True)
-register_ppu_ci(est_time=380, suite="nightly-1-ppu", nightly=True)
 
 TEST_GCS_MODEL = "gs://vertex-model-garden-public-us/codegemma/codegemma-2b/"
 
@@ -19,7 +17,6 @@ PROMPTS = [
 ]
 
 
-@skip_if_model_missing("gs://vertex-model-garden-public-us/codegemma/codegemma-2b/")
 class TestRunaiModelLoader(CustomTestCase):
     @classmethod
     def setUpClass(cls):
