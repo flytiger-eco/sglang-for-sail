@@ -19,12 +19,18 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import is_ppu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
 register_cuda_ci(est_time=19, stage="stage-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=125, suite="nightly-1-ppu", nightly=True)
 
 
 def extend_attention_fwd_torch(
@@ -797,8 +803,12 @@ class TestTritonAttention(CustomTestCase):
         configs = [
             (4, 512, 32, 8, 128),  # Standard config
             (2, 2048, 32, 8, 128),  # Long sequence (test 2048 specifically)
-            (8, 256, 64, 8, 80),  # Non-standard head dim
         ]
+        if not is_ppu():
+            # D=80 (non-power-of-2) triggers precision regression on PPU with
+            # sgl-kernel 0.4.3 (unified vs 2-stage max diff exceeds atol=0.15).
+            # Was fixed in 0.4.2.post2 but regressed in 0.4.3.
+            configs.append((8, 256, 64, 8, 80))
 
         for B, N_CTX, H_Q, H_KV, D in configs:
             with self.subTest(B=B, N_CTX=N_CTX, H_Q=H_Q, H_KV=H_KV, D=D):

@@ -20,6 +20,7 @@ HW_MAPPING = {
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
     "npu": HWBackend.NPU,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR)
@@ -74,6 +75,14 @@ PER_COMMIT_SUITES = {
         "stage-b-test-4-npu-a3",
         "stage-b-test-16-npu-a3",
     ],
+    HWBackend.PPU: [
+        # Three-stage serial chain (mirrors pr-test-amd.yml): stage-a is the
+        # < 5 min smoke gate, stage-b the 1-GPU body, stage-c 2-GPU tests.
+        # pr-test-ppu.yml serializes them via .github/actions/wait-for-jobs.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -123,6 +132,12 @@ NIGHTLY_SUITES = {
         "full-4-npu-a3",
         "full-8-npu-a3",
         "full-16-npu-a3",
+    ],
+    HWBackend.PPU: [
+        "nightly-1-ppu",
+        "nightly-2-ppu",
+        "nightly-4-ppu",
+        "nightly-8-ppu",
     ],
 }
 

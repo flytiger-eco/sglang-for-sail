@@ -46,10 +46,12 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small")
+
+register_ppu_ci(est_time=35, suite="stage-b-test-1-gpu-ppu")
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,11 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.kits.abort_timeout_kit import AbortAllMixin, WaitingTimeoutMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.test_utils import (
@@ -22,6 +26,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=367, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=565, suite="nightly-1-ppu", nightly=True)
 
 
 class TestAbort(CustomTestCase):

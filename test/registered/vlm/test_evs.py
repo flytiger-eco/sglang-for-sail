@@ -3,11 +3,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import run_doctests
 
 register_cuda_ci(est_time=11, stage="stage-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
+
+register_ppu_ci(est_time=11, suite="nightly-1-ppu", nightly=True)
 
 
 def test_resolve_evs_config():

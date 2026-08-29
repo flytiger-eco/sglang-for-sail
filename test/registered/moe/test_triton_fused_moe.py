@@ -9,10 +9,12 @@ from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsQuantIn
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="stage-b", runner_config="1-gpu-large")
+
+register_ppu_ci(est_time=159, suite="nightly-1-ppu", nightly=True)
 
 
 class TestFusedMOE(CustomTestCase):

@@ -6,9 +6,14 @@ from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large")
+
+register_ppu_ci(est_time=134, suite="nightly-1-ppu", nightly=True)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
