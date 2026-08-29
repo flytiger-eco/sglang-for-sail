@@ -63,6 +63,11 @@ cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.tom
 # all_ppu doesn't pull it in. test_tracing needs it to exercise the OTLP path.
 cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu,tracing]" --no-build-isolation
 
+# The v2.1.1 image ships a PPU-patched xgrammar 0.2.1 build that predates the
+# AnyTokensFormat API; v0.5.18's function_call.kimik3_structural_tag imports it
+# at engine startup. Refresh from the pinned upstream version.
+${PIP_INSTALL} --force-reinstall --no-deps "xgrammar==0.2.1"
+
 # ==================== sgl-kernel: PR wheel / source build / PyPI ==================== #
 # Priority 1: install the PR-built wheel downloaded by the build-sgl-kernel
 #   CI job (SGL_KERNEL_WHEEL_DIR points at the artifact directory), so tests
