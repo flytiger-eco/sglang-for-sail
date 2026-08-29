@@ -76,6 +76,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.plugins import load_plugins
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
@@ -681,6 +682,9 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    # Idempotent; needed here because tp_size > 1 spawns this as a fresh process.
+    load_plugins()
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -881,6 +885,9 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
+    # Idempotent; needed here because tp_size > 1 spawns this as a fresh process.
+    load_plugins()
+
     initialize_moe_config(server_args)
     initialize_fp8_gemm_config(server_args)
     initialize_fp4_gemm_config(server_args)
@@ -993,6 +1000,12 @@ def main(server_args, bench_args):
     # not propagate to cuda_graph_config; update the decode phase directly.
     if server_args.cuda_graph_config is not None:
         server_args.cuda_graph_config[Phase.DECODE].max_bs = max(bench_args.batch_size)
+
+    # Platform plugins install hardware-specific ops (e.g. PPU replaces the FA3
+    # entry points with its own). Without this the generic CUDA path is taken and
+    # fails on non-CUDA hardware. Also called in the work funcs below, since
+    # tp_size > 1 spawns fresh processes that do not inherit applied hooks.
+    load_plugins()
 
     _set_envs_and_config(server_args)
 
