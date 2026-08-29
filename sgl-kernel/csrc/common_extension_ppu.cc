@@ -149,18 +149,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_sum", torch::kCUDA, &moe_sum);
 
   m.def(
-      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
-
-  m.def(
-      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
-      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
-      "(Tensor[])");
-  m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
-
-  m.def(
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
       " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
       "()");
