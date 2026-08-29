@@ -19,7 +19,7 @@
 set -euo pipefail
 
 REPO_ROOT="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/../../.." && pwd)}"
-KERNEL_DIR="${REPO_ROOT}/sgl-kernel"
+KERNEL_DIR="${REPO_ROOT}/python/sglang/kernels/aot"
 
 echo "========================================"
 echo "  PPU sgl-kernel: building from source"
