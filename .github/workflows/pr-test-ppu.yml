@@ -1,12 +1,15 @@
 name: PR Test (PPU)
 
 on:
-  # No branch whitelist: any PR may request PPU CI. Actual runner
-  # consumption is gated by the `run-ci` label (see the check-changes
-  # `if` below); unlabeled PRs produce a fully-skipped run at zero
-  # runner cost.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
+  # No pull_request trigger: the PR path is orchestrated by ci.yml
+  # (org-level gate chain: precheck -> smoke/AI review -> human review ->
+  # this workflow via workflow_call), and a direct pull_request trigger
+  # here would double-run alongside that chain. The run-ci label gate
+  # below still applies to the inherited pull_request event on the
+  # workflow_call path unless the caller opts out via
+  # require_run_ci_label: false (which ci.yml does, since human approval
+  # already gated the run). Manual verification keeps using
+  # workflow_dispatch, which bypasses the gate.
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -20,6 +23,14 @@ on:
         required: false
         type: boolean
         default: false
+      require_run_ci_label:
+        description: >-
+          Whether the run-ci label gate applies when the caller's event
+          is pull_request. ci.yml passes false so Full CI runs after
+          human approval without needing the label.
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: pr-test-ppu-${{ inputs.ref || github.ref }}
@@ -35,12 +46,13 @@ env:
 jobs:
   # ==================== Check Changes ==================== #
   check-changes:
-    # Per-commit PPU CI is gated behind the `run-ci` label to save
-    # self-hosted PPU runner capacity. Maintainers add the label via the
-    # `/run-ci` slash command (or manually); the `labeled` event above
-    # dispatches a fresh run once the label is present. Manual runs
-    # (workflow_dispatch / workflow_call) bypass the gate.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    # PPU runner consumption is gated behind the `run-ci` label on the
+    # pull_request event. A called workflow inherits the caller's event,
+    # so the gate also applies on the ci.yml -> workflow_call path;
+    # ci.yml bypasses it with require_run_ci_label: false because its
+    # human-review job already authorized the run. Manual runs
+    # (workflow_dispatch) bypass the gate via the event check.
+    if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
