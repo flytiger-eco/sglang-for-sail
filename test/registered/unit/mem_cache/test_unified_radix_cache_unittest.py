@@ -63,6 +63,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
+from sglang.srt.utils.common import is_ppu
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -482,7 +483,10 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
-            hicache_io_backend="direct",
+            # The direct backend transfers KV via cudaMemcpyBatchAsync,
+            # which the PPU runtime does not implement; fall back to the
+            # kernel backend.
+            hicache_io_backend="kernel" if is_ppu() else "direct",
             hicache_write_policy=write_policy,
         )
         set_global_server_args_for_scheduler(server_args)
@@ -2878,7 +2882,10 @@ class UnifiedRadixCacheSuite:
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
-            hicache_io_backend="direct",
+            # The direct backend transfers KV via cudaMemcpyBatchAsync,
+            # which the PPU runtime does not implement; fall back to the
+            # kernel backend.
+            hicache_io_backend="kernel" if is_ppu() else "direct",
             hicache_write_policy=write_policy,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
