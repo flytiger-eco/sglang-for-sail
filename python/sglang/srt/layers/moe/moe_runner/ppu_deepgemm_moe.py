@@ -562,18 +562,6 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
-@torch.compile
-def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
-    # Same numerics as swiglu_with_alpha_and_limit, for w13 stored as two
-    # contiguous [gate; up] halves instead of gpt-oss' row-interleaved pairs.
-    # MiniMax-M3 builds its fused MoE with gate_up_interleaved=False.
-    # Twin of triton_utils.fused_moe.swiglu_no_interleaved_with_alpha_and_limit.
-    gate, up = x.chunk(2, dim=-1)
-    gate = gate.clamp(min=None, max=gemm1_limit)
-    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
-
-
 def deep_moe_impl_fused(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -594,7 +582,6 @@ def deep_moe_impl_fused(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
-    gate_up_interleaved: bool = True,
     out_hidden_states: Optional[torch.Tensor] = None,
 ):
     block_align = 1
@@ -774,25 +761,11 @@ def deep_moe_impl_fused(
                 a, w1, out1, expert_ids, num_recv_tokens_per_expert
             )
 
-    # Every branch below other than the gemm1_alpha one splits gate/up by
-    # chunking, i.e. assumes the non-interleaved [gate; up] layout. Only
-    # gpt-oss-style interleaved w13 needs the strided variant, and gpt-oss
-    # always supplies gemm1_alpha, so an interleaved layout reaching any other
-    # branch means the caller wired up a combination we never validated.
-    assert gate_up_interleaved is False or gemm1_alpha is not None, (
-        "gate_up_interleaved=True is only supported on the gemm1_alpha SwiGLU "
-        "path of the PPU deep_gemm MoE runner"
-    )
     if gemm1_alpha is None and gemm1_limit is None and use_mxfp4:
         a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
         if gemm1_alpha is not None:
-            swiglu_alpha_limit = (
-                swiglu_with_alpha_and_limit
-                if gate_up_interleaved
-                else swiglu_no_interleaved_with_alpha_and_limit
-            )
-            out2 = swiglu_alpha_limit(
+            out2 = swiglu_with_alpha_and_limit(
                 out1,
                 gemm1_alpha,
                 gemm1_limit,
@@ -907,7 +880,6 @@ def fused_experts_none_to_deep_gemm(
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         swiglu_limit=moe_runner_config.swiglu_limit,
-        gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         out_hidden_states=output,
     )
 
