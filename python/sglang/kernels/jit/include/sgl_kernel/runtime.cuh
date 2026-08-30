@@ -54,8 +54,15 @@ namespace host::runtime {
 template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
   int num_blocks_per_sm = 0;
-  RuntimeDeviceCheck(
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
+  cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem);
+  if (err != cudaSuccess || num_blocks_per_sm <= 0) {
+    // The occupancy API is unavailable for JIT-loaded kernels on some
+    // runtimes (e.g. PPU/hggc reports cudaErrorInvalidValue). Fall back to
+    // a conservative bound of one active block per SM; callers cap the grid
+    // with the required work, so correctness is preserved.
+    (void)::cudaGetLastError();  // clear any sticky error
+    return 1;
+  }
   return static_cast<uint32_t>(num_blocks_per_sm);
 }
 

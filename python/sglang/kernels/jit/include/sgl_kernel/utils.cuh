@@ -304,7 +304,10 @@ struct LaunchKernel {
     (void)enabled;
     m_config.numAttrs = 0;
 #else
-    if (enabled) {
+    // Programmatic Dependent Launch is a compute capability >= 9.0 feature.
+    // Query the capability defensively: some runtimes (e.g. PPU/hggc) do not
+    // recognize the PDL launch attribute and reject the launch outright.
+    if (enabled && s_pdl_supported()) {
       auto& attr = m_attrs[m_config.numAttrs++];
       attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
       attr.val.programmaticStreamSerializationAllowed = true;
@@ -313,6 +316,22 @@ struct LaunchKernel {
 #endif
     return *this;
   }
+
+#ifndef USE_ROCM
+  static bool s_pdl_supported() {
+    static const bool supported = [] {
+      int device = 0;
+      int cc_major = 0;
+      if (::cudaGetDevice(&device) != cudaSuccess ||
+          ::cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+        (void)::cudaGetLastError();  // clear any sticky error
+        return false;
+      }
+      return cc_major >= 9;
+    }();
+    return supported;
+  }
+#endif
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
 #ifdef USE_ROCM
