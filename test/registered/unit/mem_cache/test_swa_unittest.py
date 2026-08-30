@@ -20,11 +20,16 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=9, suite="stage-b-test-1-gpu-ppu")
 
 
 def _event_hashes(events):
