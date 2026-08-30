@@ -100,6 +100,15 @@ def _init_jit_cuda_arch_once():
     except Exception:
         logger.warning("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
+    # Explicit override for accelerators whose runtime reports a CUDA
+    # capability that differs from the target their compiler emits: the PPU
+    # device pass defines __CUDA_ARCH__=890 while the runtime reports 8.0,
+    # which trips the SGL_CUDA_ARCH self-check in utils.cuh. Set via
+    # SGLANG_JIT_CUDA_ARCH="major.minor".
+    override = os.environ.get("SGLANG_JIT_CUDA_ARCH")
+    if override:
+        override_major, override_minor = override.split(".")
+        major, minor = int(override_major), int(override_minor)
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.

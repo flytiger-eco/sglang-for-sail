@@ -74,6 +74,7 @@ jobs:
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true \
+            -e SGLANG_JIT_CUDA_ARCH=8.9 \
             -e CUDA_VISIBLE_DEVICES=0 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
             -e HF_HUB_OFFLINE=1 \
@@ -146,6 +147,7 @@ jobs:
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true \
+            -e SGLANG_JIT_CUDA_ARCH=8.9 \
             -e CUDA_VISIBLE_DEVICES=0 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
             -e HF_HUB_OFFLINE=1 \
@@ -211,6 +213,7 @@ jobs:
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true \
+            -e SGLANG_JIT_CUDA_ARCH=8.9 \
             -e CUDA_VISIBLE_DEVICES=0,1 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
             -e HF_HUB_OFFLINE=1 \
@@ -270,6 +273,7 @@ jobs:
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true \
+            -e SGLANG_JIT_CUDA_ARCH=8.9 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
             -e HF_HUB_OFFLINE=1 \
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
@@ -328,6 +332,7 @@ jobs:
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
             -e SGLANG_IS_IN_CI=true \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true \
+            -e SGLANG_JIT_CUDA_ARCH=8.9 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
             -e HF_HUB_OFFLINE=1 \
             -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
