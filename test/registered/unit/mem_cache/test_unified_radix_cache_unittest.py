@@ -547,6 +547,14 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNotNone(split_child.hash_value)
         self.assertEqual(len(split_child.hash_value), 1)
 
+    @unittest.skipIf(
+        is_ppu(),
+        "hicache GPU<->CPU transfers have no working IO backend on PPU: "
+        "the direct backend requires cudaMemcpyBatchAsync, which the PPU "
+        "runtime has not implemented, and the kernel backend's transfer "
+        "kernel raises an invalid-page device exception. Re-enable once "
+        "the SDK closes either gap.",
+    )
     def test_hicache_kv_events_track_gpu_cpu_transitions(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(cache)
