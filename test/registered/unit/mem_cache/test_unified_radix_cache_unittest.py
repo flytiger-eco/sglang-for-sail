@@ -2774,13 +2774,15 @@ class UnifiedRadixCacheSuite:
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
-        if is_ppu() and self.cfg.has_mamba:
-            # MambaPoolHost only supports the page_first_direct layout,
-            # whose direct transfer path requires cudaMemcpyBatchAsync;
-            # the PPU runtime has not implemented it, and the kernel
-            # backend's page_first layout is rejected by MambaPoolHost.
+        if is_ppu():
+            # Every hicache host transfer path on PPU is blocked by runtime
+            # gaps: the direct backend and the write-back staged transfer
+            # (jit_kernel kvcacheio staged_write_back) call
+            # cudaMemcpyBatchAsync, which hggc has not implemented, and the
+            # kernel backend's transfer kernel hits a device-side invalid
+            # page fault while MambaPoolHost rejects its page_first layout.
             self.skipTest(
-                "Mamba hicache host transfers have no working IO backend on PPU"
+                "hicache GPU<->CPU transfers have no working IO backend on PPU"
             )
         return False
 
