@@ -2774,6 +2774,14 @@ class UnifiedRadixCacheSuite:
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
+        if is_ppu() and self.cfg.has_mamba:
+            # MambaPoolHost only supports the page_first_direct layout,
+            # whose direct transfer path requires cudaMemcpyBatchAsync;
+            # the PPU runtime has not implemented it, and the kernel
+            # backend's page_first layout is rejected by MambaPoolHost.
+            self.skipTest(
+                "Mamba hicache host transfers have no working IO backend on PPU"
+            )
         return False
 
     def _simulate_backup(self, cache, node):
