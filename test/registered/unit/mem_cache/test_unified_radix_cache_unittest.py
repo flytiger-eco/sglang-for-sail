@@ -2818,6 +2818,11 @@ class UnifiedRadixCacheSuite:
         prefetch_threshold: Optional[int] = None,
         prefetch_policy: str = "wait_complete",
     ):
+        # Central guard: every hicache fixture goes through this entry, so
+        # unsupported platform/stack combinations (e.g. Mamba host transfers
+        # on PPU) are skipped uniformly even if an individual test forgets
+        # to call the guard itself.
+        self._skip_unsupported_hicache_test()
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost
