@@ -1260,9 +1260,15 @@ class KimiK3DeltaAttention(nn.Module):
         # For the full-rank gate (K3) the checkpoint quantizes only the MoE
         # experts; attention linears resolve to UnquantizedLinearMethod, so a
         # non-None quant_config is fine for the merged projection.
-        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
+        self.use_fused_input_projection = (
+            self.use_full_rank_gate
+            and is_ppu()
+            and envs.SGLANG_K3_KDA_INPUT_PROJ_FUSION.get()
         )
+        self.do_fuse_qkvbfg = (
+            self.attn_tp_size == self.tp_size
+            and (quant_config is None or self.use_full_rank_gate)
+        ) or self.use_fused_input_projection
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1284,8 +1290,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1535,10 +1541,15 @@ class KimiK3DeltaAttention(nn.Module):
         cuda graph capture)."""
         if not self.use_full_rank_gate:
             return
-        self._bfa_w, sizes = _merge_weights_as_views(
-            [self.f_a_proj, self.b_proj], pad_rows_to=8
-        )
-        self._bfa_fa_size, self._bfa_b_size = sizes
+        if self.use_fused_input_projection:
+            self._bfa_w, sizes = _merge_weights_as_views(
+                [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=16
+            )
+        else:
+            self._bfa_w, sizes = _merge_weights_as_views(
+                [self.f_a_proj, self.b_proj], pad_rows_to=8
+            )
+        self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -1607,6 +1618,17 @@ class KimiK3DeltaAttention(nn.Module):
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+
+                if self.use_fused_input_projection:
+                    fused_states = gemm(hidden_states, w)
+                    qkv_end, qkvg_end = self.split_sizes[0], sum(self.split_sizes)
+                    f_a_end = qkvg_end + n_fa
+                    qkv = fused_states[..., :qkv_end]
+                    g_proj_states = fused_states[..., qkv_end:qkvg_end]
+                    f_a = fused_states[..., qkvg_end:f_a_end]
+                    beta = fused_states[..., f_a_end : f_a_end + n_b]
+                    forget_gate = gemm(f_a, self.f_b_proj.weight)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None
