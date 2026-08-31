@@ -562,6 +562,21 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@torch.compile
+def swiglu_no_interleaved_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+    # Same numerics as swiglu_with_alpha_and_limit, for w13 stored as two
+    # contiguous [gate; up] halves instead of gpt-oss' row-interleaved pairs.
+    # MiniMax-M3 builds its fused MoE with gate_up_interleaved=False.
+    # Same computation as
+    # triton_utils.fused_moe.swiglu_no_interleaved_with_alpha_and_limit.
+    # Its interleaved counterpart is named swiglu_gpt_oss_sigmoid_alpha in
+    # the Triton runner and swiglu_with_alpha_and_limit in this runner.
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
 def deep_moe_impl_fused(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -582,6 +597,7 @@ def deep_moe_impl_fused(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
     out_hidden_states: Optional[torch.Tensor] = None,
 ):
     block_align = 1
@@ -761,11 +777,28 @@ def deep_moe_impl_fused(
                 a, w1, out1, expert_ids, num_recv_tokens_per_expert
             )
 
+    # gate_up_interleaved describes the physical layout of GEMM1's output:
+    # True means [gate_0, up_0, gate_1, up_1, ...], while False means two
+    # contiguous [gate; up] halves. It is only consulted by the gemm1_alpha
+    # branch below, where we explicitly choose the matching SwiGLU variant.
+    #
+    # The remaining activation paths already split gate/up by contiguous
+    # halves internally. Some models, including MiniMax-M2, use that layout
+    # but do not explicitly set gate_up_interleaved, so they retain the
+    # historical default True even though it does not describe their actual
+    # weights. Rejecting True here would therefore turn a harmless, unused
+    # legacy default into a startup failure. Keep the layout check local to
+    # the gemm1_alpha branch, where this flag actually affects computation.
     if gemm1_alpha is None and gemm1_limit is None and use_mxfp4:
         a, a_scale = silu_and_mul_post_quant_mxfp4(out1, swiglu_limit=swiglu_limit)
     else:
         if gemm1_alpha is not None:
-            out2 = swiglu_with_alpha_and_limit(
+            swiglu_alpha_limit = (
+                swiglu_with_alpha_and_limit
+                if gate_up_interleaved
+                else swiglu_no_interleaved_with_alpha_and_limit
+            )
+            out2 = swiglu_alpha_limit(
                 out1,
                 gemm1_alpha,
                 gemm1_limit,
@@ -880,6 +913,7 @@ def fused_experts_none_to_deep_gemm(
         gemm1_alpha=moe_runner_config.gemm1_alpha,
         gemm1_limit=moe_runner_config.gemm1_clamp_limit,
         swiglu_limit=moe_runner_config.swiglu_limit,
+        gate_up_interleaved=moe_runner_config.gate_up_interleaved,
         out_hidden_states=output,
     )
 
