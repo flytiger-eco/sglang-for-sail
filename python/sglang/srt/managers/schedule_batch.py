@@ -1732,6 +1732,7 @@ class Req(ReqDllmMixin):
             self.retraction_backup.cpu_tensors,
             token_indices,
             mamba_indices=self.mamba_pool_idx,
+            req_pool_index=self.req_pool_idx,
         )
         self.retraction_backup = None
 
