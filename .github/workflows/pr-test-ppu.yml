@@ -1,0 +1,319 @@
+name: PR Test (PPU)
+
+on:
+  # No pull_request trigger: the PR path is orchestrated by ci.yml
+  # (org-level gate chain: precheck -> smoke/AI review -> human review ->
+  # this workflow via workflow_call), and a direct pull_request trigger
+  # here would double-run alongside that chain. The run-ci label gate
+  # below still applies to the inherited pull_request event on the
+  # workflow_call path unless the caller opts out via
+  # require_run_ci_label: false (which ci.yml does, since human approval
+  # already gated the run). Manual verification keeps using
+  # workflow_dispatch, which bypasses the gate.
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      run_all_tests:
+        description: "Run all tests"
+        required: false
+        type: boolean
+        default: false
+      require_run_ci_label:
+        description: >-
+          Whether the run-ci label gate applies when the caller's event
+          is pull_request. ci.yml passes false so Full CI runs after
+          human approval without needing the label.
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: pr-test-ppu-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    # PPU runner consumption is gated behind the `run-ci` label on the
+    # pull_request event. A called workflow inherits the caller's event,
+    # so the gate also applies on the ci.yml -> workflow_call path;
+    # ci.yml bypasses it with require_run_ci_label: false because its
+    # human-review job already authorized the run. Manual runs
+    # (workflow_dispatch) bypass the gate via the event check.
+    if: github.event_name != 'pull_request' || !inputs.require_run_ci_label || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    outputs:
+      changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
+        || steps.run-mode.outputs.run_all_tests == 'true' }}
+      sgl_kernel_changed: ${{ steps.filter.outputs.sgl_kernel == 'true' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Determine run mode
+        id: run-mode
+        run: |
+          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        if: steps.run-mode.outputs.run_all_tests != 'true'
+        with:
+          filters: |
+            ppu_code:
+              - ".github/workflows/pr-test-ppu.yml"
+              - "python/pyproject_other.toml"
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/srt/hardware_backend/ppu/**"
+              - "python/sglang/srt/platforms/ppu.py"
+              - "python/sglang/kernels/aot/**"
+              - "test/registered/**"
+              - "scripts/ci/ppu/**"
+            sgl_kernel:
+              - "python/sglang/kernels/aot/**"
+
+  # ==================== Build sgl-kernel Wheel ==================== #
+  build-sgl-kernel:
+    # Reuses the SAIL wheel-build pipeline so a PR touching sgl-kernel
+    # sources tests a wheel built from the PR's own merge commit,
+    # without consuming self-hosted PPU runner time for the source build.
+    needs: [check-changes]
+    if: needs.check-changes.outputs.changes_exist == 'true'
+      && needs.check-changes.outputs.sgl_kernel_changed == 'true'
+    uses: ./.github/workflows/_sail-pr-test-sgl-kernel-build.yml
+    with:
+      git_ref: ${{ inputs.ref || github.sha }}
+
+  # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
+  # Covers the two independent boot failure surfaces measured on ppu1
+  # (ci-mechanism-gap-review §10.3): test_ppu_basic.py proves the offline
+  # engine initializes and decodes (~194s), test_anthropic_server.py proves
+  # a real HTTP server comes up (~40s). The 27 no-runtime unit/mock files
+  # were deliberately left out: all-green there says nothing about the PPU
+  # hardware path.
+  stage-a-test-1-gpu-ppu:
+    needs: [check-changes, build-sgl-kernel]
+    # A plain `if` does NOT override skip-on-skipped-dependency: only
+    # status check functions (always() / !failure() / !cancelled()) do.
+    # Without always(), a skipped build-sgl-kernel -- the normal case for
+    # PRs that don't touch sgl-kernel -- cascaded into a skipped stage-a
+    # while finish still reported success, so the PPU per-commit suite
+    # silently never ran on test-only PRs (gap-review §3.1b, PR #7
+    # run 32552530166). With always() && !failure() && !cancelled(), a
+    # skipped build no longer kills stage-a while a failed build still
+    # does; the wheel download step below is then skipped and the install
+    # script falls back to source build / PyPI wheel.
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`; the default shallow fetch (depth 1)
+          # leaves HEAD~1 nonexistent, so detection always failed.
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ./sgl-kernel-wheel/
+
+      - name: Run PPU smoke test (stage-a)
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          command: |
+            cd /workspace/source
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            git config --global --add safe.directory /workspace/source
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0)
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; }
+            cd test
+            python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
+          source_dir: /workspace/source
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true,SGLANG_JIT_CUDA_ARCH=8.9,SGLANG_TEST_MAX_RETRY=0,CUDA_VISIBLE_DEVICES=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel,SGL_KERNEL_BUILD_FROM_SOURCE="
+          container_options: |
+            privileged: true
+            host_ipc: true
+            shm_size: 8Gi
+          artifact_paths: |
+            sgl-kernel-wheel
+          timeout_minutes: 120
+        # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
+        # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
+        # budget). A smoke gate must fail fast and retries would mask flakiness
+        # (ci-mechanism-gap-review §10.3 fact 1).
+
+  # ==================== Stage B: 1-GPU body ==================== #
+  stage-b-test-1-gpu-ppu:
+    # Stage B runs after Stage A completes (direct dependency). The
+    # ppu-distributed-action handles pod submission and waiting internally,
+    # so no separate wait-for polling job is needed. The always() &&
+    # !failure() pattern ensures a skipped stage-a (e.g. when the smoke
+    # gate is not applicable) still lets this job evaluate, while a
+    # genuine failure fast-fails the chain.
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-a-test-1-gpu-ppu,
+      ]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ./sgl-kernel-wheel/
+
+      - name: Run PPU 1-GPU tests (stage-b)
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          command: |
+            cd /workspace/source
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            git config --global --add safe.directory /workspace/source
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0)
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; }
+            cd test
+            python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
+          source_dir: /workspace/source
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true,SGLANG_JIT_CUDA_ARCH=8.9,CUDA_VISIBLE_DEVICES=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel,SGL_KERNEL_BUILD_FROM_SOURCE="
+          container_options: |
+            privileged: true
+            host_ipc: true
+            shm_size: 8Gi
+          artifact_paths: |
+            sgl-kernel-wheel
+          timeout_minutes: 120
+
+  # ==================== Stage C: 2-GPU ==================== #
+  stage-c-test-2-gpu-ppu:
+    # Stage C runs after Stage B completes. Same direct-dependency pattern
+    # as Stage B. The 2-GPU test requires host_network for inter-device
+    # communication, matching the nightly-2-ppu job in nightly-test-ppu.yml.
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-b-test-1-gpu-ppu,
+      ]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ./sgl-kernel-wheel/
+
+      - name: Run PPU 2-GPU tests (stage-c)
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 2
+          command: |
+            cd /workspace/source
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            git config --global --add safe.directory /workspace/source
+            JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0)
+            { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; }
+            cd test
+            CUDA_VISIBLE_DEVICES=0,1 python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error
+          source_dir: /workspace/source
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=true,SGLANG_JIT_CUDA_ARCH=8.9,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel,SGL_KERNEL_BUILD_FROM_SOURCE="
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          artifact_paths: |
+            sgl-kernel-wheel
+          timeout_minutes: 120
+
+  # ==================== Finish ==================== #
+  pr-test-ppu-finish:
+    needs:
+      [
+        check-changes,
+        build-sgl-kernel,
+        stage-a-test-1-gpu-ppu,
+        stage-b-test-1-gpu-ppu,
+        stage-c-test-2-gpu-ppu,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "Job $job did not succeed (result: $result)."
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
