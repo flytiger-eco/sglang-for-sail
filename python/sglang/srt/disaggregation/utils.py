@@ -1336,3 +1336,19 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+def should_bypass_dsa_cp_prefix_cache(server_args) -> bool:
+    """Check whether radix cache must be disabled for DSA context-parallel
+    prefix cache resharding on PD prefill workers.
+
+    Returns True only when the server is a PD-disaggregated prefill worker
+    with DSA prefill context parallelism enabled — a combination that requires
+    CP-aware KV-cache resharding incompatible with radix cache.  Standalone
+    (non-PD) deployments always return False.
+    """
+    # [PPU-Patch4] stub: PD disaggregation with DSA CP is not used in standalone mode
+    return (
+        getattr(server_args, "disaggregation_mode", "null") != "null"
+        and getattr(server_args, "enable_dsa_prefill_context_parallel", False)
+    )

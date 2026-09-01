@@ -1245,6 +1245,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model = None
         self.lm_head = None
         self.logits_processor = None
+
+        # [PPU-fix] ignore list prefix remap: checkpoint uses model.language_model. prefix,
+        # but sglang module prefix is model. — without remap 501 ignore entries are ineffective,
+        # causing BF16 layers to be incorrectly quantized as INT8 (see cohere2_vision.py precedent)
+        if quant_config is not None and hasattr(quant_config, "ignore") and quant_config.ignore:
+            quant_config.ignore = [
+                e.replace("model.language_model.", "model.") if e.startswith("model.language_model.") else e
+                for e in quant_config.ignore
+            ]
+
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
             self.model = Glm5NextModel(
