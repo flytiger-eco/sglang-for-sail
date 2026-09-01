@@ -1,0 +1,1641 @@
+"""Deterministic, dependency-light evaluator for the PPU Answer MVP.
+
+The module intentionally does not call an embedding model or an LLM judge.  It
+implements the L0/L1 gate and emits records that can be labelled later.  The
+public report is redacted by default; raw candidate answers are only written
+when the caller explicitly opts in to a private output.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import unicodedata
+import xml.etree.ElementTree as ET
+from collections import Counter
+from datetime import datetime, timezone
+from importlib import metadata
+from pathlib import Path
+from typing import Any, Iterable
+
+
+class AnswerEvalError(RuntimeError):
+    """Base error for malformed test data or candidate API responses."""
+
+
+class CandidateRequestError(AnswerEvalError):
+    """An L0 failure while calling or parsing the candidate endpoint."""
+
+    def __init__(self, reason_code: str, message: str):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise AnswerEvalError(f"{path} must contain a JSON object")
+    return value
+
+
+def canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _text_digest(value: str) -> str:
+    """Hash even a JSON-escaped unpaired surrogate without losing evidence."""
+    return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def validate_dataset(dataset: dict[str, Any]) -> None:
+    if dataset.get("schema_version") != "ppu-answer-cases/v1":
+        raise AnswerEvalError("unsupported case schema")
+    cases = dataset.get("cases")
+    if not isinstance(cases, list) or len(cases) != 10:
+        raise AnswerEvalError("the Answer MVP dataset must contain exactly 10 cases")
+    case_ids = [case.get("id") for case in cases if isinstance(case, dict)]
+    if len(case_ids) != 10 or len(set(case_ids)) != 10 or not all(case_ids):
+        raise AnswerEvalError("case ids must be ten unique non-empty strings")
+    if any(not case.get("prompt") or not case.get("rules") for case in cases):
+        raise AnswerEvalError("every case must define a prompt and deterministic rules")
+
+
+def validate_profile(profile: dict[str, Any]) -> None:
+    if profile.get("schema_version") != "ppu-answer-quality-profile/v1":
+        raise AnswerEvalError("unsupported quality profile schema")
+    repetition = profile.get("repetition", {})
+    thresholds = (
+        repetition.get("ngram_suspect_coverage"),
+        repetition.get("ngram_hard_fail_coverage"),
+    )
+    if not all(isinstance(value, (int, float)) for value in thresholds):
+        raise AnswerEvalError("n-gram coverage thresholds must be numeric")
+    if not 0 <= thresholds[0] < thresholds[1] <= 1:
+        raise AnswerEvalError("invalid n-gram coverage thresholds")
+
+
+def validate_test_config(config: dict[str, Any]) -> None:
+    """Validate the public, data-driven Answer execution contract."""
+
+    if config.get("schema_version") != "ppu-answer-test-config/v1":
+        raise AnswerEvalError("unsupported Answer test config schema")
+    if not isinstance(config.get("test_id"), str) or not config["test_id"]:
+        raise AnswerEvalError("test_id must be a non-empty string")
+
+    for section in ("hardware", "model", "server", "request", "evaluation"):
+        if not isinstance(config.get(section), dict):
+            raise AnswerEvalError(f"{section} must be an object")
+
+    hardware = config["hardware"]
+    if hardware.get("platform") != "PPU":
+        raise AnswerEvalError("hardware.platform must be PPU")
+    if not isinstance(hardware.get("generation"), str) or not hardware["generation"]:
+        raise AnswerEvalError("hardware.generation must be a non-empty string")
+    visible_devices = hardware.get("visible_devices")
+    if (
+        not isinstance(visible_devices, list)
+        or not visible_devices
+        or any(
+            not isinstance(device, int) or isinstance(device, bool) or device < 0
+            for device in visible_devices
+        )
+        or len(set(visible_devices)) != len(visible_devices)
+    ):
+        raise AnswerEvalError(
+            "hardware.visible_devices must contain unique non-negative integers"
+        )
+    memory_gib = hardware.get("memory_gib_per_device")
+    if (
+        not isinstance(memory_gib, (int, float))
+        or isinstance(memory_gib, bool)
+        or memory_gib <= 0
+    ):
+        raise AnswerEvalError("hardware.memory_gib_per_device must be positive")
+
+    model = config["model"]
+    model_path = model.get("path")
+    if not isinstance(model_path, str) or not Path(model_path).is_absolute():
+        raise AnswerEvalError("model.path must be an absolute path")
+    for field in ("checkpoint_name", "served_model_name"):
+        if not isinstance(model.get(field), str) or not model[field]:
+            raise AnswerEvalError(f"model.{field} must be a non-empty string")
+    if Path(model_path).name != model["checkpoint_name"]:
+        raise AnswerEvalError(
+            "model.checkpoint_name must match the basename of model.path"
+        )
+    accepted_model_types = model.get("accepted_model_types")
+    if (
+        not isinstance(accepted_model_types, list)
+        or not accepted_model_types
+        or any(
+            not isinstance(value, str) or not value for value in accepted_model_types
+        )
+    ):
+        raise AnswerEvalError(
+            "model.accepted_model_types must contain non-empty strings"
+        )
+
+    server = config["server"]
+    startup_timeout = server.get("startup_timeout_seconds")
+    if (
+        not isinstance(startup_timeout, (int, float))
+        or isinstance(startup_timeout, bool)
+        or startup_timeout <= 0
+    ):
+        raise AnswerEvalError("server.startup_timeout_seconds must be positive")
+    parameters = server.get("parameters")
+    required_server_parameters = {
+        "trust_remote_code",
+        "tp_size",
+        "attention_backend",
+        "mem_fraction_static",
+        "quantization",
+        "reasoning_parser",
+    }
+    if (
+        not isinstance(parameters, dict)
+        or set(parameters) != required_server_parameters
+    ):
+        raise AnswerEvalError(
+            "server.parameters must contain exactly the supported SGLang parameters"
+        )
+    if not isinstance(parameters["trust_remote_code"], bool):
+        raise AnswerEvalError("server.parameters.trust_remote_code must be boolean")
+    if (
+        not isinstance(parameters["tp_size"], int)
+        or isinstance(parameters["tp_size"], bool)
+        or parameters["tp_size"] <= 0
+    ):
+        raise AnswerEvalError("server.parameters.tp_size must be a positive integer")
+    if parameters["tp_size"] != len(visible_devices):
+        raise AnswerEvalError(
+            "server.parameters.tp_size must equal the visible device count"
+        )
+    mem_fraction = parameters["mem_fraction_static"]
+    if (
+        not isinstance(mem_fraction, (int, float))
+        or isinstance(mem_fraction, bool)
+        or not 0 < mem_fraction <= 1
+    ):
+        raise AnswerEvalError("server.parameters.mem_fraction_static must be in (0, 1]")
+    for field in ("attention_backend", "quantization", "reasoning_parser"):
+        if not isinstance(parameters[field], str) or not parameters[field]:
+            raise AnswerEvalError(
+                f"server.parameters.{field} must be a non-empty string"
+            )
+
+    request = config["request"]
+    request_timeout = request.get("timeout_seconds")
+    if (
+        not isinstance(request_timeout, (int, float))
+        or isinstance(request_timeout, bool)
+        or request_timeout <= 0
+    ):
+        raise AnswerEvalError("request.timeout_seconds must be positive")
+    generation = request.get("generation")
+    required_generation_parameters = {
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "separate_reasoning",
+        "chat_template_kwargs",
+    }
+    if (
+        not isinstance(generation, dict)
+        or set(generation) != required_generation_parameters
+    ):
+        raise AnswerEvalError(
+            "request.generation must contain exactly the reviewed generation parameters"
+        )
+    if not isinstance(generation["temperature"], (int, float)) or isinstance(
+        generation["temperature"], bool
+    ):
+        raise AnswerEvalError("request.generation.temperature must be numeric")
+    if (
+        not isinstance(generation["top_p"], (int, float))
+        or isinstance(generation["top_p"], bool)
+        or not 0 <= generation["top_p"] <= 1
+    ):
+        raise AnswerEvalError("request.generation.top_p must be in [0, 1]")
+    if (
+        not isinstance(generation["max_tokens"], int)
+        or isinstance(generation["max_tokens"], bool)
+        or generation["max_tokens"] <= 0
+    ):
+        raise AnswerEvalError(
+            "request.generation.max_tokens must be a positive integer"
+        )
+    if not isinstance(generation["separate_reasoning"], bool):
+        raise AnswerEvalError("request.generation.separate_reasoning must be boolean")
+    chat_template_kwargs = generation["chat_template_kwargs"]
+    if (
+        not isinstance(chat_template_kwargs, dict)
+        or set(chat_template_kwargs) != {"enable_thinking"}
+        or not isinstance(chat_template_kwargs["enable_thinking"], bool)
+    ):
+        raise AnswerEvalError(
+            "request.generation.chat_template_kwargs must define boolean enable_thinking"
+        )
+
+    for field in ("dataset", "quality_profile"):
+        value = config["evaluation"].get(field)
+        if not isinstance(value, str) or not value:
+            raise AnswerEvalError(f"evaluation.{field} must be a non-empty path")
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise AnswerEvalError(
+                f"evaluation.{field} must stay relative to the config directory"
+            )
+
+
+def build_answer_server_args(config: dict[str, Any]) -> list[str]:
+    """Translate a validated Answer config into SGLang server CLI arguments."""
+
+    parameters = config["server"]["parameters"]
+    args = []
+    if parameters["trust_remote_code"]:
+        args.append("--trust-remote-code")
+    for name in (
+        "tp_size",
+        "attention_backend",
+        "mem_fraction_static",
+        "quantization",
+        "reasoning_parser",
+    ):
+        args.extend([f"--{name.replace('_', '-')}", str(parameters[name])])
+    args.extend(["--served-model-name", config["model"]["served_model_name"]])
+    return args
+
+
+def answer_expected_hardware(config: dict[str, Any]) -> str:
+    """Render the reviewed hardware contract for provenance."""
+
+    hardware = config["hardware"]
+    memory_gib = hardware["memory_gib_per_device"]
+    if isinstance(memory_gib, float) and memory_gib.is_integer():
+        memory_gib = int(memory_gib)
+    return (
+        f"{hardware['generation']}-" f"{len(hardware['visible_devices'])}x{memory_gib}g"
+    )
+
+
+def normalize_answer(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).replace("\r\n", "\n")
+    normalized = normalized.replace("\r", "\n")
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def compact_text(text: str) -> str:
+    return "".join(char for char in normalize_answer(text) if not char.isspace())
+
+
+def parse_thinking_blocks(raw_response: str) -> tuple[str, list[dict[str, Any]]]:
+    """Remove non-nested ``<think>`` blocks with a small deterministic parser."""
+
+    open_tag = "<think>"
+    close_tag = "</think>"
+    cursor = 0
+    inside = False
+    final_parts: list[str] = []
+    malformed: list[str] = []
+
+    while cursor < len(raw_response):
+        if raw_response.startswith(open_tag, cursor):
+            if inside:
+                malformed.append("nested_open_tag")
+            inside = True
+            cursor += len(open_tag)
+            continue
+        if raw_response.startswith(close_tag, cursor):
+            if not inside:
+                malformed.append("closing_tag_without_open")
+            else:
+                inside = False
+            cursor += len(close_tag)
+            continue
+        if not inside:
+            final_parts.append(raw_response[cursor])
+        cursor += 1
+
+    if inside:
+        malformed.append("unclosed_thinking_block")
+
+    final_answer = "".join(final_parts).strip()
+    findings = []
+    if malformed:
+        findings.append(
+            _finding(
+                "malformed_thinking_block",
+                "hard_fail",
+                observed=sorted(set(malformed)),
+                threshold="balanced, non-nested <think> blocks",
+            )
+        )
+    if not normalize_answer(final_answer):
+        findings.append(
+            _finding(
+                "empty_final_answer",
+                "hard_fail",
+                observed=0,
+                threshold="at least one non-whitespace code point",
+            )
+        )
+    return final_answer, findings
+
+
+def _finding(
+    reason_code: str,
+    action: str,
+    *,
+    observed: Any,
+    threshold: Any,
+    evidence: str | None = None,
+    rule_description: str | None = None,
+) -> dict[str, Any]:
+    result = {
+        "reason_code": reason_code,
+        "action": action,
+        "observed": observed,
+        "threshold": threshold,
+    }
+    if evidence:
+        result["evidence"] = evidence[:160]
+    if rule_description:
+        result["rule_description"] = rule_description
+    return result
+
+
+def _unicode_findings(text: str, profile: dict[str, Any], surface: str) -> list[dict]:
+    settings = profile["unicode"]
+    invalid = []
+    abnormal = []
+    non_whitespace = 0
+    for index, char in enumerate(text):
+        if not char.isspace():
+            non_whitespace += 1
+        category = unicodedata.category(char)
+        if (
+            char == settings["replacement_character"]
+            or category == "Cs"
+            or (category == "Cc" and char not in "\t\n\r")
+        ):
+            invalid.append((index, f"U+{ord(char):04X}"))
+        if category in settings["abnormal_categories"]:
+            abnormal.append((index, f"U+{ord(char):04X}"))
+
+    findings = []
+    if invalid:
+        findings.append(
+            _finding(
+                "invalid_unicode",
+                "hard_fail",
+                observed={"surface": surface, "count": len(invalid)},
+                threshold="zero replacement, surrogate, or disallowed control code points",
+                evidence=", ".join(codepoint for _, codepoint in invalid[:8]),
+            )
+        )
+    abnormal_ratio = len(abnormal) / max(non_whitespace, 1)
+    if (
+        len(abnormal) >= settings["abnormal_min_count"]
+        and abnormal_ratio >= settings["abnormal_ratio"]
+    ):
+        findings.append(
+            _finding(
+                "abnormal_codepoint_ratio",
+                "hard_fail",
+                observed={
+                    "surface": surface,
+                    "count": len(abnormal),
+                    "ratio": round(abnormal_ratio, 6),
+                },
+                threshold={
+                    "min_count": settings["abnormal_min_count"],
+                    "min_ratio": settings["abnormal_ratio"],
+                },
+                evidence=", ".join(codepoint for _, codepoint in abnormal[:8]),
+            )
+        )
+    return findings
+
+
+def _same_codepoint_run(text: str, threshold: int) -> tuple[int, str]:
+    best_count = 0
+    best_char = ""
+    previous = ""
+    current = 0
+    for char in text:
+        if char.isspace():
+            previous = ""
+            current = 0
+        elif char == previous:
+            current += 1
+        else:
+            previous = char
+            current = 1
+        if current > best_count:
+            best_count = current
+            best_char = char
+        if best_count >= threshold:
+            break
+    return best_count, best_char
+
+
+def _periodic_fragment(text: str, settings: dict[str, Any]) -> dict[str, Any] | None:
+    compact = compact_text(text)
+    min_unit = settings["periodic_unit_min"]
+    max_unit = settings["periodic_unit_max"]
+    min_repeats = settings["periodic_min_repeats"]
+    min_span = settings["periodic_min_span"]
+    for start in range(len(compact)):
+        for unit_length in range(min_unit, max_unit + 1):
+            if start + unit_length * min_repeats > len(compact):
+                break
+            unit = compact[start : start + unit_length]
+            repeats = 1
+            cursor = start + unit_length
+            while compact.startswith(unit, cursor):
+                repeats += 1
+                cursor += unit_length
+            span = repeats * unit_length
+            if repeats >= min_repeats and span >= min_span:
+                return {
+                    "unit": unit[:32],
+                    "unit_chars": unit_length,
+                    "repeats": repeats,
+                    "span_chars": span,
+                }
+    return None
+
+
+def _sentence_repetition(text: str, settings: dict[str, Any]) -> tuple[int, str]:
+    # Preserve line boundaries here.  ``normalize_answer`` intentionally
+    # collapses all whitespace for fact matching, but doing that before this
+    # split would make three identical newline-delimited answers look like one
+    # long sentence.
+    normalized = unicodedata.normalize("NFKC", text).replace("\r\n", "\n")
+    normalized = normalized.replace("\r", "\n")
+    segments = re.split(r"[。！？!?\n]+", normalized)
+    cleaned = [segment.strip(" ,，、；;：:\"'“”‘’") for segment in segments]
+    cleaned = [
+        segment
+        for segment in cleaned
+        if len(compact_text(segment)) >= settings["sentence_min_chars"]
+    ]
+    if not cleaned:
+        return 0, ""
+    sentence, count = Counter(cleaned).most_common(1)[0]
+    return count, sentence
+
+
+def _ngram_set(text: str, size: int) -> set[str]:
+    compact = compact_text(text)
+    return {compact[i : i + size] for i in range(max(0, len(compact) - size + 1))}
+
+
+def _repeated_ngram_coverage(text: str, settings: dict[str, Any]) -> float:
+    compact = compact_text(text)
+    size = settings["ngram_size"]
+    if len(compact) < settings["ngram_min_text_chars"] or len(compact) < size:
+        return 0.0
+    grams = [compact[index : index + size] for index in range(len(compact) - size + 1)]
+    frequent = {
+        gram
+        for gram, count in Counter(grams).items()
+        if count >= settings["ngram_min_occurrences"]
+    }
+    covered: set[int] = set()
+    for index, gram in enumerate(grams):
+        if gram in frequent:
+            covered.update(range(index, index + size))
+    return len(covered) / len(compact)
+
+
+def _mojibake_occurrences(text: str, markers: Iterable[str]) -> tuple[int, list[str]]:
+    hits: list[str] = []
+    for marker in markers:
+        hits.extend([marker] * text.count(marker))
+    return len(hits), hits
+
+
+def _cjk_count(text: str) -> int:
+    return sum(
+        "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+        for char in text
+    )
+
+
+def _reversible_latin1_utf8_mojibake(text: str) -> list[dict[str, Any]]:
+    """Find high-confidence UTF-8 bytes that were decoded as Latin-1.
+
+    A marker list catches common Western mojibake, but Chinese UTF-8 decoded as
+    Latin-1 often appears as ``ä½ å¥½`` and contains none of those markers.
+    Only flag a segment when a strict Latin-1 -> UTF-8 round trip succeeds and
+    materially increases the number of CJK code points.  This keeps ordinary
+    Latin-1 words such as ``café`` out of the hard-fail path.
+    """
+
+    occurrences = []
+    for match in re.finditer(r"[\x00-\xff]{3,}", text):
+        segment = match.group(0)
+        try:
+            repaired = segment.encode("latin-1").decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        before = _cjk_count(segment)
+        after = _cjk_count(repaired)
+        if after > before and after >= 1:
+            occurrences.append(
+                {
+                    "offset": match.start(),
+                    "encoded_chars": len(segment),
+                    "repaired_cjk_chars": after,
+                }
+            )
+    return occurrences
+
+
+def degradation_findings(
+    raw_response: str, final_answer: str, profile: dict[str, Any]
+) -> list[dict[str, Any]]:
+    findings = []
+    findings.extend(_unicode_findings(raw_response, profile, "raw_response"))
+    if final_answer != raw_response:
+        findings.extend(_unicode_findings(final_answer, profile, "final_answer"))
+
+    settings = profile["repetition"]
+    for surface, text in (
+        ("raw_response", raw_response),
+        ("final_answer", final_answer),
+    ):
+        run_count, run_char = _same_codepoint_run(
+            normalize_answer(text), settings["same_codepoint_run"]
+        )
+        if run_count >= settings["same_codepoint_run"]:
+            findings.append(
+                _finding(
+                    "same_codepoint_run",
+                    "hard_fail",
+                    observed={
+                        "surface": surface,
+                        "codepoint": f"U+{ord(run_char):04X}",
+                        "run": run_count,
+                    },
+                    threshold=settings["same_codepoint_run"],
+                )
+            )
+
+        periodic = _periodic_fragment(text, settings)
+        if periodic:
+            findings.append(
+                _finding(
+                    "periodic_fragment_repeat",
+                    "hard_fail",
+                    observed={"surface": surface, **periodic},
+                    threshold={
+                        "min_repeats": settings["periodic_min_repeats"],
+                        "min_span": settings["periodic_min_span"],
+                    },
+                    evidence=periodic["unit"],
+                )
+            )
+
+        sentence_count, sentence = _sentence_repetition(text, settings)
+        if sentence_count >= settings["sentence_min_repeats"]:
+            findings.append(
+                _finding(
+                    "exact_sentence_repeat",
+                    "hard_fail",
+                    observed={"surface": surface, "repeats": sentence_count},
+                    threshold=settings["sentence_min_repeats"],
+                    evidence=sentence,
+                )
+            )
+
+        coverage = _repeated_ngram_coverage(text, settings)
+        if coverage >= settings["ngram_hard_fail_coverage"]:
+            findings.append(
+                _finding(
+                    "repeated_4gram_coverage",
+                    "hard_fail",
+                    observed={"surface": surface, "coverage": round(coverage, 6)},
+                    threshold=settings["ngram_hard_fail_coverage"],
+                )
+            )
+        elif coverage >= settings["ngram_suspect_coverage"]:
+            findings.append(
+                _finding(
+                    "suspicious_4gram_coverage",
+                    "suspect",
+                    observed={"surface": surface, "coverage": round(coverage, 6)},
+                    threshold=settings["ngram_suspect_coverage"],
+                )
+            )
+
+    mojibake_count, mojibake_hits = _mojibake_occurrences(
+        raw_response, profile["mojibake"]["markers"]
+    )
+    if mojibake_count >= profile["mojibake"]["min_occurrences"]:
+        findings.append(
+            _finding(
+                "mojibake_marker",
+                "hard_fail",
+                observed={"count": mojibake_count},
+                threshold=profile["mojibake"]["min_occurrences"],
+                evidence=" ".join(mojibake_hits[:4]),
+            )
+        )
+    reversible_mojibake = _reversible_latin1_utf8_mojibake(raw_response)
+    if reversible_mojibake:
+        findings.append(
+            _finding(
+                "reversible_utf8_mojibake",
+                "hard_fail",
+                observed={"count": len(reversible_mojibake)},
+                threshold="zero strict Latin-1 to UTF-8 repairs with a CJK gain",
+            )
+        )
+    return _deduplicate_findings(findings)
+
+
+def _deduplicate_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = []
+    seen = set()
+    for finding in findings:
+        key = (finding["reason_code"], json.dumps(finding["observed"], sort_keys=True))
+        if key not in seen:
+            seen.add(key)
+            unique.append(finding)
+    return unique
+
+
+_CLAUSE_BOUNDARIES = "，,。；;！？!?\n"
+_NEGATION_BEFORE_ALIAS = re.compile(
+    r"(?:不是|并不是|并非是|并非|非是|不为|不应是|不属于|不包括|不含|不与|没与|未与)"
+    r"[^，,。；;！？!?\n]{0,12}$"
+)
+_NEGATION_AFTER_ALIAS = re.compile(
+    r"^(?:并不是|不是|并非是|并非|非是|不为|不应是|不属于|不包括|不含|不与|没与|未与)"
+)
+
+
+def _is_negated_span(text: str, start: int, end: int) -> bool:
+    clause_start = max((text.rfind(mark, 0, start) for mark in _CLAUSE_BOUNDARIES)) + 1
+    clause_ends = [text.find(mark, end) for mark in _CLAUSE_BOUNDARIES]
+    clause_ends = [position for position in clause_ends if position >= 0]
+    clause_end = min(clause_ends) if clause_ends else len(text)
+    before = text[clause_start:start]
+    after = text[end:clause_end]
+    return bool(
+        _NEGATION_BEFORE_ALIAS.search(before) or _NEGATION_AFTER_ALIAS.search(after)
+    )
+
+
+def _contains_alias(text: str, aliases: Iterable[str]) -> tuple[bool, str | None]:
+    folded = normalize_answer(text).casefold()
+    for alias in aliases:
+        normalized_alias = normalize_answer(alias).casefold()
+        cursor = 0
+        while True:
+            position = folded.find(normalized_alias, cursor)
+            if position < 0:
+                break
+            if not _is_negated_span(folded, position, position + len(normalized_alias)):
+                return True, alias
+            cursor = position + len(normalized_alias)
+    return False, None
+
+
+def _parse_chinese_integer(token: str) -> int:
+    digits = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10_000, "亿": 100_000_000}
+    if not any(char in units for char in token):
+        return int("".join(str(digits[char]) for char in token))
+
+    total = 0
+    section = 0
+    number = 0
+    for char in token:
+        if char in digits:
+            number = digits[char]
+            continue
+        unit = units[char]
+        if unit < 10_000:
+            section += (number or 1) * unit
+        else:
+            total += (section + number) * unit
+            section = 0
+        number = 0
+    return total + section + number
+
+
+def _extract_numbers(text: str) -> list[float]:
+    values = []
+    for match in re.finditer(r"(?<![\d.])[-+]?\d[\d,]*(?:\.\d+)?(?![\d.])", text):
+        token = match.group(0).replace(",", "")
+        try:
+            values.append(float(token))
+        except ValueError:
+            continue
+    for token in re.findall(r"[零〇一二两三四五六七八九十百千万亿]+", text):
+        values.append(float(_parse_chinese_integer(token)))
+    return values
+
+
+def _number_mentions(text: str) -> list[tuple[float, bool, int, int]]:
+    """Return numeric values, negation state, and source spans."""
+
+    mentions = []
+    for match in re.finditer(r"(?<![\d.])[-+]?\d[\d,]*(?:\.\d+)?(?![\d.])", text):
+        try:
+            value = float(match.group(0).replace(",", ""))
+        except ValueError:
+            continue
+        mentions.append(
+            (
+                value,
+                _is_negated_span(text, match.start(), match.end()),
+                match.start(),
+                match.end(),
+            )
+        )
+    for match in re.finditer(r"[零〇一二两三四五六七八九十百千万亿]+", text):
+        mentions.append(
+            (
+                float(_parse_chinese_integer(match.group(0))),
+                _is_negated_span(text, match.start(), match.end()),
+                match.start(),
+                match.end(),
+            )
+        )
+    return mentions
+
+
+_ASSERTED_NUMBER_PREFIX = re.compile(
+    r"(?:(?:正确答案|答案|最终答案|最终结果|实际答案|实际结果)"
+    r"(?:也)?(?:应当|应该|应)?(?:是|为|等于)|"
+    r"(?:而|但|却)(?:实际|其实)?(?:也)?(?:是|为|等于)|"
+    r"也(?:是|为|等于))\s*$"
+)
+
+
+def _is_asserted_number(text: str, start: int) -> bool:
+    """Detect a nearby assertion that makes a second value contradictory."""
+
+    clause_start = max((text.rfind(mark, 0, start) for mark in _CLAUSE_BOUNDARIES)) + 1
+    return bool(_ASSERTED_NUMBER_PREFIX.search(text[clause_start:start]))
+
+
+def _numeric_rule_matches(
+    text: str,
+    mentions: list[tuple[float, bool, int, int]],
+    target: float,
+    tolerance: float,
+) -> bool:
+    has_target = any(
+        not negated and math.isclose(value, target, abs_tol=tolerance, rel_tol=0)
+        for value, negated, _, _ in mentions
+    )
+    has_asserted_conflict = any(
+        not negated
+        and not math.isclose(value, target, abs_tol=tolerance, rel_tol=0)
+        and _is_asserted_number(text, start)
+        for value, negated, start, _ in mentions
+    )
+    return has_target and not has_asserted_conflict
+
+
+_SEQUENCE_LABEL = re.compile(
+    r"(?:第\s*)?[0-9零〇一二两三四五六七八九十]+\s*(?:句|位|项|条|个|名)?"
+)
+
+
+def _sequence_gap_is_decorative(gap: str) -> bool:
+    """Allow numbering/labels between expected items, but no extra content."""
+
+    undecorated = unicodedata.normalize("NFKC", gap)
+    undecorated = _SEQUENCE_LABEL.sub("", undecorated).replace("姓", "")
+    return all(
+        char.isspace() or unicodedata.category(char).startswith(("P", "Z"))
+        for char in undecorated
+    )
+
+
+def _sequence_has_adjacent_extra_item(
+    text: str, start: int, end: int, max_item_chars: int
+) -> bool:
+    """Reject short list items immediately before or after the expected run.
+
+    Prefix and suffix prose is allowed, but an adjacent delimiter plus a short
+    alphanumeric token is another enumerated item.  This closes the otherwise
+    invisible ``刘、赵...陈`` and ``赵...陈、刘`` cases without rejecting
+    introductions such as ``前十个姓是：`` or a sentence after the list.
+    """
+
+    before = re.search(r"([^、,，。；;！？!?：:\n]+)[、,，]\s*$", text[:start])
+    after = re.match(r"\s*[、,，]\s*([^、,，。；;！？!?：:\n]+)", text[end:])
+    candidates = [match.group(1) for match in (before, after) if match]
+    for candidate in candidates:
+        cleaned = _SEQUENCE_LABEL.sub("", candidate)
+        cleaned = "".join(char for char in cleaned if char.isalnum())
+        if 0 < len(cleaned) <= max_item_chars:
+            return True
+    return False
+
+
+def _evaluate_rule(rule: dict[str, Any], text: str) -> dict[str, Any] | None:
+    rule_type = rule["type"]
+    description = rule.get("description")
+    if rule_type == "contains_all":
+        missing = []
+        for aliases in rule["items"]:
+            found, _ = _contains_alias(text, aliases)
+            if not found:
+                missing.append(aliases)
+        if missing:
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={"rule": rule_type, "missing": missing},
+                threshold="all fact groups present",
+                rule_description=description,
+            )
+    elif rule_type == "contains_any":
+        found, _ = _contains_alias(text, rule["items"])
+        if not found:
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={"rule": rule_type, "missing_all_of": rule["items"]},
+                threshold="at least one term present",
+                rule_description=description,
+            )
+    elif rule_type == "ordered_items":
+        folded = text.casefold()
+        cursor = 0
+        missing_or_unordered = []
+        matches = []
+        for aliases in rule["items"]:
+            positioned_aliases = [
+                (folded.find(normalize_answer(alias).casefold(), cursor), alias)
+                for alias in aliases
+            ]
+            positioned_aliases = [
+                (position, alias)
+                for position, alias in positioned_aliases
+                if position >= 0
+            ]
+            if not positioned_aliases:
+                missing_or_unordered.append(aliases)
+                continue
+            position = min(position for position, _ in positioned_aliases)
+            matched_alias = max(
+                (
+                    normalize_answer(alias).casefold()
+                    for candidate_position, alias in positioned_aliases
+                    if candidate_position == position
+                ),
+                key=len,
+            )
+            matches.append((position, matched_alias))
+            cursor = position + len(matched_alias)
+        if missing_or_unordered:
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={
+                    "rule": rule_type,
+                    "missing_or_unordered": missing_or_unordered,
+                },
+                threshold="all fact groups present in order",
+                rule_description=description,
+            )
+        if rule.get("exact_sequence"):
+            gaps = [
+                folded[
+                    matches[index][0] + len(matches[index][1]) : matches[index + 1][0]
+                ]
+                for index in range(len(matches) - 1)
+            ]
+            max_item_chars = max(
+                len(normalize_answer(alias))
+                for aliases in rule["items"]
+                for alias in aliases
+            )
+            has_extra_edge_item = rule.get(
+                "strict_list_edges", False
+            ) and _sequence_has_adjacent_extra_item(
+                folded, matches[0][0], cursor, max_item_chars
+            )
+            if (
+                any(not _sequence_gap_is_decorative(gap) for gap in gaps)
+                or has_extra_edge_item
+            ):
+                return _finding(
+                    "fact_rule_failed",
+                    "hard_fail",
+                    observed={
+                        "rule": rule_type,
+                        "unexpected_content_between_or_adjacent_to_items": True,
+                    },
+                    threshold=(
+                        "only punctuation, whitespace, numbering, or item labels "
+                        "within the exact ordered sequence"
+                    ),
+                    rule_description=description,
+                )
+    elif rule_type == "exact_entity_set":
+        observed = set()
+        for canonical, aliases in rule["items"].items():
+            found, _ = _contains_alias(text, aliases)
+            if found:
+                observed.add(canonical)
+        for canonical, aliases in rule.get("forbidden_items", {}).items():
+            found, _ = _contains_alias(text, aliases)
+            if found:
+                observed.add(canonical)
+        expected = set(rule["expected"])
+        if observed != expected:
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={
+                    "rule": rule_type,
+                    "missing": sorted(expected - observed),
+                    "unexpected": sorted(observed - expected),
+                },
+                threshold={"exact_set": sorted(expected)},
+                rule_description=description,
+            )
+    elif rule_type == "number":
+        mentions = _number_mentions(text)
+        values = [value for value, _, _, _ in mentions]
+        target = float(rule["target"])
+        tolerance = float(rule.get("tolerance", 0))
+        if not _numeric_rule_matches(text, mentions, target, tolerance):
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={"rule": rule_type, "numbers": values},
+                threshold={"target": target, "absolute_tolerance": tolerance},
+                rule_description=description,
+            )
+    elif rule_type == "probability":
+        target = float(rule["target"])
+        tolerance = float(rule["tolerance"])
+        mentions = []
+        compound_spans = []
+        for match in re.finditer(r"(\d+)\s*/\s*(\d+)", text):
+            numerator, denominator = match.groups()
+            if int(denominator):
+                compound_spans.append(match.span())
+                mentions.append(
+                    (
+                        int(numerator) / int(denominator),
+                        _is_negated_span(text, match.start(), match.end()),
+                        match.start(),
+                        match.end(),
+                    )
+                )
+        for match in re.finditer(r"([-+]?\d+(?:\.\d+)?)\s*%", text):
+            compound_spans.append(match.span())
+            mentions.append(
+                (
+                    float(match.group(1)) / 100,
+                    _is_negated_span(text, match.start(), match.end()),
+                    match.start(),
+                    match.end(),
+                )
+            )
+        for value, negated, start, end in _number_mentions(text):
+            overlaps_compound = any(
+                compound_start <= start and end <= compound_end
+                for compound_start, compound_end in compound_spans
+            )
+            if not overlaps_compound and 0 <= value <= 1:
+                mentions.append((value, negated, start, end))
+        if not _numeric_rule_matches(text, mentions, target, tolerance):
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={
+                    "rule": rule_type,
+                    "probability_candidates": [value for value, _, _, _ in mentions],
+                },
+                threshold={"target": target, "absolute_tolerance": tolerance},
+                rule_description=description,
+            )
+    elif rule_type == "length":
+        observed = len(compact_text(text))
+        minimum = int(rule["min_chars"])
+        maximum = int(rule["max_chars"])
+        if not minimum <= observed <= maximum:
+            return _finding(
+                "fact_rule_failed",
+                "hard_fail",
+                observed={"rule": rule_type, "non_whitespace_chars": observed},
+                threshold={"min_chars": minimum, "max_chars": maximum},
+                rule_description=description,
+            )
+    else:
+        raise AnswerEvalError(f"unsupported rule type: {rule_type}")
+    return None
+
+
+def _sample_id(case_id: str, case_revision: int, normalized_answer: str) -> str:
+    material = f"{case_id}\0{case_revision}\0{normalized_answer}"
+    return _text_digest(material)
+
+
+def _set_verdict(result: dict[str, Any]) -> None:
+    failed = any(item["action"] == "hard_fail" for item in result["findings"])
+    result["verdict"] = "failed" if failed else "passed"
+    if failed:
+        result.setdefault("failure_class", "candidate_failed")
+    else:
+        result.pop("failure_class", None)
+
+
+def evaluate_case(
+    case: dict[str, Any],
+    raw_response: str,
+    finish_reason: str | None,
+    profile: dict[str, Any],
+    case_revision: int,
+) -> dict[str, Any]:
+    if not isinstance(raw_response, str):
+        raise AnswerEvalError("raw_response must be a string")
+    final_answer, findings = parse_thinking_blocks(raw_response)
+    normalized = normalize_answer(final_answer)
+    findings.extend(degradation_findings(raw_response, final_answer, profile))
+    if finish_reason != "stop":
+        reason_code = (
+            "finish_reason_length"
+            if finish_reason == "length"
+            else "finish_reason_incomplete"
+        )
+        findings.append(
+            _finding(
+                reason_code,
+                "hard_fail",
+                observed=finish_reason,
+                threshold="finish_reason must be stop",
+            )
+        )
+    for rule in case["rules"]:
+        finding = _evaluate_rule(rule, normalized)
+        if finding:
+            findings.append(finding)
+
+    result = {
+        "case_id": case["id"],
+        "kind": case["kind"],
+        "sample_id": _sample_id(case["id"], case_revision, normalized),
+        "answer_sha256": _text_digest(normalized),
+        "raw_response": raw_response,
+        "final_answer": final_answer,
+        "normalized_answer": normalized,
+        "finish_reason": finish_reason,
+        "findings": _deduplicate_findings(findings),
+        "judge": {"mode": "disabled", "status": "deferred"},
+        "semantic_coverage": (
+            "deterministic_facts"
+            if case["kind"] == "objective"
+            else "hard_constraints_only"
+        ),
+    }
+    _set_verdict(result)
+    return result
+
+
+def apply_cross_case_checks(
+    results: list[dict[str, Any]], profile: dict[str, Any]
+) -> None:
+    settings = profile["repetition"]
+    ngram_size = settings["ngram_size"]
+    for left_index, left in enumerate(results):
+        if not left.get("normalized_answer"):
+            continue
+        left_compact = compact_text(left["normalized_answer"])
+        for right in results[left_index + 1 :]:
+            if not right.get("normalized_answer"):
+                continue
+            right_compact = compact_text(right["normalized_answer"])
+            reason_code = None
+            action = None
+            observed: dict[str, Any] = {}
+            if (
+                left_compact == right_compact
+                and len(left_compact) >= settings["cross_case_exact_min_chars"]
+            ):
+                reason_code = "cross_case_duplicate"
+                action = "hard_fail"
+                observed = {"exact": True, "chars": len(left_compact)}
+            elif (
+                min(len(left_compact), len(right_compact))
+                >= settings["cross_case_near_min_chars"]
+            ):
+                left_grams = _ngram_set(left_compact, ngram_size)
+                right_grams = _ngram_set(right_compact, ngram_size)
+                union = left_grams | right_grams
+                jaccard = len(left_grams & right_grams) / len(union) if union else 1.0
+                observed = {"jaccard": round(jaccard, 6)}
+                if jaccard >= settings["cross_case_hard_fail_jaccard"]:
+                    reason_code = "cross_case_duplicate"
+                    action = "hard_fail"
+                elif jaccard >= settings["cross_case_suspect_jaccard"]:
+                    reason_code = "cross_case_near_duplicate"
+                    action = "suspect"
+            if reason_code:
+                for current, peer in ((left, right), (right, left)):
+                    current["findings"].append(
+                        _finding(
+                            reason_code,
+                            action,
+                            observed={"peer_case_id": peer["case_id"], **observed},
+                            threshold=(
+                                settings["cross_case_hard_fail_jaccard"]
+                                if action == "hard_fail"
+                                else settings["cross_case_suspect_jaccard"]
+                            ),
+                        )
+                    )
+    for result in results:
+        result["findings"] = _deduplicate_findings(result["findings"])
+        _set_verdict(result)
+
+
+def _normal_sample_selected(sample_id: str, profile: dict[str, Any]) -> bool:
+    selection = profile["selection"]
+    digest = hashlib.sha256(f"{selection['seed']}:{sample_id}".encode()).digest()
+    bucket = int.from_bytes(digest[:4], "big") % 100
+    return bucket < int(selection["normal_sample_percent"])
+
+
+def validate_annotation_record(record: dict[str, Any]) -> None:
+    """Validate annotation lifecycle invariants not expressible in JSON Schema."""
+
+    if record.get("schema_version") != "ppu-answer-annotation/v1":
+        raise AnswerEvalError("unsupported annotation schema")
+    answer_fields = [
+        key
+        for key in ("candidate_answer", "candidate_answer_ref")
+        if isinstance(record.get(key), str) and record[key]
+    ]
+    if len(answer_fields) != 1:
+        raise AnswerEvalError(
+            "exactly one non-empty candidate answer field is required"
+        )
+
+    annotation = record.get("annotation")
+    if not isinstance(annotation, dict):
+        raise AnswerEvalError("annotation must be an object")
+    status = annotation.get("status")
+    reviews = annotation.get("reviews")
+    adjudication = annotation.get("adjudication")
+    partition = annotation.get("partition")
+    if not isinstance(reviews, list) or len(reviews) > 2:
+        raise AnswerEvalError("annotation reviews must contain at most two entries")
+    reviewers = [
+        review.get("reviewer") for review in reviews if isinstance(review, dict)
+    ]
+    if len(reviewers) != len(reviews) or not all(
+        isinstance(reviewer, str) and reviewer.strip() for reviewer in reviewers
+    ):
+        raise AnswerEvalError("every review must identify its reviewer")
+    canonical_reviewers = {reviewer.strip().casefold() for reviewer in reviewers}
+    if len(reviewers) != len(canonical_reviewers):
+        raise AnswerEvalError("the two reviews must come from different reviewers")
+
+    if status == "pending":
+        valid_state = not reviews and adjudication is None and partition is None
+    elif status == "reviewed":
+        valid_state = len(reviews) == 2 and adjudication is None and partition is None
+    elif status == "adjudicated":
+        valid_state = (
+            len(reviews) == 2
+            and isinstance(adjudication, dict)
+            and partition in {"calibration", "holdout"}
+        )
+    else:
+        raise AnswerEvalError("unsupported annotation status")
+    if not valid_state:
+        raise AnswerEvalError(f"invalid annotation lifecycle state: {status}")
+
+
+def build_label_candidates(
+    results: list[dict[str, Any]],
+    profile: dict[str, Any],
+    provenance: dict[str, Any],
+    *,
+    case_revision: int,
+) -> list[dict[str, Any]]:
+    candidates = []
+    for result in results:
+        # Request/infrastructure failures do not contain an answer that a human
+        # can label and their null identifiers would violate the annotation
+        # schema.  Keep them in the run report only.
+        if not result.get("sample_id") or not result.get("answer_sha256"):
+            continue
+        reasons = sorted(
+            {
+                finding["reason_code"]
+                for finding in result["findings"]
+                if finding["action"] in ("hard_fail", "suspect")
+            }
+        )
+        if result["kind"] == "open_ended":
+            reasons.append("open_ended_pending_judge")
+        if not reasons and _normal_sample_selected(result["sample_id"], profile):
+            reasons.append("stable_normal_sample")
+        if not reasons:
+            continue
+        candidate = {
+            "schema_version": "ppu-answer-annotation/v1",
+            "sample_id": result["sample_id"],
+            "case_id": result["case_id"],
+            "case_revision": case_revision,
+            "answer_sha256": result["answer_sha256"],
+            "quality_profile": {
+                "id": profile["profile_id"],
+                "sha256": canonical_digest(profile),
+            },
+            "selection_reasons": sorted(set(reasons)),
+            "source_type": "github_nightly_output",
+            "provenance": provenance,
+            "candidate_answer": result["final_answer"],
+            "annotation": {
+                "status": "pending",
+                "reviews": [],
+                "adjudication": None,
+                "partition": None,
+            },
+        }
+        validate_annotation_record(candidate)
+        candidates.append(candidate)
+    return candidates
+
+
+def build_report(
+    dataset: dict[str, Any],
+    profile: dict[str, Any],
+    responses: dict[str, dict[str, Any]],
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    validate_dataset(dataset)
+    validate_profile(profile)
+    results = []
+    expected_model = provenance.get("served_model_name")
+    for case in dataset["cases"]:
+        response = responses.get(case["id"])
+        if response is None or response.get("error"):
+            reason_code = (response or {}).get("reason_code", "request_error")
+            message = (response or {}).get("error", "missing response record")
+            failure_class = (response or {}).get("failure_class", "server_error")
+            if failure_class not in {"server_error", "runner_error"}:
+                failure_class = "server_error"
+            result = {
+                "case_id": case["id"],
+                "kind": case["kind"],
+                "sample_id": None,
+                "answer_sha256": None,
+                "raw_response": "",
+                "final_answer": "",
+                "normalized_answer": "",
+                "finish_reason": None,
+                "findings": [
+                    _finding(
+                        reason_code,
+                        "hard_fail",
+                        observed=message,
+                        threshold="successful, valid candidate response",
+                    )
+                ],
+                "judge": {"mode": "disabled", "status": "deferred"},
+                "semantic_coverage": "none",
+                "verdict": "failed",
+                "failure_class": failure_class,
+            }
+        else:
+            result = evaluate_case(
+                case,
+                response["content"],
+                response.get("finish_reason"),
+                profile,
+                int(dataset["revision"]),
+            )
+            result["returned_model"] = response.get("model")
+            result["usage"] = response.get("usage")
+            result["reasoning_sha256"] = (
+                _text_digest(response["reasoning_content"])
+                if response.get("reasoning_content")
+                else None
+            )
+            if expected_model and response.get("model") != expected_model:
+                result["findings"].append(
+                    _finding(
+                        "unexpected_model_name",
+                        "hard_fail",
+                        observed=response.get("model"),
+                        threshold=expected_model,
+                    )
+                )
+                _set_verdict(result)
+        results.append(result)
+
+    apply_cross_case_checks(results, profile)
+    hard_failed = sum(result["verdict"] == "failed" for result in results)
+    suspects = sum(
+        any(finding["action"] == "suspect" for finding in result["findings"])
+        for result in results
+    )
+    report = {
+        "schema_version": "ppu-answer-result/v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "dataset": {
+            "id": dataset["dataset_id"],
+            "revision": dataset["revision"],
+            "sha256": canonical_digest(dataset),
+        },
+        "quality_profile": {
+            "id": profile["profile_id"],
+            "sha256": canonical_digest(profile),
+        },
+        "judge": {"mode": "disabled", "status": "deferred"},
+        "provenance": {
+            **provenance,
+            "python_version": platform.python_version(),
+            "unicode_version": unicodedata.unidata_version,
+        },
+        "summary": {
+            "total": len(results),
+            "passed": len(results) - hard_failed,
+            "failed": hard_failed,
+            "suspect": suspects,
+            "verdict": "passed" if hard_failed == 0 else "failed",
+            "semantic_coverage": "L0/L1 only; LLM-as-Judge deferred",
+        },
+        "cases": results,
+    }
+    report["label_candidates"] = build_label_candidates(
+        results,
+        profile,
+        report["provenance"],
+        case_revision=int(dataset["revision"]),
+    )
+    return report
+
+
+def request_chat_completion(
+    base_url: str,
+    model: str,
+    prompt: str,
+    request_suffix: str,
+    *,
+    timeout_seconds: float,
+    generation_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Call an OpenAI-compatible endpoint and decode its body as strict UTF-8."""
+
+    import requests
+
+    if {"model", "messages"} & generation_config.keys():
+        raise AnswerEvalError("generation_config must not override model or messages")
+
+    try:
+        response = requests.post(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            headers={"Authorization": "Bearer EMPTY"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": f"{prompt}\n\n{request_suffix}"}
+                ],
+                **generation_config,
+            },
+            timeout=timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        raise CandidateRequestError("request_error", type(exc).__name__) from exc
+    if response.status_code != 200:
+        raise CandidateRequestError(
+            "request_error", f"candidate endpoint returned HTTP {response.status_code}"
+        )
+    try:
+        body = response.content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise CandidateRequestError(
+            "response_decode_error", "response is not UTF-8"
+        ) from exc
+    try:
+        payload = json.loads(body)
+        choice = payload["choices"][0]
+        message = choice["message"]
+        content = message["content"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise CandidateRequestError(
+            "response_schema_error",
+            "response does not match the chat completion schema",
+        ) from exc
+    if not isinstance(content, str):
+        raise CandidateRequestError(
+            "response_decode_error", "chat completion content must be a string"
+        )
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content is not None and not isinstance(reasoning_content, str):
+        raise CandidateRequestError(
+            "response_schema_error", "reasoning_content must be a string or null"
+        )
+    return {
+        "content": content,
+        "reasoning_content": reasoning_content,
+        "finish_reason": choice.get("finish_reason"),
+        "model": payload.get("model"),
+        "usage": payload.get("usage"),
+    }
+
+
+def redact_report(report: dict[str, Any]) -> dict[str, Any]:
+    public = copy.deepcopy(report)
+    expected_model = public.get("provenance", {}).get("served_model_name")
+    for result in public["cases"]:
+        result.pop("sample_id", None)
+        result.pop("answer_sha256", None)
+        result.pop("reasoning_sha256", None)
+        result.pop("raw_response", None)
+        result.pop("final_answer", None)
+        result.pop("normalized_answer", None)
+        returned_model = result.get("returned_model")
+        if returned_model and returned_model != expected_model:
+            result["returned_model"] = "<redacted-unexpected-model-name>"
+        for finding in result["findings"]:
+            finding.pop("evidence", None)
+            finding.pop("observed", None)
+    public.pop("label_candidates", None)
+    return public
+
+
+def render_summary(report: dict[str, Any]) -> str:
+    summary = report["summary"]
+    lines = [
+        "## PPU Qwen3.5 Answer MVP",
+        "",
+        f"- Verdict: **{summary['verdict']}**",
+        f"- Cases: {summary['passed']}/{summary['total']} passed",
+        f"- Suspect cases: {summary['suspect']}",
+        "- Semantic coverage: L0/L1 deterministic checks; LLM-as-Judge deferred",
+        "",
+        "| Case | Kind | Verdict | Findings |",
+        "| --- | --- | --- | --- |",
+    ]
+    for result in report["cases"]:
+        reasons = ", ".join(
+            sorted({finding["reason_code"] for finding in result["findings"]})
+        )
+        lines.append(
+            f"| `{result['case_id']}` | {result['kind']} | {result['verdict']} | {reasons or '-'} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_junit(report: dict[str, Any]) -> bytes:
+    summary = report["summary"]
+    suite = ET.Element(
+        "testsuite",
+        name="ppu-qwen35-answer",
+        tests=str(summary["total"]),
+        failures=str(summary["failed"]),
+        errors="0",
+    )
+    for result in report["cases"]:
+        testcase = ET.SubElement(
+            suite,
+            "testcase",
+            classname="ppu.answer.qwen3_5_397b_a17b",
+            name=result["case_id"],
+        )
+        if result["verdict"] == "failed":
+            reasons = sorted(
+                {
+                    finding["reason_code"]
+                    for finding in result["findings"]
+                    if finding["action"] == "hard_fail"
+                }
+            )
+            failure = ET.SubElement(
+                testcase,
+                "failure",
+                type=result.get("failure_class", "candidate_failed"),
+                message=", ".join(reasons),
+            )
+            failure.text = json.dumps(reasons)
+        output = ET.SubElement(testcase, "system-out")
+        output.text = json.dumps({"semantic_coverage": result.get("semantic_coverage")})
+    return ET.tostring(suite, encoding="utf-8", xml_declaration=True)
+
+
+def write_report_files(
+    report: dict[str, Any], output_dir: Path, *, include_raw_outputs: bool = False
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    public_report = redact_report(report)
+    (output_dir / "result.json").write_text(
+        json.dumps(public_report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (output_dir / "summary.md").write_text(
+        render_summary(public_report), encoding="utf-8"
+    )
+    (output_dir / "junit.xml").write_bytes(render_junit(public_report))
+    if include_raw_outputs:
+        (output_dir / "label_candidates.jsonl").write_text(
+            "".join(
+                json.dumps(item, ensure_ascii=True) + "\n"
+                for item in report["label_candidates"]
+            ),
+            encoding="utf-8",
+        )
+        (output_dir / "result.private.json").write_text(
+            json.dumps(report, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
+def checkpoint_config_digest(model_path: str) -> str | None:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with config_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _installed_package_versions() -> dict[str, str | None]:
+    versions = {}
+    for package in ("sglang", "sglang-kernel", "torch", "transformers"):
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
+def default_provenance(
+    served_model_name: str,
+    model_path: str,
+    *,
+    server_config: dict[str, Any] | None = None,
+    generation_config: dict[str, Any] | None = None,
+    expected_hardware: str | None = None,
+    accelerator: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    run_url = (
+        f"{server_url}/{repository}/actions/runs/{run_id}"
+        if repository and run_id
+        else None
+    )
+    return {
+        "source_revision": os.environ.get("SGLANG_PPU_SOURCE_REVISION")
+        or os.environ.get("GITHUB_SHA"),
+        "github_run_id": run_id,
+        "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+        "github_run_url": run_url,
+        "base_image": os.environ.get("PPU_BASE_IMAGE"),
+        "base_image_digest": os.environ.get("PPU_BASE_IMAGE_DIGEST"),
+        "served_model_name": served_model_name,
+        "checkpoint_name": Path(model_path).name if model_path else None,
+        "checkpoint_config_sha256": checkpoint_config_digest(model_path),
+        "expected_hardware": expected_hardware,
+        "accelerator": accelerator,
+        "server_config": server_config,
+        "generation_config": generation_config,
+        "package_versions": _installed_package_versions(),
+    }

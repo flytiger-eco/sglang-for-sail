@@ -1,0 +1,170 @@
+name: Nightly Answer Test (PPU)
+
+on:
+  schedule:
+    # Deliberately offset from nightly-test-ppu.yml (0 16 * * *). Both
+    # workflows target the same single `ppu` runner, so an identical cron
+    # would either serialize the two chains (~4h + ~5h, overflowing the
+    # nightly window) or have them contend for the same 8 devices. 21:00
+    # UTC == 05:00 Beijing, by which time the main nightly chain (started
+    # 00:00 Beijing, ~4h) has finished.
+    - cron: '0 21 * * *'  # 5:00 AM Beijing Time (UTC+8) every day
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: nightly-test-ppu-answer-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  ANSWER_TEST_CONFIG: test/registered/ppu/answer_eval/data/qwen3_5_397b_a17b_w8a8_int8_test_config.json
+
+jobs:
+  nightly-answer-8-ppu:
+    runs-on: ppu
+    timeout-minutes: 300
+    steps:
+      - name: Clean workspace (root-owned files from prior Docker runs)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`; the default shallow fetch (depth 1)
+          # leaves HEAD~1 nonexistent, so detection always failed.
+          fetch-depth: 2
+
+      - name: Load reviewed test parameters
+        shell: bash
+        run: |
+          python3 -c '
+          import json
+          import os
+          from pathlib import Path
+
+          config_path = Path(os.environ["ANSWER_TEST_CONFIG"])
+          config = json.loads(config_path.read_text(encoding="utf-8"))
+          values = {
+              "SGLANG_PPU_ANSWER_TEST_CONFIG": f"/workspace/{config_path.as_posix()}",
+              "SGLANG_PPU_ANSWER_MODEL_PATH": config["model"]["path"],
+              "SGLANG_PPU_ANSWER_VISIBLE_DEVICES": ",".join(
+                  str(device) for device in config["hardware"]["visible_devices"]
+              ),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+              for name, value in values.items():
+                  if "\n" in value or "\r" in value:
+                      raise ValueError(f"unsafe newline in {name}")
+                  print(f"{name}={value}", file=stream)
+          '
+
+      - name: Record tested checkout and image
+        shell: bash
+        run: |
+          echo "SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}' "${PPU_BASE_IMAGE}")"
+          echo "PPU_BASE_IMAGE_DIGEST=${image_digest}" >> "${GITHUB_ENV}"
+
+      - name: Warm checkpoint page cache
+        shell: bash
+        run: |
+          model_path="${SGLANG_PPU_ANSWER_MODEL_PATH}"
+          if [[ ! -d "${model_path}" ]]; then
+            echo "::warning::Checkpoint is missing; the test will emit structured setup-failure evidence."
+          fi
+          bash scripts/ci/warm_page_cache.sh "${model_path}"
+
+      - name: Run Qwen3.5 Answer test on 8 PPU devices
+        timeout-minutes: 280
+        env:
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          docker run --rm \
+            --privileged \
+            --network host \
+            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
+            --device=/dev/alixpu_ctl \
+            --device=/dev/alixpu \
+            --ipc=host \
+            --shm-size=8g \
+            --ulimit memlock=-1 \
+            --ulimit stack=67108864 \
+            -v ${{ github.workspace }}:/workspace \
+            -v /nas_aisw:/nas_aisw \
+            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -e SGLANG_IS_IN_CI=true \
+            -e "CUDA_VISIBLE_DEVICES=${SGLANG_PPU_ANSWER_VISIBLE_DEVICES}" \
+            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
+            -e HF_HUB_OFFLINE=1 \
+            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
+            -e PPU_ARTIFACTORY_USER \
+            -e PPU_ARTIFACTORY_PASSWORD \
+            -e PPU_SUPPORTS_FP8=0 \
+            -e GITHUB_REPOSITORY \
+            -e GITHUB_RUN_ATTEMPT \
+            -e GITHUB_RUN_ID \
+            -e GITHUB_SERVER_URL \
+            -e GITHUB_SHA \
+            -e PPU_BASE_IMAGE \
+            -e SGLANG_PPU_ANSWER_TEST_CONFIG \
+            -e SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=0 \
+            -e SGLANG_PPU_ANSWER_RESULTS_DIR=/workspace/ppu-answer-artifacts \
+            -e SGLANG_PPU_SOURCE_REVISION \
+            -e PPU_BASE_IMAGE_DIGEST \
+            ${{ env.PPU_BASE_IMAGE }} \
+            bash -c "
+              cd /workspace && \
+              bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              git config --global --add safe.directory /workspace && \
+              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
+              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
+              cd test && \
+              python3 run_suite.py --hw ppu --suite nightly-answer-8-ppu --nightly --timeout-per-file 14400
+            "
+        # Routed through run_suite.py rather than a direct pytest invocation so
+        # the executed set is exactly what register_ppu_ci declares; a bare
+        # pytest path would let the file drift out of the suite while CI kept
+        # running it (or vice versa). timeout-per-file is raised from the 1200s
+        # default because server startup alone is budgeted 3600s for a 397B
+        # checkpoint. No --continue-on-error: an Answer-quality regression must
+        # turn the nightly red.
+
+      - name: Publish Answer summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f ppu-answer-artifacts/summary.md ]]; then
+            cat ppu-answer-artifacts/summary.md >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload redacted Answer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-qwen35-answer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
