@@ -174,6 +174,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.CUDA,
     HWBackend.CPU,
     HWBackend.MUSA,
+    HWBackend.PPU,
     HWBackend.XPU,
 }
 
