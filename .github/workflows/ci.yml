@@ -1,0 +1,48 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ==================== Stage 1: Precheck (org-level gate) ==================== #
+  # TODO: re-enable once the reusable workflow is available in this org
+  # precheck:
+  #   uses: flytiger-eco/.github/.github/workflows/precheck.yml@main
+  #   with:
+  #     pr_number: ${{ github.event.pull_request.number }}
+
+  # ==================== Stage 2a: Smoke test (PR file checks) ==================== #
+  # TODO: re-enable once the reusable workflow is available in this org
+  # smoke-test:
+  #   needs: [precheck]
+  #   uses: flytiger-eco/.github/.github/workflows/smoke-test.yml@main
+
+  # ==================== Stage 2b: AI Code Review ==================== #
+  # TODO: re-enable once the reusable workflow is available in this org
+  # ai-code-review:
+  #   needs: [precheck]
+  #   uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
+
+  # ==================== Stage 3: Human Review Gate ==================== #
+  # TODO: re-enable once the reusable workflow is available in this org
+  # human-review:
+  #   needs: [smoke-test, ai-code-review]
+  #   uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+
+  # ==================== Stage 4: CI (PPU test pipeline) ==================== #
+  ci:
+    # TODO: gate on human-review once enabled:
+    # needs: [human-review]
+    uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      require_run_ci_label: false
+    secrets: inherit
