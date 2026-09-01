@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys  # [PPU-int8] added for FlashMLA debug prints
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -887,7 +888,7 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")  # [PPU-int8] allow flashmla_sparse for kpool on SM80
         ):
             return
         raise NotImplementedError(
@@ -3721,6 +3722,23 @@ class DeepseekSparseAttnBackend(
             q_input = q_all
 
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
+        # [PPU-int8] Pad topk dimension for FlashMLA alignment (kpool tail tokens break alignment)
+        if page_table_1.shape[-1] % 128 != 0:
+            old_topk = page_table_1.shape[-1]
+            new_topk = ((old_topk + 127) // 128) * 128
+            padding_size = new_topk - old_topk
+            padding = torch.full(
+                (page_table_1.shape[0], padding_size),
+                -1,
+                dtype=page_table_1.dtype,
+                device=page_table_1.device,
+            )
+            page_table_1 = torch.cat([page_table_1, padding], dim=-1)
+            print(
+                f"[PPU-FlashMLA] Padded topk {old_topk} -> {new_topk} for alignment",
+                file=sys.stderr,
+                flush=True,
+            )
         indices_input = page_table_1.unsqueeze(1)
 
         # topk_length is the per-row count of valid indices
