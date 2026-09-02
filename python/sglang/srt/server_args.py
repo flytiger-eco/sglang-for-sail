@@ -2415,6 +2415,7 @@ class ServerArgs:
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
+    enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
     eplb_rebalance_num_iterations: A[
         int,
         "Number of iterations to automatically trigger a EPLB re-balance.",
@@ -2476,6 +2477,10 @@ class ServerArgs:
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
         NS("exec.moe"),
+    ] = False
+    enable_deepep_waterfill: A[
+        bool,
+        "Enable DeepEP-specific waterfill optimization for MoE expert dispatch.",
     ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],
@@ -7078,6 +7083,19 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
+        if self.enable_eplb_async:
+            assert self.enable_eplb, (
+                "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+                "passed together."
+            )
+            assert self.device == "cuda", "EPLB async is only supported on CUDA."
+            os.environ["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] = "1"
+            # avoid warmup request timeout
+            os.environ["SGLANG_WARMUP_TIMEOUT"] = "3600"
+
+            if envs.SGLANG_PROFILE_NVTX.get():
+                os.environ["SGLANG_EPLB_RUNTIME_NVTX"] = "1"
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
@@ -7123,6 +7141,11 @@ class ServerArgs:
                     "--elastic-ep-rejoin (deprecated) conflicts with "
                     f"--elastic-ep-join-mode {self.ep_join_mode}."
                 )
+        if self.enable_eplb_async:
+            assert (
+                self.elastic_ep_backend is None
+            ), "EPLB async is incompatible with elastic EP."
+
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
