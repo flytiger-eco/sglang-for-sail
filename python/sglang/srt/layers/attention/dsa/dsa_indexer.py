@@ -60,6 +60,9 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+# Cached env flag: enable NaN check on logits before topk_transform.
+_enable_logits_nan_check = envs.SGLANG_BF16_TOPK_DEBUG.get()
+
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -173,6 +176,44 @@ def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
         backend_name = prefill_backend
 
     return backend_name in ("dsa", "nsa")
+
+
+def _check_logits_nan_in_valid_range(
+    logits: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    row_offset: int = 0,
+) -> None:
+    """Fail fast if *logits* contains NaN within valid range [ks, ke).
+
+    Gated by SGLANG_BF16_TOPK_DEBUG env var (default off).
+    Only the diagnostic branch (.sum / .where) runs when NaN is detected;
+    the fast-path check is a single fused isnan+mask+any.
+    """
+    col_idx = torch.arange(logits.shape[1], device=logits.device)
+    valid_mask = (col_idx.unsqueeze(0) >= ks.unsqueeze(1)) & (
+        col_idx.unsqueeze(0) < ke.unsqueeze(1)
+    )
+    if (torch.isnan(logits) & valid_mask).any().item():
+        nan_in_valid = (torch.isnan(logits) & valid_mask).sum().item()
+        total_valid = valid_mask.sum().item()
+        nan_rows = torch.where((torch.isnan(logits) & valid_mask).any(dim=1))[0]
+        if nan_rows.numel() > 0:
+            r = nan_rows[0].item()
+            ks_v, ke_v = ks[r].item(), ke[r].item()
+            raise RuntimeError(
+                f"NaN detected in valid range of logits! "
+                f"shape={logits.shape}, dtype={logits.dtype}, "
+                f"NaN in valid={nan_in_valid}/{total_valid}, "
+                f"first NaN row={row_offset + r}, valid range [{ks_v},{ke_v}). "
+                f"Likely upstream mqa_logits kernel bug."
+            )
+        raise RuntimeError(
+            f"NaN detected in valid range of logits! "
+            f"shape={logits.shape}, dtype={logits.dtype}, "
+            f"NaN in valid={nan_in_valid}/{total_valid}. "
+            f"Likely upstream mqa_logits kernel bug."
+        )
 
 
 if is_ppu():
@@ -741,6 +782,10 @@ class Indexer(MultiPlatformOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
+                # [DSV4-BF16-TOPK] INT8 path must emit bf16 logits so the dsv4
+                # bf16 per-row topk kernel can consume them directly (default
+                # would be fp32, which falls back to fast_topk_transform_fused).
+                logits_dtype=torch.bfloat16,
             )
         raise NotImplementedError
 
@@ -806,6 +851,7 @@ class Indexer(MultiPlatformOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
+                # Decode path must NOT emit bf16 logits to avoid entering the prefill-only DSV4 BF16 topk kernel.
             )
         raise NotImplementedError
 
@@ -1639,6 +1685,10 @@ class Indexer(MultiPlatformOp):
             assert logits.shape[1] == k_offset
 
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
+
+            # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
+            if _enable_logits_nan_check:
+                _check_logits_nan_in_valid_range(logits, ks, ke)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
             return topk_result
@@ -1707,6 +1757,12 @@ class Indexer(MultiPlatformOp):
                 topk_offset_chunk = None
                 cu_seqlens_q_chunk = cu_seqlens_q_full[start:end]
                 batch_idx_chunk = token_to_batch_idx[start:end]
+
+            # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
+            if _enable_logits_nan_check:
+                _check_logits_nan_in_valid_range(
+                    logits_chunk, ks[start:end], ke[start:end], row_offset=start
+                )
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
