@@ -2943,8 +2943,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            if "weight_packed" in name:
+            # MXFP4 stores its packed values in `weight_packed`, but its MoE
+            # loader consumes `weight`. WNA16 MoE needs the original name.
+            is_mxfp4 = self.quant_config is not None and (
+                self.quant_config.get_name() == "mxfp4"
+                or "mxfp4" in (getattr(self.quant_config, "quant_format", None) or "")
+            )
+            if "weight_packed" in name and is_mxfp4:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
@@ -3154,6 +3159,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
             "block_sparse_moe": "mlp",
         },
     )
+
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
