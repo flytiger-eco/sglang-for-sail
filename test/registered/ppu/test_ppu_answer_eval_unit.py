@@ -95,7 +95,7 @@ class TestPPUAnswerEval(unittest.TestCase):
                 "Qwen3.5-397B-A17B-W8A8-INT8",
             ],
         )
-        self.assertEqual(answer_expected_hardware(self.test_config), "btv1.5-8x144g")
+        self.assertEqual(answer_expected_hardware(self.test_config), "zw810e-8x96g")
         self.assertEqual(len(canonical_digest(self.dataset)), 64)
         self.assertEqual(len({case["id"] for case in self.dataset["cases"]}), 10)
 
@@ -131,7 +131,7 @@ class TestPPUAnswerEval(unittest.TestCase):
                     str(model_dir),
                     server_config=self.test_config["server"]["parameters"],
                     generation_config=self.test_config["request"]["generation"],
-                    expected_hardware="btv1.5-8x144g",
+                    expected_hardware="zw810e-8x96g",
                 )
         self.assertEqual(provenance["source_revision"], "tested-sha")
         self.assertEqual(provenance["base_image_digest"], "sha256:image")

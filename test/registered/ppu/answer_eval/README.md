@@ -57,6 +57,40 @@ The server configuration is TP=8, FA3 attention, static memory fraction 0.8,
 and `w8a8_int8` quantization. Candidate generation is deterministic:
 temperature 0, top-p 1, and at most 2048 output tokens.
 
+## Measured baseline
+
+The first on-machine run was executed on `ptg-ppu-02` (16 × PPU-ZW810E, 96GiB
+per device, driver 1.6.1, SDK 2.1.1) on 2026-09-01 using eight devices, and it
+establishes the reference cost of this test:
+
+| Phase | Cost | Observation |
+| --- | --- | --- |
+| Checkpoint page-cache warm | 26m17s | ~250MB/s across eight parallel readers |
+| Weight load | 66s | 47.35 GB per device, 47.64 GB free afterwards |
+| CUDA graph capture | ~3m | 18.66 GB free afterwards |
+| Ten candidate generations | ~4m | 98.6 decode tokens/s |
+| Test body total | 7m31s | well inside the 280-minute step budget |
+
+Two properties of this host are load-bearing and are the reason the warm step
+carries the comment it does: the checkpoint is only reachable over NFS at about
+57MB/s per stream, and the page cache is reclaimed back to its baseline within
+30 minutes regardless of free memory. Neither is a property of the test, and a
+run that skips or defers the warm will exhaust `startup_timeout_seconds`
+instead of producing a verdict.
+
+During capture each of the eight TP ranks emits one
+`Scheduler watchdog timeout (soft=True)` record with a py-spy dump. The
+watchdog is soft, no process is killed, and the run proceeds normally; the only
+effect is several hundred extra log lines.
+
+The run reported nine of ten cases passing. `deepseek-letter-count` answered
+`3` where the reviewed fact is `4`, with `finish_reason=stop` and complete
+usage accounting, so the failure is a model-capability result rather than a
+serving or evaluation defect. `fact_rule_failed` is classified `hard_fail`
+by the kit, and neither the quality profile nor the case schema carries a
+severity field, so this case fails the suite until the judgement contract is
+revised upstream.
+
 ## Results and annotations
 
 The public workflow uploads only redacted rule findings, provenance, a

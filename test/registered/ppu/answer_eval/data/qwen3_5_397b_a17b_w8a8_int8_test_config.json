@@ -1,15 +1,15 @@
 {
   "schema_version": "ppu-answer-test-config/v1",
-  "test_id": "qwen3.5-397b-a17b-w8a8-int8-answer-144g",
+  "test_id": "qwen3.5-397b-a17b-w8a8-int8-answer-96g",
   "name": "Qwen3.5-397B-A17B-W8A8-INT8 Answer",
   "category": "LLM_Infer",
   "framework": "sglang",
   "test_category": "answer",
   "hardware": {
     "platform": "PPU",
-    "generation": "btv1.5",
+    "generation": "zw810e",
     "visible_devices": [0, 1, 2, 3, 4, 5, 6, 7],
-    "memory_gib_per_device": 144
+    "memory_gib_per_device": 96
   },
   "model": {
     "path": "/nas_aisw/datasets/checkpoints/LLM/qwen/v3.5/Qwen3.5-397B-A17B-W8A8-INT8",

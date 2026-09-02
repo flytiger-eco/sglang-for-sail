@@ -87,6 +87,15 @@ jobs:
           image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}{{.Id}}{{end}}' "${PPU_BASE_IMAGE}")"
           echo "PPU_BASE_IMAGE_DIGEST=${image_digest}" >> "${GITHUB_ENV}"
 
+      # This step is a hard dependency of the run below, not an optimization,
+      # and it must stay immediately before it. Measured on ptg-ppu-02
+      # (2026-09-01) for the 379GB / 94-shard checkpoint: a single NFS stream
+      # reaches only ~57MB/s, so a cold load progresses at 74s/shard and needs
+      # about 1h52m, which exceeds the 3600s startup_timeout_seconds and fails
+      # the test; the parallel warm reaches ~250MB/s and finishes in ~26m, after
+      # which the loader takes 66s. The host also drops the NFS page cache back
+      # to its ~116GB baseline within 30 minutes even with 1.8TB free, so a warm
+      # that is separated from the load by another step is wasted machine time.
       - name: Warm checkpoint page cache
         shell: bash
         run: |
