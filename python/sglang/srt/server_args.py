@@ -4446,6 +4446,14 @@ class ServerArgs:
             # disable deepseek v4 topk_v2 on PPU
             if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            # disable shared experts fusion for mxfp4 and mixed_precision_w4
+            hf_config = self.get_model_config().hf_config
+            quant_method = get_quantization_config(hf_config)
+            if quant_method in ("mxfp4", "mixed_precision_w4"):
+                self.disable_shared_experts_fusion = True
+                logger.info(
+                    f"{quant_method} model uses different quant method for routed experts and shared experts. --disable-shared-experts-fusion is automatically set."
+                )
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
