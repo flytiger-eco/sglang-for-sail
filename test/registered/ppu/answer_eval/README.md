@@ -1,16 +1,26 @@
 # PPU Answer MVP
 
-This directory contains the public, versioned inputs for the Qwen3.5 Answer
-nightly test. The evaluator lives in
-`python/sglang/test/kits/answer_eval_kit.py`.
+This directory contains the public, versioned inputs for the PPU Answer nightly
+tests. The evaluator lives in `python/sglang/test/kits/answer_eval_kit.py` and
+the on-machine driver in `python/sglang/test/kits/answer_suite_kit.py`.
 
-The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs
-this test on eight PPU devices. It has its own workflow instead of being
+Two models are covered, one registered file and one suite each because
+`register_ppu_ci` registers per file and the two claim different device counts:
+
+| Suite | Test file | Model | Devices |
+| --- | --- | --- | --- |
+| `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 1 |
+| `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B-W8A8-INT8 | 8 |
+
+The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
+as a `max-parallel: 1` matrix. It has its own workflow instead of being
 dispatched by the general `nightly-test-ppu.yml` workflow, so Answer failures,
 timeouts, scheduling, and artifacts remain isolated; its cron is offset to
-05:00 Beijing so the two workflows do not contend for the same runner. The
-test is registered as `nightly-answer-8-ppu` and executed through
-`run_suite.py`, so the executed set is exactly what the registry declares.
+05:00 Beijing so the two workflows do not contend for the same runner. Both
+entries are executed through `run_suite.py`, so the executed set is exactly what
+the registry declares. `fail-fast` is off: one model's verdict must not suppress
+the other's evidence, and the single-card entry runs first so a break in the
+shared serving path appears hours before the 8-card entry would report it.
 
 The current phase enforces only request integrity and deterministic facts and
 quality checks. LLM-as-Judge is intentionally deferred. Open-ended cases are
@@ -19,15 +29,20 @@ presented as fully semantic evaluations.
 
 ## Runner configuration
 
-`data/qwen3_5_397b_a17b_w8a8_int8_test_config.json` is the reviewed source of
-truth for hardware selection, checkpoint identity and path, SGLang server
-parameters, request generation parameters, timeouts, dataset, and quality
-profile. The workflow reads the same file to select the visible devices and to
-warm the checkpoint page cache, then exports its path as
-`SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python test generic and makes
+`data/*_test_config.json` are the reviewed sources of truth for hardware
+selection, checkpoint identity and path, SGLang server parameters, request
+generation parameters, timeouts, dataset, and quality profile. The workflow
+reads the same file the test will read to select the visible devices and to warm
+the checkpoint page cache, then exports its path as
+`SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python tests generic and makes
 the exact execution contract visible in the workflow log.
 
-CI runs the suite the same way every other registered test runs:
+The two models share `data/answer_cases_zh_v1.json` and
+`data/quality_profile.json`: the ten prompts are public general knowledge with
+reviewed reference facts, so they identify a judgement standard rather than a
+model, and a shared file keeps the two suites comparable by construction.
+
+CI runs each suite the same way every other registered test runs:
 
 ```bash
 cd test
@@ -44,24 +59,49 @@ SGLANG_PPU_ANSWER_TEST_CONFIG=test/registered/ppu/answer_eval/data/qwen3_5_397b_
   python3 test/registered/ppu/test_ppu_qwen35_answer.py
 ```
 
+Each test file also names its own config as the default, so the variable is only
+needed to depart from it. A config handed to the wrong file still fails loudly
+rather than silently testing something else: validation ties `tp_size` to the
+declared devices and the preflight ties the checkpoint to the devices actually
+visible.
+
 For local pytest users, `test/registered/ppu/conftest.py` exposes the same
 selection as `--answer-test-config <path>`; that option is not part of the CI
 path.
 
-The test validates the configuration, checkpoint directory, and `config.json`
+The tests validate the configuration, checkpoint directory, and `config.json`
 before starting SGLang. The test configuration digest and checkpoint
 configuration digest are included in provenance; the first on-machine run must
 establish the reviewed checkpoint digest baseline.
 
-The server configuration is TP=8, FA3 attention, static memory fraction 0.8,
-and `w8a8_int8` quantization. Candidate generation is deterministic:
-temperature 0, top-p 1, and at most 2048 output tokens.
+Candidate generation is deterministic for both models: temperature 0, top-p 1,
+and at most 2048 output tokens. The 397B server configuration is TP=8, FA3
+attention, static memory fraction 0.8, and `w8a8_int8` quantization; the 27B is
+TP=1, FA3, static memory fraction 0.85, and `unquant`, which is how
+`server_args` spells an explicit opt-out for a BF16 checkpoint.
+
+## Relation to the internal test cases
+
+Both suites are ports of internal `llm_infer_sglang_evalscope` answer cases
+(`qwen3.5-397b-a17b-w8a8-int8_3001` and `qwen3.8-27b-bf16_3001`). The port keeps
+the checkpoint, device count, attention backend, memory fraction, and
+quantization intent, and deliberately departs in two places:
+
+- generation parameters are pinned to the deterministic house line (temperature
+  0, top-p 1) instead of the sampling values the internal cases carry, because a
+  rule-based verdict must be reproducible;
+- serving parameters that the reviewed schema does not model — `page_size`,
+  `watchdog_timeout`, `stream_interval`, `max_running_requests`,
+  `cuda_graph_max_bs_decode`, `dist_timeout`, and the `disable_*` flags — are
+  left at SGLang defaults. `validate_test_config` accepts exactly the reviewed
+  parameter set, so adding one of them is a schema change with its own review
+  rather than a silent config edit.
 
 ## Measured baseline
 
 The first on-machine run was executed on `ptg-ppu-02` (16 × PPU-ZW810E, 96GiB
 per device, driver 1.6.1, SDK 2.1.1) on 2026-09-01 using eight devices, and it
-establishes the reference cost of this test:
+establishes the reference cost of the 397B test:
 
 | Phase | Cost | Observation |
 | --- | --- | --- |
@@ -90,6 +130,12 @@ serving or evaluation defect. `fact_rule_failed` is classified `hard_fail`
 by the kit, and neither the quality profile nor the case schema carries a
 severity field, so this case fails the suite until the judgement contract is
 revised upstream.
+
+The 27B entry has no measured baseline yet. Its budgets are derived rather than
+observed: the checkpoint is 52GB in 18 shards, which even at the measured
+single-stream 57MB/s loads inside the 1800s `startup_timeout_seconds`, so the
+step is given 50 minutes and the job 60. Replace this paragraph with a measured
+table once the suite has run on the machine.
 
 ## Results and annotations
 

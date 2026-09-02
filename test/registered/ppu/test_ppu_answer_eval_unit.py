@@ -39,9 +39,9 @@ from sglang.test.kits.answer_eval_kit import (
 
 # Hardware-free (pure stdlib evaluator), so the CPU suite owns it. It is also
 # registered on the PPU per-commit chain: this file is the only guard for the
-# evaluator that gates nightly-answer-8-ppu, and a PR that breaks a threshold
-# or a redaction rule should turn the PPU gate red immediately rather than
-# surface hours later in the nightly Answer run.
+# evaluator that gates the nightly-answer-*-ppu suites, and a PR that breaks a
+# threshold or a redaction rule should turn the PPU gate red immediately rather
+# than surface hours later in the nightly Answer run.
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")
 
@@ -54,7 +54,7 @@ class TestPPUAnswerEval(unittest.TestCase):
         cls.test_config = load_json(
             DATA_DIR / "qwen3_5_397b_a17b_w8a8_int8_test_config.json"
         )
-        cls.dataset = load_json(DATA_DIR / "qwen3_5_397b_a17b_answer_cases.json")
+        cls.dataset = load_json(DATA_DIR / "answer_cases_zh_v1.json")
         cls.profile = load_json(DATA_DIR / "quality_profile.json")
         cls.cases = {case["id"]: case for case in cls.dataset["cases"]}
 
@@ -109,6 +109,42 @@ class TestPPUAnswerEval(unittest.TestCase):
         )
         self.assertEqual(len(canonical_digest(self.dataset)), 64)
         self.assertEqual(len({case["id"] for case in self.dataset["cases"]}), 10)
+
+    def test_every_reviewed_test_config_is_executable(self):
+        # One config per nightly Answer job, and only the workflow names the ones
+        # this class does not load, so they are validated here instead of first
+        # failing on the machine after a checkpoint has been warmed.
+        config_paths = sorted(DATA_DIR.glob("*_test_config.json"))
+        self.assertGreaterEqual(len(config_paths), 2)
+        test_ids = set()
+        for config_path in config_paths:
+            with self.subTest(config=config_path.name):
+                config = load_json(config_path)
+                validate_test_config(config)
+                test_ids.add(config["test_id"])
+                for field in ("dataset", "quality_profile"):
+                    self.assertTrue(
+                        (config_path.parent / config["evaluation"][field]).is_file(),
+                        f"evaluation.{field} does not resolve to a file",
+                    )
+                args = build_answer_server_args(config)
+                self.assertEqual(
+                    args[args.index("--tp-size") + 1],
+                    str(len(config["hardware"]["visible_devices"])),
+                )
+                # The schema only requires a non-empty string, so a value that
+                # argparse would reject would otherwise surface as a server that
+                # never starts. server_args is imported here rather than at
+                # module scope to keep the evaluator's own import path stdlib
+                # only; "unquant" is that module's spelling for an explicit
+                # opt-out, which is how a BF16 checkpoint satisfies the field.
+                from sglang.srt.server_args import QUANTIZATION_CHOICES
+
+                self.assertIn(
+                    config["server"]["parameters"]["quantization"],
+                    QUANTIZATION_CHOICES,
+                )
+        self.assertEqual(len(test_ids), len(config_paths), "test_id must be unique")
 
     def test_expected_hardware_renders_the_declared_topology(self):
         config = {

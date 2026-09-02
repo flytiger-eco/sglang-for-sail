@@ -1,6 +1,6 @@
 {
   "schema_version": "ppu-answer-cases/v1",
-  "dataset_id": "qwen3.5-397b-a17b-answer-zh-v1",
+  "dataset_id": "ppu-answer-zh-v1",
   "revision": 1,
   "license": "Apache-2.0",
   "publication_approval": {

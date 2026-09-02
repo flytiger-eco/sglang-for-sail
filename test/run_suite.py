@@ -155,11 +155,12 @@ NIGHTLY_SUITES = {
         "nightly-2-ppu",
         "nightly-4-ppu",
         "nightly-8-ppu",
-        # Answer-quality suite, kept out of the nightly-1..8 serial chain and
-        # driven by its own workflow (nightly-test-ppu-answer.yml) so a 5-hour
+        # Answer-quality suites, kept out of the nightly-1..8 serial chain and
+        # driven by their own workflow (nightly-test-ppu-answer.yml) so a 5-hour
         # 8-card accuracy run cannot push the main nightly chain past its
-        # window. Listed here so the suite name is a registered one and
-        # run_suite.py / the coverage report account for its tests.
+        # window. Listed here so the suite names are registered ones and
+        # run_suite.py / the coverage report account for their tests.
+        "nightly-answer-1-ppu",
         "nightly-answer-8-ppu",
     ],
 }

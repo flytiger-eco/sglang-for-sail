@@ -1500,8 +1500,11 @@ def redact_report(report: dict[str, Any]) -> dict[str, Any]:
 
 def render_summary(report: dict[str, Any]) -> str:
     summary = report["summary"]
+    # Two suites now publish into the same step summary, so the heading has to
+    # name the model that produced the table rather than one particular one.
+    served_model_name = report.get("provenance", {}).get("served_model_name")
     lines = [
-        "## PPU Qwen3.5 Answer MVP",
+        f"## PPU Answer MVP ({served_model_name or 'unknown model'})",
         "",
         f"- Verdict: **{summary['verdict']}**",
         f"- Cases: {summary['passed']}/{summary['total']} passed",
