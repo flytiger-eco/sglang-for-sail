@@ -2,9 +2,9 @@
 #include <cuda_fp8.h>
 
 #include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
+#include "vec_dtypes.cuh"
 
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
@@ -65,7 +65,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
+  using vec_t = sgl::vec_t<T, vec_size>;
 
   const int32_t num_vec_elems = group_size / vec_size;
 

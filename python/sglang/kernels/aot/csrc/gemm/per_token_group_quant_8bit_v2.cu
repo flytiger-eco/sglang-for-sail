@@ -2,9 +2,9 @@
 #include <c10/util/Float8_e4m3fn.h>
 
 #include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
+#include "vec_dtypes.cuh"
 
 template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {

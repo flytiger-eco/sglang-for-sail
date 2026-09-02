@@ -2,11 +2,11 @@
 #include <cudaTypedefs.h>
 #include <torch/all.h>
 
-#include <flashinfer/vec_dtypes.cuh>
 #include <iostream>
 
 #include "cutlass/array.h"
 #include "utils.h"
+#include "vec_dtypes.cuh"
 
 constexpr uint64_t THREADS_PER_EXPERT = 512;
 
@@ -272,7 +272,7 @@ __global__ void apply_shuffle_mul_sum_kernel(
 
   constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
   using t = float;
-  using vec_t = flashinfer::vec_t<t, vec_size>;
+  using vec_t = sgl::vec_t<t, vec_size>;
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 
