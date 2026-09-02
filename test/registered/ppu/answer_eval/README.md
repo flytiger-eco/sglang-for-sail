@@ -131,11 +131,44 @@ by the kit, and neither the quality profile nor the case schema carries a
 severity field, so this case fails the suite until the judgement contract is
 revised upstream.
 
-The 27B entry has no measured baseline yet. Its budgets are derived rather than
-observed: the checkpoint is 52GB in 18 shards, which even at the measured
-single-stream 57MB/s loads inside the 1800s `startup_timeout_seconds`, so the
-step is given 50 minutes and the job 60. Replace this paragraph with a measured
-table once the suite has run on the machine.
+The 27B entry was measured on the same host on 2026-09-02 using one device:
+
+| Phase | Cost | Observation |
+| --- | --- | --- |
+| Checkpoint page-cache warm | 3m34s | 51.7GiB in 18 shards, ~247MB/s in parallel |
+| Weight load | 11.4s | 51.05 GB used, 44.93 GB free afterwards |
+| CUDA graph capture | 87.5s | batch sizes up to 33, 13.96 GB free afterwards |
+| Server startup, launch to ready | 2m43s | against the 1800s `startup_timeout_seconds` |
+| Ten candidate generations | ~27s | ~37 decode tokens/s |
+| Test body total | 3m10s | reported elapsed 199s against `est_time` 1200 |
+| Whole job | 8m41s | against the 60-minute job budget |
+
+The generous budgets are kept deliberately: they cover a cold checkpoint. At the
+measured single-stream 57MB/s, 51.7GiB needs about 15m30s, which together with
+capture still fits inside `startup_timeout_seconds`, so this entry produces a
+verdict even if the warm step is skipped — unlike the 397B entry, for which the
+warm is a hard dependency. `max_total_num_tokens` came out at 264724 with
+`context_len` 262144, so `mem_fraction_static` 0.85 leaves the KV pool ample
+room on a 96GiB device.
+
+That run reported seven of ten cases passing, all three failures being
+`fact_rule_failed` on objective cases:
+
+| Case | Answer | Reviewed fact |
+| --- | --- | --- |
+| `deepseek-letter-count` | `2` | 4 |
+| `henan-bordering-provinces` | includes 湖南, omits 河北 | the six bordering provinces |
+| `red-ball-probability` | `12.5` | 1/7, about 14.29% |
+
+The first two are model-capability results: the request path is clean and the
+rules are correct — the second even reproduces the error that the reviewed rule
+was written to correct in the internal golden. The third is a wrong answer as
+well, but it also exposes a limitation of the `probability` rule, which accepts
+`a/b`, `X%`, or a bare number already in `[0, 1]`. The prompt asks for a
+percentage, so a bare `14.29` would be discarded exactly as `12.5` was, and the
+rule cannot pass on a correctly formed bare-percentage answer. Neither the rule
+nor the severity classification is changed here, for the reason given above; an
+explicit optional unit on the rule would be the narrow fix.
 
 ## Results and annotations
 
