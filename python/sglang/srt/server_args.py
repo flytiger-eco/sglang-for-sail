@@ -2392,7 +2392,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 2
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        Literal["auto", "bf16", "fp8", "int8", "nvfp4", "uint8"],
         "Select DeepEP dispatcher output dtype",
         NS("exec.moe"),
     ] = "auto"
@@ -4418,6 +4418,11 @@ class ServerArgs:
                 envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
             if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
                 check_acext_version_compatibility()
+            # deep gemm init
+            if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+            if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+                envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
