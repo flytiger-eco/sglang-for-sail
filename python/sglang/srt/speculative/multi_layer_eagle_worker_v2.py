@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from dataclasses import replace
@@ -102,6 +103,53 @@ _is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
+
+
+# ==== NVTX profiling for MTP stages ====
+# Import-guarded NVTX helpers (mirror model_runner.py) so non-NVTX builds work.
+try:
+    from torch.cuda.nvtx import range_pop as _th_nvtx_range_pop  # type: ignore
+    from torch.cuda.nvtx import range_push as _th_nvtx_range_push  # type: ignore
+except ImportError:
+
+    def _th_nvtx_range_push(label):  # type: ignore
+        pass
+
+    def _th_nvtx_range_pop():  # type: ignore
+        pass
+
+
+_SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if _SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter as _prof_iter
+
+        from sglang.srt.model_executor.cuda_graph_runner import (
+            get_is_capture_mode as _get_is_capture_mode,
+        )
+
+        _use_model_prof = True
+    except ImportError:
+        _use_model_prof = False
+
+
+def _mtp_nvtx(name: str):
+    """Bracket an MTP stage method with an NVTX range; active under SGLANG_PROFILE_NVTX."""
+
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if _SGLANG_PROFILE_NVTX:
+                _th_nvtx_range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if _SGLANG_PROFILE_NVTX:
+                    _th_nvtx_range_pop()
+
+        return _wrapped
+
+    return _deco
 
 
 logger = logging.getLogger(__name__)
@@ -431,6 +479,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             - tic
         )
 
+    @_mtp_nvtx("mtp_draft_decode")
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
@@ -444,9 +493,22 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
         # Run draft
+        # nvtx: draft bypasses model_runner, so mirror forward() to emit the
+        # Use target_worker.model_runner's iteration to keep iteration same
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(
+                f"total bs_draft={forward_batch.batch_size}, "
+                f"forward_pass_id={target_iteration}"
+            )
+            _prof_iter(target_iteration)
+
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-        return build_eagle_verify_input(
+        result = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -460,6 +522,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if _draft_prof:
+            _th_nvtx_range_pop()
+        return result
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -564,6 +629,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    @_mtp_nvtx("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -578,6 +644,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # NVTX: add prof_range for mtp_draft_extend_prefill
+        # use self.target_worker.model_runner's iteration to keep sync.
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration-1}")
+
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
         # would be clamped away instead of surfacing.
@@ -700,11 +776,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
 
+        if _draft_prof:
+            _th_nvtx_range_pop()
         return next_draft_input
 
+    @_mtp_nvtx("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration-1}")
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -913,6 +998,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         if ret_draft_probs is None and ret_draft_probs_list:
             ret_draft_probs = torch.stack(ret_draft_probs_list, dim=1)
         next_draft_input.draft_probs = ret_draft_probs
+        if _draft_prof:
+            _th_nvtx_range_pop()
 
 
 class MultiLayerEagleWorkerV2(BaseSpecWorker):
@@ -1029,6 +1116,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
+    @_mtp_nvtx("mtp_target_verify")
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
         return run_eagle_verify(
             batch,
