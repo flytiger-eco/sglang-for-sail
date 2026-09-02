@@ -261,7 +261,7 @@ void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b, tvm::ffi::TensorV
   // Opt in to >48 KB dynamic shared memory if needed (Hopper supports up to
   // 228 KB per block).
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
   }
 
   LaunchKernel(/*grid_dim=*/1, /*block_dim=*/BLOCK_DIM, device, smem_bytes)(

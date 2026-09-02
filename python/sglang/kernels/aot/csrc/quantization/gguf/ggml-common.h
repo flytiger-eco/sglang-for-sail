@@ -931,7 +931,7 @@ typedef half dfloat;  // dequantize float
 typedef half2 dfloat2;
 typedef void (*dequantize_kernel_t)(const void* vx, const int ib, const int iqs, dfloat2& v);
 template <typename dst_t>
-using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int k, cudaStream_t stream);
+using to_cuda_ggml_t = void (*)(const void* __restrict__ x, dst_t* __restrict__ y, int k, hggcStream_t stream);
 typedef float (*vec_dot_q_cuda_t)(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& iqs);
 typedef void (*allocate_tiles_cuda_t)(int** x_ql, half2** x_dm, int** x_qh, int** x_sc);
 typedef void (*load_tiles_cuda_t)(
@@ -964,7 +964,7 @@ static __device__ __forceinline__ dst_t convert_from_half(half val) {
 
 template <>
 __device__ __forceinline__ c10::BFloat16 convert_from_half<c10::BFloat16>(half val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 || defined(USE_MUSA)
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800 || defined(USE_MUSA)
   return __float2bfloat16(__half2float(val));
 #else
   return __half2float(val);

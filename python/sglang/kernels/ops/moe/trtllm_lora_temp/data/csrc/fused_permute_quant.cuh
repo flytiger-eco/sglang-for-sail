@@ -56,8 +56,8 @@
 
 #include "nv_internal/tensorrt_llm/kernels/quantization_utils.cuh"
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 #include <optional>
 #include <type_traits>
 
@@ -276,7 +276,7 @@ void invokeFusedPermuteNvfp4Quant(uint32_t numTokens, uint32_t topK, uint32_t n,
                                   uint8_t *weightOutput, uint8_t *scaleOutput,
                                   float *perTokenScaleOutput,
                                   tensorrt_llm::QuantizationSFLayout sfLayout,
-                                  bool dedup, cudaStream_t stream) {
+                                  bool dedup, hggcStream_t stream) {
   // [opt] Occupancy tuning (ncu: kernel is occupancy-bound, not DRAM-bound —
   // DRAM <1%, achieved occupancy was 19.8% no-dedup / 5.5% dedup at
   // BLOCK_SIZE=128). The dedup variant launches only num_tokens CTAs (=64 at

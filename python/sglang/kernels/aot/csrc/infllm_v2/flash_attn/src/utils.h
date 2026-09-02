@@ -5,12 +5,12 @@
 #pragma once
 
 #include <assert.h>
-#include <cuda_fp16.h>
+#include <hggc_fp16.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_bf16.h>
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
+#include <hggc_bf16.h>
 #endif
 
 #include <cutlass/array.h>
@@ -35,7 +35,7 @@ template <>
 __forceinline__ __device__ uint32_t relu2<cutlass::half_t>(const uint32_t x) {
   uint32_t res;
   const uint32_t zero = 0u;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   asm volatile("max.f16x2 %0, %1, %2;\n" : "=r"(res) : "r"(x), "r"(zero));
 #else
   asm volatile(
@@ -50,7 +50,7 @@ __forceinline__ __device__ uint32_t relu2<cutlass::half_t>(const uint32_t x) {
   return res;
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
 template <>
 __forceinline__ __device__ uint32_t relu2<cutlass::bfloat16_t>(const uint32_t x) {
   uint32_t res;
@@ -62,7 +62,7 @@ __forceinline__ __device__ uint32_t relu2<cutlass::bfloat16_t>(const uint32_t x)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
 
 template <typename T>
 __forceinline__ __device__ uint32_t convert_relu2(const float2 x);
@@ -302,7 +302,7 @@ __forceinline__ __device__ auto convert_type_relu(Tensor<Engine, Layout> const& 
   static_assert(std::is_same_v<float, From_type>);
   constexpr int numel = decltype(size(tensor))::value;
   static_assert(numel % 2 == 0);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   // HACK: this requires tensor to be "contiguous"
   Tensor tensor_float2 = recast<float2>(tensor);
   Tensor out_uint32 = make_tensor<uint32_t>(tensor_float2.layout());

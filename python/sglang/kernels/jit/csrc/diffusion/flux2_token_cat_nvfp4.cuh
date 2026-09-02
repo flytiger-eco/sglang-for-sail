@@ -66,15 +66,15 @@ __global__ void kernel(const Params __grid_constant__ params) {
     input.load(static_cast<const bf16_t*>(params.mlp) + int64_t(row) * kMlpHidden + mlp_group * kGroupSize);
   }
 
-  tensorrt_llm::kernels::PackedVec<__nv_bfloat16, kGroupSize> quant_vec;
-  auto* quant_values = reinterpret_cast<__nv_bfloat16*>(&quant_vec);
+  tensorrt_llm::kernels::PackedVec<__ppu_bfloat16, kGroupSize> quant_vec;
+  auto* quant_values = reinterpret_cast<__ppu_bfloat16*>(&quant_vec);
 #pragma unroll
   for (int element = 0; element < kGroupSize; ++element) {
-    quant_values[element] = static_cast<__nv_bfloat16>(input[element]);
+    quant_values[element] = static_cast<__ppu_bfloat16>(input[element]);
   }
 
   const float global_scale = *static_cast<const float*>(params.global_scale);
-  const uint64_t packed = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, kGroupSize, kGroupSize, false>(
+  const uint64_t packed = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__ppu_bfloat16, kGroupSize, kGroupSize, false>(
       quant_vec, global_scale, quant_scales + scale_offset);
   static_cast<uint64_t*>(params.quantized)[int64_t(row) * kScaleColumns + group] = packed;
 }

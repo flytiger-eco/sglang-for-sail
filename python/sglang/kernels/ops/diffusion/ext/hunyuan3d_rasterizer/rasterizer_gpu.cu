@@ -129,7 +129,7 @@ std::vector<torch::Tensor> rasterize_image_gpu(torch::Tensor V, torch::Tensor F,
                                                float occlusion_truncation,
                                                int use_depth_prior) {
   int device_id = V.get_device();
-  cudaSetDevice(device_id);
+  hggcSetDevice(device_id);
   int num_faces = F.size(0);
   int num_vertices = V.size(0);
   auto options = torch::TensorOptions()

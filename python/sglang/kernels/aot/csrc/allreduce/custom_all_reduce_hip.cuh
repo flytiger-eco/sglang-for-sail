@@ -4,7 +4,7 @@
 #include <hip/hip_runtime.h>
 #ifdef USE_ROCM
 #include <hip/hip_bf16.h>
-typedef __hip_bfloat16 nv_bfloat16;
+typedef __hip_bfloat16 ppu_bfloat16;
 #else
 #include <hip/hip_bf16.h>
 #endif
@@ -97,15 +97,15 @@ DINLINE float& assign_add(float& a, float b) {
   return a += b;
 }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-DINLINE float upcast_s(nv_bfloat16 val) {
+#if (COMPATIBLE_ARCH >= 800 || !defined(COMPATIBLE_ARCH))
+DINLINE float upcast_s(ppu_bfloat16 val) {
   return __bfloat162float(val);
 }
 template <>
-DINLINE nv_bfloat16 downcast_s(float val) {
+DINLINE ppu_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
 }
-DINLINE nv_bfloat16& assign_add(nv_bfloat16& a, nv_bfloat16 b) {
+DINLINE ppu_bfloat16& assign_add(ppu_bfloat16& a, ppu_bfloat16 b) {
   a = __hadd(a, b);
   return a;
 }
@@ -528,7 +528,7 @@ class CustomAllreduce {
 #ifdef USE_ROCM
               HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #else
-              CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+              HG_POINTER_ATTRIBUTE_RANGE_START_ADDR,
 #endif
               (hipDeviceptr_t)ptr) != hipSuccess)
         throw std::runtime_error("failed to get pointer attr");

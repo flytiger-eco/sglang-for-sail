@@ -174,7 +174,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
 }
 
 template <typename DType, typename IdType, typename IdType2>
-cudaError_t TreeSpeculativeSamplingTargetOnly(
+hggcError_t TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,                   // mutable
     IdType* output_token_ids,           // mutable
     IdType* output_accepted_token_num,  // mutable
@@ -193,7 +193,7 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
     DType threshold_single = 1,
     DType threshold_acc = 1,
     bool deterministic = true,
-    cudaStream_t stream = 0) {
+    hggcStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
@@ -230,10 +230,10 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
             DType,
             IdType,
             IdType2>;
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        FLASHINFER_CUDA_CALL(hggcLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       })});
-  return cudaSuccess;
+  return hggcSuccess;
 }
 
 }  // namespace sampling

@@ -69,7 +69,7 @@ namespace sglang {
 
 namespace device::marlin {
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if !defined(COMPATIBLE_ARCH) || COMPATIBLE_ARCH >= 800
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
@@ -160,7 +160,7 @@ __device__ inline void dequant<half2, host::kU4.id(), false>(int q, half2* frag_
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU4B8.id(), true>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant<ppu_bfloat162, host::kU4B8.id(), true>(int q, ppu_bfloat162* frag_b) {
   static constexpr uint32_t MASK = 0x000f000f;
   static constexpr uint32_t EX = 0x43004300;
 
@@ -171,33 +171,33 @@ __device__ inline void dequant<nv_bfloat162, host::kU4B8.id(), true>(int q, nv_b
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
   // clang-format on
 
-  frag_b[0] = *reinterpret_cast<nv_bfloat162*>(&lo);
-  frag_b[1] = *reinterpret_cast<nv_bfloat162*>(&hi);
+  frag_b[0] = *reinterpret_cast<ppu_bfloat162*>(&lo);
+  frag_b[1] = *reinterpret_cast<ppu_bfloat162*>(&hi);
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU4B8.id(), false>(int q, nv_bfloat162* frag_b) {
-  dequant<nv_bfloat162, host::kU4B8.id(), true>(q, frag_b);
+__device__ inline void dequant<ppu_bfloat162, host::kU4B8.id(), false>(int q, ppu_bfloat162* frag_b) {
+  dequant<ppu_bfloat162, host::kU4B8.id(), true>(q, frag_b);
 
   static constexpr uint32_t SUB = 0x43084308;
 
-  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const nv_bfloat162*>(&SUB));
-  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const nv_bfloat162*>(&SUB));
+  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const ppu_bfloat162*>(&SUB));
+  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const ppu_bfloat162*>(&SUB));
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU4.id(), true>(int q, nv_bfloat162* frag_b) {
-  dequant<nv_bfloat162, host::kU4B8.id(), true>(q, frag_b);
+__device__ inline void dequant<ppu_bfloat162, host::kU4.id(), true>(int q, ppu_bfloat162* frag_b) {
+  dequant<ppu_bfloat162, host::kU4B8.id(), true>(q, frag_b);
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU4.id(), false>(int q, nv_bfloat162* frag_b) {
-  dequant<nv_bfloat162, host::kU4.id(), true>(q, frag_b);
+__device__ inline void dequant<ppu_bfloat162, host::kU4.id(), false>(int q, ppu_bfloat162* frag_b) {
+  dequant<ppu_bfloat162, host::kU4.id(), true>(q, frag_b);
 
   static constexpr uint32_t SUB = 0x43004300;
 
-  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const nv_bfloat162*>(&SUB));
-  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const nv_bfloat162*>(&SUB));
+  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const ppu_bfloat162*>(&SUB));
+  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const ppu_bfloat162*>(&SUB));
 }
 
 //
@@ -245,7 +245,7 @@ __device__ inline void dequant<half2, host::kU8.id(), false>(int q, half2* frag_
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU8B128.id(), false>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant<ppu_bfloat162, host::kU8B128.id(), false>(int q, ppu_bfloat162* frag_b) {
   float fp32_intermediates[4];
   uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
 
@@ -266,7 +266,7 @@ __device__ inline void dequant<nv_bfloat162, host::kU8B128.id(), false>(int q, n
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kU8.id(), false>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant<ppu_bfloat162, host::kU8.id(), false>(int q, ppu_bfloat162* frag_b) {
   float fp32_intermediates[4];
   uint32_t* fp32_intermediates_casted = reinterpret_cast<uint32_t*>(fp32_intermediates);
 
@@ -320,7 +320,7 @@ __device__ inline void dequant<half2, host::kFE4M3fn.id(), false>(int q, half2* 
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kFE4M3fn.id(), true>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant<ppu_bfloat162, host::kFE4M3fn.id(), true>(int q, ppu_bfloat162* frag_b) {
   // Constants for FP8 (E4M3) and BF16 formats
   constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
@@ -333,13 +333,13 @@ __device__ inline void dequant<nv_bfloat162, host::kFE4M3fn.id(), true>(int q, n
   int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
+  frag_b[1] = *reinterpret_cast<const ppu_bfloat162*>(&Out1);
+  frag_b[0] = *reinterpret_cast<const ppu_bfloat162*>(&Out2);
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kFE4M3fn.id(), false>(int q, nv_bfloat162* frag_b) {
-  dequant<nv_bfloat162, host::kFE4M3fn.id(), true>(q, frag_b);
+__device__ inline void dequant<ppu_bfloat162, host::kFE4M3fn.id(), false>(int q, ppu_bfloat162* frag_b) {
+  dequant<ppu_bfloat162, host::kFE4M3fn.id(), true>(q, frag_b);
 
   // Constants for FP8 (E4M3) and BF16 formats
   constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
@@ -349,7 +349,7 @@ __device__ inline void dequant<nv_bfloat162, host::kFE4M3fn.id(), false>(int q, 
   // Add 127 (float exponent bias) to BIAS_OFFSET and shift to float exponent
   // position
   constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-  const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+  const ppu_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
 
   // Convert to bfloat162 and apply bias
   frag_b[1] = __hmul2(frag_b[1], bias_reg);
@@ -390,7 +390,7 @@ __device__ inline void dequant<half2, host::kFE2M1f.id(), false>(int q, half2* f
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kFE2M1f.id(), true>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant<ppu_bfloat162, host::kFE2M1f.id(), true>(int q, ppu_bfloat162* frag_b) {
   // Constants for FP4 (E2M1) and FP16 formats
   constexpr int FP4_EXPONENT = 2, BF16_EXPONENT = 8;
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP4_EXPONENT;
@@ -402,13 +402,13 @@ __device__ inline void dequant<nv_bfloat162, host::kFE2M1f.id(), true>(int q, nv
   int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
+  frag_b[1] = *reinterpret_cast<const ppu_bfloat162*>(&Out1);
+  frag_b[0] = *reinterpret_cast<const ppu_bfloat162*>(&Out2);
 }
 
 template <>
-__device__ inline void dequant<nv_bfloat162, host::kFE2M1f.id(), false>(int q, nv_bfloat162* frag_b) {
-  dequant<nv_bfloat162, host::kFE2M1f.id(), true>(q, frag_b);
+__device__ inline void dequant<ppu_bfloat162, host::kFE2M1f.id(), false>(int q, ppu_bfloat162* frag_b) {
+  dequant<ppu_bfloat162, host::kFE2M1f.id(), true>(q, frag_b);
 
   // Constants for FP4 (E2M1) and BF16 formats
   constexpr int FP4_EXPONENT = 2, BF16_EXPONENT = 8;
@@ -418,7 +418,7 @@ __device__ inline void dequant<nv_bfloat162, host::kFE2M1f.id(), false>(int q, n
   // Add 127 (float exponent bias) to BIAS_OFFSET and shift to float exponent
   // position
   constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-  const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+  const ppu_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
 
   // Convert to half2 and apply bias
   frag_b[1] = __hmul2(frag_b[1], bias_reg);
@@ -441,7 +441,7 @@ __device__ inline void dequant_fp8_scales<half2>(int q, half2* frag_b) {
 };
 
 template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant_fp8_scales<ppu_bfloat162>(int q, ppu_bfloat162* frag_b) {
   constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
   constexpr int MASK = 0x7F007F00;
@@ -452,8 +452,8 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162>(int q, nv_bfloat162* fra
   int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
+  frag_b[1] = *reinterpret_cast<const ppu_bfloat162*>(&Out1);
+  frag_b[0] = *reinterpret_cast<const ppu_bfloat162*>(&Out2);
 };
 
 // New version with s_type_id parameter for marlin_moe_wna16_v2
@@ -473,7 +473,7 @@ __device__ inline void dequant_fp8_scales<half2, host::kFE4M3fn.id()>(int q, hal
 };
 
 template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE4M3fn.id()>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant_fp8_scales<ppu_bfloat162, host::kFE4M3fn.id()>(int q, ppu_bfloat162* frag_b) {
   constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
   constexpr int MASK = 0x7F007F00;
@@ -484,12 +484,12 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE4M3fn.id()>(int
   int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
+  frag_b[1] = *reinterpret_cast<const ppu_bfloat162*>(&Out1);
+  frag_b[0] = *reinterpret_cast<const ppu_bfloat162*>(&Out2);
 }
 
 template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant_fp8_scales<ppu_bfloat162, host::kFE8M0fnu.id()>(int q, ppu_bfloat162* frag_b) {
   // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
   // but we assume that such a extreme value would not occur in real models.
   int Out1 = (q & 0xFF00FF00) >> 1;
@@ -497,8 +497,8 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(in
   int Out2 = q & 0x7F807F80;
 
   // Note: reverse indexing is intentional because weights are permuted
-  frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
-  frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
+  frag_b[1] = *reinterpret_cast<const ppu_bfloat162*>(&Out1);
+  frag_b[0] = *reinterpret_cast<const ppu_bfloat162*>(&Out2);
 }
 
 #endif

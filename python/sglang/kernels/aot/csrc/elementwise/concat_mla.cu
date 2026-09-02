@@ -1,6 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 #include "pytorch_extension_utils.h"
 #include "utils.cuh"
@@ -14,9 +14,9 @@ constexpr int HEAD_CHUNK_SIZE = 16;
 constexpr int NUM_HEAD_CHUNKS = NUM_LOCAL_HEADS / HEAD_CHUNK_SIZE;
 
 __global__ void concat_mla_k_kernel(
-    nv_bfloat16* __restrict__ k,
-    const nv_bfloat16* __restrict__ k_nope,
-    const nv_bfloat16* __restrict__ k_rope,
+    ppu_bfloat16* __restrict__ k,
+    const ppu_bfloat16* __restrict__ k_nope,
+    const ppu_bfloat16* __restrict__ k_rope,
     const int num_tokens,
     const int64_t k_stride_0,
     const int k_stride_1,
@@ -31,8 +31,8 @@ __global__ void concat_mla_k_kernel(
 
   using NopeVec = int2;  // 8B/thread，32 thread = 256B/row
   using RopeVec = int;   // 4B/thread，32 thread = 128B/row
-  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(nv_bfloat16), "nope vec mismatch");
-  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(nv_bfloat16), "rope vec mismatch");
+  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(ppu_bfloat16), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(ppu_bfloat16), "rope vec mismatch");
 
   const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
 
@@ -101,17 +101,17 @@ void concat_mla_k(at::Tensor k, at::Tensor k_nope, at::Tensor k_rope) {
   const int block_size = num_warps_per_block * 32;
 
   concat_mla_k_kernel<<<grid_size, block_size, 0, stream>>>(
-      reinterpret_cast<nv_bfloat16*>(k.data_ptr()),
-      reinterpret_cast<nv_bfloat16*>(k_nope.data_ptr()),
-      reinterpret_cast<nv_bfloat16*>(k_rope.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(k.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(k_nope.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(k_rope.data_ptr()),
       num_tokens,
       k.stride(0),
       k.stride(1),
       k_nope.stride(0),
       k_nope.stride(1),
       k_rope.stride(0));
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+  hggcError_t err = hggcGetLastError();
+  TORCH_CHECK(err == hggcSuccess, "CUDA kernel launch failed: ", hggcGetErrorString(err));
 }
 
 // ============================== concat_mla_absorb_q ==============================
@@ -121,9 +121,9 @@ constexpr int A_LAST_DIM = 512;
 constexpr int B_LAST_DIM = 64;
 
 __global__ void concat_mla_absorb_q_kernel(
-    nv_bfloat16* a,
-    nv_bfloat16* b,
-    nv_bfloat16* out,
+    ppu_bfloat16* a,
+    ppu_bfloat16* b,
+    ppu_bfloat16* out,
     const int num_items,
     const int dim_1,
     const int64_t a_stride_0,
@@ -201,9 +201,9 @@ void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out) {
   const int block_size = num_warps_per_block * 32;
 
   concat_mla_absorb_q_kernel<<<grid_size, block_size, 0, stream>>>(
-      reinterpret_cast<nv_bfloat16*>(a.data_ptr()),
-      reinterpret_cast<nv_bfloat16*>(b.data_ptr()),
-      reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(a.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(b.data_ptr()),
+      reinterpret_cast<ppu_bfloat16*>(out.data_ptr()),
       num_items,
       a.size(1),
       a.stride(0),
@@ -212,7 +212,7 @@ void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out) {
       b.stride(1),
       out.stride(0),
       out.stride(1));
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+  hggcError_t err = hggcGetLastError();
+  TORCH_CHECK(err == hggcSuccess, "CUDA kernel launch failed: ", hggcGetErrorString(err));
 }
 // test-1

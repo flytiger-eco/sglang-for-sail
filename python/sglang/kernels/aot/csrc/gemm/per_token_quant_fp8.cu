@@ -202,7 +202,7 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
     const dim3& grid,
     const dim3& block,
     size_t dynamicSmemSz,
-    cudaStream_t stream,
+    hggcStream_t stream,
     bool use_vec16,
     bool use_vec8,
     torch::Tensor input,
@@ -213,26 +213,26 @@ static inline void launch_per_token_quant_fp8_warp_kernel(
   const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
 
   if (use_vec16) {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
+    per_token_quant_fp8_kernel<scalar_t, __hg_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
   } else if (use_vec8) {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
+    per_token_quant_fp8_kernel<scalar_t, __hg_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
   } else {
-    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
+    per_token_quant_fp8_kernel<scalar_t, __hg_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
         <<<grid, block, smem_size, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
@@ -248,7 +248,7 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const int64_t hidden_dim = input_sizes[1];
   TORCH_CHECK(hidden_dim % 4 == 0, "Hidden dimension must be divisible by 4, but got ", hidden_dim);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
@@ -287,23 +287,23 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
       dim3 block(THREADS);
 
       if (use_vec16) {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 16><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, __hg_fp8_e4m3, 16><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
       } else if (use_vec8) {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, __hg_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
       } else {
-        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
+        per_token_quant_fp8_small_batch_kernel<scalar_t, __hg_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<__hg_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);

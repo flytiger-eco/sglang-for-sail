@@ -123,8 +123,8 @@ void tree_speculative_sampling_target_only(
   CHECK_GE(threshold_acc, 0);
   CHECK_GE(1, threshold_acc);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
       static_cast<int32_t*>(predicts.data_ptr()),
       static_cast<int32_t*>(accept_index.data_ptr()),
       static_cast<int32_t*>(accept_token_num.data_ptr()),
@@ -146,6 +146,6 @@ void tree_speculative_sampling_target_only(
       stream);
 
   TORCH_CHECK(
-      status == cudaSuccess,
-      "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(cudaGetErrorString(status)));
+      status == hggcSuccess,
+      "TreeSpeculativeSamplingTargetOnly failed with error code " + std::string(hggcGetErrorString(status)));
 }

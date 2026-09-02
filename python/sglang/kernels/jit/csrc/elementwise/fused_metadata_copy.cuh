@@ -36,7 +36,7 @@
 
 #include <algorithm>  // for std::min
 #ifndef USE_ROCM
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 #else
 #include <hip/hip_runtime.h>
 #endif

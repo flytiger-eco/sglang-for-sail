@@ -8,30 +8,30 @@
 
 namespace sglang {
 
-#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
-#if CUDA_VERSION >= 13000
+#if !defined(USE_ROCM) && defined(COMPATIBLE_VERSION) && COMPATIBLE_VERSION >= 12080
+#if COMPATIBLE_VERSION >= 13000
 using CudaMemcpyBatchPtr = const void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
+using CudaMemcpyBatchAsyncFn = hggcError_t (*)(
     CudaMemcpyBatchPtr*,
     CudaMemcpyBatchPtr*,
     const size_t*,
     size_t,
-    cudaMemcpyAttributes*,
+    hggcMemcpyAttributes*,
     size_t*,
     size_t,
-    cudaStream_t);
+    hggcStream_t);
 #else
 using CudaMemcpyBatchPtr = void*;
-using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
+using CudaMemcpyBatchAsyncFn = hggcError_t (*)(
     CudaMemcpyBatchPtr*,
     CudaMemcpyBatchPtr*,
     size_t*,
     size_t,
-    cudaMemcpyAttributes*,
+    hggcMemcpyAttributes*,
     size_t*,
     size_t,
     size_t*,
-    cudaStream_t);
+    hggcStream_t);
 #endif
 
 inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
@@ -48,11 +48,11 @@ inline auto call_cuda_memcpy_batch_async(
     CudaMemcpyBatchPtr* srcs,
     size_t* sizes,
     size_t count,
-    cudaMemcpyAttributes* attrs,
+    hggcMemcpyAttributes* attrs,
     size_t* attrs_idxs,
     size_t num_attrs,
-    cudaStream_t stream) -> cudaError_t {
-#if CUDA_VERSION >= 13000
+    hggcStream_t stream) -> hggcError_t {
+#if COMPATIBLE_VERSION >= 13000
   return copy_fn(dsts, srcs, sizes, count, attrs, attrs_idxs, num_attrs, stream);
 #else
   size_t fail_idx = std::numeric_limits<size_t>::max();
@@ -67,7 +67,7 @@ inline void copy_page_first_pages_fallback(
     const int64_t* dst_indices_ptr,
     int64_t num_pages,
     int64_t page_size,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using namespace host;
 
   RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
@@ -86,7 +86,7 @@ inline void copy_page_first_pages_fallback(
                             static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
                       static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
+      RuntimeDeviceCheck(hggcMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, hggcMemcpyDeviceToHost, stream));
     }
   }
 }
@@ -98,8 +98,8 @@ inline bool try_copy_page_first_pages_batch(
     int64_t num_pages,
     int64_t page_size,
     int device_id,
-    cudaStream_t stream) {
-#if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
+    hggcStream_t stream) {
+#if defined(USE_ROCM) || !defined(COMPATIBLE_VERSION) || (COMPATIBLE_VERSION < 12080)
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
@@ -109,8 +109,8 @@ inline bool try_copy_page_first_pages_batch(
   thread_local std::vector<size_t> batch_sizes;
 
   int driver_version = 0;
-  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
-  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+  hggcError_t driver_version_err = compatibleDriverGetVersion(&driver_version);
+  if (driver_version_err != hggcSuccess || driver_version < 12080) {
     return false;
   }
 
@@ -156,15 +156,15 @@ inline bool try_copy_page_first_pages_batch(
   }
 
   std::vector<size_t> attrs_idxs(1, 0);
-  cudaMemcpyAttributes attrs{};
+  hggcMemcpyAttributes attrs{};
   attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-  attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+  attrs.srcLocHint.type = hggcMemLocationTypeDevice;
   attrs.srcLocHint.id = device_id;
-  attrs.dstLocHint.type = cudaMemLocationTypeHost;
+  attrs.dstLocHint.type = hggcMemLocationTypeHost;
   attrs.dstLocHint.id = 0;
   attrs.flags = 0;
 
-  cudaError_t err = call_cuda_memcpy_batch_async(
+  hggcError_t err = call_cuda_memcpy_batch_async(
       copy_fn,
       batch_dsts.data(),
       batch_srcs.data(),
@@ -174,11 +174,11 @@ inline bool try_copy_page_first_pages_batch(
       attrs_idxs.data(),
       1,
       stream);
-  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver || err == cudaErrorInvalidValue) {
-    (void)cudaGetLastError();
+  if (err == hggcErrorNotSupported || err == cudaErrorCallRequiresNewerDriver || err == hggcErrorInvalidValue) {
+    (void)hggcGetLastError();
     return false;
   }
-  host::RuntimeCheck(err == cudaSuccess, "cudaMemcpyBatchAsync failed. error=", cudaGetErrorString(err));
+  host::RuntimeCheck(err == hggcSuccess, "cudaMemcpyBatchAsync failed. error=", hggcGetErrorString(err));
   return true;
 #endif
 }

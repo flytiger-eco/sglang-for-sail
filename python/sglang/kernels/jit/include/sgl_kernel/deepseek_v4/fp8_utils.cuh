@@ -6,7 +6,7 @@
 
 #include <cstdint>
 #ifndef USE_ROCM
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 #endif
 
 // Small helpers shared by the DeepSeek-V4 FP8/UE8M0 quantization kernels

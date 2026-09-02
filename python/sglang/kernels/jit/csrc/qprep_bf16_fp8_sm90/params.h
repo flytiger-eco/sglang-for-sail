@@ -20,7 +20,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
@@ -50,7 +50,7 @@ struct QprepBf16Fp8Sm90Params {
   // coalesced uint4 stores for the nope half (else direct u16 stores)
   bool out_vec16;
 
-  cudaStream_t stream;
+  hggcStream_t stream;
 };
 
 }  // namespace sglang

@@ -42,9 +42,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 #include <map>
 #include <type_traits>
 #include <vector>
@@ -105,7 +105,7 @@ static __device__ __forceinline__ void prefetch_tensormap(const void* tmap) {
   asm volatile("prefetch.tensormap [%0];" ::"l"(tmap) : "memory");
 }
 static __device__ __forceinline__ void
-cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
+cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const HGtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::"
       "complete_tx::bytes"
@@ -441,7 +441,7 @@ namespace kda {
 
 constexpr int BT = 64;  // chunk tokens
 constexpr int K = 128;  // head dim (qk == v)
-using bf16 = __nv_bfloat16;
+using bf16 = __ppu_bfloat16;
 
 // balanced piece boundaries (k1's wall = the LONGEST piece: only a
 // balanced split minimizes it)
@@ -484,8 +484,8 @@ static __device__ __forceinline__ void widen_map_tf32(float* slot, const bf16* p
 #pragma unroll
   for (int g = 0; g < 8; ++g) {  // 4-col groups: one 16B half-row each
     const int in0 = ch * 32 + g * 4;
-    const float2 f0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w[2 * g]));
-    const float2 f1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w[2 * g + 1]));
+    const float2 f0 = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&w[2 * g]));
+    const float2 f1 = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&w[2 * g + 1]));
     const int half = ((in0 >> 2) & 1) ^ ((vc >> 2) & 1);
     *reinterpret_cast<float4*>(slot + (in0 >> 3) * 1024 + vc * 8 + half * 4) = float4{f0.x, f0.y, f1.x, f1.y};
   }
@@ -569,7 +569,7 @@ static __device__ __forceinline__ void row_rnorm(
         *reinterpret_cast<const uint4*>(kk + o + 8),
         *reinterpret_cast<const uint4*>(q + o),
         *reinterpret_cast<const uint4*>(q + o + 8)};
-    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(xb);
+    const __ppu_bfloat162* x2 = reinterpret_cast<const __ppu_bfloat162*>(xb);
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const float2 kf = __bfloat1622float2(x2[e]);
@@ -586,7 +586,7 @@ static __device__ __forceinline__ void row_rnorm(
   if ((tid & 7) == 0) dst = float2{__frcp_rn(__fsqrt_rn(sk + L2_EPS)), __frcp_rn(__fsqrt_rn(sq + L2_EPS))};
 }
 // one element pair through fla's l2norm: x * rstd, rounded to bf16
-static __device__ __forceinline__ __nv_bfloat162 l2_bf16(float2 x, float rst) {
+static __device__ __forceinline__ __ppu_bfloat162 l2_bf16(float2 x, float rst) {
   return __floats2bfloat162_rn(x.x * rst, x.y * rst);
 }
 static __device__ __forceinline__ float2 l2_round(float2 x, float rst) {
@@ -650,7 +650,7 @@ __device__ static void k1_body(
     // fused-tail pTt staging TMA: the negated-P global (the W mma's
     // MN-major B source; every pieceL-passing caller supplies it — the
     // NP == 1 k1_factors_mma launch runs pieceL == nullptr, no tail)
-    const CUtensorMap* ptm = nullptr) {
+    const HGtensorMap* ptm = nullptr) {
   constexpr int SB = 16, NSB = BT / SB;  // 4 sub-blocks
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
@@ -700,7 +700,7 @@ __device__ static void k1_body(
       if (VL && p / K >= rows) continue;  // pad rows stay zfill 0
       uint4* gp = reinterpret_cast<uint4*>(&gt[p / K][p % K]);
       uint4 g4 = *gp;
-      __nv_bfloat162* g2 = reinterpret_cast<__nv_bfloat162*>(&g4);
+      __ppu_bfloat162* g2 = reinterpret_cast<__ppu_bfloat162*>(&g4);
       const float4 d0 = *reinterpret_cast<const float4*>(&dtr[p % K]);
       const float4 d1 = *reinterpret_cast<const float4*>(&dtr[p % K + 4]);
       const float dv[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
@@ -833,9 +833,9 @@ __device__ static void k1_body(
           if (VL && tid * 2 / K + (hb * 4 + j) * 8 >= C_act) {
             kv[j] = qv[j] = vv[j] = float2{0.f, 0.f};  // pad rows
           } else {
-            kv[j] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pk));
-            qv[j] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pq));
-            vv[j] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pv));
+            kv[j] = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(pk));
+            qv[j] = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(pq));
+            vv[j] = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(pv));
             if constexpr (RAW) {  // l2norm, in fla's bf16 bytes
               const float2 r = rn2((tid >> 6) + (hb * 4 + j) * 8);
               kv[j] = l2_round(kv[j], r.x);
@@ -853,17 +853,17 @@ __device__ static void k1_body(
           const float ei0 = __expf(sg[i][colp] - a0v[si]);
           const float ei1 = __expf(sg[i][colp + 1] - a1v[si]);
           const float kw0 = kv[j].x * ei0, kw1 = kv[j].y * ei1;
-          *reinterpret_cast<__nv_bfloat162*>(&kw[i][colp]) = __floats2bfloat162_rn(kw0, kw1);
+          *reinterpret_cast<__ppu_bfloat162*>(&kw[i][colp]) = __floats2bfloat162_rn(kw0, kw1);
           const float qw0 = qv[j].x * ei0 * scale;
           const float qw1 = qv[j].y * ei1 * scale;
-          *reinterpret_cast<__nv_bfloat162*>(&qw[i][colp]) = __floats2bfloat162_rn(qw0, qw1);
+          *reinterpret_cast<__ppu_bfloat162*>(&qw[i][colp]) = __floats2bfloat162_rn(qw0, qw1);
           const float bi = sb[i];                     // beta folded into the solve rhs
           *reinterpret_cast<float2*>(&sU[i][colp]) =  // kappa
               float2{kw0 * (bi * ea0[si]), kw1 * (bi * ea1[si])};
           *reinterpret_cast<float2*>(&sU[i][K + colp]) = float2{vv[j].x * bi, vv[j].y * bi};
-          *reinterpret_cast<__nv_bfloat162*>(qd) = __floats2bfloat162_rn(qw0 * ea0[si], qw1 * ea1[si]);
+          *reinterpret_cast<__ppu_bfloat162*>(qd) = __floats2bfloat162_rn(qw0 * ea0[si], qw1 * ea1[si]);
           qd += 8 * K;  // i advances 8 rows per tap
-          *reinterpret_cast<__nv_bfloat162*>(&stg[i][colp]) =
+          *reinterpret_cast<__ppu_bfloat162*>(&stg[i][colp]) =
               __floats2bfloat162_rn(kv[j].x * __expf(gl0 - sg[i][colp]), kv[j].y * __expf(gl1 - sg[i][colp + 1]));
         }
       }
@@ -876,7 +876,7 @@ __device__ static void k1_body(
 #pragma unroll
       for (int n = 0; n < BT * K / 2048; ++n) {
         const int cn = cc + n * 32;
-        alignas(8) const __nv_bfloat162 p2[2] = {{stg[rr][cn], stg[rr + 1][cn]}, {stg[rr + 2][cn], stg[rr + 3][cn]}};
+        alignas(8) const __ppu_bfloat162 p2[2] = {{stg[rr][cn], stg[rr + 1][cn]}, {stg[rr + 2][cn], stg[rr + 3][cn]}};
         *reinterpret_cast<float2*>(kd + n * 2048) = *reinterpret_cast<const float2*>(p2);
       }
     }
@@ -894,7 +894,7 @@ __device__ static void k1_body(
         f0[s - 1] = __expf(a0v[s] - a0v[s - 1]);
         f1[s - 1] = __expf(a1v[s] - a1v[s - 1]);
       }
-      __nv_bfloat162 kvz[NSB][2];
+      __ppu_bfloat162 kvz[NSB][2];
       // running pointer: the 8 taps advance a fixed 8 rows (sj*SB + rr*8
       // = 0,8,..,56), so one 64-bit add per tap replaces the per-tap
       // address rebuild (same addresses bit-exact; the P2b diet pattern)
@@ -905,7 +905,7 @@ __device__ static void k1_body(
         for (int rr = 0; rr < 2; ++rr) {
           const int j = sj * SB + u + rr * 8;
           kvz[sj][rr] =
-              !VL || j < C_act ? *reinterpret_cast<const __nv_bfloat162*>(pz) : __floats2bfloat162_rn(0.f, 0.f);
+              !VL || j < C_act ? *reinterpret_cast<const __ppu_bfloat162*>(pz) : __floats2bfloat162_rn(0.f, 0.f);
           if constexpr (RAW)  // l2norm at the load: the tiles below
             // then see the same bytes P2b's kw did
             kvz[sj][rr] = l2_bf16(__bfloat1622float2(kvz[sj][rr]), rn2(j).x);
@@ -929,7 +929,7 @@ __device__ static void k1_body(
               v0 *= f0[si - 1];
               v1 *= f1[si - 1];
             }
-            *reinterpret_cast<__nv_bfloat162*>(&kz[si * (si + 1) / 2 + sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
+            *reinterpret_cast<__ppu_bfloat162*>(&kz[si * (si + 1) / 2 + sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
           }
         }
     }
@@ -1006,9 +1006,9 @@ __device__ static void k1_body(
           if (jj <= ii) {
             const float q0 = valq[e2 * 2];
             const float q1 = jj + 1 <= ii ? valq[e2 * 2 + 1] : 0.f;
-            const __nv_bfloat162 ah{__float2bfloat16(q0), __float2bfloat16(q1)};
-            *reinterpret_cast<__nv_bfloat162*>(&aqk_h[abase + ii * BT + jj]) = ah;
-            *reinterpret_cast<__nv_bfloat162*>(&aqk_l[abase + ii * BT + jj]) =
+            const __ppu_bfloat162 ah{__float2bfloat16(q0), __float2bfloat16(q1)};
+            *reinterpret_cast<__ppu_bfloat162*>(&aqk_h[abase + ii * BT + jj]) = ah;
+            *reinterpret_cast<__ppu_bfloat162*>(&aqk_l[abase + ii * BT + jj]) =
                 __floats2bfloat162_rn(q0 - __bfloat162float(ah.x), q1 - __bfloat162float(ah.y));
           }
         }
@@ -1028,8 +1028,8 @@ __device__ static void k1_body(
       const float2 av = j / SB > i / SB ? float2{0.f, 0.f} : *reinterpret_cast<const float2*>(&sA[i][j]);
       const bf16 ah0 = __float2bfloat16(av.x);
       const bf16 ah1 = __float2bfloat16(av.y);
-      *reinterpret_cast<__nv_bfloat162*>(&sp.f.aC_h[i][j]) = __nv_bfloat162{ah0, ah1};
-      *reinterpret_cast<__nv_bfloat162*>(&sp.f.aC_l[i][j]) =
+      *reinterpret_cast<__ppu_bfloat162*>(&sp.f.aC_h[i][j]) = __ppu_bfloat162{ah0, ah1};
+      *reinterpret_cast<__ppu_bfloat162*>(&sp.f.aC_l[i][j]) =
           __floats2bfloat162_rn(av.x - __bfloat162float(ah0), av.y - __bfloat162float(ah1));
     }
     __syncthreads();
@@ -1086,11 +1086,11 @@ __device__ static void k1_body(
                           // 112B-strided, so b*SB+i lands 16B-aligned)
 #pragma unroll
           for (int i = 0; i < SB; i += 8) {
-            alignas(16) __nv_bfloat162 hv[4], lv[4];
+            alignas(16) __ppu_bfloat162 hv[4], lv[4];
 #pragma unroll
             for (int w = 0; w < 4; ++w) {
               const float e0 = r[i + 2 * w], e1 = r[i + 2 * w + 1];
-              hv[w] = __nv_bfloat162{__float2bfloat16(e0), __float2bfloat16(e1)};
+              hv[w] = __ppu_bfloat162{__float2bfloat16(e0), __float2bfloat16(e1)};
               lv[w] = __floats2bfloat162_rn(e0 - __bfloat162float(hv[w].x), e1 - __bfloat162float(hv[w].y));
             }
             *reinterpret_cast<uint4*>(&sp.f.upT_h[col][b * SB + i]) = *reinterpret_cast<const uint4*>(hv);
@@ -1102,7 +1102,7 @@ __device__ static void k1_body(
     const size_t base = ((size_t)c * H + h) * BT * K;
     for (int p2 = tid; p2 < BT * K / 2; p2 += blockDim.x) {
       const int p = p2 * 2;
-      *reinterpret_cast<__nv_bfloat162*>(&P[base + p]) =
+      *reinterpret_cast<__ppu_bfloat162*>(&P[base + p]) =
           __floats2bfloat162_rn(-sU[p / K][p % K], -sU[p / K][p % K + 1]);
       *reinterpret_cast<float2*>(&u0[base + p]) = float2{sU[p / K][K + p % K], sU[p / K][K + p % K + 1]};
     }
@@ -1401,12 +1401,12 @@ __device__ static void chain_body(
     int h,
     int sg,
     int nseg,
-    const CUtensorMap& pneg_map,
-    const CUtensorMap& kdt_map,
-    const CUtensorMap& qd_map,
-    const CUtensorMap& aqh_map,
-    const CUtensorMap& aql_map,
-    const CUtensorMap& u0f_map,
+    const HGtensorMap& pneg_map,
+    const HGtensorMap& kdt_map,
+    const HGtensorMap& qd_map,
+    const HGtensorMap& aqh_map,
+    const HGtensorMap& aql_map,
+    const HGtensorMap& u0f_map,
     const float* __restrict__ gC,
     int n_chunks,
     int H,
@@ -1417,8 +1417,8 @@ __device__ static void chain_body(
     void* __restrict__ hpc,
     bool hpc_bf16,
     bool hpc_v_first,
-    const CUtensorMap* sl_map,  // fp32 piece L maps
-    const CUtensorMap* sc_map,  // fp32 piece offsets
+    const HGtensorMap* sl_map,  // fp32 piece L maps
+    const HGtensorMap* sc_map,  // fp32 piece offsets
     const float* __restrict__ h0s,
     const uint32_t* __restrict__ pflags = nullptr,  // fused: piece-done
     // varlen (defaults = eqlen): sg/nseg/n_chunks are SEQUENCE-local; cbase/
@@ -1567,8 +1567,8 @@ __device__ static void chain_body(
   }  // sg > 0
   // packed cvt.bf16x2 (per-half rn == the scalar pair; low half = e0)
   auto pack2 = [](float e0, float e1, uint32_t& hi, uint32_t& lo) {
-    const __nv_bfloat162 h2 = __floats2bfloat162_rn(e0, e1);
-    const __nv_bfloat162 l2 = __floats2bfloat162_rn(e0 - __bfloat162float(h2.x), e1 - __bfloat162float(h2.y));
+    const __ppu_bfloat162 h2 = __floats2bfloat162_rn(e0, e1);
+    const __ppu_bfloat162 l2 = __floats2bfloat162_rn(e0 - __bfloat162float(h2.x), e1 - __bfloat162float(h2.y));
     hi = *reinterpret_cast<const uint32_t*>(&h2);
     lo = *reinterpret_cast<const uint32_t*>(&l2);
   };
@@ -1612,7 +1612,7 @@ __device__ static void chain_body(
       uint32_t hw[16];
 #pragma unroll
       for (int w = 0; w < 16; ++w) {
-        const __nv_bfloat162 h2 = __floats2bfloat162_rn(Sreg[2 * w], Sreg[2 * w + 1]);
+        const __ppu_bfloat162 h2 = __floats2bfloat162_rn(Sreg[2 * w], Sreg[2 * w + 1]);
         hw[w] = *reinterpret_cast<const uint32_t*>(&h2);
       }
       ptx::tcgen05_st_32x32b_x16(a1st, hw);
@@ -1625,7 +1625,7 @@ __device__ static void chain_body(
       if (hpc_v_first) {  // [V,K]: kc contiguous, one run per thread
         const size_t off = hb + (size_t)vc * K + ch * 32;
         if (hpc_bf16) {
-          auto* p = reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<bf16*>(hpc) + off);
+          auto* p = reinterpret_cast<__ppu_bfloat162*>(reinterpret_cast<bf16*>(hpc) + off);
 #pragma unroll
           for (int j = 0; j < 16; ++j)
             p[j] = __floats2bfloat162_rn(Sreg[2 * j], Sreg[2 * j + 1]);
@@ -1814,14 +1814,14 @@ __device__ static void chain_body(
 // eqlen NP == 1 fallback: whole chain from h0, no piece maps/flags (the
 // sl/sc maps are valid encodes over the workspace but never dereferenced)
 __global__ void __launch_bounds__(512) k2_chain_tc(
-    const __grid_constant__ CUtensorMap pneg_map,
-    const __grid_constant__ CUtensorMap kdt_map,
-    const __grid_constant__ CUtensorMap qd_map,
-    const __grid_constant__ CUtensorMap aqh_map,
-    const __grid_constant__ CUtensorMap aql_map,
-    const __grid_constant__ CUtensorMap sl_map,
-    const __grid_constant__ CUtensorMap sc_map,
-    const __grid_constant__ CUtensorMap u0f_map,
+    const __grid_constant__ HGtensorMap pneg_map,
+    const __grid_constant__ HGtensorMap kdt_map,
+    const __grid_constant__ HGtensorMap qd_map,
+    const __grid_constant__ HGtensorMap aqh_map,
+    const __grid_constant__ HGtensorMap aql_map,
+    const __grid_constant__ HGtensorMap sl_map,
+    const __grid_constant__ HGtensorMap sc_map,
+    const __grid_constant__ HGtensorMap u0f_map,
     const float* __restrict__ gC,
     const float* __restrict__ h0,
     int n_chunks,
@@ -1885,14 +1885,14 @@ __global__ void __launch_bounds__(512) kda_fused(
     bf16* __restrict__ pieceL,
     float* __restrict__ piecec,
     int NP,
-    const __grid_constant__ CUtensorMap pneg_map,
-    const __grid_constant__ CUtensorMap kdt_map,
-    const __grid_constant__ CUtensorMap qd_map,
-    const __grid_constant__ CUtensorMap aqh_map,
-    const __grid_constant__ CUtensorMap aql_map,
-    const __grid_constant__ CUtensorMap u0f_map,
-    const __grid_constant__ CUtensorMap sl_map,
-    const __grid_constant__ CUtensorMap sc_map,
+    const __grid_constant__ HGtensorMap pneg_map,
+    const __grid_constant__ HGtensorMap kdt_map,
+    const __grid_constant__ HGtensorMap qd_map,
+    const __grid_constant__ HGtensorMap aqh_map,
+    const __grid_constant__ HGtensorMap aql_map,
+    const __grid_constant__ HGtensorMap u0f_map,
+    const __grid_constant__ HGtensorMap sl_map,
+    const __grid_constant__ HGtensorMap sc_map,
     const float* __restrict__ h0,
     bf16* __restrict__ o,
     float* __restrict__ Sf,
@@ -2022,14 +2022,14 @@ __global__ void __launch_bounds__(512) kda_fused_vl(
     const VlPiece* __restrict__ pieces,
     int npt,
     int nc_tot,
-    const __grid_constant__ CUtensorMap pneg_map,
-    const __grid_constant__ CUtensorMap kdt_map,
-    const __grid_constant__ CUtensorMap qd_map,
-    const __grid_constant__ CUtensorMap aqh_map,
-    const __grid_constant__ CUtensorMap aql_map,
-    const __grid_constant__ CUtensorMap u0f_map,
-    const __grid_constant__ CUtensorMap sl_map,
-    const __grid_constant__ CUtensorMap sc_map,
+    const __grid_constant__ HGtensorMap pneg_map,
+    const __grid_constant__ HGtensorMap kdt_map,
+    const __grid_constant__ HGtensorMap qd_map,
+    const __grid_constant__ HGtensorMap aqh_map,
+    const __grid_constant__ HGtensorMap aql_map,
+    const __grid_constant__ HGtensorMap u0f_map,
+    const __grid_constant__ HGtensorMap sl_map,
+    const __grid_constant__ HGtensorMap sc_map,
     const float* __restrict__ h0,
     bf16* __restrict__ o,
     float* __restrict__ Sf,
@@ -2296,7 +2296,7 @@ __device__ static void k1_tf_body(
     const bf16* __restrict__ kk,
     const bf16* __restrict__ v,
     const bf16* __restrict__ glog,
-    const CUtensorMap& glog_map,
+    const HGtensorMap& glog_map,
     const float* __restrict__ beta,
     int T,
     int H,
@@ -2414,7 +2414,7 @@ __device__ static void k1_tf_body(
     }
     // the ONE k tile: tap m == hb*4+j == 2*sj+rr is row u + 8m, column colp,
     // under one pad mask — so P2b, P2c and the pane-0 rhs all read this
-    __nv_bfloat162 kvz[NSB][2];
+    __ppu_bfloat162 kvz[NSB][2];
     {  // P2b: kw/qw/qdec/kdec (the rhs is built later, in the solve)
       bf16(*stg)[K + 4] = reinterpret_cast<bf16(*)[K + 4]>(&kz[0][0][0]);
       const float gl0 = sgc[BT - 1][colp], gl1 = sgc[BT - 1][colp + 1];
@@ -2437,8 +2437,8 @@ __device__ static void k1_tf_body(
             kv[j] = qv[j] = float2{0.f, 0.f};  // pad rows
             kvz[m >> 1][m & 1] = __floats2bfloat162_rn(0.f, 0.f);
           } else {
-            kvz[m >> 1][m & 1] = *reinterpret_cast<const __nv_bfloat162*>(pk);
-            qv[j] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pq));
+            kvz[m >> 1][m & 1] = *reinterpret_cast<const __ppu_bfloat162*>(pk);
+            qv[j] = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(pq));
             if constexpr (RAW) {  // l2norm, in fla's bf16 bytes
               const float2 r = rn[(tid >> 6) + m * 8];
               kvz[m >> 1][m & 1] = l2_bf16(__bfloat1622float2(kvz[m >> 1][m & 1]), r.x);
@@ -2456,13 +2456,13 @@ __device__ static void k1_tf_body(
           const float ei0 = __expf(sgc[i][colp] - a0v[si]);
           const float ei1 = __expf(sgc[i][colp + 1] - a1v[si]);
           const float kw0 = kv[j].x * ei0, kw1 = kv[j].y * ei1;
-          *reinterpret_cast<__nv_bfloat162*>(&kw[i][colp]) = __floats2bfloat162_rn(kw0, kw1);
+          *reinterpret_cast<__ppu_bfloat162*>(&kw[i][colp]) = __floats2bfloat162_rn(kw0, kw1);
           const float qw0 = qv[j].x * ei0 * scale;
           const float qw1 = qv[j].y * ei1 * scale;
-          *reinterpret_cast<__nv_bfloat162*>(&qw[i][colp]) = __floats2bfloat162_rn(qw0, qw1);
-          *reinterpret_cast<__nv_bfloat162*>(qd) = __floats2bfloat162_rn(qw0 * ea0[si], qw1 * ea1[si]);
+          *reinterpret_cast<__ppu_bfloat162*>(&qw[i][colp]) = __floats2bfloat162_rn(qw0, qw1);
+          *reinterpret_cast<__ppu_bfloat162*>(qd) = __floats2bfloat162_rn(qw0 * ea0[si], qw1 * ea1[si]);
           qd += 8 * K;  // i advances 8 rows per tap
-          *reinterpret_cast<__nv_bfloat162*>(&stg[sr0 + srt * (hb * 4 + j)][colp]) =
+          *reinterpret_cast<__ppu_bfloat162*>(&stg[sr0 + srt * (hb * 4 + j)][colp]) =
               __floats2bfloat162_rn(kv[j].x * __expf(gl0 - sgc[i][colp]), kv[j].y * __expf(gl1 - sgc[i][colp + 1]));
         }
       }
@@ -2473,7 +2473,7 @@ __device__ static void k1_tf_body(
 #pragma unroll
       for (int n = 0; n < BT * K / 2048; ++n) {
         const int cn = cc + n * 32;
-        alignas(8) const __nv_bfloat162 p2[2] = {
+        alignas(8) const __ppu_bfloat162 p2[2] = {
             {stg[kdec_r(rr)][cn], stg[kdec_r(rr + 1)][cn]}, {stg[kdec_r(rr + 2)][cn], stg[kdec_r(rr + 3)][cn]}};
         *reinterpret_cast<float2*>(kd + n * 2048) = *reinterpret_cast<const float2*>(p2);
       }
@@ -2499,7 +2499,7 @@ __device__ static void k1_tf_body(
           const bool real = !VL || j < C_act;
           const float v0 = real ? kf.x * __expf(a0v[sj] - sgc[j][colp]) : 0.f;
           const float v1 = real ? kf.y * __expf(a1v[sj] - sgc[j][colp + 1]) : 0.f;
-          *reinterpret_cast<__nv_bfloat162*>(&kz[sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
+          *reinterpret_cast<__ppu_bfloat162*>(&kz[sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
         }
     }
     if (tid < K / 4) {  // gC = e^{cumsum at chunk end}
@@ -2579,10 +2579,10 @@ __device__ static void k1_tf_body(
 #pragma unroll
           for (int e = 1; e < 4; ++e)
             if (lim < e) v[e] = 0.f;
-          const __nv_bfloat162 ah[2] = {
+          const __ppu_bfloat162 ah[2] = {
               {__float2bfloat16(v[0]), __float2bfloat16(v[1])}, {__float2bfloat16(v[2]), __float2bfloat16(v[3])}};
           *reinterpret_cast<float2*>(&aqk_h[abase + ii * BT + jj]) = *reinterpret_cast<const float2*>(ah);
-          const __nv_bfloat162 al[2] = {
+          const __ppu_bfloat162 al[2] = {
               __floats2bfloat162_rn(v[0] - __bfloat162float(ah[0].x), v[1] - __bfloat162float(ah[0].y)),
               __floats2bfloat162_rn(v[2] - __bfloat162float(ah[1].x), v[3] - __bfloat162float(ah[1].y))};
           *reinterpret_cast<float2*>(&aqk_l[abase + ii * BT + jj]) = *reinterpret_cast<const float2*>(al);
@@ -2626,7 +2626,7 @@ __device__ static void k1_tf_body(
           for (int si = sj + 1; si < NSB; ++si) {
             v0 *= f0[si - 1];
             v1 *= f1[si - 1];
-            *reinterpret_cast<__nv_bfloat162*>(&kz[si * (si - 1) / 2 + sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
+            *reinterpret_cast<__ppu_bfloat162*>(&kz[si * (si - 1) / 2 + sj][jj][colp]) = __floats2bfloat162_rn(v0, v1);
           }
         }
     }
@@ -2681,7 +2681,7 @@ __device__ static void k1_tf_body(
         for (int e2 = 0; e2 < 2; ++e2) {
           const int ii = offsi * SB + r + e2 * 8;
           const int jj = offsj * SB + n8 * 8 + c2;
-          *reinterpret_cast<__nv_bfloat162*>(&aC_h[ii][jj]) =
+          *reinterpret_cast<__ppu_bfloat162*>(&aC_h[ii][jj]) =
               __floats2bfloat162_rn(sb[ii] * vals[e2 * 2], sb[ii] * vals[e2 * 2 + 1]);
         }
       }
@@ -2696,7 +2696,7 @@ __device__ static void k1_tf_body(
         if (jl < il) av.x = tri[i / SB][tb + jl];
         if (jl + 1 < il) av.y = tri[i / SB][tb + jl + 1];
       }
-      *reinterpret_cast<__nv_bfloat162*>(&aC_h[i][j]) = __floats2bfloat162_rn(av.x, av.y);
+      *reinterpret_cast<__ppu_bfloat162*>(&aC_h[i][j]) = __floats2bfloat162_rn(av.x, av.y);
     }
     __syncthreads();
     const size_t base = ((size_t)c * H + h) * BT * K;
@@ -2709,12 +2709,12 @@ __device__ static void k1_tf_body(
       const bf16* px = &v[gp0];  // pane 0's k taps are already in kvz
 #pragma unroll
       for (int hb = 0; hb < 2; ++hb) {
-        __nv_bfloat162 xr[4];
+        __ppu_bfloat162 xr[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           const int m = hb * 4 + j;
           xr[j] = pane == 0 ? kvz[m >> 1][m & 1]
-                            : (!VL || tid * 2 / K + m * 8 < C_act ? *reinterpret_cast<const __nv_bfloat162*>(px)
+                            : (!VL || tid * 2 / K + m * 8 < C_act ? *reinterpret_cast<const __ppu_bfloat162*>(px)
                                                                   : __floats2bfloat162_rn(0.f, 0.f));  // pad rows
           px += gst;
         }
@@ -2742,8 +2742,8 @@ __device__ static void k1_tf_body(
       auto pu_store4p = [&](int p) {
         const float* r4 = &sU[p / K][su_c(p / K, p % K)];
         if (pane == 0) {
-          const __nv_bfloat162 h01 = __floats2bfloat162_rn(-r4[0], -r4[1]);
-          const __nv_bfloat162 h23 = __floats2bfloat162_rn(-r4[2], -r4[3]);
+          const __ppu_bfloat162 h01 = __floats2bfloat162_rn(-r4[0], -r4[1]);
+          const __ppu_bfloat162 h23 = __floats2bfloat162_rn(-r4[2], -r4[3]);
           *reinterpret_cast<uint2*>(&P[base + p]) =
               uint2{*reinterpret_cast<const uint32_t*>(&h01), *reinterpret_cast<const uint32_t*>(&h23)};
         } else {
@@ -2808,8 +2808,8 @@ __device__ static void k1_tf_body(
               r0 -= crr[kp * 2];
               r1 -= crr[kp * 2 + 1];
             }
-            const __nv_bfloat162 hv = __floats2bfloat162_rn(r0, r1);
-            const __nv_bfloat162 lv = __floats2bfloat162_rn(r0 - __bfloat162float(hv.x), r1 - __bfloat162float(hv.y));
+            const __ppu_bfloat162 hv = __floats2bfloat162_rn(r0, r1);
+            const __ppu_bfloat162 lv = __floats2bfloat162_rn(r0 - __bfloat162float(hv.x), r1 - __bfloat162float(hv.y));
             bh[kp] = *reinterpret_cast<const uint32_t*>(&hv);
             bl[kp] = *reinterpret_cast<const uint32_t*>(&lv);
           }
@@ -2850,7 +2850,7 @@ __global__ void __launch_bounds__(512, 2) k1_tf_builder(
     const bf16* __restrict__ kk,
     const bf16* __restrict__ v,
     const bf16* __restrict__ glog,
-    const __grid_constant__ CUtensorMap glog_map,
+    const __grid_constant__ HGtensorMap glog_map,
     const float* __restrict__ a_log,
     const float* __restrict__ dtb,
     float lb,
@@ -2906,7 +2906,7 @@ __global__ void __launch_bounds__(512, 2) k1_tf_builder_vl(
     const bf16* __restrict__ kk,
     const bf16* __restrict__ v,
     const bf16* __restrict__ glog,
-    const __grid_constant__ CUtensorMap glog_map,
+    const __grid_constant__ HGtensorMap glog_map,
     const float* __restrict__ a_log,
     const float* __restrict__ dtb,
     float lb,
@@ -2988,12 +2988,12 @@ __global__ void __launch_bounds__(512, 2) k1_tf_builder_vl(
 // from h0 (nseg == 1 — no piece maps, no flags). seqs[s] is the whole-sequence
 // entry the host appends after the builder piece table.
 __global__ void __launch_bounds__(512) k2_chain_tc_vl(
-    const __grid_constant__ CUtensorMap pneg_map,
-    const __grid_constant__ CUtensorMap kdt_map,
-    const __grid_constant__ CUtensorMap qd_map,
-    const __grid_constant__ CUtensorMap aqh_map,
-    const __grid_constant__ CUtensorMap aql_map,
-    const __grid_constant__ CUtensorMap u0f_map,
+    const __grid_constant__ HGtensorMap pneg_map,
+    const __grid_constant__ HGtensorMap kdt_map,
+    const __grid_constant__ HGtensorMap qd_map,
+    const __grid_constant__ HGtensorMap aqh_map,
+    const __grid_constant__ HGtensorMap aql_map,
+    const __grid_constant__ HGtensorMap u0f_map,
     const float* __restrict__ gC,
     const float* __restrict__ h0,
     int H,
@@ -3069,107 +3069,107 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
 
 #define KDA_CU_CHECK(expr)                                                                             \
   do {                                                                                                 \
-    CUresult _e = (expr);                                                                              \
-    if (_e != CUDA_SUCCESS) {                                                                          \
+    HGresult _e = (expr);                                                                              \
+    if (_e != HGGC_SUCCESS) {                                                                          \
       const char* _s = nullptr;                                                                        \
-      cuGetErrorString(_e, &_s);                                                                       \
+      hgGetErrorString(_e, &_s);                                                                       \
       TORCH_CHECK(false, "CUDA driver call failed at ", __FILE__, ":", __LINE__, ": ", _s ? _s : "?"); \
     }                                                                                                  \
   } while (0)
 
 // TMA maps over K1's bf16 outputs (128B swizzle, K-major tiles)
-static CUtensorMap enc2d(void* ptr, uint64_t rows, uint64_t cols, uint32_t brows, uint32_t bcols) {
-  cuuint64_t gdim[2] = {cols, rows};
-  cuuint64_t gstr[1] = {cols * 2};
-  cuuint32_t bdim[2] = {bcols, brows};
-  cuuint32_t estr[2] = {1, 1};
-  CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+static HGtensorMap enc2d(void* ptr, uint64_t rows, uint64_t cols, uint32_t brows, uint32_t bcols) {
+  hguint64_t gdim[2] = {cols, rows};
+  hguint64_t gstr[1] = {cols * 2};
+  hguint32_t bdim[2] = {bcols, brows};
+  hguint32_t estr[2] = {1, 1};
+  HGtensorMap m{};
+  KDA_CU_CHECK(hgTensorMapEncodeTiled(
       &m,
-      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+      HG_TENSOR_MAP_DATA_TYPE_BFLOAT16,
       2,
       ptr,
       gdim,
       gstr,
       bdim,
       estr,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+      HG_TENSOR_MAP_INTERLEAVE_NONE,
+      HG_TENSOR_MAP_SWIZZLE_128B,
+      HG_TENSOR_MAP_L2_PROMOTION_NONE,
+      HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return m;
 }
 // fp32 c-map tiles for the tf32 chain prefix: SWZ32 k-major chunks
 // (box 8 fp32 x 128 rows; 32B swizzle caps the box inner extent at 8 fp32
 // -> 16 boxes per 128x128 tile)
-static CUtensorMap enc2df(void* ptr, uint64_t rows, uint64_t cols) {
-  cuuint64_t gdim[2] = {cols, rows};
-  cuuint64_t gstr[1] = {cols * 4};
-  cuuint32_t bdim[2] = {8, 128};
-  cuuint32_t estr[2] = {1, 1};
-  CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+static HGtensorMap enc2df(void* ptr, uint64_t rows, uint64_t cols) {
+  hguint64_t gdim[2] = {cols, rows};
+  hguint64_t gstr[1] = {cols * 4};
+  hguint32_t bdim[2] = {8, 128};
+  hguint32_t estr[2] = {1, 1};
+  HGtensorMap m{};
+  KDA_CU_CHECK(hgTensorMapEncodeTiled(
       &m,
-      CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+      HG_TENSOR_MAP_DATA_TYPE_FLOAT32,
       2,
       ptr,
       gdim,
       gstr,
       bdim,
       estr,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_32B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+      HG_TENSOR_MAP_INTERLEAVE_NONE,
+      HG_TENSOR_MAP_SWIZZLE_32B,
+      HG_TENSOR_MAP_L2_PROMOTION_NONE,
+      HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return m;
 }
 // fp32 u0 chunk tiles for the chain: plain linear [BT x K] boxes (the
 // consumer is per-thread smem loads, not an mma desc, so no swizzle — and
 // only swizzled modes cap the box inner extent)
-static CUtensorMap enc2dfn(void* ptr, uint64_t rows, uint64_t cols) {
-  cuuint64_t gdim[2] = {cols, rows};
-  cuuint64_t gstr[1] = {cols * 4};
-  cuuint32_t bdim[2] = {(cuuint32_t)cols, BT};
-  cuuint32_t estr[2] = {1, 1};
-  CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+static HGtensorMap enc2dfn(void* ptr, uint64_t rows, uint64_t cols) {
+  hguint64_t gdim[2] = {cols, rows};
+  hguint64_t gstr[1] = {cols * 4};
+  hguint32_t bdim[2] = {(hguint32_t)cols, BT};
+  hguint32_t estr[2] = {1, 1};
+  HGtensorMap m{};
+  KDA_CU_CHECK(hgTensorMapEncodeTiled(
       &m,
-      CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+      HG_TENSOR_MAP_DATA_TYPE_FLOAT32,
       2,
       ptr,
       gdim,
       gstr,
       bdim,
       estr,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_NONE,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+      HG_TENSOR_MAP_INTERLEAVE_NONE,
+      HG_TENSOR_MAP_SWIZZLE_NONE,
+      HG_TENSOR_MAP_L2_PROMOTION_NONE,
+      HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return m;
 }
 // The tail-free builder's gate input: [BT x K] bf16 boxes out of the
 // [T x H*K] gate stream. SWIZZLE_NONE, so the landed tile is row-major with a
 // 256 B pitch — byte-for-byte the per-thread staging it replaces. rows == the
 // ALLOCATED token count, so a tail chunk's rows past the buffer read as zeros.
-static CUtensorMap enc2dgb(void* ptr, uint64_t rows, uint64_t cols) {
-  cuuint64_t gdim[2] = {cols, rows};
-  cuuint64_t gstr[1] = {cols * 2};
-  cuuint32_t bdim[2] = {K, BT};
-  cuuint32_t estr[2] = {1, 1};
-  CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+static HGtensorMap enc2dgb(void* ptr, uint64_t rows, uint64_t cols) {
+  hguint64_t gdim[2] = {cols, rows};
+  hguint64_t gstr[1] = {cols * 2};
+  hguint32_t bdim[2] = {K, BT};
+  hguint32_t estr[2] = {1, 1};
+  HGtensorMap m{};
+  KDA_CU_CHECK(hgTensorMapEncodeTiled(
       &m,
-      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+      HG_TENSOR_MAP_DATA_TYPE_BFLOAT16,
       2,
       ptr,
       gdim,
       gstr,
       bdim,
       estr,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_NONE,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+      HG_TENSOR_MAP_INTERLEAVE_NONE,
+      HG_TENSOR_MAP_SWIZZLE_NONE,
+      HG_TENSOR_MAP_L2_PROMOTION_NONE,
+      HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
   return m;
 }
 
@@ -3189,7 +3189,7 @@ struct Workspace {
   torch::Tensor h0z;         // zeros initial state (lazy)
   torch::Tensor pieces_dev;  // varlen piece table (lazy)
   std::vector<int64_t> cu;   // piece-table provenance (varlen)
-  CUtensorMap pneg_map, kdt_map, qd_map, aqh_map, aql_map, sl_map, sc_map, u0f_map, gin_map;
+  HGtensorMap pneg_map, kdt_map, qd_map, aqh_map, aql_map, sl_map, sc_map, u0f_map, gin_map;
   const void* gin_ptr = nullptr;  // what gin_map was encoded over
 };
 
@@ -3199,7 +3199,7 @@ struct Workspace {
 static int64_t builder_slots(bool tf, bool varlen) {
   auto query = [](auto fn) {
     int occ = 0;
-    AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 512, 0));
+    AT_CUDA_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fn, 512, 0));
     return int64_t(at::cuda::getCurrentDeviceProperties()->multiProcessorCount) * std::max(1, occ);
   };
   static const int64_t slots[4] = {
@@ -3504,7 +3504,7 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
   }
 
   const c10::cuda::CUDAGuard guard(q.device());
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   Workspace& ws = get_workspace(q.device(), T, nc, H, npieces, N);
 
   // initial state (None -> cached zeros; kernels only READ h0)
@@ -3713,7 +3713,7 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
         hpc_bf16,
         h_v_first);
   } else if (varlen) {
-    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
+    AT_CUDA_CHECK(hggcMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       kda_fused_vl<gmv(), rawv(), bsv()><<<2 * int(npieces * H), 512, 0, stream>>>(
           q_p,
@@ -3756,7 +3756,7 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
           pf_p);
     });
   } else if (npieces > 1) {  // eqlen default: one fused trailing grid
-    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
+    AT_CUDA_CHECK(hggcMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       kda_fused<gmv(), rawv(), bsv()><<<2 * int(npieces * H), 512, 0, stream>>>(
           q_p,

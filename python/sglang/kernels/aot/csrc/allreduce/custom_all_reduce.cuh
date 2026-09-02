@@ -1,10 +1,10 @@
 // Adapted from https://github.com/vllm-project/vllm/blob/v0.8.2/csrc/custom_all_reduce.cuh
 #pragma once
 
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hggc.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_runtime.h>
 
 #include <array>
 #include <iostream>
@@ -99,15 +99,15 @@ DINLINE float& assign_add(float& a, float b) {
   return a += b;
 }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
-DINLINE float upcast_s(nv_bfloat16 val) {
+#if (COMPATIBLE_ARCH >= 800 || !defined(COMPATIBLE_ARCH))
+DINLINE float upcast_s(ppu_bfloat16 val) {
   return __bfloat162float(val);
 }
 template <>
-DINLINE nv_bfloat16 downcast_s(float val) {
+DINLINE ppu_bfloat16 downcast_s(float val) {
   return __float2bfloat16(val);
 }
-DINLINE nv_bfloat16& assign_add(nv_bfloat16& a, nv_bfloat16 b) {
+DINLINE ppu_bfloat16& assign_add(ppu_bfloat16& a, ppu_bfloat16 b) {
   a = __hadd(a, b);
   return a;
 }
@@ -153,7 +153,7 @@ DINLINE O downcast(array_t<float, O::size> val) {
 static DINLINE void st_flag_release(FlagType* flag_addr, FlagType flag) {
 #ifdef USE_MUSA
   volatile_store((uint32_t)flag, (uint32_t*)flag_addr);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#elif defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 700
   asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
 #else
   asm volatile("membar.sys; st.volatile.global.u32 [%1], %0;" ::"r"(flag), "l"(flag_addr));
@@ -167,7 +167,7 @@ static DINLINE FlagType ld_flag_acquire(FlagType* flag_addr) {
 #endif
 
   FlagType flag;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 700
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(flag) : "l"(flag_addr));
 #else
   asm volatile("ld.volatile.global.u32 %0, [%1]; membar.gl;" : "=r"(flag) : "l"(flag_addr));
@@ -338,8 +338,8 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_1s
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
 #endif
   }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  cudaTriggerProgrammaticLaunchCompletion();
+#if (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900))
+  hggcTriggerProgrammaticLaunchCompletion();
 #endif
   multi_gpu_barrier<ngpus, false>(sg, self_sg, rank);
 }
@@ -529,9 +529,9 @@ __global__ void __launch_bounds__(kMaxThreadsPerBlock, 1) cross_device_reduce_2s
   }
 }
 
-using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
-static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
-static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
+using IPC_KEY = std::array<uint8_t, sizeof(hggcIpcMemHandle_t)>;
+static_assert(sizeof(IPC_KEY) == sizeof(hggcIpcMemHandle_t));
+static_assert(alignof(IPC_KEY) == alignof(hggcIpcMemHandle_t));
 
 class CustomAllreduce {
  public:
@@ -592,8 +592,8 @@ class CustomAllreduce {
     auto [it, new_handle] = ipc_handles_.insert({*((IPC_KEY*)ipc_handle), nullptr});
     if (new_handle) {
       char* ipc_ptr;
-      CHECK_CUDA_SUCCESS(cudaIpcOpenMemHandle(
-          (void**)&ipc_ptr, *((const cudaIpcMemHandle_t*)ipc_handle), cudaIpcMemLazyEnablePeerAccess));
+      CHECK_CUDA_SUCCESS(hggcIpcOpenMemHandle(
+          (void**)&ipc_ptr, *((const hggcIpcMemHandle_t*)ipc_handle), hggcIpcMemLazyEnablePeerAccess));
       it->second = ipc_ptr;
     }
     return it->second;
@@ -601,7 +601,7 @@ class CustomAllreduce {
 
   std::pair<std::string, std::vector<int64_t>> get_graph_buffer_ipc_meta() {
     auto num_buffers = graph_unreg_buffers_.size();
-    auto handle_sz = sizeof(cudaIpcMemHandle_t);
+    auto handle_sz = sizeof(hggcIpcMemHandle_t);
     std::string handles(handle_sz * num_buffers, static_cast<char>(0));
     std::vector<int64_t> offsets(num_buffers);
     for (int i = 0; i < num_buffers; i++) {
@@ -609,9 +609,9 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      if (cuPointerGetAttribute(&base_ptr, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, (CUdeviceptr)ptr) != CUDA_SUCCESS)
+      if (hgPointerGetAttribute(&base_ptr, HG_POINTER_ATTRIBUTE_RANGE_START_ADDR, (HGdeviceptr)ptr) != HGGC_SUCCESS)
         throw std::runtime_error("failed to get pointer attr");
-      CHECK_CUDA_SUCCESS(cudaIpcGetMemHandle((cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
+      CHECK_CUDA_SUCCESS(hggcIpcGetMemHandle((hggcIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
     }
     return std::make_pair(handles, offsets);
@@ -633,7 +633,7 @@ class CustomAllreduce {
       data.ptrs[i] = ptrs[i];
     }
     auto d_data = d_rank_data_base_++;
-    CHECK_CUDA_SUCCESS(cudaMemcpy(d_data, &data, sizeof(RankData), cudaMemcpyHostToDevice));
+    CHECK_CUDA_SUCCESS(hggcMemcpy(d_data, &data, sizeof(RankData), hggcMemcpyHostToDevice));
     buffers_[ptrs[rank_]] = d_data;
   }
 
@@ -654,7 +654,7 @@ class CustomAllreduce {
       auto& rd = rank_data[i];
       for (int j = 0; j < world_size_; j++) {
         if (j != rank_) {
-          char* handle = open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
+          char* handle = open_ipc_handle(&handles[j][i * sizeof(hggcIpcMemHandle_t)]);
           handle += offsets[j][i];
           rd.ptrs[j] = handle;
         } else {
@@ -663,7 +663,7 @@ class CustomAllreduce {
       }
     }
     CHECK_CUDA_SUCCESS(
-        cudaMemcpy(d_rank_data_base_, rank_data.data(), sizeof(RankData) * num_buffers, cudaMemcpyHostToDevice));
+        hggcMemcpy(d_rank_data_base_, rank_data.data(), sizeof(RankData) * num_buffers, hggcMemcpyHostToDevice));
     d_rank_data_base_ += num_buffers;
     graph_unreg_buffers_.clear();
   }
@@ -679,7 +679,7 @@ class CustomAllreduce {
    */
   template <typename T>
   void allreduce(
-      cudaStream_t stream,
+      hggcStream_t stream,
       T* input,
       T* output,
       int size,
@@ -696,9 +696,9 @@ class CustomAllreduce {
           "max supported block limit is " + std::to_string(kMaxBlocks) + ". Got " + std::to_string(block_limit));
 
     RankData* ptrs;
-    cudaStreamCaptureStatus status;
-    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
+    hggcStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(hggcStreamIsCapturing(stream, &status));
+    if (status == hggcStreamCaptureStatusActive) {
       ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
       graph_unreg_buffers_.push_back(input);
     } else {
@@ -786,7 +786,7 @@ class CustomAllreduce {
 
   ~CustomAllreduce() {
     for (auto [_, ptr] : ipc_handles_) {
-      CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
+      CHECK_CUDA_SUCCESS(hggcIpcCloseMemHandle(ptr));
     }
   }
 };

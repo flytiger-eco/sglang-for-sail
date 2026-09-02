@@ -22,9 +22,9 @@
 // header sits in nearly every kernel's dependency closure, which the build
 // cache is keyed on, so editing it rebuilds every JIT module.
 namespace cub = hipcub;
-#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
-#define cudaFuncSetAttribute hipFuncSetAttribute
-#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define hggcDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define hggcFuncSetAttribute hipFuncSetAttribute
+#define hggcFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #endif
 
 #ifndef WARP_SIZE
@@ -513,8 +513,8 @@ struct MoeLoraAlignBlockSizeKernel {
     int device_max_shared_mem;
     auto device = topk_ids.device();
     int dev_id = device.device_id;
-    RuntimeDeviceCheck(cudaDeviceGetAttribute(&device_max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+    RuntimeDeviceCheck(hggcDeviceGetAttribute(&device_max_shared_mem, hggcDevAttrMaxSharedMemoryPerBlockOptin, dev_id));
+    const hggcStream_t stream = LaunchKernel::resolve_device(device);
 
     int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
@@ -546,7 +546,7 @@ struct MoeLoraAlignBlockSizeKernel {
       dim3 blockDim(num_thread + fill_threads);
       auto kernel = moe::moe_lora_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
       const auto fptr = std::bit_cast<const void*>(kernel);
-      RuntimeDeviceCheck(cudaFuncSetAttribute(fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
+      RuntimeDeviceCheck(hggcFuncSetAttribute(fptr, hggcFuncAttributeMaxDynamicSharedMemorySize, shared_mem));
 
       LaunchKernel(dim3(max_loras), blockDim, stream, shared_mem)(
           kernel,

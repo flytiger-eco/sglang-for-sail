@@ -172,11 +172,11 @@ struct CodecQ4 : public CodecBase {
             int32_t int16_2 = (qw >> (i * 4)) & kMask000F;
             int16_t low = static_cast<int16_t>(int16_2 & 0xFFFF);
             int16_t high = static_cast<int16_t>((int16_2 >> 16) & 0xFFFF);
-            nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
-            nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
-            nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
+            ppu_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+            ppu_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+            ppu_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
             int32_t packed_bf16 = *reinterpret_cast<int32_t*>(&bf2);
-            w[i] = packed_add<nv_bfloat16>(packed_bf16, kRangeMin);
+            w[i] = packed_add<ppu_bfloat16>(packed_bf16, kRangeMin);
           }
         }
       }
@@ -332,11 +332,11 @@ struct CodecQ6 : public CodecBase {
             int16_t low = static_cast<int16_t>(int16_2 & 0xFFFF);
             int16_t high = static_cast<int16_t>((int16_2 >> 16) & 0xFFFF);
 
-            nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
-            nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
-            nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
+            ppu_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+            ppu_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+            ppu_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
             int32_t packed_bf16 = *reinterpret_cast<int32_t*>(&bf2);
-            w[i] = packed_add<nv_bfloat16>(packed_bf16, kRangeMin);
+            w[i] = packed_add<ppu_bfloat16>(packed_bf16, kRangeMin);
           }
         }
       }
@@ -479,11 +479,11 @@ struct CodecQ8 : public CodecBase {
             int32_t int16_2 = (qw[i / 2] >> ((i % 2) * 8)) & kMask00FF;
             int16_t low = static_cast<int16_t>(int16_2 & 0xFFFF);
             int16_t high = static_cast<int16_t>((int16_2 >> 16) & 0xFFFF);
-            nv_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
-            nv_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
-            nv_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
+            ppu_bfloat16 bf_low = __float2bfloat16(static_cast<float>(low));
+            ppu_bfloat16 bf_high = __float2bfloat16(static_cast<float>(high));
+            ppu_bfloat162 bf2 = __halves2bfloat162(bf_low, bf_high);
             int32_t packed_bf16 = *reinterpret_cast<int32_t*>(&bf2);
-            w[i] = packed_add<nv_bfloat16>(packed_bf16, kRangeMin);
+            w[i] = packed_add<ppu_bfloat16>(packed_bf16, kRangeMin);
           }
         }
       }
@@ -510,7 +510,7 @@ struct CodecQ8 : public CodecBase {
 // spelling it out fails to assemble for gfx942. The narrowing itself is left to
 // __float22half2_rn, which every target implements and which matches the
 // round-to-nearest conversion the quantized path above uses.
-__quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(nv_bfloat162 value, float scale) {
+__quickreduce_device_inline__ half2 scaled_bfloat162_to_half2(ppu_bfloat162 value, float scale) {
   float2 scaled = __bfloat1622float2(value);
   scaled.x *= scale;
   scaled.y *= scale;
@@ -557,7 +557,7 @@ struct AllReduceTwoshot {
       tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
       src_offset += kAtomStride * sizeof(int32x4_t);
       if constexpr (cast_bf2half) {
-        const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
+        const ppu_bfloat162* bf_buf = reinterpret_cast<const ppu_bfloat162*>(&tA[i]);
         half2 half_buf[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -660,7 +660,7 @@ struct AllReduceTwoshot {
     for (int i = 0; i < kAtoms; i++) {
       if constexpr (cast_bf2half) {
         const half2* half_buf = reinterpret_cast<const half2*>(&tA[i]);
-        nv_bfloat162 bf16_buf[4];
+        ppu_bfloat162 bf16_buf[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = __half22float2(half_buf[j]);

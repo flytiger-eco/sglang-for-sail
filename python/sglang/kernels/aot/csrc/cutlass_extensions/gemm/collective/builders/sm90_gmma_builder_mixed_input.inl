@@ -24,7 +24,7 @@
 #include "cutlass/pipeline/sm90_pipeline.hpp"
 
 // SM90 Collective Builders should be used only starting CUDA 12.0
-#if (__CUDACC_VER_MAJOR__ >= 12)
+#if (__COMPATIBLECC_VER_MAJOR__ >= 12)
 #define CUTLASS_SM90_COLLECTIVE_BUILDER_SUPPORTED
 #endif
 

@@ -608,7 +608,7 @@ inline PrefillPlan plan_compress_prefill(
 
   const auto copy_to_device = [stream](void* cuda_ptr, auto* host_ptr, size_t count) {
     const auto size_bytes = count * sizeof(*host_ptr);
-    RuntimeDeviceCheck(cudaMemcpyAsync(cuda_ptr, host_ptr, size_bytes, cudaMemcpyHostToDevice, stream));
+    RuntimeDeviceCheck(hggcMemcpyAsync(cuda_ptr, host_ptr, size_bytes, hggcMemcpyHostToDevice, stream));
   };
   const auto num_c_padded = use_cuda_graph ? num_q_tokens : counter_c;
   const auto num_w_padded = use_cuda_graph ? num_q_tokens : counter_w;
@@ -781,7 +781,7 @@ inline PrefillPlan plan_compress_prefill_legacy(
   const auto stream = LaunchKernel::resolve_device(device);
   const auto copy_to_device = [stream](void* cuda_ptr, auto* host_ptr, size_t count) {
     const auto size_bytes = count * sizeof(*host_ptr);
-    RuntimeDeviceCheck(cudaMemcpyAsync(cuda_ptr, host_ptr, size_bytes, cudaMemcpyHostToDevice, stream));
+    RuntimeDeviceCheck(hggcMemcpyAsync(cuda_ptr, host_ptr, size_bytes, hggcMemcpyHostToDevice, stream));
   };
   const auto num_c_padded = use_cuda_graph ? num_q_tokens : counter_c;
   const auto num_w_padded = use_cuda_graph ? num_q_tokens : counter_w;

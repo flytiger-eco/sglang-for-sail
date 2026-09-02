@@ -13,7 +13,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 
@@ -42,8 +42,8 @@ __global__ void gather_scatter_kernel(const __grid_constant__ GatherScatterParam
   const int c0 = (blockIdx.x * kGSThreads + threadIdx.x) * 2;
   if (c0 >= static_cast<int>(p.D)) return;
 
-  const auto* hp = static_cast<const __nv_bfloat16*>(p.hidden);
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
+  const auto* hp = static_cast<const __ppu_bfloat16*>(p.hidden);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
   const int64_t dst_slot = static_cast<const int64_t*>(p.dst)[static_cast<int64_t>(b) * p.dst_stride_b];
   const int64_t cache_base = dst_slot * p.cache_stride_slot + c0;
   const int64_t track_base = static_cast<int64_t>(b) * p.track_stride_b;
@@ -52,8 +52,8 @@ __global__ void gather_scatter_kernel(const __grid_constant__ GatherScatterParam
   for (int w = 0; w < W1; ++w) {
     const int64_t src_t =
         static_cast<const int32_t*>(p.track_idx)[track_base + static_cast<int64_t>(w) * p.track_stride_w];
-    const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&hp[src_t * p.hs_stride_t + c0]);
-    *reinterpret_cast<__nv_bfloat162*>(&cp[cache_base + static_cast<int64_t>(w) * p.cache_stride_w]) = v;
+    const __ppu_bfloat162 v = *reinterpret_cast<const __ppu_bfloat162*>(&hp[src_t * p.hs_stride_t + c0]);
+    *reinterpret_cast<__ppu_bfloat162*>(&cp[cache_base + static_cast<int64_t>(w) * p.cache_stride_w]) = v;
   }
 }
 

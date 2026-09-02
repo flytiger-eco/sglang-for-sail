@@ -16,7 +16,13 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
+// The PPU SDK's hggc_runtime.h does not pull in hggc_runtime_api.h, unlike
+// CUDA's cuda_runtime.h which includes cuda_runtime_api.h. Without this the
+// host runtime API (hggcGetDevice, hggcGetErrorString, hggcDeviceGetAttribute,
+// hggcGetLastError, ...) is undeclared in every translation unit that only
+// asks for the runtime umbrella header.
+#include <hggc_runtime_api.h>
 #include <torch/all.h>
 
 #ifdef USE_ROCM
@@ -53,7 +59,7 @@ limitations under the License.
 #ifdef FLASHINFER_ENABLE_BF16
 #define _DISPATCH_CASE_BF16(c_type, ...) \
   case at::ScalarType::BFloat16: {       \
-    using c_type = nv_bfloat16;          \
+    using c_type = ppu_bfloat16;         \
     return __VA_ARGS__();                \
   }
 #else
@@ -63,7 +69,7 @@ limitations under the License.
 #ifdef FLASHINFER_ENABLE_FP8_E4M3
 #define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
   case at::ScalarType::Float8_e4m3fn: {      \
-    using c_type = __nv_fp8_e4m3;            \
+    using c_type = __hg_fp8_e4m3;            \
     return __VA_ARGS__();                    \
   }
 #else
@@ -73,7 +79,7 @@ limitations under the License.
 #ifdef FLASHINFER_ENABLE_FP8_E5M2
 #define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
   case at::ScalarType::Float8_e5m2: {        \
-    using c_type = __nv_fp8_e5m2;            \
+    using c_type = __hg_fp8_e5m2;            \
     return __VA_ARGS__();                    \
   }
 #else
@@ -233,10 +239,10 @@ struct cuda_error : public std::runtime_error {
 
 #define CHECK_CUDA_SUCCESS(cmd)                                         \
   do {                                                                  \
-    cudaError_t e = cmd;                                                \
-    if (e != cudaSuccess) {                                             \
+    hggcError_t e = cmd;                                                \
+    if (e != hggcSuccess) {                                             \
       std::stringstream _message;                                       \
-      auto s = cudaGetErrorString(e);                                   \
+      auto s = hggcGetErrorString(e);                                   \
       _message << std::string(s) + "\n" << __FILE__ << ':' << __LINE__; \
       throw cuda_error(_message.str());                                 \
     }                                                                   \
@@ -250,27 +256,27 @@ struct cuda_error : public std::runtime_error {
 
 inline int getSMVersion() {
   int device{-1};
-  CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+  CHECK_CUDA_SUCCESS(hggcGetDevice(&device));
   int sm_major = 0;
   int sm_minor = 0;
-  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
-  CHECK_CUDA_SUCCESS(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
+  CHECK_CUDA_SUCCESS(hggcDeviceGetAttribute(&sm_major, hggcDevAttrComputeCapabilityMajor, device));
+  CHECK_CUDA_SUCCESS(hggcDeviceGetAttribute(&sm_minor, hggcDevAttrComputeCapabilityMinor, device));
   return sm_major * 10 + sm_minor;
 }
 
 inline bool isDeviceType(const std::string& device_type) {
   int deviceCount;
-  CHECK_CUDA_SUCCESS(cudaGetDeviceCount(&deviceCount));
+  CHECK_CUDA_SUCCESS(hggcGetDeviceCount(&deviceCount));
 
   int device_id = -1;
   if (deviceCount >= 1) {
-    CHECK_CUDA_SUCCESS(cudaGetDevice(&device_id));
+    CHECK_CUDA_SUCCESS(hggcGetDevice(&device_id));
   } else {
     return false;
   }
 
-  cudaDeviceProp prop;
-  CHECK_CUDA_SUCCESS(cudaGetDeviceProperties(&prop, device_id));
+  hggcDeviceProp prop;
+  CHECK_CUDA_SUCCESS(hggcGetDeviceProperties(&prop, device_id));
   if (device_type == std::string(prop.name)) {
     return true;
   }

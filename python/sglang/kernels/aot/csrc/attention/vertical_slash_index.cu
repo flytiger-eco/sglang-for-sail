@@ -4,7 +4,7 @@
 
 #include <assert.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda.h>
+#include <hggc.h>
 #include <torch/all.h>
 
 // Save the start index of each block in the given range into block_offset.
@@ -177,7 +177,7 @@ void convert_vertical_slash_indexes_64x64(
   const dim3 dimBlock((int32_t)N_THREADS);
   const dim3 dimGrid(
       (int32_t)N_HEADS, (int32_t)BATCH_SIZE, ((int32_t)N_ROWS + (int32_t)N_THREADS - 1) / (int32_t)N_THREADS);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   convert_vertical_slash_indexes_kernel<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
@@ -210,7 +210,7 @@ void convert_vertical_slash_indexes(
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
-  cudaSetDevice(q_seqlens.get_device());
+  hggcSetDevice(q_seqlens.get_device());
 
   int64_t batch_size = slash_indexes.size(0);
   int64_t num_heads = slash_indexes.size(1);
@@ -395,7 +395,7 @@ void convert_vertical_slash_indexes_64x64_mergehead(
   const int N_THREADS = 64;
   const dim3 dimBlock(N_THREADS);
   const dim3 dimGrid(N_HEADS, BATCH_SIZE, (N_ROWS + N_THREADS - 1) / N_THREADS);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   convert_vertical_slash_indexes_kernel_mergehead<<<dimGrid, dimBlock, 0, stream>>>(
       q_seqlens,
       kv_seqlens,
@@ -432,7 +432,7 @@ void convert_vertical_slash_indexes_mergehead(
     int64_t block_size_M,
     int64_t block_size_N,
     bool causal) {
-  cudaSetDevice(q_seqlens.get_device());
+  hggcSetDevice(q_seqlens.get_device());
 
   int batch_size = slash_indexes.size(0);
   int num_heads = slash_indexes.size(1);

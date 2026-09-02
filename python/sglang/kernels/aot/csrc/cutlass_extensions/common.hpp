@@ -1,7 +1,7 @@
 #pragma once
 
-#include "cuda_runtime.h"
 #include "cutlass/cutlass.h"
+#include "hggc_runtime.h"
 
 /**
  * A wrapper for a kernel that is used to guard against compilation on
@@ -14,7 +14,7 @@ template <typename Kernel>
 struct enable_sm90_or_later : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 900
+#if defined COMPATIBLE_ARCH && COMPATIBLE_ARCH >= 900
     Kernel::operator()(std::forward<Args>(args)...);
 #endif
   }

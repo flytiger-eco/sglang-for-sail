@@ -20,9 +20,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 
 // Local PTX / TMA primitives
 // Only what this kernel issues, kept in-file on purpose: these are raw-ISA
@@ -299,7 +299,7 @@ static SGL_DEVICE void prefetch_tensormap(const void* tmap) {
 
 // global -> shared::cta 2D tile load.
 static SGL_DEVICE void
-cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
+cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const HGtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_smem),
@@ -322,7 +322,7 @@ cp_async_bulk_tensor_2d_load(uint32_t dst_smem, const CUtensorMap* tmap, int32_t
 // 24, that is the cta_group::2 trick and would mis-route the signal.
 static SGL_DEVICE void cp_async_bulk_tensor_2d_load_multicast_cg1(
     uint32_t dst_smem,
-    const CUtensorMap* tmap,
+    const HGtensorMap* tmap,
     int32_t x,
     int32_t y,
     uint64_t* bar,
@@ -373,23 +373,23 @@ namespace tmap {
 // tensor-map encoder), so it goes through cutlass's dlopen-based driver wrapper
 // like the other JIT kernels that encode tensor maps — that keeps the module
 // off `-lcuda`.
-inline CUtensorMap encode_tiled_2d(
+inline HGtensorMap encode_tiled_2d(
     void* global_ptr,
-    CUtensorMapDataType dtype,
+    HGtensorMapDataType dtype,
     uint64_t global_rows,
     uint64_t global_cols,
     uint64_t row_stride_bytes,
     uint32_t box_rows,
     uint32_t box_cols,
-    CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE,
-    CUtensorMapL2promotion promo = CU_TENSOR_MAP_L2_PROMOTION_NONE) {
-  cuuint64_t global_dim[2] = {global_cols, global_rows};
-  cuuint64_t global_strides[1] = {row_stride_bytes};
-  cuuint32_t box_dim[2] = {box_cols, box_rows};
-  cuuint32_t element_strides[2] = {1, 1};
+    HGtensorMapSwizzle swizzle = HG_TENSOR_MAP_SWIZZLE_NONE,
+    HGtensorMapL2promotion promo = HG_TENSOR_MAP_L2_PROMOTION_NONE) {
+  hguint64_t global_dim[2] = {global_cols, global_rows};
+  hguint64_t global_strides[1] = {row_stride_bytes};
+  hguint32_t box_dim[2] = {box_cols, box_rows};
+  hguint32_t element_strides[2] = {1, 1};
 
-  CUtensorMap m{};
-  const CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+  HGtensorMap m{};
+  const HGresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(hgTensorMapEncodeTiled)(
       &m,
       dtype,
       /*rank=*/2,
@@ -398,11 +398,11 @@ inline CUtensorMap encode_tiled_2d(
       global_strides,
       box_dim,
       element_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      HG_TENSOR_MAP_INTERLEAVE_NONE,
       swizzle,
       promo,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  if (res != CUDA_SUCCESS) {
+      HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (res != HGGC_SUCCESS) {
     std::fprintf(
         stderr,
         "gemm_ar: cuTensorMapEncodeTiled failed (%d) at %s:%d — rows=%llu cols=%llu "
@@ -534,7 +534,7 @@ constexpr __host__ __device__ size_t region_bytes(int R) {
 // the same way; an unfused cublas composite cannot cooperate across the
 // vendor-kernel boundary.
 SGL_DEVICE uint32_t bf2_u32(float2 f) {
-  const __nv_bfloat162 p = __float22bfloat162_rn(f);
+  const __ppu_bfloat162 p = __float22bfloat162_rn(f);
   return *reinterpret_cast<const uint32_t*>(&p);
 }
 
@@ -542,11 +542,11 @@ SGL_DEVICE uint32_t bf2_u32(float2 f) {
 
 template <int R>
 struct Params {
-  uint8_t* mc_base;                 // MC VA (null when no MC object — kPeer runs)
-  uint8_t* uc_base[R];              // per-rank unicast VAs of the shared region
-  uint32_t* gather;                 // device-local u32[kRing]
-  __nv_bfloat16* out;               // [M,N] local output
-  const __nv_bfloat16* partial_in;  // GEMM_ON=false input [M,N]
+  uint8_t* mc_base;                  // MC VA (null when no MC object — kPeer runs)
+  uint8_t* uc_base[R];               // per-rank unicast VAs of the shared region
+  uint32_t* gather;                  // device-local u32[kRing]
+  __ppu_bfloat16* out;               // [M,N] local output
+  const __ppu_bfloat16* partial_in;  // GEMM_ON=false input [M,N]
   // Device-resident per-fam CTA ticket counters. Every CTA takes one ticket
   // at entry and divides by the (family-stable) gridDim to recover the
   // launch epoch. All CTAs have taken their tickets before this grid
@@ -594,8 +594,8 @@ struct Strip {
 // followers skip their own A issue but keep full expect_tx.
 template <int M, int K, int R, Comm COMM, bool GEMM_ON, int S, int CH, int C>
 __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
-    const __grid_constant__ CUtensorMap w_map,
-    const __grid_constant__ CUtensorMap x_map,
+    const __grid_constant__ HGtensorMap w_map,
+    const __grid_constant__ HGtensorMap x_map,
     const __grid_constant__ Params<R> prm) {
   constexpr int Mp = (M + 15) & ~15;  // mma m16 padding (x buffer padded)
   constexpr int MT = Mp / 16;
@@ -817,7 +817,7 @@ __global__ void __launch_bounds__(kThreads) oproj_ar_kernel(
         const uint32_t w4[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w4[j]));
+          const float2 f = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&w4[j]));
           s[j].x += f.x;
           s[j].y += f.y;
         }
@@ -879,8 +879,8 @@ SGL_DEVICE size_t d3_slot_off(int t, int nb, int w, int l, int nblk_per_tile) {
 // transposes (local scatter, cheap at these payloads).
 template <int M, int K, int R, Comm COMM>
 __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
-    const __grid_constant__ CUtensorMap x_tmap,  // A = x [kMMax, K]
-    const __grid_constant__ CUtensorMap w_tmap,  // B = W [kN, K]
+    const __grid_constant__ HGtensorMap x_tmap,  // A = x [kMMax, K]
+    const __grid_constant__ HGtensorMap w_tmap,  // B = W [kN, K]
     const __grid_constant__ Params<R> prm) {
   constexpr bool SWAP = (M <= 64);
   // two-shot planes share RS/reduce/out-copy; they differ only in the AG +
@@ -1140,7 +1140,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
         const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w4[j]));
+          const float2 f = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&w4[j]));
           acc2[j].x += f.x;
           acc2[j].y += f.y;
         }
@@ -1225,7 +1225,7 @@ __global__ void __launch_bounds__(kD3Threads) oproj_dense_ar_kernel(
         const uint32_t w4[4] = {vv.x, vv.y, vv.z, vv.w};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w4[j]));
+          const float2 f = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&w4[j]));
           acc2[j].x += f.x;
           acc2[j].y += f.y;
         }
@@ -1268,18 +1268,18 @@ struct Launcher3 {
   static constexpr int kGrid = kTiles < 152 ? kTiles : 152;
   static constexpr size_t kSmem = size_t(d3_ns(kBN)) * (kD3ABytes + kBN * kD3BK * 2);
   static void set_smem_attr() {
-    CHECK_CUDA(cudaFuncSetAttribute(
-        oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
-    CHECK_CUDA(cudaFuncSetAttribute(
-        oproj_dense_ar_kernel<M, K, R, COMM>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    CHECK_CUDA(hggcFuncSetAttribute(
+        oproj_dense_ar_kernel<M, K, R, COMM>, hggcFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
+    CHECK_CUDA(hggcFuncSetAttribute(
+        oproj_dense_ar_kernel<M, K, R, COMM>, hggcFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   static void
-  launch(const CUtensorMap& x_tmap, const CUtensorMap& w_tmap, const Params<R>& prm, cudaStream_t stream, bool pdl) {
-    cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute attr[1];
+  launch(const HGtensorMap& x_tmap, const HGtensorMap& w_tmap, const Params<R>& prm, hggcStream_t stream, bool pdl) {
+    hggcLaunchConfig_t cfg{};
+    hggcLaunchAttribute attr[1];
     int na = 0;
     if (pdl) {
-      attr[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[na].id = hggcLaunchAttributeProgrammaticStreamSerialization;
       attr[na].val.programmaticStreamSerializationAllowed = 1;
       ++na;
     }
@@ -1289,7 +1289,7 @@ struct Launcher3 {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
+    CHECK_CUDA(hggcLaunchKernelEx(&cfg, oproj_dense_ar_kernel<M, K, R, COMM>, x_tmap, w_tmap, prm));
   }
 };
 
@@ -1311,13 +1311,13 @@ struct Launcher {
                                       : 4096;  // AR-only path never touches the feed ring
   // once per device, before first launch
   static void set_smem_attr() {
-    CHECK_CUDA(cudaFuncSetAttribute(
-        oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
+    CHECK_CUDA(hggcFuncSetAttribute(
+        oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, hggcFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)));
     // 100% carveout → the SM smem config fits TWO CTAs (this grid's tail
     // + the next PDL grid's feed); the default config blocks dual
     // residency and with it the whole tail-hiding scheme.
-    CHECK_CUDA(cudaFuncSetAttribute(
-        oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+    CHECK_CUDA(hggcFuncSetAttribute(
+        oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, hggcFuncAttributePreferredSharedMemoryCarveout, 100));
   }
   // pdl=false = the NON-COOPERATIVE-neighbor regime: no programmatic
   // serialization attribute, so successive kernels fully serialize — the
@@ -1325,22 +1325,22 @@ struct Launcher {
   // don't PDL-cooperate or can't co-reside. In-kernel griddepcontrol ops
   // are no-ops without the attribute; the done-guard is trivially met.
   static void launch(
-      const CUtensorMap& w_map,
-      const CUtensorMap& x_map,
+      const HGtensorMap& w_map,
+      const HGtensorMap& x_map,
       const Params<R>& prm,
       int ncta,
-      cudaStream_t stream,
+      hggcStream_t stream,
       bool pdl) {
-    cudaLaunchConfig_t cfg{};
-    cudaLaunchAttribute attr[2];
+    hggcLaunchConfig_t cfg{};
+    hggcLaunchAttribute attr[2];
     int na = 0;
     if (pdl) {
-      attr[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[na].id = hggcLaunchAttributeProgrammaticStreamSerialization;
       attr[na].val.programmaticStreamSerializationAllowed = 1;
       ++na;
     }
     if constexpr (C > 1) {
-      attr[na].id = cudaLaunchAttributeClusterDimension;
+      attr[na].id = hggcLaunchAttributeClusterDimension;
       attr[na].val.clusterDim.x = C;
       attr[na].val.clusterDim.y = 1;
       attr[na].val.clusterDim.z = 1;
@@ -1352,7 +1352,7 @@ struct Launcher {
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = unsigned(na);
-    CHECK_CUDA(cudaLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
+    CHECK_CUDA(hggcLaunchKernelEx(&cfg, oproj_ar_kernel<M, K, R, COMM, GEMM_ON, S, CH, C>, w_map, x_map, prm));
   }
 };
 
@@ -1422,7 +1422,7 @@ struct GemmArKernel {
 
   // Per-weight-pointer W tensor maps (encode once; weights are static).
   struct WMaps {
-    CUtensorMap w48, w64, w128, w256;
+    HGtensorMap w48, w64, w128, w256;
   };
 
   static const WMaps& w_maps(void* w) {
@@ -1433,7 +1433,7 @@ struct GemmArKernel {
     if (it == cache.end()) {
       auto enc = [&](uint32_t box_rows) {
         return tmap::encode_tiled_2d(
-            w, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, kN, K, size_t(K) * 2, box_rows, kBK, CU_TENSOR_MAP_SWIZZLE_128B);
+            w, HG_TENSOR_MAP_DATA_TYPE_BFLOAT16, kN, K, size_t(K) * 2, box_rows, kBK, HG_TENSOR_MAP_SWIZZLE_128B);
       };
       it = cache.emplace(w, WMaps{enc(kBNRows), enc(64), enc(128), enc(256)}).first;
     }
@@ -1442,9 +1442,9 @@ struct GemmArKernel {
 
   // x tensor map over the caller's [M, K] tensor: global rows = M, TMA
   // zero-fills the [M, cell) padding rows out-of-bounds.
-  static CUtensorMap x_map(void* x, int m, uint32_t box_rows) {
+  static HGtensorMap x_map(void* x, int m, uint32_t box_rows) {
     return tmap::encode_tiled_2d(
-        x, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, uint64_t(m), K, size_t(K) * 2, box_rows, kBK, CU_TENSOR_MAP_SWIZZLE_128B);
+        x, HG_TENSOR_MAP_DATA_TYPE_BFLOAT16, uint64_t(m), K, size_t(K) * 2, box_rows, kBK, HG_TENSOR_MAP_SWIZZLE_128B);
   }
 
   static void set_smem_attrs_once() {
@@ -1463,17 +1463,17 @@ struct GemmArKernel {
   }
 
   template <int CELL>
-  static void enqueue_cell(const WMaps& wm, void* x, int m, const Params<R>& prm, cudaStream_t stream, bool pdl) {
+  static void enqueue_cell(const WMaps& wm, void* x, int m, const Params<R>& prm, hggcStream_t stream, bool pdl) {
     if constexpr (CELL <= 16) {
-      const CUtensorMap xm = x_map(x, m, 16);
+      const HGtensorMap xm = x_map(x, m, 16);
       Launcher<CELL, K, R, Comm::kPeer, true>::launch(wm.w48, xm, prm, kM1Grid_(), stream, pdl);
     } else if constexpr (CELL < kTwoShotMinM) {
-      const CUtensorMap xm = x_map(x, m, CELL <= 32 ? 16 : (CELL <= 64 ? 32 : 128));
-      const CUtensorMap& wmap = CELL <= 64 ? wm.w128 : wm.w64;
+      const HGtensorMap xm = x_map(x, m, CELL <= 32 ? 16 : (CELL <= 64 ? 32 : 128));
+      const HGtensorMap& wmap = CELL <= 64 ? wm.w128 : wm.w64;
       Launcher3<CELL, K, R, Comm::kPeer>::launch(xm, wmap, prm, stream, pdl);
     } else {
-      const CUtensorMap xm = x_map(x, m, 128);
-      const CUtensorMap& wmap = CELL == 128 ? wm.w64 : (CELL == 256 ? wm.w128 : wm.w256);
+      const HGtensorMap xm = x_map(x, m, 128);
+      const HGtensorMap& wmap = CELL == 128 ? wm.w64 : (CELL == 256 ? wm.w128 : wm.w256);
       Launcher3<CELL, K, R, Comm::kTwoShotPeer>::launch(xm, wmap, prm, stream, pdl);
     }
   }
@@ -1528,14 +1528,14 @@ struct GemmArKernel {
     set_smem_attrs_once();
 
     const DLDevice dev = device.unwrap();
-    const auto stream = static_cast<cudaStream_t>(::TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+    const auto stream = static_cast<hggcStream_t>(::TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
     Params<R> prm{};
     prm.mc_base = nullptr;  // pure-P2P plane
     for (int r = 0; r < R; ++r)
       prm.uc_base[r] = bases_store()[r];
     prm.gather = static_cast<uint32_t*>(gather.data_ptr());
-    prm.out = static_cast<__nv_bfloat16*>(out.data_ptr());
+    prm.out = static_cast<__ppu_bfloat16*>(out.data_ptr());
     prm.partial_in = nullptr;
     prm.epoch_base = static_cast<uint32_t*>(epochs.data_ptr());
     prm.my_rank = int(my_rank);
@@ -1566,7 +1566,7 @@ struct GemmArKernel {
         enqueue_cell<512>(wm, x.data_ptr(), m, prm, stream, pdl);
         break;
     }
-    CHECK_CUDA(cudaGetLastError()) << "gemm_ar launch (cell=" << cell << ")";
+    CHECK_CUDA(hggcGetLastError()) << "gemm_ar launch (cell=" << cell << ")";
   }
 };
 

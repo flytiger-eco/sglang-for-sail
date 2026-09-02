@@ -5,7 +5,7 @@
 #pragma once
 
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
-#include <cuda.h>
+#include <hggc.h>
 
 #include <vector>
 
@@ -149,4 +149,4 @@ struct Flash_fwd_params : public Qkv_params {
 };
 
 template <typename T, int Headdim, bool Is_causal>
-void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream);
+void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, hggcStream_t stream);

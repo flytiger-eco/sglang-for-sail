@@ -229,7 +229,7 @@ void build_tree_kernel_efficient(
   int bs = parent_list.size(0);
   dim3 grid(bs);
   dim3 block(draft_token_num);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (tree_mask_mode == QLEN_ONLY_BITPACKING) {
     size_t num_bytes_per_item = 1;
@@ -388,7 +388,7 @@ void verify_tree_greedy(
     throw std::runtime_error("Expected 'target_predict' to be of type long (torch.int64).");
   }
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   dim3 grid(batch_size);
   dim3 block(1);
 

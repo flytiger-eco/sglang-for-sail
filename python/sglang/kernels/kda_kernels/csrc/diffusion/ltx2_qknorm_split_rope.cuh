@@ -15,7 +15,7 @@
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel and CUDA dtype aliases
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 

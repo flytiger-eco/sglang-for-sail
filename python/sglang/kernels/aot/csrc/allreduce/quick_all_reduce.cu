@@ -72,9 +72,9 @@ void qr_all_reduce(
           quant_level,
           stream);
     } else {
-      fa->allreduce<quickreduce::nv_bfloat16, false>(
-          reinterpret_cast<quickreduce::nv_bfloat16*>(inp.data_ptr()),
-          reinterpret_cast<quickreduce::nv_bfloat16*>(out.data_ptr()),
+      fa->allreduce<quickreduce::ppu_bfloat16, false>(
+          reinterpret_cast<quickreduce::ppu_bfloat16*>(inp.data_ptr()),
+          reinterpret_cast<quickreduce::ppu_bfloat16*>(out.data_ptr()),
           out.numel(),
           quant_level,
           stream);
@@ -94,14 +94,14 @@ int64_t qr_max_size() {
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 4>, cast_bf2half>; \
   template struct quickreduce::AllReduceTwoshot<T, Codec<T, 8>, cast_bf2half>;
 
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, false)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecFP, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ4, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ6, true)
-INSTANTIATE_FOR_WORLDSIZE(quickreduce::nv_bfloat16, quickreduce::CodecQ8, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecFP, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ4, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ6, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ8, false)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecFP, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ4, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ6, true)
+INSTANTIATE_FOR_WORLDSIZE(quickreduce::ppu_bfloat16, quickreduce::CodecQ8, true)
 
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecFP, false)
 INSTANTIATE_FOR_WORLDSIZE(half, quickreduce::CodecQ4, false)

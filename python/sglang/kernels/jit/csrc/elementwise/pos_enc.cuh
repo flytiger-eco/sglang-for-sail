@@ -8,8 +8,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hggc_fp16.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
@@ -138,7 +138,7 @@ void launch_kernel(
     int head_size,
     dim3 grid,
     dim3 block,
-    const cudaStream_t stream) {
+    const hggcStream_t stream) {
   rotary_embedding_kernel<scalar_t, IS_NEOX><<<grid, block, 0, stream>>>(
       positions_data_ptr,
       static_cast<scalar_t*>(query_ptr),
@@ -160,7 +160,7 @@ void launch_kernel(
   } else if (DTYPE_CODE == kDLFloat && DTYPE_BITS == 16) {                                                        \
     launch_kernel<half, IS_NEOX>(__VA_ARGS__);                                                                    \
   } else if (DTYPE_CODE == kDLBfloat && DTYPE_BITS == 16) {                                                       \
-    launch_kernel<nv_bfloat16, IS_NEOX>(__VA_ARGS__);                                                             \
+    launch_kernel<ppu_bfloat16, IS_NEOX>(__VA_ARGS__);                                                            \
   } else {                                                                                                        \
     RuntimeCheck(                                                                                                 \
         false, "Unsupported data type for rotary embedding. Only float32, float16, and bfloat16 are supported."); \
@@ -183,7 +183,7 @@ void dispatch_by_dtype(
     int head_size,
     dim3 grid,
     dim3 block,
-    const cudaStream_t stream) {
+    const hggcStream_t stream) {
   using namespace host;
   DISPATCH_DTYPE(
       query_dtype.code,
@@ -268,7 +268,7 @@ struct RotaryEmbeddingKernel {
     dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
 
     auto device = query.device();
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+    const hggcStream_t stream = LaunchKernel::resolve_device(device);
 
     auto positions_data_ptr = static_cast<const int64_t*>(positions.data_ptr());
 

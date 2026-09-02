@@ -27,11 +27,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
+#include <hgrtc.h>
 #include <iomanip>
 #include <iostream>
-#include <nvrtc.h>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -562,7 +562,7 @@ public:
     // Execute routing
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(
         tile_tokens_dim);
-    cudaStream_t routing_stream = get_stream(hidden_states.device());
+    hggcStream_t routing_stream = get_stream(hidden_states.device());
 
     // This base class only supports Mode 1 (FromLogits) - compute routing from
     // logits
@@ -596,7 +596,7 @@ public:
     check_moe();
     prepare_moe(moe_tactic);
 
-    cudaStream_t moe_stream = get_stream(hidden_states.device());
+    hggcStream_t moe_stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id,
                     moe_stream, moe_tactic, enable_pdl);
 
@@ -617,8 +617,8 @@ void FusedMoeLauncher::init_common(
   // Check devicearchitecture: Blackwell (SM 10.x) required
   auto device = hidden_states.device().device_id;
   int major = 0, minor = 0;
-  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  hggcDeviceGetAttribute(&major, hggcDevAttrComputeCapabilityMajor, device);
+  hggcDeviceGetAttribute(&minor, hggcDevAttrComputeCapabilityMinor, device);
   TVM_FFI_ICHECK(major == 10 || major == 12)
       << "MoE kernel requires SM 10.x or SM 12.x architecture. Current device "
          "has SM "
@@ -1470,7 +1470,7 @@ public:
     check_routing();
     prepare_routing();
 
-    cudaStream_t routing_stream = get_stream(hidden_states.device());
+    hggcStream_t routing_stream = get_stream(hidden_states.device());
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(
         tile_tokens_dim);
 
@@ -1511,7 +1511,7 @@ public:
     check_moe();
     prepare_moe(moe_tactic);
 
-    cudaStream_t moe_stream = get_stream(hidden_states.device());
+    hggcStream_t moe_stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id,
                     moe_stream, moe_tactic, enable_pdl);
 
@@ -2078,7 +2078,7 @@ public:
     // Execute routing
     tensorrt_llm::kernels::trtllmgen_moe::Routing::Runner routing_runner(
         tile_tokens_dim);
-    cudaStream_t routing_stream = get_stream(hidden_states.device());
+    hggcStream_t routing_stream = get_stream(hidden_states.device());
 
     // Set routing kernel parameters based on mode (see RoutingInputMode enum
     // for documentation)
@@ -2136,7 +2136,7 @@ public:
     check_moe();
     prepare_moe(moe_tactic);
 
-    cudaStream_t moe_stream = get_stream(hidden_states.device());
+    hggcStream_t moe_stream = get_stream(hidden_states.device());
     moe_runner->run(*args, workspace, hidden_states.device().device_id,
                     moe_stream, moe_tactic, enable_pdl);
 
@@ -2682,7 +2682,7 @@ void sgl_trtllm_fp8_block_scale_moe_lora_finalize(
   int const num_blocks_x = (hidden_size + num_threads - 1) / num_threads;
   int const num_blocks_y = std::min<int64_t>(8192, num_tokens);
   dim3 grid(num_blocks_x, num_blocks_y);
-  cudaStream_t stream = get_stream(output.device());
+  hggcStream_t stream = get_stream(output.device());
   sgl_trtllm_fp8_block_scale_moe_lora_finalize_kernel<<<grid, num_threads, 0,
                                                         stream>>>(
       static_cast<cutlass::bfloat16_t const *>(gemm2_output.data_ptr()),
@@ -2692,8 +2692,8 @@ void sgl_trtllm_fp8_block_scale_moe_lora_finalize(
       static_cast<cutlass::bfloat16_t *>(output.data_ptr()), num_tokens, top_k,
       hidden_size, gemm2_output.size(1),
       static_cast<float>(routed_scaling_factor.value_or(1.0)));
-  auto err = cudaGetLastError();
-  FLASHINFER_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+  auto err = hggcGetLastError();
+  FLASHINFER_CHECK(err == hggcSuccess, hggcGetErrorString(err));
 }
 
 Array<Tensor> trtllm_fp4_block_scale_moe(
@@ -2944,7 +2944,7 @@ public:
     namespace moe_ns = tensorrt_llm::kernels::trtllmgen_moe;
     auto device = hidden_states_.device();
     int dev_id = device.device_id;
-    cudaStream_t stream = get_stream(device);
+    hggcStream_t stream = get_stream(device);
 
     int64_t const num_tokens = hidden_states_.size(0);
     int64_t const hidden_size = hidden_states_.dtype() == dl_uint8
@@ -3072,9 +3072,9 @@ public:
       // each token once, scatter) — fewer reads and (with BLOCK_SIZE=512)
       // faster than no-dedup at decode (3.71us vs 6.25us, bench).
       float const gu_globalScaleInv = 1.f / 448.f / 6.f;
-      sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__nv_bfloat16>(
+      sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__ppu_bfloat16>(
           num_tokens, top_k, hidden_size, max_num_padded_tokens,
-          reinterpret_cast<__nv_bfloat16 const *>(hidden_bf16_ptr),
+          reinterpret_cast<__ppu_bfloat16 const *>(hidden_bf16_ptr),
           gu_globalScaleInv,
           static_cast<int32_t const *>(expanded_idx_to_permuted_idx.data_ptr()),
           reinterpret_cast<uint8_t *>(hidden_fp4.data_ptr()),
@@ -3118,9 +3118,9 @@ public:
       float const gu_globalScaleInv = 1.f / 448.f / 6.f;
       // input is already permuted, so map=nullptr and m=max_padded (process all
       // rows; padding=0).
-      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__ppu_bfloat16>(
           max_num_padded_tokens, hidden_size,
-          reinterpret_cast<__nv_bfloat16 const *>(
+          reinterpret_cast<__ppu_bfloat16 const *>(
               permuted_hidden_bf16.data_ptr()),
           gu_globalScaleInv,
           /*expanded_idx_to_permuted_idx=*/nullptr,
@@ -3187,8 +3187,8 @@ public:
     // above overlaps the side-stream LoRA shrink/expand. No-op (0)
     // on the single-stream path.
     if (lora_ready_event_ != 0) {
-      cudaStreamWaitEvent(stream,
-                          reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
+      hggcStreamWaitEvent(stream,
+                          reinterpret_cast<hggcEvent_t>(lora_ready_event_), 0);
     }
 
     // ---- 6+7) activation (SwiGLU + LoRA) then NvFP4 per-token quant of the
@@ -3229,10 +3229,10 @@ public:
       // vecs/row falls to the unfused chain below.
       flashinfer::sgl_fused_act_quant::launchFusedActivationQuant(
           num_tokens * top_k, inter, gate_up_n,
-          reinterpret_cast<__nv_bfloat16 const *>(gate_up_bf16.data_ptr()),
-          reinterpret_cast<__nv_bfloat16 const *>(
+          reinterpret_cast<__ppu_bfloat16 const *>(gate_up_bf16.data_ptr()),
+          reinterpret_cast<__ppu_bfloat16 const *>(
               gate_up_lora_delta_.data_ptr()),
-          reinterpret_cast<__nv_bfloat16 *>(activation_lora_input_.data_ptr()),
+          reinterpret_cast<__ppu_bfloat16 *>(activation_lora_input_.data_ptr()),
           static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
           globalScaleInv, reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
           reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
@@ -3268,9 +3268,9 @@ public:
       // quant#2: m = num_tokens*top_k + the expanded->permuted map so only
       // valid (non-padding) permuted rows are quantized (padding rows of
       // activated_bf16 are left uninitialized).
-      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+      tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__ppu_bfloat16>(
           num_tokens * top_k, inter,
-          reinterpret_cast<__nv_bfloat16 const *>(activated_bf16.data_ptr()),
+          reinterpret_cast<__ppu_bfloat16 const *>(activated_bf16.data_ptr()),
           globalScaleInv,
           static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr()),
           reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
@@ -3327,7 +3327,7 @@ public:
     // stream can start the down-proj LoRA shrink/expand concurrent with the
     // finalize below. 0 = no-op.
     if (gemm2_done_event_ != 0) {
-      cudaEventRecord(reinterpret_cast<cudaEvent_t>(gemm2_done_event_), stream);
+      hggcEventRecord(reinterpret_cast<hggcEvent_t>(gemm2_done_event_), stream);
     }
 
     if (!do_finalize) {
@@ -3521,7 +3521,7 @@ void sgl_trtllm_fp4_block_scale_moe_lora_finalize(
   int const num_blocks_x = (hidden_size + num_threads - 1) / num_threads;
   int const num_blocks_y = std::min<int64_t>(8192, num_tokens);
   dim3 grid(num_blocks_x, num_blocks_y);
-  cudaStream_t stream = get_stream(output.device());
+  hggcStream_t stream = get_stream(output.device());
   sgl_trtllm_fp8_block_scale_moe_lora_finalize_kernel<<<grid, num_threads, 0,
                                                         stream>>>(
       static_cast<cutlass::bfloat16_t const *>(gemm2_output.data_ptr()),
@@ -3531,8 +3531,8 @@ void sgl_trtllm_fp4_block_scale_moe_lora_finalize(
       static_cast<cutlass::bfloat16_t *>(output.data_ptr()), num_tokens, top_k,
       hidden_size, gemm2_output.size(1),
       static_cast<float>(routed_scaling_factor.value_or(1.0)));
-  auto err = cudaGetLastError();
-  FLASHINFER_CHECK(err == cudaSuccess, cudaGetErrorString(err));
+  auto err = hggcGetLastError();
+  FLASHINFER_CHECK(err == hggcSuccess, hggcGetErrorString(err));
 }
 
 // ===========================================================================
@@ -3594,7 +3594,7 @@ public:
     namespace moe_ns = tensorrt_llm::kernels::trtllmgen_moe;
     auto device = hidden_states_.device();
     int dev_id = device.device_id;
-    cudaStream_t stream = get_stream(device);
+    hggcStream_t stream = get_stream(device);
 
     int64_t const num_tokens = hidden_states_.size(0);
     int64_t const hidden_size = hidden_states_.size(1);
@@ -3738,8 +3738,8 @@ public:
     // above overlaps the side-stream LoRA shrink/expand. No-op (0) on the
     // single-stream path.
     if (lora_ready_event_ != 0) {
-      cudaStreamWaitEvent(stream,
-                          reinterpret_cast<cudaEvent_t>(lora_ready_event_), 0);
+      hggcStreamWaitEvent(stream,
+                          reinterpret_cast<hggcEvent_t>(lora_ready_event_), 0);
     }
 
     // ---- 4) activation (SwiGLU + gate_up LoRA delta, bf16 -> bf16, NO quant)
@@ -3820,7 +3820,7 @@ public:
     // stream can start the down-proj LoRA shrink/expand concurrent with the
     // finalize below. 0 = no-op.
     if (gemm2_done_event_ != 0) {
-      cudaEventRecord(reinterpret_cast<cudaEvent_t>(gemm2_done_event_), stream);
+      hggcEventRecord(reinterpret_cast<hggcEvent_t>(gemm2_done_event_), stream);
     }
 
     if (!do_finalize) {
@@ -4209,7 +4209,7 @@ Array<int64_t> sgl_trtllm_fp4_probe_gemm2(int64_t out_dim, int64_t k_dim,
 int64_t bench_permute(TensorView hidden_in, TensorView idx_map,
                       TensorView total_pad, TensorView permuted_out,
                       int64_t num_tokens, int64_t top_k, int64_t hidden_size) {
-  cudaStream_t stream = get_stream(hidden_in.device());
+  hggcStream_t stream = get_stream(hidden_in.device());
   moe::dev::permute::Data d;
   d.mDtypeElt = btg::Dtype::Bfloat16;
   d.mUsePdl = false;
@@ -4231,7 +4231,7 @@ int64_t bench_nvfp4_quant(TensorView in_bf16, Optional<TensorView> idx_map,
                           TensorView out_fp4, TensorView out_sf,
                           TensorView out_ptsf, int64_t m, int64_t n,
                           int64_t tile) {
-  cudaStream_t stream = get_stream(in_bf16.device());
+  hggcStream_t stream = get_stream(in_bf16.device());
   auto sfLayout = tile >= 128
                       ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                       : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
@@ -4239,8 +4239,8 @@ int64_t bench_nvfp4_quant(TensorView in_bf16, Optional<TensorView> idx_map,
   int *map = idx_map.has_value()
                  ? static_cast<int *>(idx_map.value().data_ptr())
                  : nullptr;
-  tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
-      m, n, reinterpret_cast<__nv_bfloat16 const *>(in_bf16.data_ptr()), gsi,
+  tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__ppu_bfloat16>(
+      m, n, reinterpret_cast<__ppu_bfloat16 const *>(in_bf16.data_ptr()), gsi,
       map, reinterpret_cast<uint8_t *>(out_fp4.data_ptr()),
       reinterpret_cast<uint8_t *>(out_sf.data_ptr()),
       reinterpret_cast<float *>(out_ptsf.data_ptr()), sfLayout, stream);
@@ -4252,7 +4252,7 @@ int64_t bench_activation(TensorView gate_up, TensorView lora_delta,
                          TensorView activated_out, TensorView lora_input_out,
                          int64_t inner_dim, int64_t num_tokens, int64_t top_k,
                          int64_t grid_x_override, int64_t opt_mode) {
-  cudaStream_t stream = get_stream(gate_up.device());
+  hggcStream_t stream = get_stream(gate_up.device());
   moe::dev::activation::Data d;
   d.mDtypeElt = btg::Dtype::Bfloat16;
   d.mUsePdl = false;
@@ -4288,15 +4288,15 @@ int64_t bench_fused_permute_quant(TensorView hidden_in, TensorView idx_map,
                                   TensorView out_ptsf, int64_t num_tokens,
                                   int64_t top_k, int64_t hidden_size,
                                   int64_t maxpad, int64_t tile, int64_t dedup) {
-  cudaStream_t stream = get_stream(hidden_in.device());
+  hggcStream_t stream = get_stream(hidden_in.device());
   auto sfLayout = tile >= 128
                       ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                       : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
   float const gsi = 1.f / 448.f / 6.f;
-  sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__nv_bfloat16>(
+  sgl_fused_permute_quant::invokeFusedPermuteNvfp4Quant<__ppu_bfloat16>(
       static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(top_k),
       static_cast<uint32_t>(hidden_size), static_cast<int>(maxpad),
-      reinterpret_cast<__nv_bfloat16 const *>(hidden_in.data_ptr()), gsi,
+      reinterpret_cast<__ppu_bfloat16 const *>(hidden_in.data_ptr()), gsi,
       static_cast<int32_t const *>(idx_map.data_ptr()),
       reinterpret_cast<uint8_t *>(out_fp4.data_ptr()),
       reinterpret_cast<uint8_t *>(out_sf.data_ptr()),
@@ -4325,7 +4325,7 @@ int64_t bench_fused_act_quant(
         lora_input_out, // [num_tokens, top_k, inner_half] bf16, by expandedIdx
     int64_t inner_half, int64_t inner_dim, int64_t num_tokens, int64_t top_k,
     int64_t tile) {
-  cudaStream_t stream = get_stream(gate_up.device());
+  hggcStream_t stream = get_stream(gate_up.device());
   auto sfLayout = tile >= 128
                       ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_128x4
                       : tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4;
@@ -4333,9 +4333,9 @@ int64_t bench_fused_act_quant(
   flashinfer::sgl_fused_act_quant::launchFusedActivationQuant(
       static_cast<int>(num_tokens * top_k), static_cast<int>(inner_half),
       static_cast<int>(inner_dim),
-      reinterpret_cast<__nv_bfloat16 const *>(gate_up.data_ptr()),
-      reinterpret_cast<__nv_bfloat16 const *>(lora_delta.data_ptr()),
-      reinterpret_cast<__nv_bfloat16 *>(lora_input_out.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16 const *>(gate_up.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16 const *>(lora_delta.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16 *>(lora_input_out.data_ptr()),
       static_cast<int32_t const *>(idx_map.data_ptr()), globalScaleInv,
       reinterpret_cast<uint8_t *>(fp4_out.data_ptr()),
       reinterpret_cast<uint8_t *>(sf_out.data_ptr()),

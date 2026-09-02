@@ -21,7 +21,7 @@
 #include <limits>
 #include <type_traits>
 #ifndef USE_ROCM
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 #endif
 
 namespace sglang {

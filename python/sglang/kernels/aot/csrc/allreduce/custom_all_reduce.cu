@@ -67,7 +67,7 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
   auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
   if (reg_buffer) {
     TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
-    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+    AT_CUDA_CHECK(hggcMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, hggcMemcpyDeviceToDevice, stream));
   } else {
     reg_buffer = inp.data_ptr();
   }
@@ -82,12 +82,12 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out, fptr_t _reg_
           stream, reinterpret_cast<half*>(reg_buffer), reinterpret_cast<half*>(out.data_ptr()), out.numel());
       break;
     }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if (COMPATIBLE_ARCH >= 800 || !defined(COMPATIBLE_ARCH))
     case at::ScalarType::BFloat16: {
-      fa->allreduce<nv_bfloat16>(
+      fa->allreduce<ppu_bfloat16>(
           stream,
-          reinterpret_cast<nv_bfloat16*>(reg_buffer),
-          reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+          reinterpret_cast<ppu_bfloat16*>(reg_buffer),
+          reinterpret_cast<ppu_bfloat16*>(out.data_ptr()),
           out.numel());
       break;
     }

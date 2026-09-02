@@ -163,7 +163,7 @@ void lp_prep(
   KernelT kernel = lp_prep_kernel<NC, NV, NUM_SINGLE, NUM_RED_LOG, NUM_GPUS, BLOCK_DIM>;
 
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
   }
 
   const DLDevice device = device_.unwrap();

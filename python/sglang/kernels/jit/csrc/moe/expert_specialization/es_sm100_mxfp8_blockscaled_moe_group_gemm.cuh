@@ -26,7 +26,7 @@ void es_sm100_mxfp8_blockscaled_moe_group_gemm_pre_compute(
     int num_experts,
     int m,
     int k,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using OffsetFunctor = Sm100Mxfp8BlockScaledMoeGroupGemmOffsetFunctor<GemmTraits>;
   using ElementB = typename OffsetFunctor::ElementB;
   using ElementSF = typename OffsetFunctor::ElementSF;
@@ -61,7 +61,7 @@ void es_sm100_mxfp8_blockscaled_moe_group_gemm(
     int k,
     int device_id,
     int sm_count,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using Gemm = typename GemmTraits::Gemm;
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
@@ -118,7 +118,7 @@ void es_sm100_mxfp8_blockscaled_moe_group_gemm_dispatch_dtype(
     int k,
     int device_id,
     int sm_count,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using GemmTraits = ExpertSpecializationSm100MXFP8BlockscaledMoeGroupGemmTraits<MMA2SMConfig, DType>;
 
   es_sm100_mxfp8_blockscaled_moe_group_gemm_pre_compute<GemmTraits>(
@@ -185,7 +185,7 @@ struct EsSm100MXFP8BlockscaledMoeGroupGemm {
     // Check output
     TensorMatcher({num_tokens, M}).with_strides({M, 1}).with_dtype<DType>().with_device(device).verify(d);
 
-    cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+    hggcStream_t stream = LaunchKernel::resolve_device(device.unwrap());
     int device_id = device.unwrap().device_id;
 
     if constexpr (std::is_same_v<DType, bf16_t> || std::is_same_v<DType, fp16_t>) {

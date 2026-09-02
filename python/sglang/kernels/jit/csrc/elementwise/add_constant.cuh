@@ -76,7 +76,7 @@ void add_constant(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
   [[maybe_unused]]  // optional, can be omitted
   const size_t dynamic_smem = 0;
   [[maybe_unused]]  // optional, LaunchKernel can auto determine stream from device
-  const cudaStream_t stream = LaunchKernel::resolve_device(device);
+  const hggcStream_t stream = LaunchKernel::resolve_device(device);
   // some extra runtime checks using host::RuntimeCheck
   RuntimeCheck(num_elements > 0, "We only support non-empty tensors, got num_elements = ", num_elements);
 

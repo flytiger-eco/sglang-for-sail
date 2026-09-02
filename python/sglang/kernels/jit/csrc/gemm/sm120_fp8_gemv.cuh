@@ -7,7 +7,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 
 namespace sglang {
 
@@ -26,8 +26,8 @@ using namespace device;
 constexpr uint32_t kFp8VecSize = 16;  // 16 fp8 values per 16B load
 
 __device__ __forceinline__ float dot16_fp8_f32(const float4 wv, const float4 xv) {
-  const __nv_fp8x2_e4m3* w2 = reinterpret_cast<const __nv_fp8x2_e4m3*>(&wv);
-  const __nv_fp8x2_e4m3* x2 = reinterpret_cast<const __nv_fp8x2_e4m3*>(&xv);
+  const __hg_fp8x2_e4m3* w2 = reinterpret_cast<const __hg_fp8x2_e4m3*>(&wv);
+  const __hg_fp8x2_e4m3* x2 = reinterpret_cast<const __hg_fp8x2_e4m3*>(&xv);
   float acc = 0.0f;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {

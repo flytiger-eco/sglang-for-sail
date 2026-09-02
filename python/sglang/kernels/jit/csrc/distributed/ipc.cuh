@@ -11,9 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <functional>
+#include <hggc.h>
+#include <hggc_runtime.h>
 #include <map>
 #include <string_view>
 #include <unordered_map>
@@ -30,12 +30,12 @@ struct AllocationRange {
 };
 
 inline auto get_allocation_range(uintptr_t ptr) -> AllocationRange {
-  CUdeviceptr base = 0;
+  HGdeviceptr base = 0;
   size_t size = 0;
-  const CUresult res = cuMemGetAddressRange(&base, &size, ptr);
-  if (res != CUDA_SUCCESS) {
+  const HGresult res = hgMemGetAddressRange(&base, &size, ptr);
+  if (res != HGGC_SUCCESS) {
     const char* name = nullptr;
-    cuGetErrorName(res, &name);
+    hgGetErrorName(res, &name);
     RuntimeCheck(false, "cuMemGetAddressRange failed: ", name ? name : "unknown");
   }
   const auto b = static_cast<uintptr_t>(base);
@@ -53,7 +53,7 @@ inline auto get_allocation_range(uintptr_t ptr) -> AllocationRange {
  */
 struct IPCManager : public tvm::ffi::Object {
  public:
-  using IPCHandle = std::array<char, sizeof(cudaIpcMemHandle_t)>;
+  using IPCHandle = std::array<char, sizeof(hggcIpcMemHandle_t)>;
   using FFIHandle = tvm::ffi::Array<char>;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.IPCManager", IPCManager, tvm::ffi::Object);
   static constexpr bool _type_mutable = true;
@@ -69,7 +69,7 @@ struct IPCManager : public tvm::ffi::Object {
   void destroy() {
     for (const auto& [handle, base_addr] : m_handle2ptr_cache) {
       if (m_local_handles.count(handle)) continue;
-      RuntimeDeviceCheck(cudaIpcCloseMemHandle(reinterpret_cast<void*>(base_addr)));
+      RuntimeDeviceCheck(hggcIpcCloseMemHandle(reinterpret_cast<void*>(base_addr)));
     }
     m_handle2ptr_cache.clear();
     m_ptr2handle_cache.clear();
@@ -108,23 +108,23 @@ struct IPCManager : public tvm::ffi::Object {
  private:
   static IPCHandle to_ipc_handle(const FFIHandle& ffi_handle) {
     IPCHandle ipc_handle;
-    RuntimeCheck(ffi_handle.size() == sizeof(cudaIpcMemHandle_t), "Invalid IPC handle size: ", ffi_handle.size());
-    for (size_t i = 0; i < sizeof(cudaIpcMemHandle_t); ++i) {
+    RuntimeCheck(ffi_handle.size() == sizeof(hggcIpcMemHandle_t), "Invalid IPC handle size: ", ffi_handle.size());
+    for (size_t i = 0; i < sizeof(hggcIpcMemHandle_t); ++i) {
       ipc_handle[i] = static_cast<char>(ffi_handle[i]);
     }
     return ipc_handle;
   }
 
-  static IPCHandle to_ipc_handle(const cudaIpcMemHandle_t& cuda_handle) {
+  static IPCHandle to_ipc_handle(const hggcIpcMemHandle_t& cuda_handle) {
     IPCHandle ipc_handle;
-    std::memcpy(ipc_handle.data(), &cuda_handle, sizeof(cudaIpcMemHandle_t));
+    std::memcpy(ipc_handle.data(), &cuda_handle, sizeof(hggcIpcMemHandle_t));
     return ipc_handle;
   }
 
   static FFIHandle to_ffi_handle(const IPCHandle& ipc_handle) {
     FFIHandle ffi_handle;
-    ffi_handle.reserve(sizeof(cudaIpcMemHandle_t));
-    for (size_t i = 0; i < sizeof(cudaIpcMemHandle_t); ++i) {
+    ffi_handle.reserve(sizeof(hggcIpcMemHandle_t));
+    for (size_t i = 0; i < sizeof(hggcIpcMemHandle_t); ++i) {
       ffi_handle.push_back(static_cast<uint8_t>(ipc_handle[i]));
     }
     return ffi_handle;
@@ -140,8 +140,8 @@ struct IPCManager : public tvm::ffi::Object {
     }
     // Not found in cache, query CUDA and cache the result
     const auto range = get_allocation_range(ptr);
-    cudaIpcMemHandle_t handle;
-    RuntimeDeviceCheck(cudaIpcGetMemHandle(&handle, reinterpret_cast<void*>(range.base)));
+    hggcIpcMemHandle_t handle;
+    RuntimeDeviceCheck(hggcIpcGetMemHandle(&handle, reinterpret_cast<void*>(range.base)));
     const auto ipc_handle = to_ipc_handle(handle);
     const auto [_, success] = m_ptr2handle_cache.try_emplace(range.base, ipc_handle, range.size);
     RuntimeCheck(success, "Internal error: base address already exists in cache");
@@ -155,10 +155,10 @@ struct IPCManager : public tvm::ffi::Object {
     if (it != m_handle2ptr_cache.end()) {
       return it->second;
     }
-    cudaIpcMemHandle_t cuda_handle;
-    std::memcpy(&cuda_handle, handle.data(), sizeof(cudaIpcMemHandle_t));
+    hggcIpcMemHandle_t cuda_handle;
+    std::memcpy(&cuda_handle, handle.data(), sizeof(hggcIpcMemHandle_t));
     void* base_ptr = nullptr;
-    RuntimeDeviceCheck(cudaIpcOpenMemHandle(&base_ptr, cuda_handle, cudaIpcMemLazyEnablePeerAccess));
+    RuntimeDeviceCheck(hggcIpcOpenMemHandle(&base_ptr, cuda_handle, hggcIpcMemLazyEnablePeerAccess));
     const auto base_addr = reinterpret_cast<uintptr_t>(base_ptr);
     const auto [_, success] = m_handle2ptr_cache.try_emplace(handle, base_addr);
     RuntimeCheck(success, "Internal error: IPC handle already exists in cache");
@@ -167,13 +167,13 @@ struct IPCManager : public tvm::ffi::Object {
 
   struct EqualCUDAIPC {
     bool operator()(const IPCHandle& a, const IPCHandle& b) const {
-      return std::memcmp(a.data(), b.data(), sizeof(cudaIpcMemHandle_t)) == 0;
+      return std::memcmp(a.data(), b.data(), sizeof(hggcIpcMemHandle_t)) == 0;
     }
   };
 
   struct HashCUDAIPC {
     std::size_t operator()(const IPCHandle& handle) const {
-      const auto sv = std::string_view{handle.data(), sizeof(cudaIpcMemHandle_t)};
+      const auto sv = std::string_view{handle.data(), sizeof(hggcIpcMemHandle_t)};
       return std::hash<std::string_view>{}(sv);
     }
   };

@@ -4,9 +4,9 @@
 #pragma once
 
 // ref: https://forums.developer.nvidia.com/t/c-20s-source-location-compilation-error-when-using-nvcc-12-1/258026/3
-#ifdef __CUDACC__
-#include <cuda.h>
-#if CUDA_VERSION <= 12010
+#ifdef __HGGCCC__
+#include <hggc.h>
+#if COMPATIBLE_VERSION <= 12010
 
 #pragma push_macro("__cpp_consteval")
 #pragma push_macro("_NODISCARD")

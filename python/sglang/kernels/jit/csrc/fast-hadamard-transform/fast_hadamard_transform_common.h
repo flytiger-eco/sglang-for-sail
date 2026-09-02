@@ -6,8 +6,8 @@
 
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
 
 #define FULL_MASK 0xffffffff
 

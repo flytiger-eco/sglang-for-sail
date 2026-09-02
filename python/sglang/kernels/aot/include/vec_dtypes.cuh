@@ -37,10 +37,10 @@ limitations under the License.
 
 #ifndef USE_ROCM
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
 
 #define SGL_VEC_INLINE inline __attribute__((always_inline)) __device__
 

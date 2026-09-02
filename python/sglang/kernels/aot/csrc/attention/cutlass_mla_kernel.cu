@@ -29,7 +29,7 @@ limitations under the License.
 #include "utils.h"
 
 // clang-format off
-#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+#if !defined(COMPATIBLE_VERSION) || COMPATIBLE_VERSION < 12040
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,
@@ -185,7 +185,7 @@ void runMla(
     at::Tensor const& workspace,
     double sm_scale,
     int64_t num_kv_splits,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using MlaSm100Type = MlaSm100<Element, IsPaged128, PersistenceOption>;
   typename MlaSm100Type::Fmha fmha;
   auto arguments = args_from_options<MlaSm100Type>(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, sm_scale, num_kv_splits);
@@ -224,7 +224,7 @@ void cutlass_mla_decode(
 
   auto in_dtype = q_nope.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
   const int page_size = kv_c_and_k_pe_cache.size(1);
 
   // NOTE(alcanderian): IsPersistent has bug with manual split_kv.

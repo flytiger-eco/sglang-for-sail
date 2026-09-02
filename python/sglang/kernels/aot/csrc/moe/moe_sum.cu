@@ -35,7 +35,7 @@ void moe_sum(
   dim3 grid(num_tokens);
   dim3 block(std::min(hidden_size, 1024));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   switch (topk) {
     case 2:

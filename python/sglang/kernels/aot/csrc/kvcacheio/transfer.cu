@@ -2,7 +2,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/irange.h>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 #include <cstdint>
 #include <limits>
@@ -351,7 +351,7 @@ void transfer_kv_launcher(
   const uintptr_t* src_v_tbl_ptr = IsMLA || !src_v_layers.defined() ? nullptr : src_v_layers.data_ptr<uintptr_t>();
   const uintptr_t* dst_v_tbl_ptr = IsMLA || !dst_v_layers.defined() ? nullptr : dst_v_layers.data_ptr<uintptr_t>();
 
-  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   if constexpr (PageHeadLayout) {
     transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
         src_k_ptr,
@@ -805,7 +805,7 @@ void transfer_embedding_ranges_direct(
 
   const auto copy_device = src.is_cuda() ? src.device() : dst.device();
   const at::cuda::OptionalCUDAGuard device_guard(copy_device);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   const size_t row_bytes = static_cast<size_t>(src.size(1)) * src.element_size();
   const char* src_base = static_cast<const char*>(src.data_ptr());
@@ -844,7 +844,7 @@ void transfer_embedding_ranges_direct(
 
   const auto fallback_to_async_copies = [&]() {
     for (size_t i = 0; i < batch_sizes.size(); ++i) {
-      C10_CUDA_CHECK(cudaMemcpyAsync(batch_dsts[i], batch_srcs[i], batch_sizes[i], cudaMemcpyDefault, stream));
+      C10_CUDA_CHECK(hggcMemcpyAsync(batch_dsts[i], batch_srcs[i], batch_sizes[i], hggcMemcpyDefault, stream));
     }
   };
 
@@ -852,7 +852,7 @@ void transfer_embedding_ranges_direct(
     return;
   }
 
-#if defined(USE_ROCM) || defined(USE_MUSA) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+#if defined(USE_ROCM) || defined(USE_MUSA) || !defined(COMPATIBLE_VERSION) || COMPATIBLE_VERSION < 12080
   fallback_to_async_copies();
   return;
 #else
@@ -863,8 +863,8 @@ void transfer_embedding_ranges_direct(
   }
 
   int driver_version = 0;
-  const cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
-  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+  const hggcError_t driver_version_err = compatibleDriverGetVersion(&driver_version);
+  if (driver_version_err != hggcSuccess || driver_version < 12080) {
     fallback_to_async_copies();
     return;
   }
@@ -876,8 +876,8 @@ void transfer_embedding_ranges_direct(
   }
 
   static int runtime_version = 0;
-  static const cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
-  if (runtime_version_err != cudaSuccess) {
+  static const hggcError_t runtime_version_err = compatibleRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != hggcSuccess) {
     fallback_to_async_copies();
     return;
   }
@@ -885,19 +885,19 @@ void transfer_embedding_ranges_direct(
 
   const int device_id = copy_device.index();
   std::vector<size_t> attrs_idxs(1, 0);
-  cudaMemcpyAttributes attrs{};
+  hggcMemcpyAttributes attrs{};
   attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-  attrs.srcLocHint.type = src.is_cuda() ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost;
+  attrs.srcLocHint.type = src.is_cuda() ? hggcMemLocationTypeDevice : hggcMemLocationTypeHost;
   attrs.srcLocHint.id = src.is_cuda() ? device_id : 0;
-  attrs.dstLocHint.type = dst.is_cuda() ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost;
+  attrs.dstLocHint.type = dst.is_cuda() ? hggcMemLocationTypeDevice : hggcMemLocationTypeHost;
   attrs.dstLocHint.id = dst.is_cuda() ? device_id : 0;
   attrs.flags = 0;
 
-  cudaError_t err;
+  hggcError_t err;
   size_t fail_idx = std::numeric_limits<size_t>::max();
   if (use_v13_signature) {
-    using FnV13 = cudaError_t (*)(
-        void* const*, const void* const*, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
+    using FnV13 = hggcError_t (*)(
+        void* const*, const void* const*, const size_t*, size_t, hggcMemcpyAttributes*, size_t*, size_t, hggcStream_t);
     auto fn = reinterpret_cast<FnV13>(cuda_memcpy_batch_async_sym);
     err =
         fn(batch_dsts.data(),
@@ -910,7 +910,7 @@ void transfer_embedding_ranges_direct(
            stream);
   } else {
     using FnV12 =
-        cudaError_t (*)(void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+        hggcError_t (*)(void**, void**, size_t*, size_t, hggcMemcpyAttributes*, size_t*, size_t, size_t*, hggcStream_t);
     auto fn = reinterpret_cast<FnV12>(cuda_memcpy_batch_async_sym);
     err =
         fn(batch_dsts.data(),
@@ -924,13 +924,13 @@ void transfer_embedding_ranges_direct(
            stream);
   }
 
-  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
-    (void)cudaGetLastError();
+  if (err == hggcErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    (void)hggcGetLastError();
     fallback_to_async_copies();
     return;
   }
   TORCH_CHECK(
-      err == cudaSuccess, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+      err == hggcSuccess, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", hggcGetErrorString(err));
 #endif
 }
 
@@ -994,7 +994,7 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
-#if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
+#if defined(USE_ROCM) || !defined(COMPATIBLE_VERSION) || COMPATIBLE_VERSION < 12080
 #if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70200000
   // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); requires
   // ROCm >= 7.2.  Disabled by default, falls back to per-page copy below.
@@ -1073,8 +1073,8 @@ inline void transfer_kv_page_first_direct_impl(
 #else
   // Driver capability gate: only use cudaMemcpyBatchAsync on CUDA 12.8+ drivers.
   int driver_version = 0;
-  cudaError_t driver_version_err = cudaDriverGetVersion(&driver_version);
-  if (driver_version_err != cudaSuccess || driver_version < 12080) {
+  hggcError_t driver_version_err = compatibleDriverGetVersion(&driver_version);
+  if (driver_version_err != hggcSuccess || driver_version < 12080) {
     fallback_to_page_copy();
     return;
   }
@@ -1096,8 +1096,8 @@ inline void transfer_kv_page_first_direct_impl(
   // thread-safe in C++11+) to keep the KV-transfer hot path free of a redundant
   // runtime API call per invocation.
   static int runtime_version = 0;
-  static cudaError_t runtime_version_err = cudaRuntimeGetVersion(&runtime_version);
-  if (runtime_version_err != cudaSuccess) {
+  static hggcError_t runtime_version_err = compatibleRuntimeGetVersion(&runtime_version);
+  if (runtime_version_err != hggcSuccess) {
     fallback_to_page_copy();
     return;
   }
@@ -1108,9 +1108,9 @@ inline void transfer_kv_page_first_direct_impl(
   std::vector<void*> batch_dsts;
   std::vector<size_t> batch_sizes;
   std::vector<size_t> attrs_idxs(1, 0);
-  cudaMemcpyAttributes attrs{};
+  hggcMemcpyAttributes attrs{};
   const int device_id = at::cuda::current_device();
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
     batch_srcs.push_back(src);
@@ -1128,9 +1128,9 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t elem_size = dst_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    attrs.srcLocHint.type = hggcMemLocationTypeDevice;
     attrs.srcLocHint.id = device_id;
-    attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.type = hggcMemLocationTypeHost;
     attrs.dstLocHint.id = 0;
     attrs.flags = 0;
 
@@ -1169,9 +1169,9 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    attrs.srcLocHint.type = hggcMemLocationTypeHost;
     attrs.srcLocHint.id = 0;
-    attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs.dstLocHint.type = hggcMemLocationTypeDevice;
     attrs.dstLocHint.id = device_id;
     attrs.flags = 0;
 
@@ -1202,24 +1202,24 @@ inline void transfer_kv_page_first_direct_impl(
 
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
-    cudaError_t err;
+    hggcError_t err;
     size_t fail_idx = std::numeric_limits<size_t>::max();
     if (use_v13_signature) {
-      using FnV13 = cudaError_t (*)(
+      using FnV13 = hggcError_t (*)(
           void* const*,
           const void* const*,
           const size_t*,
           size_t,
-          cudaMemcpyAttributes*,
+          hggcMemcpyAttributes*,
           size_t*,
           size_t,
-          cudaStream_t);
+          hggcStream_t);
       auto fn = reinterpret_cast<FnV13>(cuda_memcpy_batch_async_sym);
       err = fn(
           batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, attrs_idxs.data(), 1, stream);
     } else {
-      using FnV12 = cudaError_t (*)(
-          void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+      using FnV12 = hggcError_t (*)(
+          void**, void**, size_t*, size_t, hggcMemcpyAttributes*, size_t*, size_t, size_t*, hggcStream_t);
       auto fn = reinterpret_cast<FnV12>(cuda_memcpy_batch_async_sym);
       err =
           fn(batch_dsts.data(),
@@ -1232,12 +1232,12 @@ inline void transfer_kv_page_first_direct_impl(
              &fail_idx,
              stream);
     }
-    if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    if (err == hggcErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
       fallback_to_page_copy();
       return;
     }
-    if (err != cudaSuccess) {
-      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+    if (err != hggcSuccess) {
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", hggcGetErrorString(err));
     }
   }
 #endif

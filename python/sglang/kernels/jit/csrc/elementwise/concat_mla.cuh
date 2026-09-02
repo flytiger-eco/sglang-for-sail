@@ -5,8 +5,8 @@
 
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 

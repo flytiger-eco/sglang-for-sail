@@ -23,7 +23,7 @@ limitations under the License.
 #ifndef USE_ROCM
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
-#include <cuda/functional>
+#include <hggc/functional>
 #else
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -36,7 +36,7 @@ limitations under the License.
 
 // Define reduction operators based on CUDA version
 // CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
+#if COMPATIBLE_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else
@@ -60,7 +60,7 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+  } else if constexpr (std::is_same_v<T, __ppu_bfloat16>) {
     return __bfloat162float(x);
   } else if constexpr (std::is_same_v<T, float>) {
     return x;
@@ -401,7 +401,7 @@ void topkGatingSigmoidLauncherHelper(
     const int end_expert,
     const bool renormalize,
     const float* correction_bias,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
   static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
@@ -441,7 +441,7 @@ void topkGatingSigmoidKernelLauncher(
     const int topk,
     const bool renormalize,
     const float* correction_bias,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr int WARPS_PER_TB = 4;
   switch (num_experts) {
     case 1:
@@ -531,7 +531,7 @@ void topk_sigmoid(
   const int64_t workspace_size = needs_workspace ? num_tokens * num_experts : 0;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   torch::Tensor sigmoid_workspace =
       torch::empty({workspace_size}, gating_output.options().dtype(at::ScalarType::Float));
 
@@ -575,8 +575,8 @@ void topk_sigmoid(
         bias_ptr,
         stream);
   } else if (dtype == at::ScalarType::BFloat16) {
-    topkGatingSigmoidKernelLauncher<__nv_bfloat16>(
-        reinterpret_cast<const __nv_bfloat16*>(gating_output.data_ptr<at::BFloat16>()),
+    topkGatingSigmoidKernelLauncher<__ppu_bfloat16>(
+        reinterpret_cast<const __ppu_bfloat16*>(gating_output.data_ptr<at::BFloat16>()),
         topk_weights.data_ptr<float>(),
         topk_indices.data_ptr<int>(),
         sigmoid_workspace.data_ptr<float>(),

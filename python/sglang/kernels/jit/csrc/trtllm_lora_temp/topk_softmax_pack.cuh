@@ -49,7 +49,7 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+  } else if constexpr (std::is_same_v<T, __ppu_bfloat16>) {
     return __bfloat162float(x);
   } else if constexpr (std::is_same_v<T, float>) {
     return x;
@@ -395,8 +395,8 @@ void topk_softmax_pack(
         renormalize,
         device);
   } else {
-    dispatchExperts<__nv_bfloat16>(
-        static_cast<const __nv_bfloat16*>(gating_output.data_ptr()),
+    dispatchExperts<__ppu_bfloat16>(
+        static_cast<const __ppu_bfloat16*>(gating_output.data_ptr()),
         weights_ptr,
         indices_ptr,
         packed_ptr,

@@ -251,7 +251,7 @@ struct DeviceComms {
         TWOSHOT_DISPATCH(CodecFP)
         break;
     }
-    HIP_CHECK(cudaGetLastError());
+    HIP_CHECK(hggcGetLastError());
     // The color now advances on-device inside the kernel; no host-side bump.
   }
 };

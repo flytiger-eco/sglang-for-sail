@@ -18,11 +18,11 @@
 #pragma once
 
 #include <cub/block/block_reduce.cuh>
-#include <cuda/functional>
+#include <hggc/functional>
 
 #include "nv_internal/tensorrt_llm/kernels/quantization_utils.cuh"
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 #include <optional>
 
 namespace flashinfer {
@@ -44,20 +44,20 @@ __global__ void fusedActivationQuantKernel(
     int innerHalf, // inter == n (output width per row); must be a multiple of
                    // 16
     int innerDim,  // gate_up_n == 2 * innerHalf
-    __nv_bfloat16 const *__restrict__ gateUp, // interleaved gate/up, [..,
-                                              // innerDim] by permutedIdx
-    __nv_bfloat16 const
+    __ppu_bfloat16 const *__restrict__ gateUp, // interleaved gate/up, [..,
+                                               // innerDim] by permutedIdx
+    __ppu_bfloat16 const
         *__restrict__ loraDelta, // [.., innerDim] by expandedIdx, may be null
-    __nv_bfloat16 *__restrict__ loraInputOut, // [.., innerHalf] by expandedIdx,
-                                              // may be null
+    __ppu_bfloat16 *__restrict__ loraInputOut, // [.., innerHalf] by
+                                               // expandedIdx, may be null
     int32_t const *__restrict__ expandedIdxToPermutedIdx, float globalScaleInv,
     uint8_t *__restrict__ weightOutput, // fp4 [.., innerHalf/2] by permutedIdx
     uint8_t *__restrict__ scaleOutput,  // swizzled e4m3 SF
     float *__restrict__ perTokenScaleOutput) {
   constexpr int SF_VEC_SIZE = 16;
   using InType =
-      tk::PackedVec<__nv_bfloat16, SF_VEC_SIZE>; // 16 bf16 == 8 __nv_bfloat162
-  using PackedFp4Type = uint64_t;                // SF_VEC_SIZE == 16
+      tk::PackedVec<__ppu_bfloat16, SF_VEC_SIZE>; // 16 bf16 == 8 __nv_bfloat162
+  using PackedFp4Type = uint64_t;                 // SF_VEC_SIZE == 16
 
   int const expandedIdx = blockIdx.x;
   if (expandedIdx >= m)
@@ -101,20 +101,20 @@ __global__ void fusedActivationQuantKernel(
   float localAmax = 0.f;
   if (active) {
     int const h0 = vecIdx * SF_VEC_SIZE;
-    __nv_bfloat16 const *g =
+    __ppu_bfloat16 const *g =
         gateUp + permBase + (int64_t)2 * h0; // 32 interleaved bf16
-    __nv_bfloat16 const *dlo =
+    __ppu_bfloat16 const *dlo =
         loraDelta + expBase + h0; // silu-arg delta (lower half)
-    __nv_bfloat16 const *dhi =
+    __ppu_bfloat16 const *dhi =
         loraDelta + expBase + innerHalf + h0; // multiplier delta (upper half)
-    __nv_bfloat162 amax2 = __float2bfloat162_rn(0.0f);
+    __ppu_bfloat162 amax2 = __float2bfloat162_rn(0.0f);
     union {
       int4 v[4];
-      __nv_bfloat16 b[32];
+      __ppu_bfloat16 b[32];
     } gu;
     union {
       int4 v[2];
-      __nv_bfloat16 b[16];
+      __ppu_bfloat16 b[16];
     } dl, dh;
     int4 const *gp = reinterpret_cast<int4 const *>(g);
 #pragma unroll
@@ -143,7 +143,7 @@ __global__ void fusedActivationQuantKernel(
       }
       float act0 = fused_silu(a0) * b0;
       float act1 = fused_silu(a1) * b1;
-      __nv_bfloat162 e = __float22bfloat162_rn(make_float2(act0, act1));
+      __ppu_bfloat162 e = __float22bfloat162_rn(make_float2(act0, act1));
       vec.elts[i] = e;
       amax2 = __hmax2(amax2, __habs2(e));
     }
@@ -175,9 +175,9 @@ __global__ void fusedActivationQuantKernel(
     // 5 template args on this flashinfer build: Type, SF_VEC_SIZE,
     // CVT_ELTS_PER_THREAD, UE8M0_SF=false, TE_EXACT_NVFP4=false (the default
     // nvfp4 quant path).
-    auto fp4Vals =
-        tk::cvt_warp_fp16_to_fp4<__nv_bfloat16, SF_VEC_SIZE, SF_VEC_SIZE, false,
-                                 false>(vec, globalEncodeScale, &fp8Scale);
+    auto fp4Vals = tk::cvt_warp_fp16_to_fp4<__ppu_bfloat16, SF_VEC_SIZE,
+                                            SF_VEC_SIZE, false, false>(
+        vec, globalEncodeScale, &fp8Scale);
     int64_t const vecOffset = (int64_t)permutedIdx * num_vecs_per_row + vecIdx;
     reinterpret_cast<PackedFp4Type *>(weightOutput)[vecOffset] = fp4Vals;
 
@@ -201,12 +201,12 @@ __global__ void fusedActivationQuantKernel(
 // Host launch: globalScaleInv = 1/448/6. BLOCK_SIZE must be >= innerHalf/16
 // (one SF block/thread).
 inline void launchFusedActivationQuant(
-    int m, int innerHalf, int innerDim, __nv_bfloat16 const *gateUp,
-    __nv_bfloat16 const *loraDelta, __nv_bfloat16 *loraInputOut,
+    int m, int innerHalf, int innerDim, __ppu_bfloat16 const *gateUp,
+    __ppu_bfloat16 const *loraDelta, __ppu_bfloat16 *loraInputOut,
     int32_t const *expandedIdxToPermutedIdx, float globalScaleInv,
     uint8_t *weightOutput, uint8_t *scaleOutput, float *perTokenScaleOutput,
     tensorrt_llm::QuantizationSFLayout sfLayout, bool disableFp4FastMath,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   // One SF block per thread, no stride loop: BLOCK_SIZE must cover innerHalf/16
   // (a fixed 128 left cols [2048,inter) unwritten at Inkling EP8's inter=3072
   // -> NaN from the down GEMM).

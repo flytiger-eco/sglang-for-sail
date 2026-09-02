@@ -722,7 +722,7 @@ struct AttnResFusedTmaKernel {
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        RuntimeDeviceCheck(hggcFuncSetAttribute(kTable[i], hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;
     }();
@@ -797,7 +797,7 @@ struct AttnResFusedTmaKernel {
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
         RuntimeDeviceCheck(
-            cudaFuncSetAttribute(kPullTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+            hggcFuncSetAttribute(kPullTable[i], hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;
     }();
@@ -874,7 +874,7 @@ struct AttnResFusedTmaKernel {
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kAgTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        RuntimeDeviceCheck(hggcFuncSetAttribute(kAgTable[i], hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;
     }();

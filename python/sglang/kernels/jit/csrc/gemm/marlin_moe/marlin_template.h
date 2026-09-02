@@ -26,9 +26,9 @@
 #include "../marlin/marlin_dtypes.cuh"
 #include <type_traits>
 
-#define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
-  static_assert(                                                                         \
-      std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value, \
+#define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                         \
+  static_assert(                                                                          \
+      std::is_same<scalar_t, half>::value || std::is_same<scalar_t, ppu_bfloat16>::value, \
       "only float16 and bfloat16 is supported");
 
 namespace sglang {
@@ -36,7 +36,7 @@ namespace sglang {
 namespace device::marlin_moe {
 using namespace device::marlin;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 
 template <
     typename scalar_t,                   // compute dtype, half or nv_float16
@@ -103,7 +103,7 @@ mma(const typename ScalarType<scalar_t>::FragA& a_frag,
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
         : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
-  } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<scalar_t, ppu_bfloat16>::value) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
@@ -139,7 +139,7 @@ __device__ inline void mma_trans(
           "f"(c[1]),
           "f"(c[2]),
           "f"(c[3]));
-  } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<scalar_t, ppu_bfloat16>::value) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
@@ -353,7 +353,7 @@ __global__ void Marlin(
   static constexpr auto s_type = host::ScalarType::from_id(s_type_id);
   if constexpr (w_type == host::kFE2M1f) {
     static_assert(s_type == host::kFE4M3fn && group_blocks == 1 || s_type == host::kFE8M0fnu && group_blocks == 2);
-  } else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<scalar_t, ppu_bfloat16>::value) {
     static_assert(s_type == host::kBFloat16);
   } else if constexpr (std::is_same<scalar_t, half>::value) {
     static_assert(s_type == host::kFloat16);
@@ -365,7 +365,7 @@ __global__ void Marlin(
   constexpr bool is_8bit_scale = s_type.size_bits() == 8;
   // see comments of dequant.h for more details
   constexpr bool dequant_skip_flop = w_type == host::kFE4M3fn || w_type == host::kFE2M1f && s_type == host::kFE4M3fn ||
-                                     has_zp && !is_zp_float && !std::is_same<scalar_t, nv_bfloat16>::value ||
+                                     has_zp && !is_zp_float && !std::is_same<scalar_t, ppu_bfloat16>::value ||
                                      has_zp && !is_zp_float && !(w_type == host::kU8);
 
   scalar_t2 global_scale;
@@ -476,7 +476,7 @@ __global__ void Marlin(
         }
       }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH == 750
       if constexpr (moe_block_size >= 16) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
       if constexpr (moe_block_size >= 8) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
       if constexpr (moe_block_size >= 4) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);

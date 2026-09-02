@@ -22,15 +22,15 @@ limitations under the License.
 #include "kernel.cuh"
 #include <cmath>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
 static inline void
 _set_device_and_stream(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
   DLDevice dev = q.device();
-  cudaSetDevice(dev.device_id);
-  params.stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  hggcSetDevice(dev.device_id);
+  params.stream = reinterpret_cast<hggcStream_t>(cuda_stream);
 }
 
 template <int D_QK>

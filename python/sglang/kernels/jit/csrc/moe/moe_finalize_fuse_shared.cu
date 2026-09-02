@@ -52,7 +52,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "tvm_ffi_utils.h"
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
@@ -76,8 +76,8 @@ __global__ void moeFinalizeKernel(
     TypeExpW const* __restrict__ expertWeightsPtr,
     BF16 const* __restrict__ sharedBiasPtr,
     BF16* __restrict__ outPtr) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  cudaGridDependencySynchronize();
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
+  hggcGridDependencySynchronize();
 #endif
 
   for (int64_t tokenIdx = blockIdx.y; tokenIdx < numTokens; tokenIdx += gridDim.y) {
@@ -101,8 +101,8 @@ __global__ void moeFinalizeKernel(
     }
   }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  cudaTriggerProgrammaticLaunchCompletion();
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
+  hggcTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -185,8 +185,8 @@ __global__ void moeFinalizeKernelVecLoad(
   auto const* sharedElemPtr =
       sharedBiasPtr != nullptr ? reinterpret_cast<InputElem const*>(sharedBiasPtr + tokenIdx * hiddenDim) : nullptr;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  cudaGridDependencySynchronize();
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
+  hggcGridDependencySynchronize();
 #endif
   __syncthreads();
 
@@ -239,8 +239,8 @@ __global__ void moeFinalizeKernelVecLoad(
     outElemPtr[elemIndex] = toBF16(threadOutput);
   }
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  cudaTriggerProgrammaticLaunchCompletion();
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
+  hggcTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -259,8 +259,8 @@ void dispatchFinalize(
     BF16 const* sharedPtr,
     BF16* outPtr,
     bool useVecLoad,
-    cudaStream_t stream,
-    cudaLaunchAttribute const* attrs,
+    hggcStream_t stream,
+    hggcLaunchAttribute const* attrs,
     int numAttrs) {
   auto const* weightsPtr = static_cast<TypeExpW const*>(weightsPtrVoid);
   constexpr int kNumThreads = 256;
@@ -268,15 +268,15 @@ void dispatchFinalize(
   if (!useVecLoad) {
     int const numBlocksX = (hiddenDim + kNumThreads - 1) / kNumThreads;
     int const numBlocksY = std::min(8192, numTokens);
-    cudaLaunchConfig_t config;
+    hggcLaunchConfig_t config;
     config.gridDim = dim3(numBlocksX, numBlocksY);
     config.blockDim = dim3(kNumThreads);
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     config.numAttrs = numAttrs;
-    config.attrs = const_cast<cudaLaunchAttribute*>(attrs);
+    config.attrs = const_cast<hggcLaunchAttribute*>(attrs);
 
-    cudaLaunchKernelEx(
+    hggcLaunchKernelEx(
         &config,
         moeFinalizeKernel<TypeExpW>,
         numTokens,
@@ -293,14 +293,14 @@ void dispatchFinalize(
 
   auto launch = [&](auto unroll_tag) {
     constexpr int UNROLL = decltype(unroll_tag)::value;
-    cudaLaunchConfig_t config;
+    hggcLaunchConfig_t config;
     config.gridDim = dim3(numTokens);
     config.blockDim = dim3(FINALIZE_THREADS_PER_BLOCK);
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     config.numAttrs = numAttrs;
-    config.attrs = const_cast<cudaLaunchAttribute*>(attrs);
-    cudaLaunchKernelEx(
+    config.attrs = const_cast<hggcLaunchAttribute*>(attrs);
+    hggcLaunchKernelEx(
         &config,
         moeFinalizeKernelVecLoad<TypeExpW, UNROLL>,
         numTokens,
@@ -359,8 +359,8 @@ void moe_finalize_fuse_shared(
   auto const* sharedPtr = hasShared ? static_cast<BF16 const*>(shared_output.data_ptr()) : nullptr;
   auto* outPtr = static_cast<BF16*>(out.data_ptr());
 
-  cudaSetDevice(out.device().device_id);
-  cudaStream_t const stream = get_stream(out.device());
+  hggcSetDevice(out.device().device_id);
+  hggcStream_t const stream = get_stream(out.device());
 
   // Dispatch heuristic (matches flashinfer): few waves → general kernel,
   // many waves → vectorized. The 1184 threshold comes from 148 SMs × 8
@@ -370,8 +370,8 @@ void moe_finalize_fuse_shared(
   int const numBlocksY = std::min(8192, numTokens);
   bool const useVecLoad = (numBlocksX * numBlocksY) >= 1184 && (hiddenDim % 8 == 0) && (hiddenDimPadded % 8 == 0);
 
-  cudaLaunchAttribute attrs[1];
-  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  hggcLaunchAttribute attrs[1];
+  attrs[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
 
   auto ew_dtype = expert_weights.dtype();
@@ -409,8 +409,8 @@ void moe_finalize_fuse_shared(
     TVM_FFI_ICHECK(false) << "expert_weights dtype must be float32 or bfloat16";
   }
 
-  cudaError_t const err = cudaGetLastError();
-  TVM_FFI_ICHECK(err == cudaSuccess) << "moe_finalize_fuse_shared launch failed: " << cudaGetErrorString(err);
+  hggcError_t const err = hggcGetLastError();
+  TVM_FFI_ICHECK(err == hggcSuccess) << "moe_finalize_fuse_shared launch failed: " << hggcGetErrorString(err);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_finalize_fuse_shared, moe_finalize_fuse_shared);

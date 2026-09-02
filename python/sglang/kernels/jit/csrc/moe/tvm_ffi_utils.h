@@ -82,14 +82,14 @@ constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
   TVM_FFI_ICHECK_EQ(a.device().device_type, b.device().device_type); \
   TVM_FFI_ICHECK_EQ(a.device().device_id, b.device().device_id);
 
-inline cudaStream_t get_current_stream() {
+inline hggcStream_t get_current_stream() {
   int device;
-  cudaGetDevice(&device);
-  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
+  hggcGetDevice(&device);
+  return static_cast<hggcStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
 }
 
-inline cudaStream_t get_stream(DLDevice device) {
-  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+inline hggcStream_t get_stream(DLDevice device) {
+  return static_cast<hggcStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 }
 
 inline int64_t get_element_size(ffi::Tensor x) {

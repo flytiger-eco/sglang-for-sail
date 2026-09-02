@@ -45,10 +45,10 @@
 
 
 template<typename input_t, typename weight_t>
-void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream);
+void causal_conv1d_fwd_cuda(ConvParamsBase &params, hggcStream_t stream);
 
 template<typename input_t, typename weight_t>
-void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream);
+void causal_conv1d_update_cuda(ConvParamsBase &params, hggcStream_t stream);
 
 void set_conv_params_fwd(ConvParamsBase &params,
                          // sizes
@@ -497,7 +497,7 @@ void causal_conv1d_fwd_kernel(ConvParamsBase params) {
 
 
 template<int kNThreads, int kWidth, typename input_t, typename weight_t>
-void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
+void causal_conv1d_fwd_launch(ConvParamsBase &params, hggcStream_t stream) {
     static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
     const bool kVarlen = params.query_start_loc_ptr != nullptr;
     BOOL_SWITCH(params.seqlen % kNElts == 0 && !kVarlen, kIsVecLoad, [&] {
@@ -509,12 +509,12 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
 
         if (kSmemSize >= 48 * 1024) {
             #ifndef USE_ROCM
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            C10_CUDA_CHECK(hggcFuncSetAttribute(
+                kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             #else
             // There is a slight signature discrepancy in HIP and CUDA "FuncSetAttribute" function.
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                (void *) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+            C10_CUDA_CHECK(hggcFuncSetAttribute(
+                (void *) kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
             std::cerr << "Warning (causal_conv1d fwd launch): attempting to set maxDynamicSharedMemorySize on an AMD GPU which is currently a non-op (in ROCm versions <= 6.1). This might lead to undefined behavior. \n" << std::endl;
             #endif
         }
@@ -525,7 +525,7 @@ void causal_conv1d_fwd_launch(ConvParamsBase &params, cudaStream_t stream) {
 }
 
 template<typename input_t, typename weight_t>
-void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream) {
+void causal_conv1d_fwd_cuda(ConvParamsBase &params, hggcStream_t stream) {
     if (params.width == 2) {
         causal_conv1d_fwd_launch<128, 2, input_t, weight_t>(params, stream);
     } else if (params.width == 3) {
@@ -536,9 +536,9 @@ void causal_conv1d_fwd_cuda(ConvParamsBase &params, cudaStream_t stream) {
 }
 
 
-template void causal_conv1d_fwd_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_fwd_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_fwd_cuda<float, float>(ConvParamsBase &params, hggcStream_t stream);
+template void causal_conv1d_fwd_cuda<at::Half, at::Half>(ConvParamsBase &params, hggcStream_t stream);
+template void causal_conv1d_fwd_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, hggcStream_t stream);
 
 
 
@@ -643,7 +643,7 @@ void causal_conv1d_update_kernel(ConvParamsBase params) {
 }
 
 template<int kNThreads, int kWidth, typename input_t, typename weight_t>
-void causal_conv1d_update_launch(ConvParamsBase &params, cudaStream_t stream) {
+void causal_conv1d_update_launch(ConvParamsBase &params, hggcStream_t stream) {
     using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
     dim3 grid(params.batch, (params.dim + kNThreads - 1) / kNThreads);
     auto kernel = params.cache_seqlens == nullptr
@@ -654,7 +654,7 @@ void causal_conv1d_update_launch(ConvParamsBase &params, cudaStream_t stream) {
 }
 
 template<typename input_t, typename weight_t>
-void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream) {
+void causal_conv1d_update_cuda(ConvParamsBase &params, hggcStream_t stream) {
     if (params.width == 2) {
         causal_conv1d_update_launch<64, 2, input_t, weight_t>(params, stream);
     } else if (params.width == 3) {
@@ -664,6 +664,6 @@ void causal_conv1d_update_cuda(ConvParamsBase &params, cudaStream_t stream) {
     }
 }
 
-template void causal_conv1d_update_cuda<float, float>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::Half, at::Half>(ConvParamsBase &params, cudaStream_t stream);
-template void causal_conv1d_update_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, cudaStream_t stream);
+template void causal_conv1d_update_cuda<float, float>(ConvParamsBase &params, hggcStream_t stream);
+template void causal_conv1d_update_cuda<at::Half, at::Half>(ConvParamsBase &params, hggcStream_t stream);
+template void causal_conv1d_update_cuda<at::BFloat16, at::BFloat16>(ConvParamsBase &params, hggcStream_t stream);

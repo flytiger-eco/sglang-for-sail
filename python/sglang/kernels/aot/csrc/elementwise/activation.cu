@@ -87,7 +87,7 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -109,7 +109,7 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -131,7 +131,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -155,7 +155,7 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {

@@ -18,7 +18,7 @@ __device__ inline int lop3(int a, int b, int c) {
 }
 
 __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 750
   uint4 result;
 
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
@@ -75,7 +75,7 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 }
 
 __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   uint4 result;
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
   uint32_t const i4s = source;
@@ -91,23 +91,23 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   int lo1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 8, MASK, EX);
   int hi1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 12, MASK, EX);
 
-  nv_bfloat162* res = reinterpret_cast<nv_bfloat162*>(h);
+  ppu_bfloat162* res = reinterpret_cast<ppu_bfloat162*>(h);
   res[0] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&lo0),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&lo0),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[1] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&hi0),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&hi0),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[2] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&lo1),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&lo1),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[3] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&hi1),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&hi1),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
 
   return result;
 #else
@@ -151,15 +151,15 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 
     OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
     *(uint4*)output_ptr = weight_fp16;
-  } else if constexpr (std::is_same<OutputT, __nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<OutputT, __ppu_bfloat16>::value) {
     uint4 weight_raw = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
     uint4 zero_raw = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols]);
     uint4 scale_raw = *reinterpret_cast<uint4*>(scales + scale_offset);
 
     // Vectorized processing (each uint4 contains 4 nv_bfloat162)
-    nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_raw);
-    nv_bfloat162* zero_vec = reinterpret_cast<nv_bfloat162*>(&zero_raw);
-    nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale_raw);
+    ppu_bfloat162* weight_vec = reinterpret_cast<ppu_bfloat162*>(&weight_raw);
+    ppu_bfloat162* zero_vec = reinterpret_cast<ppu_bfloat162*>(&zero_raw);
+    ppu_bfloat162* scale_vec = reinterpret_cast<ppu_bfloat162*>(&scale_raw);
 
 // Single instruction dual-channel operation
 #pragma unroll

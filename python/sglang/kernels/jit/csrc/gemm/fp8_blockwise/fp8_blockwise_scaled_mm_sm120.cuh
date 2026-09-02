@@ -24,7 +24,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 // clang-format off
 #include "cutlass/cutlass.h"
@@ -65,7 +65,7 @@ void launch_sm120_fp8_blockwise_scaled_mm(
     tvm::ffi::TensorView b,
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using ElementBlockScale = float;
 
   // A matrix configuration
@@ -296,7 +296,7 @@ void launch_sm120_fp8_blockwise_scaled_mm_swapab(
     tvm::ffi::TensorView b,
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using ElementBlockScale = float;
 
   using ElementA = cutlass::float_e4m3_t;        // A' = weight
@@ -441,7 +441,7 @@ void sm120_fp8_blockwise_dispatch_shape(
     tvm::ffi::TensorView b,
     tvm::ffi::TensorView scales_a,
     tvm::ffi::TensorView scales_b,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   const int m = a.size(0);
   using EpilogueTileShape = Shape<_128, _64>;
 
@@ -514,7 +514,7 @@ inline void fp8_blockwise_scaled_mm_sm120(
   RuntimeCheck(
       (out.size(1) * (out.dtype().bits / 8)) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
-  const cudaStream_t stream = LaunchKernel::resolve_device(mat_a.device());
+  const hggcStream_t stream = LaunchKernel::resolve_device(mat_a.device());
 
   if (host::is_type<bf16_t>(out.dtype())) {
     sm120_fp8_blockwise_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, stream);

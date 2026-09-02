@@ -29,8 +29,8 @@
 
 #include <bit>
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
+#include <hggc_bf16.h>
+#include <hggc_fp8.h>
 #include <type_traits>
 
 namespace sglang {
@@ -84,14 +84,14 @@ __device__ __forceinline__ void store_mxfp8_vec(const float (&x)[kVecElems], voi
   if ((c & (kMXFP8Block - 1)) == 0) *sf = sf_byte;
 
   union {
-    __nv_fp8x2_e4m3 fp8x2[4];
+    __hg_fp8x2_e4m3 fp8x2[4];
     uint2 raw;
   } u;
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     const float x0 = fminf(fmaxf(x[2 * j] / descale, -kE4M3Max), kE4M3Max);
     const float x1 = fminf(fmaxf(x[2 * j + 1] / descale, -kE4M3Max), kE4M3Max);
-    u.fp8x2[j] = __nv_fp8x2_e4m3(make_float2(x0, x1));
+    u.fp8x2[j] = __hg_fp8x2_e4m3(make_float2(x0, x1));
   }
   *reinterpret_cast<uint2*>(static_cast<uint8_t*>(dst) + c) = u.raw;
 }
@@ -142,7 +142,7 @@ struct AttnPrologueParams {
 
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __grid_constant__ AttnPrologueParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>);
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
   constexpr uint32_t SF = kHeadDim / kMXFP8Block;
@@ -153,7 +153,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   const uint32_t nq = p.dq / kVecElems;
   const uint32_t nkv = p.dkv / kVecElems;
   const uint32_t vi = threadIdx.x;
-  const auto* base = static_cast<const __nv_bfloat16*>(p.qkvr);
+  const auto* base = static_cast<const __ppu_bfloat16*>(p.qkvr);
   const int64_t row = static_cast<int64_t>(t) * p.qkvr_stride_t;
 
   const int ci = static_cast<const int32_t*>(p.cache_indices)[seq];
@@ -167,8 +167,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   if (vi < nq) {
     // ---------------- q path: per-head RMSNorm only ----------------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
-    const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const auto* gq = reinterpret_cast<const __ppu_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
     if (do_tau) tau = static_cast<const float*>(p.log_tau)[t];
@@ -178,11 +178,11 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
     float ss = 0.0f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      x[j] = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&raw)[j]);
+      x[j] = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&raw)[j]);
       ss += x[j] * x[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    __nv_bfloat162 o[4];
+    __ppu_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -213,7 +213,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
           static_cast<uint8_t*>(p.sfq) + sf_idx,
           c);
     } else {
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
+      *reinterpret_cast<uint4*>(static_cast<__ppu_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
           *reinterpret_cast<const uint4*>(o);
     }
     device::PDLTriggerSecondary<USE_PDL>();
@@ -225,13 +225,13 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   const bool is_k = vi < nq + nkv;
   const uint32_t ch = (is_k ? vi - nq : vi - nq - nkv) * kVecElems;
   const int64_t x_off = is_k ? p.k_off : p.v_off;
-  const auto* cp = static_cast<const __nv_bfloat16*>(is_k ? p.k_cache : p.v_cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(is_k ? p.k_weight : p.v_weight);
-  auto* ip = static_cast<__nv_bfloat16*>(is_k ? p.k_inter : p.v_inter);
+  const auto* cp = static_cast<const __ppu_bfloat16*>(is_k ? p.k_cache : p.v_cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(is_k ? p.k_weight : p.v_weight);
+  auto* ip = static_cast<__ppu_bfloat16*>(is_k ? p.k_inter : p.v_inter);
   const int64_t cache_base = static_cast<int64_t>(slot_id) * p.cache_stride_slot + ch;
 
   uint4 pref[W1];
-  __nv_bfloat16 wt[kVecElems][W];
+  __ppu_bfloat16 wt[kVecElems][W];
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
     pref[w] = *reinterpret_cast<const uint4*>(&cp[cache_base + w * p.cache_stride_w]);
@@ -252,7 +252,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
 
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   // In-seq neighbor rows (pre-conv x straight from qkvr) + own row.
@@ -269,18 +269,18 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
   float y[kVecElems];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const float xj = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&xcur)[j]);
+    const float xj = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&xcur)[j]);
     float acc = 0.0f;
 #pragma unroll
     for (int iw = 0; iw < W1; ++iw) {
       const int shifted = static_cast<int>(t) - W1 + iw;
       float tap = 0.0f;
       if (shifted >= bos) {
-        tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&xn[W1 - 1 - iw])[j]);
+        tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&xn[W1 - 1 - iw])[j]);
       } else {
         const int prefix_pos = shifted - bos + W1;
         if (prefix_pos >= 0) {
-          tap = cm * __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&pref[prefix_pos])[j]);
+          tap = cm * __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&pref[prefix_pos])[j]);
         }
       }
       acc += tap * __bfloat162float(wt[j][iw]);
@@ -307,7 +307,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
     }
   }
 
-  __nv_bfloat162 o[4];
+  __ppu_bfloat162 o[4];
   if (is_k) {
     // per-head RMSNorm on the conv output (16-lane groups). Round to bf16
     // FIRST: the unfused pipeline writes the conv output to memory as bf16
@@ -319,7 +319,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
       ss += y[j] * y[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    const auto* gk = reinterpret_cast<const __nv_bfloat16*>(&gkraw);
+    const auto* gk = reinterpret_cast<const __ppu_bfloat16*>(&gkraw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -331,7 +331,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
       o[j] = __floats2bfloat162_rn(y[2 * j], y[2 * j + 1]);
   }
   const uint4 ov = *reinterpret_cast<const uint4*>(o);
-  auto* out = static_cast<__nv_bfloat16*>(is_k ? p.k_out : p.v_out);
+  auto* out = static_cast<__ppu_bfloat16*>(is_k ? p.k_out : p.v_out);
   *reinterpret_cast<uint4*>(out + static_cast<int64_t>(t) * p.dkv + ch) = ov;
   // Fused KV store (DO_STORE). Only used for full-attention layers writing a
   // plain bf16 [slots, Hkv, head_dim] pool indexed directly by out_cache_loc;
@@ -357,7 +357,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
                                 (ch % kHeadDim) / kMXFP8Block;
         store_mxfp8_vec(xo, buf + kv_slot * p.kv_buf_stride, sfb + sf_base, ch);
       } else {
-        auto* buf = static_cast<__nv_bfloat16*>(is_k ? p.k_buf : p.v_buf);
+        auto* buf = static_cast<__ppu_bfloat16*>(is_k ? p.k_buf : p.v_buf);
         *reinterpret_cast<uint4*>(buf + kv_slot * p.kv_buf_stride + ch) = ov;
       }
     }
@@ -567,14 +567,14 @@ template <
     bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     const __grid_constant__ AttnPrologueDecodeParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>);
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 decode prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
   const uint32_t nq = p.dq / kVecElems;
   const uint32_t nkv = p.dkv / kVecElems;
   const uint32_t vi = threadIdx.x;
-  const auto* base = static_cast<const __nv_bfloat16*>(p.qkvr);
+  const auto* base = static_cast<const __ppu_bfloat16*>(p.qkvr);
   const int64_t row = static_cast<int64_t>(t) * p.qkvr_stride_t;
 
   // PDL: the ONLY input the immediately-preceding kernel (the qkvr
@@ -585,8 +585,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   if (vi < nq) {
     // -------- q path: per-head RMSNorm only --------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
-    const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const auto* gq = reinterpret_cast<const __ppu_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
     if (do_tau) tau = static_cast<const float*>(p.log_tau)[t];
@@ -596,11 +596,11 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
     float ss = 0.0f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      x[j] = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&raw)[j]);
+      x[j] = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&raw)[j]);
       ss += x[j] * x[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    __nv_bfloat162 o[4];
+    __ppu_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -631,7 +631,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
           static_cast<uint8_t*>(p.sfq) + sf_idx,
           c);
     } else {
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
+      *reinterpret_cast<uint4*>(static_cast<__ppu_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
           *reinterpret_cast<const uint4*>(o);
     }
     device::PDLTriggerSecondary<USE_PDL>();
@@ -643,8 +643,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   const bool is_k = vi < nq + nkv;
   const uint32_t ch = (is_k ? vi - nq : vi - nq - nkv) * kVecElems;
   const int64_t x_off = is_k ? p.k_off : p.v_off;
-  auto* cp = static_cast<__nv_bfloat16*>(is_k ? p.k_cache : p.v_cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(is_k ? p.k_weight : p.v_weight);
+  auto* cp = static_cast<__ppu_bfloat16*>(is_k ? p.k_cache : p.v_cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(is_k ? p.k_weight : p.v_weight);
 
   const int ci = static_cast<const int32_t*>(p.cache_indices)[t];
   const bool valid = ci != kPadSlot;
@@ -658,7 +658,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   for (int w = 0; w < W1; ++w) {
     hist[w] = *reinterpret_cast<const uint4*>(&cp[cache_base + w * p.cache_stride_w]);
   }
-  __nv_bfloat16 wt[kVecElems][W];
+  __ppu_bfloat16 wt[kVecElems][W];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
     const int64_t wrow = static_cast<int64_t>(ch + j) * p.weight_stride_d;
@@ -674,7 +674,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   }
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   const uint4 xv = *reinterpret_cast<const uint4*>(base + row + x_off + ch);
@@ -683,11 +683,11 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   float y[kVecElems];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const float xj = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&xv)[j]);
+    const float xj = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&xv)[j]);
     float acc = 0.0f;
 #pragma unroll
     for (int w = 0; w < W1; ++w) {
-      const float h = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&hist[w])[j]);
+      const float h = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&hist[w])[j]);
       acc += h * cm * __bfloat162float(wt[j][w]);
     }
     acc += xj * __bfloat162float(wt[j][W1]);
@@ -720,7 +720,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
   }
 
   // k-norm (round to bf16 first, matching the unfused HBM round trip); v passes through.
-  __nv_bfloat162 o[4];
+  __ppu_bfloat162 o[4];
   if (is_k) {
     float ss = 0.0f;
 #pragma unroll
@@ -729,7 +729,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
       ss += y[j] * y[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    const auto* gk = reinterpret_cast<const __nv_bfloat16*>(&gkraw);
+    const auto* gk = reinterpret_cast<const __ppu_bfloat16*>(&gkraw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -741,7 +741,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
       o[j] = __floats2bfloat162_rn(y[2 * j], y[2 * j + 1]);
   }
   const uint4 ov = *reinterpret_cast<const uint4*>(o);
-  auto* out = static_cast<__nv_bfloat16*>(is_k ? p.k_out : p.v_out);
+  auto* out = static_cast<__ppu_bfloat16*>(is_k ? p.k_out : p.v_out);
   *reinterpret_cast<uint4*>(out + static_cast<int64_t>(t) * p.dkv + ch) = ov;
   if (DO_STORE && valid) {
     const int64_t kv_slot = static_cast<const int64_t*>(p.loc)[t];
@@ -763,7 +763,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
                                 (po / kMXFP8Block) * (kHeadDim / kMXFP8Block) + (ch % kHeadDim) / kMXFP8Block;
         store_mxfp8_vec(xo, buf + kv_slot * p.kv_buf_stride, sfb + sf_base, ch);
       } else {
-        auto* buf = static_cast<__nv_bfloat16*>(is_k ? p.k_buf : p.v_buf);
+        auto* buf = static_cast<__ppu_bfloat16*>(is_k ? p.k_buf : p.v_buf);
         *reinterpret_cast<uint4*>(buf + kv_slot * p.kv_buf_stride + ch) = ov;
       }
     }
@@ -974,7 +974,7 @@ struct AttnPrologueExtendParams {
 template <typename DType, int W, bool USE_SILU, bool USE_RESIDUAL, bool DO_STORE, bool USE_MXFP8, bool USE_PDL>
 __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     const __grid_constant__ AttnPrologueExtendParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>);
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>);
   static_assert(!USE_MXFP8 || DO_STORE, "MXFP8 prologue quantization owns the KV store");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
@@ -983,7 +983,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   const uint32_t nq = p.dq / kVecElems;
   const uint32_t nkv = p.dkv / kVecElems;
   const uint32_t vi = threadIdx.x;
-  const auto* base = static_cast<const __nv_bfloat16*>(p.qkvr);
+  const auto* base = static_cast<const __ppu_bfloat16*>(p.qkvr);
   const int64_t row = static_cast<int64_t>(t) * p.qkvr_stride_t;
 
   const int ci = static_cast<const int32_t*>(p.cache_indices)[seq];
@@ -1000,8 +1000,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   if (vi < nq) {
     // ---------------- q path: per-head RMSNorm only ----------------
     const uint32_t c = vi * kVecElems;
-    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.q_gamma) + (c % kHeadDim));
-    const auto* gq = reinterpret_cast<const __nv_bfloat16*>(&gqraw);
+    const uint4 gqraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.q_gamma) + (c % kHeadDim));
+    const auto* gq = reinterpret_cast<const __ppu_bfloat16*>(&gqraw);
     const bool do_tau = p.log_tau != nullptr;
     float tau = 0.0f;
     if (do_tau) tau = static_cast<const float*>(p.log_tau)[t];
@@ -1011,11 +1011,11 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     float ss = 0.0f;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      x[j] = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&raw)[j]);
+      x[j] = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&raw)[j]);
       ss += x[j] * x[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    __nv_bfloat162 o[4];
+    __ppu_bfloat162 o[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -1046,7 +1046,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
           static_cast<uint8_t*>(p.sfq) + sf_idx,
           c);
     } else {
-      *reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
+      *reinterpret_cast<uint4*>(static_cast<__ppu_bfloat16*>(p.q_out) + static_cast<int64_t>(t) * p.dq + c) =
           *reinterpret_cast<const uint4*>(o);
     }
     device::PDLTriggerSecondary<USE_PDL>();
@@ -1058,12 +1058,12 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   const bool is_k = vi < nq + nkv;
   const uint32_t ch = (is_k ? vi - nq : vi - nq - nkv) * kVecElems;
   const int64_t x_off = is_k ? p.k_off : p.v_off;
-  const auto* cp = static_cast<const __nv_bfloat16*>(is_k ? p.k_cache : p.v_cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(is_k ? p.k_weight : p.v_weight);
+  const auto* cp = static_cast<const __ppu_bfloat16*>(is_k ? p.k_cache : p.v_cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(is_k ? p.k_weight : p.v_weight);
   const int64_t cache_base = static_cast<int64_t>(slot_id) * p.cache_stride_slot + ch;
 
   uint4 pref[W1];
-  __nv_bfloat16 wt[kVecElems][W];
+  __ppu_bfloat16 wt[kVecElems][W];
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
     pref[w] = *reinterpret_cast<const uint4*>(&cp[cache_base + w * p.cache_stride_w]);
@@ -1084,7 +1084,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
 
   uint4 gkraw = make_uint4(0, 0, 0, 0);
   if (is_k) {
-    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __nv_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
+    gkraw = *reinterpret_cast<const uint4*>(static_cast<const __ppu_bfloat16*>(p.k_gamma) + (ch % kHeadDim));
   }
   device::PDLWaitPrimary<USE_PDL>();
   // In-seq neighbor rows (pre-conv x straight from qkvr) + own row.
@@ -1101,18 +1101,18 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
   float y[kVecElems];
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
-    const float xj = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&xcur)[j]);
+    const float xj = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&xcur)[j]);
     float acc = 0.0f;
 #pragma unroll
     for (int iw = 0; iw < W1; ++iw) {
       const int shifted = static_cast<int>(t) - W1 + iw;
       float tap = 0.0f;
       if (shifted >= bos) {
-        tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&xn[W1 - 1 - iw])[j]);
+        tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&xn[W1 - 1 - iw])[j]);
       } else {
         const int prefix_pos = shifted - bos + W1;
         if (prefix_pos >= 0) {
-          tap = cm * __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&pref[prefix_pos])[j]);
+          tap = cm * __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&pref[prefix_pos])[j]);
         }
       }
       acc += tap * __bfloat162float(wt[j][iw]);
@@ -1123,7 +1123,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
     y[j] = acc;
   }
 
-  __nv_bfloat162 o[4];
+  __ppu_bfloat162 o[4];
   if (is_k) {
     // per-head RMSNorm on the conv output (16-lane groups). Round to bf16
     // FIRST: the unfused pipeline writes the conv output to memory as bf16
@@ -1135,7 +1135,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
       ss += y[j] * y[j];
     }
     const float inv = head_rmsnorm_inv(ss, p.eps);
-    const auto* gk = reinterpret_cast<const __nv_bfloat16*>(&gkraw);
+    const auto* gk = reinterpret_cast<const __ppu_bfloat16*>(&gkraw);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       o[j] = __floats2bfloat162_rn(
@@ -1147,7 +1147,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
       o[j] = __floats2bfloat162_rn(y[2 * j], y[2 * j + 1]);
   }
   const uint4 ov = *reinterpret_cast<const uint4*>(o);
-  auto* out = static_cast<__nv_bfloat16*>(is_k ? p.k_out : p.v_out);
+  auto* out = static_cast<__ppu_bfloat16*>(is_k ? p.k_out : p.v_out);
   *reinterpret_cast<uint4*>(out + static_cast<int64_t>(t) * p.dkv + ch) = ov;
   if (DO_STORE) {
     const int64_t kv_slot = static_cast<const int64_t*>(p.loc)[t];
@@ -1170,7 +1170,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
                                 (ch % kHeadDim) / kMXFP8Block;
         store_mxfp8_vec(xo, buf + kv_slot * p.kv_buf_stride, sfb + sf_base, ch);
       } else {
-        auto* buf = static_cast<__nv_bfloat16*>(is_k ? p.k_buf : p.v_buf);
+        auto* buf = static_cast<__ppu_bfloat16*>(is_k ? p.k_buf : p.v_buf);
         *reinterpret_cast<uint4*>(buf + kv_slot * p.kv_buf_stride + ch) = ov;
       }
     }
@@ -1213,9 +1213,9 @@ __global__ void inkling_kv_conv_update_kernel(const __grid_constant__ KvConvUpda
   const uint32_t r = idx % (2u * nkv);
   const bool is_k = r < nkv;
   const uint32_t ch = (is_k ? r : r - nkv) * kVecElems;
-  const auto* base = static_cast<const __nv_bfloat16*>(p.qkvr);
+  const auto* base = static_cast<const __ppu_bfloat16*>(p.qkvr);
   const int64_t x_off = is_k ? p.k_off : p.v_off;
-  auto* cp = static_cast<__nv_bfloat16*>(is_k ? p.k_cache : p.v_cache);
+  auto* cp = static_cast<__ppu_bfloat16*>(is_k ? p.k_cache : p.v_cache);
   const auto* cu = static_cast<const int64_t*>(p.cu);
   const int slot = static_cast<const int32_t*>(p.cache_indices)[b];
   const int64_t qlen = cu[b + 1] - cu[b];

@@ -21,7 +21,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 
@@ -58,21 +58,22 @@ __global__ void fused_decode_update_kernel(const __grid_constant__ DecodeUpdateP
   if (c0 >= static_cast<int>(p.D)) return;
 
   const float cm = static_cast<const bool*>(p.cache_mask)[t] ? 1.0f : 0.0f;
-  const auto* xp = static_cast<const __nv_bfloat16*>(p.x);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.weight);
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
-  auto* yp = static_cast<__nv_bfloat16*>(p.y);
+  const auto* xp = static_cast<const __ppu_bfloat16*>(p.x);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.weight);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
+  auto* yp = static_cast<__ppu_bfloat16*>(p.y);
   const int cw = static_cast<int>(p.cache_stride_w);
   const int swd = static_cast<int>(p.weight_stride_d);
   const int64_t cache_base = static_cast<int64_t>(slot) * p.cache_stride_slot + c0;
 
   // History taps -> registers (RAW-safe against the update writes below).
-  __nv_bfloat162 hist[W1];
+  __ppu_bfloat162 hist[W1];
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
-    hist[w] = *reinterpret_cast<const __nv_bfloat162*>(&cp[cache_base + static_cast<int64_t>(w) * cw]);
+    hist[w] = *reinterpret_cast<const __ppu_bfloat162*>(&cp[cache_base + static_cast<int64_t>(w) * cw]);
   }
-  const __nv_bfloat162 xv = *reinterpret_cast<const __nv_bfloat162*>(&xp[static_cast<int64_t>(t) * p.x_stride_t + c0]);
+  const __ppu_bfloat162 xv =
+      *reinterpret_cast<const __ppu_bfloat162*>(&xp[static_cast<int64_t>(t) * p.x_stride_t + c0]);
   const float2 xf = __bfloat1622float2(xv);
 
   float2 wv[W];
@@ -99,13 +100,13 @@ __global__ void fused_decode_update_kernel(const __grid_constant__ DecodeUpdateP
     acc0 += xf.x;
     acc1 += xf.y;
   }
-  *reinterpret_cast<__nv_bfloat162*>(&yp[static_cast<int64_t>(t) * p.y_stride_t + c0]) =
+  *reinterpret_cast<__ppu_bfloat162*>(&yp[static_cast<int64_t>(t) * p.y_stride_t + c0]) =
       __floats2bfloat162_rn(acc0, acc1);
 
   if (!valid) return;
 
   // ---- update: shift state left (gated by cache_mask), append current token ----
-  const __nv_bfloat162 zero = __float2bfloat162_rn(0.0f);
+  const __ppu_bfloat162 zero = __float2bfloat162_rn(0.0f);
   int64_t track_base = 0;
   bool do_tr = false;
   if constexpr (DO_TRACK) {
@@ -117,11 +118,11 @@ __global__ void fused_decode_update_kernel(const __grid_constant__ DecodeUpdateP
   }
 #pragma unroll
   for (int iw = 0; iw < W1; ++iw) {
-    const __nv_bfloat162 nv = (iw < W1 - 1) ? ((cm != 0.0f) ? hist[iw + 1] : zero) : xv;
-    *reinterpret_cast<__nv_bfloat162*>(&cp[cache_base + static_cast<int64_t>(iw) * cw]) = nv;
+    const __ppu_bfloat162 nv = (iw < W1 - 1) ? ((cm != 0.0f) ? hist[iw + 1] : zero) : xv;
+    *reinterpret_cast<__ppu_bfloat162*>(&cp[cache_base + static_cast<int64_t>(iw) * cw]) = nv;
     if constexpr (DO_TRACK) {
       if (do_tr) {
-        *reinterpret_cast<__nv_bfloat162*>(&cp[track_base + static_cast<int64_t>(iw) * cw]) = nv;
+        *reinterpret_cast<__ppu_bfloat162*>(&cp[track_base + static_cast<int64_t>(iw) * cw]) = nv;
       }
     }
   }

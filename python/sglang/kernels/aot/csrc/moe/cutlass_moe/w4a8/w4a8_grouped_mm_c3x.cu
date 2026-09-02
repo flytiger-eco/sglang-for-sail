@@ -1,5 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
-#include <cudaTypedefs.h>
+#include <hggcTypedefs.h>
 #include <torch/all.h>
 
 #include <type_traits>

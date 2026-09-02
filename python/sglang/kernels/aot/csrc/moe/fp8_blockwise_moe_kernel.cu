@@ -143,7 +143,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       hw_info};
 
   at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
 
   auto can_implement_status = gemm_op.can_implement(args);
   TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
@@ -262,7 +262,7 @@ void launch_sm100_fp8_blockwise_scaled_group_mm(
       hw_info};
 
   at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
 
   auto can_implement_status = gemm_op.can_implement(args);
   TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
@@ -707,12 +707,12 @@ void fp8_blockwise_scaled_grouped_mm(
   auto sm_version = getSMVersion();
 
 #if defined(CUTLASS_ARCH_MMA_SM100A_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12080
   if (sm_version == 100
-#if CUDA_VERSION >= 12090
+#if COMPATIBLE_VERSION >= 12090
       || sm_version == 103
 #endif
-#if CUDA_VERSION >= 13040
+#if COMPATIBLE_VERSION >= 13040
       || sm_version == 107
 #endif
   ) {

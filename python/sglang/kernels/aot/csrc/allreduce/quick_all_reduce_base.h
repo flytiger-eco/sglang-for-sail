@@ -12,8 +12,8 @@
 
 namespace quickreduce {
 
-typedef __hip_bfloat16 nv_bfloat16;
-typedef __hip_bfloat162 nv_bfloat162;
+typedef __hip_bfloat16 ppu_bfloat16;
+typedef __hip_bfloat162 ppu_bfloat162;
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
@@ -127,7 +127,7 @@ __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
 }
 union bf162_int_union {
   int i;
-  nv_bfloat162 bf2;
+  ppu_bfloat162 bf2;
 };
 
 template <typename T>
@@ -145,9 +145,9 @@ __quickreduce_device_inline__ void packed_assign_add<half>(int32x4_t* A, int32x4
 }
 
 template <>
-__quickreduce_device_inline__ void packed_assign_add<nv_bfloat16>(int32x4_t* A, int32x4_t* B) {
-  nv_bfloat162* tA = reinterpret_cast<nv_bfloat162*>(A);
-  nv_bfloat162* tB = reinterpret_cast<nv_bfloat162*>(B);
+__quickreduce_device_inline__ void packed_assign_add<ppu_bfloat16>(int32x4_t* A, int32x4_t* B) {
+  ppu_bfloat162* tA = reinterpret_cast<ppu_bfloat162*>(A);
+  ppu_bfloat162* tB = reinterpret_cast<ppu_bfloat162*>(B);
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     tA[i] = __hadd2(tA[i], tB[i]);
@@ -165,7 +165,7 @@ __quickreduce_device_inline__ int packed_max<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_max<nv_bfloat16>(int a, int b) {
+__quickreduce_device_inline__ int packed_max<ppu_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
@@ -184,7 +184,7 @@ __quickreduce_device_inline__ int packed_min<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_min<nv_bfloat16>(int a, int b) {
+__quickreduce_device_inline__ int packed_min<ppu_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
@@ -207,7 +207,7 @@ __quickreduce_device_inline__ int packed_abs_max<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_abs_max<nv_bfloat16>(int a, int b) {
+__quickreduce_device_inline__ int packed_abs_max<ppu_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
@@ -227,7 +227,7 @@ __quickreduce_device_inline__ int packed_add<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_add<nv_bfloat16>(int a, int b) {
+__quickreduce_device_inline__ int packed_add<ppu_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
@@ -255,7 +255,7 @@ __quickreduce_device_inline__ int packed_sub<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_sub<nv_bfloat16>(int a, int b) {
+__quickreduce_device_inline__ int packed_sub<ppu_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
@@ -274,10 +274,10 @@ __quickreduce_device_inline__ int packed_mul<half>(int a, int b) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_mul<nv_bfloat16>(int a, int b) {
-  nv_bfloat162* tA = reinterpret_cast<nv_bfloat162*>(&a);
-  nv_bfloat162* tB = reinterpret_cast<nv_bfloat162*>(&b);
-  nv_bfloat162 tR = __hmul2(*tA, *tB);
+__quickreduce_device_inline__ int packed_mul<ppu_bfloat16>(int a, int b) {
+  ppu_bfloat162* tA = reinterpret_cast<ppu_bfloat162*>(&a);
+  ppu_bfloat162* tB = reinterpret_cast<ppu_bfloat162*>(&b);
+  ppu_bfloat162 tR = __hmul2(*tA, *tB);
   return *(reinterpret_cast<int*>(&tR));
 }
 
@@ -290,7 +290,7 @@ __quickreduce_device_inline__ int packed_rcp<half>(int a) {
 }
 
 template <>
-__quickreduce_device_inline__ int packed_rcp<nv_bfloat16>(int a) {
+__quickreduce_device_inline__ int packed_rcp<ppu_bfloat16>(int a) {
   bf162_int_union A, R;
   A.i = a;
   R.bf2 = h2rcp(A.bf2);
@@ -302,7 +302,7 @@ __quickreduce_device_inline__ float T2float_cast(half a) {
   return __half2float(a);
 }
 
-__quickreduce_device_inline__ float T2float_cast(nv_bfloat16 a) {
+__quickreduce_device_inline__ float T2float_cast(ppu_bfloat16 a) {
   return __bfloat162float(a);
 }
 

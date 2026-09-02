@@ -24,7 +24,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 
@@ -85,17 +85,17 @@ __global__ void causal_conv1d_kernel(const __grid_constant__ CausalConv1dParams 
   const int syt = static_cast<int>(p.y_stride_t);
   const int swd = static_cast<int>(p.weight_stride_d);
 
-  const auto* xp = static_cast<const __nv_bfloat16*>(p.x);
-  const auto* cp = static_cast<const __nv_bfloat16*>(p.cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.weight);
-  auto* yp = static_cast<__nv_bfloat16*>(p.y);
+  const auto* xp = static_cast<const __ppu_bfloat16*>(p.x);
+  const auto* cp = static_cast<const __ppu_bfloat16*>(p.cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.weight);
+  auto* yp = static_cast<__ppu_bfloat16*>(p.y);
 
   // Window (bf16x2 per row), read once into registers.
-  __nv_bfloat162 xr[WIN];
+  __ppu_bfloat162 xr[WIN];
 #pragma unroll
   for (int i = 0; i < WIN; ++i) {
     const int row = t0 - (W - 1) + i;
-    xr[i] = (row >= 0 && row < T) ? *reinterpret_cast<const __nv_bfloat162*>(&xp[row * sxt + c0])
+    xr[i] = (row >= 0 && row < T) ? *reinterpret_cast<const __ppu_bfloat162*>(&xp[row * sxt + c0])
                                   : __float2bfloat162_rn(0.0f);
   }
   // Weight taps for the two channels (weight[c0, iw], weight[c0+1, iw]).
@@ -125,7 +125,7 @@ __global__ void causal_conv1d_kernel(const __grid_constant__ CausalConv1dParams 
         if (shifted < bos && prefix_pos >= 0 && prefix_pos < (W - 1)) {  // rare: seq start
           const int64_t coff = static_cast<int64_t>(s_slot[j]) * p.cache_stride_slot +
                                static_cast<int64_t>(prefix_pos) * p.cache_stride_w + static_cast<int64_t>(c0);
-          float2 pv = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&cp[coff]));
+          float2 pv = __bfloat1622float2(*reinterpret_cast<const __ppu_bfloat162*>(&cp[coff]));
           if constexpr (!IS_DECODE) {
             pv.x *= s_m[j];
             pv.y *= s_m[j];
@@ -146,7 +146,7 @@ __global__ void causal_conv1d_kernel(const __grid_constant__ CausalConv1dParams 
       acc0 += x_cur.x;
       acc1 += x_cur.y;
     }
-    *reinterpret_cast<__nv_bfloat162*>(&yp[t * syt + c0]) = __floats2bfloat162_rn(acc0, acc1);
+    *reinterpret_cast<__ppu_bfloat162*>(&yp[t * syt + c0]) = __floats2bfloat162_rn(acc0, acc1);
   }
 }
 

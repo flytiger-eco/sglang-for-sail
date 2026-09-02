@@ -278,7 +278,7 @@ __global__ void memcpy_kernel(void* __restrict__ dst, const void* __restrict__ s
 inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   static const uint32_t kNumSM = [] {
     int device = 0;
-    CHECK_CUDA(cudaGetDevice(&device));
+    CHECK_CUDA(hggcGetDevice(&device));
     return host::runtime::get_sm_count(device);
   }();
   for (const uint32_t block_size : {128u, 256u, 512u}) {
@@ -368,7 +368,7 @@ struct AllReduceKernel {
         }
       }
       // safe fallback to cudaMemcpyAsync for large size or older architecture
-      CHECK_CUDA(cudaMemcpyAsync(dst, src, nbytes, cudaMemcpyDeviceToDevice, stream));
+      CHECK_CUDA(hggcMemcpyAsync(dst, src, nbytes, hggcMemcpyDeviceToDevice, stream));
     };
     const uint32_t num_blocks = comm.get_pull_blocks();
     const auto local_workspace = ws.workspaces[pull.rank];

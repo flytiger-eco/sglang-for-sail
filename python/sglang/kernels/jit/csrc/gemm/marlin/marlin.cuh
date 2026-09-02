@@ -42,7 +42,7 @@ struct Vec {
 
 using I4 = Vec<int, 4>;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 // No support for async
 #else
 

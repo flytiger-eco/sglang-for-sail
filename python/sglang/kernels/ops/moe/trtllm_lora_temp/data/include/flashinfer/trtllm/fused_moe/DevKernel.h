@@ -18,7 +18,7 @@
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/trtllm/gen/SfLayoutDecl.h"
-#include <cuda.h>
+#include <hggc.h>
 #include <iostream>
 #include <string>
 // #include <cuda_runtime_api.h>
@@ -35,12 +35,12 @@ namespace moe::dev {
 
 #define CHECK_CUDA_ERROR(cmd)                                                  \
   do {                                                                         \
-    cudaError_t e = cmd;                                                       \
-    if (e != cudaSuccess) {                                                    \
+    hggcError_t e = cmd;                                                       \
+    if (e != hggcSuccess) {                                                    \
       std::cout << "CUDA error in " << __FILE__ << ":" << __LINE__             \
-                << " executing '" << #cmd << "': " << cudaGetErrorString(e);   \
+                << " executing '" << #cmd << "': " << hggcGetErrorString(e);   \
     }                                                                          \
-    FLASHINFER_CHECK(e == cudaSuccess,                                         \
+    FLASHINFER_CHECK(e == hggcSuccess,                                         \
                      "Got CUDA error. See above for details.");                \
   } while (0)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -49,17 +49,17 @@ namespace moe::dev {
 
 #define LAUNCH_PDL(data, coopLaunch, types, kernel, numBlocks, numThreads,     \
                    smemSize, stream)                                           \
-  cudaLaunchConfig_t config{};                                                 \
+  hggcLaunchConfig_t config{};                                                 \
   config.gridDim = numBlocks;                                                  \
   config.blockDim = numThreads;                                                \
   config.dynamicSmemBytes = smemSize;                                          \
-  config.stream = (cudaStream_t)stream;                                        \
+  config.stream = (hggcStream_t)stream;                                        \
                                                                                \
-  cudaLaunchAttribute attributes[2] = {};                                      \
-  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;       \
+  hggcLaunchAttribute attributes[2] = {};                                      \
+  attributes[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;       \
   attributes[0].val.programmaticStreamSerializationAllowed =                   \
       int(data.mUsePdl);                                                       \
-  attributes[1].id = cudaLaunchAttributeCooperative;                           \
+  attributes[1].id = hggcLaunchAttributeCooperative;                           \
   attributes[1].val.cooperative = int(coopLaunch);                             \
   config.attrs = attributes;                                                   \
   config.numAttrs = 2;                                                         \
@@ -67,18 +67,18 @@ namespace moe::dev {
     auto params = KernelParams<types, true>::setKernelParams(data);            \
     auto kernelTyped = kernel<KernelParams<types, true>>;                      \
     if (smemSize > 48 * 1024)                                                  \
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                   \
-          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+      CHECK_CUDA_ERROR(hggcFuncSetAttribute(                                   \
+          kernelTyped, hggcFuncAttributeMaxDynamicSharedMemorySize,            \
           smemSize));                                                          \
-    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));        \
+    CHECK_CUDA_ERROR(hggcLaunchKernelEx(&config, kernelTyped, params));        \
   } else {                                                                     \
     auto params = KernelParams<types, false>::setKernelParams(data);           \
     auto kernelTyped = kernel<KernelParams<types, false>>;                     \
     if (smemSize > 48 * 1024)                                                  \
-      CHECK_CUDA_ERROR(cudaFuncSetAttribute(                                   \
-          kernelTyped, cudaFuncAttributeMaxDynamicSharedMemorySize,            \
+      CHECK_CUDA_ERROR(hggcFuncSetAttribute(                                   \
+          kernelTyped, hggcFuncAttributeMaxDynamicSharedMemorySize,            \
           smemSize));                                                          \
-    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, kernelTyped, params));        \
+    CHECK_CUDA_ERROR(hggcLaunchKernelEx(&config, kernelTyped, params));        \
   }
 
 #define LAUNCH(data, kernel, numBlocks, numThreads, smemSize, stream)          \

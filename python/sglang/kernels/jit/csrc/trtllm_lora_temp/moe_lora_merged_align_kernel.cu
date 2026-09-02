@@ -472,7 +472,7 @@ struct MoeLoraMergedAlignKernel {
     using namespace host;
 
     auto device = topk_ids.device();
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+    const hggcStream_t stream = LaunchKernel::resolve_device(device);
 
     int threads = 1024;
     threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;

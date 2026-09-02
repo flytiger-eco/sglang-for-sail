@@ -55,7 +55,7 @@ class ScalarType<bf16_t> {
   using FragS = Vec<bf16x2_t, 1>;
   using FragZP = Vec<bf16x2_t, 4>;
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+#if !defined(COMPATIBLE_ARCH) || COMPATIBLE_ARCH >= 800
   static __device__ float inline num2float(const bf16_t x) {
     return __bfloat162float(x);
   }

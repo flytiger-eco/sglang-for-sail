@@ -1,9 +1,9 @@
 #include <ATen/OpMathType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda.h>
-#include <cudaTypedefs.h>
-#include <cuda_runtime.h>
+#include <hggc.h>
+#include <hggcTypedefs.h>
+#include <hggc_runtime.h>
 #include <torch/all.h>
 
 #include <iostream>
@@ -36,7 +36,7 @@ __device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
 
 template <>
 __device__ __forceinline__ opmath_t<at::BFloat16> to_acc<at::BFloat16>(at::BFloat16 x) {
-  return __bfloat162float(__nv_bfloat16(x));
+  return __bfloat162float(__ppu_bfloat16(x));
 }
 template <>
 __device__ __forceinline__ at::BFloat16 from_acc<at::BFloat16>(opmath_t<at::BFloat16> x) {
@@ -50,7 +50,7 @@ __device__ __forceinline__ T ldg_cg(const T* p) {
 
 union Pack16B {
   uint4 v;
-  __nv_bfloat16 u16[8];
+  __ppu_bfloat16 u16[8];
 };
 
 template <int WARPS_PER_BLOCK>
@@ -276,7 +276,7 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         out_stride_token,
         scale);
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (bf16 vec) launch failed");
+    TORCH_CHECK(hggcGetLastError() == hggcSuccess, "moe_sum_reduce CUDA kernel (bf16 vec) launch failed");
     return;
   }
 
@@ -337,7 +337,7 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         });
 #undef LAUNCH_SMALL_TOKEN_KERNEL
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (small-token) launch failed");
+    TORCH_CHECK(hggcGetLastError() == hggcSuccess, "moe_sum_reduce CUDA kernel (small-token) launch failed");
 
   } else {
     // ---------- warp-per-token ----------
@@ -398,6 +398,6 @@ void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling
         });
 #undef LAUNCH_WARP_PER_TOKEN_KERNEL
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "moe_sum_reduce CUDA kernel (warp-token) launch failed");
+    TORCH_CHECK(hggcGetLastError() == hggcSuccess, "moe_sum_reduce CUDA kernel (warp-token) launch failed");
   }
 }

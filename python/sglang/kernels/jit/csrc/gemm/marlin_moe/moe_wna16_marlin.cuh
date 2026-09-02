@@ -36,7 +36,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 
 template <int moe_block_size>
 __global__ void permute_cols_kernel(
@@ -466,7 +466,7 @@ MarlinFuncPtr get_marlin_kernel(
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)
-  if (std::is_same<scalar_t, nv_bfloat16>::value) {
+  if (std::is_same<scalar_t, ppu_bfloat16>::value) {
     if (false) {
     }
     MXFP4_GET_IF(host::kFE2M1f)
@@ -552,8 +552,8 @@ exec_config_t determine_exec_config(
 
     if (kernel == MarlinDefault) continue;
 
-    cudaFuncAttributes attr;
-    cudaFuncGetAttributes(&attr, kernel);
+    hggcFuncAttributes attr;
+    hggcFuncGetAttributes(&attr, kernel);
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count =
         min(device_max_reg_size / reg_size,
@@ -609,7 +609,7 @@ void marlin_mm(
     int num_groups,
     int group_size,
     int dev,
-    cudaStream_t stream,
+    hggcStream_t stream,
     int thread_k,
     int thread_n,
     int sms,
@@ -703,7 +703,7 @@ void marlin_mm(
   }
 
   int max_shared_mem = 0;
-  host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  host::RuntimeDeviceCheck(hggcDeviceGetAttribute(&max_shared_mem, hggcDevAttrMaxSharedMemoryPerBlockOptin, dev));
   host::RuntimeCheck(max_shared_mem > 0);
 
   // Set thread config
@@ -825,7 +825,7 @@ void marlin_mm(
         num_bits);
   }
 
-  host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem));
+  host::RuntimeDeviceCheck(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem));
   // clang-format off
   kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
@@ -932,8 +932,8 @@ void moe_wna16_marlin_gemm(
   int sms = -1;
   DLDevice dl_device = device.unwrap();
   int dev = dl_device.device_id;
-  cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  hggcStream_t stream = LaunchKernel::resolve_device(dl_device);
+  RuntimeDeviceCheck(hggcDeviceGetAttribute(&sms, hggcDevAttrMultiProcessorCount, dev));
 
   // Verify c (allocation done in Python)
   device.verify(c.device());
@@ -1031,7 +1031,7 @@ void moe_wna16_marlin_gemm(
         "float4_e2m1f only supports group_size == 16 (NVFP4) or group_size == 32 (MXFP4). Got group_size = ",
         group_size);
     RuntimeCheck(
-        group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
+        group_size != 32 || std::is_same<scalar_t, ppu_bfloat16>::value,
         "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
   }
 

@@ -18,8 +18,8 @@ limitations under the License.
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
-#include <cuda.h>
-#include <cuda_fp16.h>
+#include <hggc.h>
+#include <hggc_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -284,14 +284,14 @@ void setup_kernel_smem_once() {
   [[maybe_unused]]
   static const auto result = [] {
 #ifdef USE_ROCM
-    return ::cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    return ::hggcFuncSetAttribute(
+        reinterpret_cast<const void*>(f), ::hggcFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
 #else
-    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+    return ::hggcFuncSetAttribute(f, ::hggcFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
 #endif
   }();
   TORCH_CHECK(
-      result == cudaSuccess, "deepseek_v4_topk_transform: cudaFuncSetAttribute failed: ", ::cudaGetErrorString(result));
+      result == hggcSuccess, "deepseek_v4_topk_transform: cudaFuncSetAttribute failed: ", ::hggcGetErrorString(result));
 }
 
 }  // namespace
@@ -376,6 +376,6 @@ void deepseek_v4_topk_transform_512(
   setup_kernel_smem_once<deepseek_v4_topk_transform_kernel, kSMEM>();
   deepseek_v4_topk_transform_kernel<<<grid, block, kSMEM, stream>>>(params);
 
-  const auto err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess, "deepseek_v4_topk_transform kernel launch failed: ", ::cudaGetErrorString(err));
+  const auto err = hggcGetLastError();
+  TORCH_CHECK(err == hggcSuccess, "deepseek_v4_topk_transform kernel launch failed: ", ::hggcGetErrorString(err));
 }

@@ -193,17 +193,17 @@ __global__ void norm_scale_shift_kernel(const NormScaleShiftParams __grid_consta
   }
   if constexpr (kQuantizeNvfp4) {
 #if defined(ENABLE_FP4) && ENABLE_FP4
-    tensorrt_llm::kernels::PackedVec<__nv_bfloat16, kVecElems> quant_vec;
-    auto* quant_values = reinterpret_cast<__nv_bfloat16*>(&quant_vec);
+    tensorrt_llm::kernels::PackedVec<__ppu_bfloat16, kVecElems> quant_vec;
+    auto* quant_values = reinterpret_cast<__ppu_bfloat16*>(&quant_vec);
 #pragma unroll
     for (int i = 0; i < kVecElems; ++i) {
-      quant_values[i] = static_cast<__nv_bfloat16>(yv[i]);
+      quant_values[i] = static_cast<__ppu_bfloat16>(yv[i]);
     }
 
     auto* scales = static_cast<uint8_t*>(params.quant_scales);
     const int64_t scale_offset = tensorrt_llm::kernels::get_sf_out_offset_128x4(row, tid, kThreads);
     const float global_scale = *static_cast<const float*>(params.global_scale);
-    const uint64_t packed = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, kVecElems, kVecElems, false>(
+    const uint64_t packed = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__ppu_bfloat16, kVecElems, kVecElems, false>(
         quant_vec, global_scale, scales + scale_offset);
     static_cast<uint64_t*>(params.quantized)[int64_t(row) * kThreads + tid] = packed;
 #else

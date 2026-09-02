@@ -2,7 +2,7 @@
 
 #include <cassert>
 #include <stdexcept>
-#ifndef __CUDACC__
+#ifndef __HGGCCC__
 #include <variant>
 #endif
 
@@ -172,7 +172,7 @@ class ScalarType {
     return bias != 0;
   }
 
-#ifndef __CUDACC__
+#ifndef __HGGCCC__
  private:
   double _floating_point_max() const {
     assert(mantissa <= 52 && exponent <= 11);
