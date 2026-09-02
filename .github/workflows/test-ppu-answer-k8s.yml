@@ -1,0 +1,184 @@
+name: Answer Test (PPU K8s)
+
+on:
+  # No schedule. GitHub only honours cron from the repository's default branch,
+  # and this file lives on a version branch, so a cron here would never fire
+  # and would misdescribe the workflow as scheduled. The btv1.5 line is
+  # therefore dispatched: by hand, or by a caller through workflow_call.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-answer-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+jobs:
+  answer-k8s:
+    name: ${{ matrix.suite }} (btv1.5)
+    # The orchestration shell is CPU-only and holds no device; the action
+    # submits a worker pod onto a board that carries the requested label.
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # Same two suites and the same registered files as the bare-metal
+    # workflow; only the reviewed config differs, because the board differs.
+    # max-parallel 1 keeps the two entries from asking the cluster for two
+    # whole boards at once, and puts the cheap single-card entry first so a
+    # break in the shared serving path is visible before the 8-card entry
+    # would report it. fail-fast is off: one model's verdict must not
+    # suppress the other's evidence.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - suite: nightly-answer-1-ppu
+            config: test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json
+            job_timeout_minutes: 150
+            pod_timeout_minutes: 120
+            timeout_per_file: 2400
+          - suite: nightly-answer-8-ppu
+            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json
+            job_timeout_minutes: 360
+            pod_timeout_minutes: 330
+            timeout_per_file: 14400
+    timeout-minutes: ${{ matrix.job_timeout_minutes }}
+    # The action does not carry files back out of the worker pod, only its
+    # logs, so the report travels over the NAS both sides already mount: the
+    # pod writes under /mnt/wl_nas and the orchestration shell reads the same
+    # bytes under /wl_nas. github.job is the job id, identical for every
+    # matrix entry, so the suite name is what keeps the two reports apart.
+    env:
+      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.suite }}
+      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.suite }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+
+      - name: Run ${{ matrix.suite }} via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          # Both entries request the whole board. nproc_per_node is a resource
+          # request, not device isolation: a pod that asks for one PPU still
+          # sees all eight /dev/alixpu_ppu* nodes and torch still reports
+          # device_count 8, so asking for one card would let a second pod land
+          # on the same board and contend for device 0 with a run that has
+          # already claimed 85% of its memory. Asking for eight makes the
+          # board's PPU allocatable fully consumed, which is the only fence
+          # available here, and it matches the internal btv1.5 plan, which
+          # schedules both answer cases as 1node8ppu.
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            set -e
+            cd /workspace/source
+            git config --global --add safe.directory /workspace/source
+            SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
+            export SGLANG_PPU_SOURCE_REVISION
+            CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
+            export CUDA_VISIBLE_DEVICES
+            ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
+            echo "source revision: $SGLANG_PPU_SOURCE_REVISION"
+            echo "test config:     $SGLANG_PPU_ANSWER_TEST_CONFIG"
+            echo "visible devices: $CUDA_VISIBLE_DEVICES"
+            echo "checkpoint:      $ANSWER_MODEL_PATH"
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$JIT_MTIME" != 0 ]; then
+              find python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} +
+              echo 'Pinned JIT source mtimes'
+            fi
+            bash scripts/ci/warm_page_cache.sh "$ANSWER_MODEL_PATH"
+            cd test
+            python3 run_suite.py --hw ppu --suite ${{ matrix.suite }} --nightly --timeout-per-file ${{ matrix.timeout_per_file }}
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ matrix.config }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: ${{ matrix.pod_timeout_minutes }}
+        # The pod derives the visible devices and the checkpoint from the same
+        # reviewed config the test will read, rather than from a second copy in
+        # this file, so the two cannot drift; the device list is also the one
+        # value that must reach the shell, and extra_env is comma-delimited, so
+        # it is exported inside the pod instead of passed as an input.
+        #
+        # The page-cache warm sits immediately before run_suite.py and inside
+        # the pod on purpose. It warms the page cache of the node that will
+        # then load the weights, which an orchestration-shell step could not
+        # do, and the measured bare-metal host reclaims the cache within 30
+        # minutes, so a warm separated from the load is wasted machine time.
+        #
+        # Routed through run_suite.py so the executed set is exactly what
+        # register_ppu_ci declares. No --continue-on-error: an Answer-quality
+        # regression must turn the run red.
+
+      - name: Collect Answer evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The path is built from the run identifiers above; refuse to touch
+          # anything that does not look like it before removing a directory.
+          case "${ANSWER_RESULTS_ON_RUNNER}" in
+            /wl_nas/devops/*/answer-results/*) ;;
+            *)
+              echo "::error::unexpected results path ${ANSWER_RESULTS_ON_RUNNER}"
+              exit 1
+              ;;
+          esac
+          destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
+          mkdir -p "${destination}"
+          if [ -d "${ANSWER_RESULTS_ON_RUNNER}" ]; then
+            cp -a "${ANSWER_RESULTS_ON_RUNNER}/." "${destination}/"
+            # The NAS is shared and this workflow is the only reader of its own
+            # run directory, so it also owns discarding it once the evidence is
+            # in the workspace and on its way to the artifact.
+            rm -rf "${ANSWER_RESULTS_ON_RUNNER}"
+          else
+            echo "::warning::the pod produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
+          fi
+          if [ -f "${destination}/summary.md" ]; then
+            cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload Answer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          retention-days: 30

@@ -26,15 +26,26 @@ Two models are covered, one registered file and one suite each because
 | `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 1 |
 | `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B-W8A8-INT8 | 8 |
 
+Each suite is executed on two boards. That is a matter of configuration rather
+than of registration: the model, the corpus, and the judging standard are the
+same, so a board is chosen by handing the suite a different reviewed config.
+
+| Board | Config suffix | Workflow | Trigger |
+| --- | --- | --- | --- |
+| ZW810E, 96GiB | none | `nightly-test-ppu-answer.yml` | cron 05:00 Beijing, dispatch |
+| ZW-M890P, 144GiB | `-144g` | `test-ppu-answer-k8s.yml` | dispatch only |
+
 The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
-as a `max-parallel: 1` matrix. It has its own workflow instead of being
-dispatched by the general `nightly-test-ppu.yml` workflow, so Answer failures,
-timeouts, scheduling, and artifacts remain isolated; its cron is offset to
-05:00 Beijing so the two workflows do not contend for the same runner. Both
-entries are executed through `run_suite.py`, so the executed set is exactly what
-the registry declares. `fail-fast` is off: one model's verdict must not suppress
-the other's evidence, and the single-card entry runs first so a break in the
-shared serving path appears hours before the 8-card entry would report it.
+ZW810E entries as a `max-parallel: 1` matrix. It has its own workflow instead of
+being dispatched by the general `nightly-test-ppu.yml` workflow, so Answer
+failures, timeouts, scheduling, and artifacts remain isolated; its cron is
+offset to 05:00 Beijing so the two workflows do not contend for the same runner.
+Both entries are executed through `run_suite.py`, so the executed set is exactly
+what the registry declares. `fail-fast` is off: one model's verdict must not
+suppress the other's evidence, and the single-card entry runs first so a break in
+the shared serving path appears hours before the 8-card entry would report it.
+The ZW-M890P workflow keeps all of that and differs only where the cluster forces
+it to; see [The ZW-M890P line](#the-zw-m890p-line).
 
 The current phase enforces only request integrity and deterministic facts and
 quality checks. LLM-as-Judge is intentionally deferred. Open-ended cases are
@@ -45,13 +56,22 @@ presented as fully semantic evaluations.
 
 `configs/<model family>/<model config>.json` are the reviewed sources of truth
 for hardware selection, checkpoint identity and path, SGLang server parameters,
-request generation parameters, timeouts, dataset, and quality profile. The path
-spells the same identity as the `test_id` inside the file, so
-`configs/qwen3.8/27b-bf16.json` carries `qwen3.8-27b-bf16-answer-96g`. The
-workflow reads the same file the test will read to select the visible devices and
-to warm the checkpoint page cache, then exports its path as
-`SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python tests generic and makes
+request generation parameters, timeouts, dataset, and quality profile. The file
+name spells the identity its `test_id` declares, with the ZW810E baseline
+carrying no board suffix: `configs/qwen3.8/27b-bf16.json` is
+`qwen3.8-27b-bf16-answer-96g` and its ZW-M890P sibling
+`configs/qwen3.8/27b-bf16-144g.json` is `qwen3.8-27b-bf16-answer-144g`. The
+suffix is the per-device capacity rather than the board name, which is how the
+internal plans separate these same two boards (`answer_96g`, `answer_144g`) and
+what `answer_expected_hardware` renders into provenance (`zw810e-8x96g`,
+`zw-m890p-8x144g`). The workflow reads the same file the test will read to select
+the visible devices and to warm the checkpoint page cache, then exports its path
+as `SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python tests generic and makes
 the exact execution contract visible in the workflow log.
+
+Only the `hardware` section and the checkpoint path differ between a board pair.
+Every server and generation parameter is held identical on purpose, so that a
+difference between two verdicts is attributable to the board alone.
 
 The two models share `dataset/answer_cases_zh_v1.json` and
 `dataset/quality_profile.json`: the ten prompts are public general knowledge with
@@ -104,6 +124,62 @@ attention, static memory fraction 0.8, and `w8a8_int8` quantization; the 27B is
 TP=1, FA3, static memory fraction 0.85, and `unquant`, which is how
 `server_args` spells an explicit opt-out for a BF16 checkpoint.
 
+## The ZW-M890P line
+
+`.github/workflows/test-ppu-answer-k8s.yml` runs the same two suites against the
+144GiB board, which is reachable only through the K8s cluster. It is a sibling
+workflow rather than a second matrix dimension of the bare-metal one because
+everything around the test differs, while the test itself does not:
+
+- **Selection.** The board is chosen by `node_selector: board-type=ZW-M890P`, and
+  the work runs in a worker pod submitted by `ppu-distributed-action` from a
+  CPU-only orchestration shell that holds no device.
+- **Devices.** `nproc_per_node` is a resource request, not isolation. A pod that
+  asks for one PPU still sees all eight `/dev/alixpu_ppu*` nodes, and
+  `torch.cuda.device_count()` still returns 8, so the preflight — which requires
+  the visible device count to equal the configured one — would fail the
+  single-card entry outright. `CUDA_VISIBLE_DEVICES` is therefore exported inside
+  the pod from the same config the test reads, and both entries request all eight
+  PPUs so that no second pod can land on the board and contend for a device with
+  a server that has already claimed most of its memory. The internal btv1.5 plan
+  schedules both answer cases as `1node8ppu` for the same reason.
+- **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
+  rather than under `qwen/v3.5/` as on the ZW810E line; the 27B path is the same
+  on both. The path is a per-config field, so this costs nothing beyond the two
+  new configs — `checkpoint_name` is unchanged, because only the parent directory
+  differs.
+- **Evidence channel.** The action returns pod logs but not pod files, so the
+  report travels over the NAS that both sides mount: the pod writes
+  `SGLANG_PPU_ANSWER_RESULTS_DIR` under `/mnt/wl_nas/devops/<run>/<job>/`, and the
+  orchestration shell reads the same bytes under `/wl_nas/...`, publishes the
+  summary, uploads the artifact, and then discards the NAS copy. The suite name is
+  part of the path because `github.job` is identical for every matrix entry.
+- **Provenance.** `base_image_digest` is null on this path. The orchestration
+  shell has no Docker daemon to inspect the image with and the pod cannot see its
+  own digest, so only the image tag is recorded; on the bare-metal line the digest
+  is resolved by `docker image inspect`.
+- **Trigger.** No cron. GitHub honours `schedule` only on the default branch, so a
+  cron on a version branch would never fire while claiming the workflow is
+  scheduled. The line is dispatched by hand or through `workflow_call`.
+- **Warm.** The page-cache warm runs inside the pod, immediately before
+  `run_suite.py`. It has to: the cache it warms belongs to the node that will then
+  load the weights, which no orchestration-shell step can reach.
+
+The board's identity and capacity are measured rather than assumed. An inventory
+probe submitted to this cluster on 2026-09-02 reported eight devices named
+`ZW-M890P` with compute capability 8.9, 39 multiprocessors, 32MB of L2, and
+`total_memory` 147456MB — 144.0GiB exactly — under torch 2.11.0, with both
+checkpoints present (94 and 18 shards) and the JIT and Hugging Face caches in
+place. `hardware.generation` is a free-form string that nothing validates against
+a list, so a guessed value would be indistinguishable from a measured one in the
+provenance record; `zw-m890p` and `memory_gib_per_device: 144` are what the
+hardware reported. Board type alone would not have settled the capacity in any
+case: the internal plans schedule this same board in both a 96GiB and a 144GiB
+configuration.
+
+No verdict has been recorded on this board yet, so the measured baseline below is
+ZW810E only.
+
 ## Relation to the internal test cases
 
 Both suites are ports of internal `llm_infer_sglang_evalscope` answer cases
@@ -121,7 +197,13 @@ quantization intent, and deliberately departs in two places:
   parameter set, so adding one of them is a schema change with its own review
   rather than a silent config edit.
 
-## Measured baseline
+The btv1.5 plan for the 144GiB board carries `qwen3.8-27b-fp8_3001` where this
+repository keeps BF16, and no BF16 entry of its own. The port stays on BF16
+deliberately: the two `-144g` configs are the `-96g` ones with a different board,
+and nothing else, so a difference in verdicts has one candidate explanation. An
+FP8 entry is a separate case with its own baseline, not a substitution.
+
+## Measured baseline (ZW810E)
 
 The first on-machine run was executed on `ptg-ppu-02` (16 × PPU-ZW810E, 96GiB
 per device, driver 1.6.1, SDK 2.1.1) on 2026-09-01 using eight devices, and it
