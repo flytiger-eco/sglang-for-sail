@@ -253,8 +253,28 @@ def validate_test_config(config: dict[str, Any]) -> None:
         path = Path(value)
         if path.is_absolute() or ".." in path.parts:
             raise AnswerEvalError(
-                f"evaluation.{field} must stay relative to the config directory"
+                f"evaluation.{field} must stay relative to the Answer data root"
             )
+
+
+def resolve_evaluation_paths(
+    config: dict[str, Any], data_root: Path
+) -> tuple[Path, Path]:
+    """Locate the dataset and quality profile a test config selects.
+
+    The paths are declared relative to the Answer data root rather than to the
+    directory holding the config, because the configs are filed per model family
+    while the corpus and the profile are shared: resolving from the config
+    directory would put the shared files above the config, reachable only
+    through ``..``, which ``validate_test_config`` rejects so that a config
+    cannot name inputs outside the reviewed tree.
+    """
+
+    evaluation = config["evaluation"]
+    return (
+        data_root / evaluation["dataset"],
+        data_root / evaluation["quality_profile"],
+    )
 
 
 def build_answer_server_args(config: dict[str, Any]) -> list[str]:

@@ -1,8 +1,22 @@
 # PPU Answer MVP
 
-This directory contains the public, versioned inputs for the PPU Answer nightly
-tests. The evaluator lives in `python/sglang/test/kits/answer_eval_kit.py` and
-the on-machine driver in `python/sglang/test/kits/answer_suite_kit.py`.
+This directory holds the registered PPU Answer nightly tests together with the
+public, versioned inputs they read. The evaluator lives in
+`python/sglang/test/kits/answer_eval_kit.py` and the on-machine driver in
+`python/sglang/test/kits/answer_suite_kit.py`.
+
+```
+answer_eval/
+├── configs/<model family>/<model config>.json   reviewed execution contracts
+├── dataset/                                     corpus, quality profile, schema
+└── test_ppu_*.py                                registered entry points
+```
+
+The test files sit here rather than in `test/registered/ppu/` so that the suites,
+the contracts they execute, and the corpus they are judged against are one
+reviewable unit. Nothing about discovery changes: `run_suite.py` and the
+`check-registered-tests` hook both walk `test/registered/**/*.py`, and a suite is
+owned by the `register_ppu_ci` call inside the file, not by its directory.
 
 Two models are covered, one registered file and one suite each because
 `register_ppu_ci` registers per file and the two claim different device counts:
@@ -29,18 +43,28 @@ presented as fully semantic evaluations.
 
 ## Runner configuration
 
-`data/*_test_config.json` are the reviewed sources of truth for hardware
-selection, checkpoint identity and path, SGLang server parameters, request
-generation parameters, timeouts, dataset, and quality profile. The workflow
-reads the same file the test will read to select the visible devices and to warm
-the checkpoint page cache, then exports its path as
+`configs/<model family>/<model config>.json` are the reviewed sources of truth
+for hardware selection, checkpoint identity and path, SGLang server parameters,
+request generation parameters, timeouts, dataset, and quality profile. The path
+spells the same identity as the `test_id` inside the file, so
+`configs/qwen3.8/27b-bf16.json` carries `qwen3.8-27b-bf16-answer-96g`. The
+workflow reads the same file the test will read to select the visible devices and
+to warm the checkpoint page cache, then exports its path as
 `SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python tests generic and makes
 the exact execution contract visible in the workflow log.
 
-The two models share `data/answer_cases_zh_v1.json` and
-`data/quality_profile.json`: the ten prompts are public general knowledge with
+The two models share `dataset/answer_cases_zh_v1.json` and
+`dataset/quality_profile.json`: the ten prompts are public general knowledge with
 reviewed reference facts, so they identify a judgement standard rather than a
 model, and a shared file keeps the two suites comparable by construction.
+
+`evaluation.dataset` and `evaluation.quality_profile` are resolved against this
+directory, which each test file declares as `data_root`, rather than against the
+directory holding the config. Resolving from the config would put the shared
+corpus above it, reachable only through `..`, which `validate_test_config`
+rejects so that no config can name inputs outside the reviewed tree. `data_root`
+is a class attribute with no environment override, unlike the config path: the
+corpus a verdict was produced against stays pinned to the checkout.
 
 CI runs each suite the same way every other registered test runs:
 
@@ -55,8 +79,8 @@ arrives through the environment variable. A local run can select the contract
 the same way:
 
 ```bash
-SGLANG_PPU_ANSWER_TEST_CONFIG=test/registered/ppu/answer_eval/data/qwen3_5_397b_a17b_w8a8_int8_test_config.json \
-  python3 test/registered/ppu/test_ppu_qwen35_answer.py
+SGLANG_PPU_ANSWER_TEST_CONFIG=test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8.json \
+  python3 test/registered/ppu/answer_eval/test_ppu_qwen35_answer.py
 ```
 
 Each test file also names its own config as the default, so the variable is only
@@ -222,6 +246,6 @@ Public data belongs here:
 
 Pending blind reviews, adjudication records, and unrevealed holdout samples
 belong in a private annotation repository. Records should conform to
-`data/annotation_record.schema.json`. GitHub artifacts are evidence for a run,
+`dataset/annotation_record.schema.json`. GitHub artifacts are evidence for a run,
 not the long-term annotation system of record, so promote a candidate into that
 repository rather than relying on the 30-day artifact retention.

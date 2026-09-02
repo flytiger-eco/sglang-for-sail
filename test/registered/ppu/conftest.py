@@ -5,7 +5,7 @@ as ``python3 <file> -f``, so the Answer test reads its config from the
 ``SGLANG_PPU_ANSWER_TEST_CONFIG`` environment variable there. The option below
 exists for local runs that prefer pytest, e.g.::
 
-    pytest -q -s test/registered/ppu/test_ppu_qwen35_answer.py \\
+    pytest -q -s test/registered/ppu/answer_eval/test_ppu_qwen35_answer.py \\
         --answer-test-config <path to a ppu-answer-test-config/v1 JSON>
 """
 

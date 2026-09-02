@@ -51,12 +51,12 @@ jobs:
       matrix:
         include:
           - suite: nightly-answer-1-ppu
-            config: test/registered/ppu/answer_eval/data/qwen3_8_27b_bf16_test_config.json
+            config: test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16.json
             job_timeout_minutes: 60
             step_timeout_minutes: 50
             timeout_per_file: 2400
           - suite: nightly-answer-8-ppu
-            config: test/registered/ppu/answer_eval/data/qwen3_5_397b_a17b_w8a8_int8_test_config.json
+            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8.json
             job_timeout_minutes: 300
             step_timeout_minutes: 280
             timeout_per_file: 14400

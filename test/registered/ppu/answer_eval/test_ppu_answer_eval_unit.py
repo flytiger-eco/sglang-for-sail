@@ -30,6 +30,7 @@ from sglang.test.kits.answer_eval_kit import (
     render_candidates,
     render_junit,
     request_chat_completion,
+    resolve_evaluation_paths,
     validate_annotation_record,
     validate_dataset,
     validate_profile,
@@ -45,17 +46,17 @@ from sglang.test.kits.answer_eval_kit import (
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")
 
-DATA_DIR = Path(__file__).with_name("answer_eval") / "data"
+DATA_ROOT = Path(__file__).parent
+CONFIG_DIR = DATA_ROOT / "configs"
+DATASET_DIR = DATA_ROOT / "dataset"
 
 
 class TestPPUAnswerEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.test_config = load_json(
-            DATA_DIR / "qwen3_5_397b_a17b_w8a8_int8_test_config.json"
-        )
-        cls.dataset = load_json(DATA_DIR / "answer_cases_zh_v1.json")
-        cls.profile = load_json(DATA_DIR / "quality_profile.json")
+        cls.test_config = load_json(CONFIG_DIR / "qwen3.5" / "397b-a17b-w8a8-int8.json")
+        cls.dataset = load_json(DATASET_DIR / "answer_cases_zh_v1.json")
+        cls.profile = load_json(DATASET_DIR / "quality_profile.json")
         cls.cases = {case["id"]: case for case in cls.dataset["cases"]}
 
     def evaluate(self, case_id, answer, finish_reason="stop"):
@@ -113,18 +114,29 @@ class TestPPUAnswerEval(unittest.TestCase):
     def test_every_reviewed_test_config_is_executable(self):
         # One config per nightly Answer job, and only the workflow names the ones
         # this class does not load, so they are validated here instead of first
-        # failing on the machine after a checkpoint has been warmed.
-        config_paths = sorted(DATA_DIR.glob("*_test_config.json"))
+        # failing on the machine after a checkpoint has been warmed. The walk is
+        # recursive because the configs are filed per model family, and it also
+        # asserts that layout: a config that lands outside a family directory
+        # would be tested here but invisible to a reader of the tree.
+        config_paths = sorted(CONFIG_DIR.rglob("*.json"))
         self.assertGreaterEqual(len(config_paths), 2)
         test_ids = set()
         for config_path in config_paths:
-            with self.subTest(config=config_path.name):
+            with self.subTest(config=config_path.relative_to(CONFIG_DIR).as_posix()):
+                self.assertEqual(
+                    config_path.parent.parent,
+                    CONFIG_DIR,
+                    "a config must live in configs/<model family>/",
+                )
                 config = load_json(config_path)
                 validate_test_config(config)
                 test_ids.add(config["test_id"])
-                for field in ("dataset", "quality_profile"):
+                for field, resolved in zip(
+                    ("dataset", "quality_profile"),
+                    resolve_evaluation_paths(config, DATA_ROOT),
+                ):
                     self.assertTrue(
-                        (config_path.parent / config["evaluation"][field]).is_file(),
+                        resolved.is_file(),
                         f"evaluation.{field} does not resolve to a file",
                     )
                 args = build_answer_server_args(config)
@@ -636,7 +648,7 @@ class TestPPUAnswerEval(unittest.TestCase):
             responses,
             {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
         )
-        schema = load_json(DATA_DIR / "annotation_record.schema.json")
+        schema = load_json(DATASET_DIR / "annotation_record.schema.json")
         allowed = set(schema["properties"])
         required = set(schema["required"])
         self.assertTrue(report["label_candidates"])

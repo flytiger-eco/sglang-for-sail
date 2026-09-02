@@ -15,13 +15,16 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.kits.answer_suite_kit import AnswerSuiteMixin
 
-DATA_DIR = Path(__file__).with_name("answer_eval") / "data"
+DATA_ROOT = Path(__file__).parent
 
 register_ppu_ci(est_time=3600, suite="nightly-answer-8-ppu", nightly=True)
 
 
 class TestPPUQwen35Answer(AnswerSuiteMixin, unittest.TestCase):
-    default_test_config_path = DATA_DIR / "qwen3_5_397b_a17b_w8a8_int8_test_config.json"
+    data_root = DATA_ROOT
+    default_test_config_path = (
+        DATA_ROOT / "configs" / "qwen3.5" / "397b-a17b-w8a8-int8.json"
+    )
 
 
 if __name__ == "__main__":

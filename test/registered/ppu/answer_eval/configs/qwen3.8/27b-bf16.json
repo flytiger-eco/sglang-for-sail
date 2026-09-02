@@ -41,7 +41,7 @@
     }
   },
   "evaluation": {
-    "dataset": "answer_cases_zh_v1.json",
-    "quality_profile": "quality_profile.json"
+    "dataset": "dataset/answer_cases_zh_v1.json",
+    "quality_profile": "dataset/quality_profile.json"
   }
 }

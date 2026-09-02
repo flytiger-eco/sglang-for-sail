@@ -32,6 +32,7 @@ from sglang.test.kits.answer_eval_kit import (
     render_candidates,
     render_summary,
     request_chat_completion,
+    resolve_evaluation_paths,
     validate_test_config,
     write_report_files,
 )
@@ -48,15 +49,21 @@ class AnswerSuiteMixin:
     A test file supplies the configuration and nothing else::
 
         class TestPPUQwen35Answer(AnswerSuiteMixin, unittest.TestCase):
-            default_test_config_path = DATA_DIR / "..._test_config.json"
+            data_root = Path(__file__).parent
+            default_test_config_path = data_root / "configs" / ... / "....json"
 
     `SGLANG_PPU_ANSWER_TEST_CONFIG` overrides that default, which is how the
     workflow keeps the file it warms and the file the test reads identical.  A
     config that does not match the file it is handed to still fails loudly:
     validation ties `tp_size` to the declared devices, and the preflight below
     ties the checkpoint to the devices actually visible.
+
+    `data_root` is not overridable that way on purpose: the dataset and the
+    quality profile are reviewed repository assets, so the corpus a verdict was
+    produced against stays pinned to the checkout even when the config does not.
     """
 
+    data_root = None
     default_test_config_path = None
 
     @classmethod
@@ -115,11 +122,15 @@ class AnswerSuiteMixin:
         cls.model_config = cls.test_config["model"]
         cls.server_config = cls.test_config["server"]["parameters"]
         cls.request_config = cls.test_config["request"]
-        evaluation = cls.test_config["evaluation"]
-        cls.dataset = load_json(cls.test_config_path.parent / evaluation["dataset"])
-        cls.profile = load_json(
-            cls.test_config_path.parent / evaluation["quality_profile"]
+        if cls.data_root is None:
+            raise RuntimeError(
+                "no Answer data root selected: set data_root on the test class"
+            )
+        dataset_path, profile_path = resolve_evaluation_paths(
+            cls.test_config, Path(cls.data_root)
         )
+        cls.dataset = load_json(dataset_path)
+        cls.profile = load_json(profile_path)
         cls.output_dir = Path(os.environ.get(RESULTS_DIR_ENV, "ppu-answer-artifacts"))
         cls.model_path = cls.model_config["path"]
         stage = "runner_preflight"
