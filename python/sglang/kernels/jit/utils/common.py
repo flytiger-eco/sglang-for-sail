@@ -60,6 +60,13 @@ def is_musa_runtime() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
+@cache_once
+def is_ppu_runtime() -> bool:
+    # T-HEAD PPU device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_ppu so all layers agree on what "running on PPU" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
+
+
 _REGISTERED_CLASSES: Dict[type, type] = {}
 
 
