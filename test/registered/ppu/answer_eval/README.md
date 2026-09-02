@@ -187,12 +187,28 @@ That run reported seven of ten cases passing, all three failures being
 The first two are model-capability results: the request path is clean and the
 rules are correct — the second even reproduces the error that the reviewed rule
 was written to correct in the internal golden. The third is a wrong answer as
-well, but it also exposes a limitation of the `probability` rule, which accepts
-`a/b`, `X%`, or a bare number already in `[0, 1]`. The prompt asks for a
-percentage, so a bare `14.29` would be discarded exactly as `12.5` was, and the
-rule cannot pass on a correctly formed bare-percentage answer. Neither the rule
-nor the severity classification is changed here, for the reason given above; an
-explicit optional unit on the rule would be the narrow fix.
+well, but it also exposed a gap in the `probability` rule, which accepted `a/b`,
+`X%`, or a bare number already in `[0, 1]`. The prompt asks for a percentage, so
+a bare `14.29` was discarded exactly as `12.5` was, and no correctly formed
+bare-percentage answer could pass at all. A case now declares how a bare number
+may be read, and this one admits either reading:
+
+```json
+{"type": "probability", "target": 0.142857142857, "tolerance": 0.0006,
+ "bare_number_units": ["percent", "probability"], "description": "..."}
+```
+
+The declaration is the only way in: the default stays the probability reading
+alone and an unknown unit fails the run, because inferring `percent` from a value
+above 1 would admit a rounded `14` against a target of 1/7 under a loose enough
+tolerance. The two readings of one bare number are alternatives for a single
+claim, so the matching one is kept — otherwise `答案是0.1429` would contradict
+itself, its percentage reading being both asserted and wrong. Neither the
+tolerance nor the severity classification is changed, so `12.5` and a rounded
+`14` still fail and the verdict for the run above stands. Changing what a rule
+accepts changes the judging standard, so `dataset/answer_cases_zh_v1.json` is now
+`revision` 2: an annotation keyed on revision 1 must not be read as though it had
+been produced under the current standard.
 
 ## Results and annotations
 

@@ -1,7 +1,7 @@
 {
   "schema_version": "ppu-answer-cases/v1",
   "dataset_id": "ppu-answer-zh-v1",
-  "revision": 1,
+  "revision": 2,
   "license": "Apache-2.0",
   "publication_approval": {
     "status": "approved",
@@ -137,7 +137,7 @@
       "prompt": "箱子里共有3个红球，4个蓝球，从箱子里依次随机取出2个球，全是红球的概率为百分之多少？",
       "reference_facts": {"probability": "1/7", "percent": 14.2857142857},
       "rules": [
-        {"type": "probability", "target": 0.142857142857, "tolerance": 0.0006, "description": "无放回抽取两个红球的概率为 1/7，约 14.29%"}
+        {"type": "probability", "target": 0.142857142857, "tolerance": 0.0006, "bare_number_units": ["percent", "probability"], "description": "无放回抽取两个红球的概率为 1/7，约 14.29%"}
       ]
     },
     {

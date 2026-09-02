@@ -447,6 +447,64 @@ class TestPPUAnswerEval(unittest.TestCase):
             also_conflicting["verdict"], "failed", also_conflicting["findings"]
         )
 
+    def test_probability_reads_bare_numbers_in_the_declared_units(self):
+        # The red-ball prompt asks for a percentage, so its rule admits a bare
+        # number as one. Without that declaration the rule could only ever be
+        # satisfied by ``a/b``, ``X%``, or a value already in [0, 1], and a
+        # correctly formed bare ``14.29`` would be discarded as if it were wrong.
+        bare_percentage = self.evaluate("red-ball-probability", "答案是14.29。")
+        bare_probability = self.evaluate("red-ball-probability", "答案是0.1429。")
+        # Admitting the percentage reading must not widen the tolerance: a bare
+        # integer is 14% here, which is outside it, and a wrong bare percentage
+        # still has to fail.
+        rounded_percentage = self.evaluate("red-ball-probability", "答案是14。")
+        wrong_bare_percentage = self.evaluate("red-ball-probability", "答案是12.5。")
+        self.assertEqual(
+            bare_percentage["verdict"], "passed", bare_percentage["findings"]
+        )
+        self.assertEqual(
+            bare_probability["verdict"], "passed", bare_probability["findings"]
+        )
+        for result in (rounded_percentage, wrong_bare_percentage):
+            self.assertEqual(result["verdict"], "failed", result["findings"])
+            self.assertIn("fact_rule_failed", self.reason_codes(result))
+
+        # A digit inside a fraction is part of it, never a candidate of its own,
+        # so the evidence a reviewer reads stays the values the answer claims.
+        negated = self.evaluate("red-ball-probability", "概率不是1/7，而是1/2。")
+        finding = next(
+            item
+            for item in negated["findings"]
+            if item["reason_code"] == "fact_rule_failed"
+        )
+        self.assertEqual(
+            [
+                round(value, 4)
+                for value in finding["observed"]["probability_candidates"]
+            ],
+            [0.1429, 0.5],
+        )
+
+        # The declaration is the only way in: the default stays the probability
+        # reading alone, so no other case loosens by being silent, and a typo in
+        # the unit fails the run instead of quietly restoring the strict default.
+        undeclared = copy.deepcopy(self.cases["red-ball-probability"])
+        del undeclared["rules"][0]["bare_number_units"]
+        strict = evaluate_case(
+            undeclared, "答案是14.29。", "stop", self.profile, self.dataset["revision"]
+        )
+        self.assertEqual(strict["verdict"], "failed", strict["findings"])
+        mistyped = copy.deepcopy(self.cases["red-ball-probability"])
+        mistyped["rules"][0]["bare_number_units"] = ["percentage"]
+        with self.assertRaisesRegex(AnswerEvalError, "unsupported bare number units"):
+            evaluate_case(
+                mistyped,
+                "答案是14.29。",
+                "stop",
+                self.profile,
+                self.dataset["revision"],
+            )
+
     def test_negated_extra_and_interleaved_facts_fail(self):
         poem = "春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。"
         negated_authors = [

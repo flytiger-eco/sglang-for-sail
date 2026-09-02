@@ -886,6 +886,35 @@ def _sequence_has_adjacent_extra_item(
     return False
 
 
+# How a bare number in an answer may be read by a probability rule, as a divisor
+# that maps it onto a probability.  The divisor doubles as the largest value the
+# unit admits, because a well-formed magnitude in either unit lands in [0, 1]
+# once divided: a bare number above it is not a quantity in that unit at all and
+# must stay out of the candidate set, the way an item count or an intermediate
+# step in a derivation does.
+_BARE_PROBABILITY_UNITS = {"probability": 1.0, "percent": 100.0}
+
+
+def _bare_probability_units(rule: dict[str, Any]) -> list[str]:
+    """Return the readings a probability rule admits for a bare number.
+
+    A bare number carries no unit, so which readings are correct depends on what
+    the prompt asked for; the reviewed case declares them rather than the
+    evaluator guessing.  The default keeps the probability reading alone, so a
+    prompt that asks for a percentage has to say so: inferring ``percent`` from a
+    value above 1 would admit a rounded integer such as ``14`` against a target
+    of 1/7 whenever the tolerance is loose enough, which is a false pass.
+    """
+
+    units = rule.get("bare_number_units", ["probability"])
+    if not isinstance(units, list) or not units:
+        raise AnswerEvalError("bare_number_units must be a non-empty list")
+    unsupported = sorted(set(units) - set(_BARE_PROBABILITY_UNITS))
+    if unsupported:
+        raise AnswerEvalError(f"unsupported bare number units: {unsupported}")
+    return units
+
+
 def _evaluate_rule(rule: dict[str, Any], text: str) -> dict[str, Any] | None:
     rule_type = rule["type"]
     description = rule.get("description")
@@ -1026,6 +1055,7 @@ def _evaluate_rule(rule: dict[str, Any], text: str) -> dict[str, Any] | None:
     elif rule_type == "probability":
         target = float(rule["target"])
         tolerance = float(rule["tolerance"])
+        units = _bare_probability_units(rule)
         mentions = []
         compound_spans = []
         for match in re.finditer(r"(\d+)\s*/\s*(\d+)", text):
@@ -1051,12 +1081,34 @@ def _evaluate_rule(rule: dict[str, Any], text: str) -> dict[str, Any] | None:
                 )
             )
         for value, negated, start, end in _number_mentions(text):
+            # A bare match that begins inside a fraction or a percentage is one of
+            # its digits. Containment alone would miss it: an integer directly
+            # before a comma absorbs the comma as a thousands separator, so the
+            # denominator of ``1/7,`` reaches one character past the fraction.
             overlaps_compound = any(
-                compound_start <= start and end <= compound_end
+                compound_start <= start < compound_end
                 for compound_start, compound_end in compound_spans
             )
-            if not overlaps_compound and 0 <= value <= 1:
-                mentions.append((value, negated, start, end))
+            if overlaps_compound:
+                continue
+            readings = [
+                value / _BARE_PROBABILITY_UNITS[unit]
+                for unit in units
+                if 0 <= value <= _BARE_PROBABILITY_UNITS[unit]
+            ]
+            # The readings of one bare number are alternative interpretations of
+            # a single claim, not several claims, so keep the one that matches
+            # when there is one. Feeding all of them to the conflict check would
+            # let a value contradict itself: ``0.1429`` matches as a probability
+            # while its percentage reading does not, and the asserting prefix
+            # would then turn a correct answer into a contradiction.
+            matching = [
+                reading
+                for reading in readings
+                if math.isclose(reading, target, abs_tol=tolerance, rel_tol=0)
+            ]
+            for reading in matching or readings:
+                mentions.append((reading, negated, start, end))
         if not _numeric_rule_matches(text, mentions, target, tolerance):
             return _finding(
                 "fact_rule_failed",
