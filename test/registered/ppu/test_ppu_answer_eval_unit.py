@@ -77,27 +77,59 @@ class TestPPUAnswerEval(unittest.TestCase):
             self.test_config["server"]["parameters"]["tp_size"],
             len(self.test_config["hardware"]["visible_devices"]),
         )
+        # The contract under test is the flag spelling and the argument order.
+        # The values belong to the reviewed configuration, so they are read from
+        # it rather than copied here, where a copy would silently become a
+        # second, competing source of truth.
+        parameters = self.test_config["server"]["parameters"]
         self.assertEqual(
             build_answer_server_args(self.test_config),
             [
                 "--trust-remote-code",
                 "--tp-size",
-                "8",
+                str(parameters["tp_size"]),
                 "--attention-backend",
-                "fa3",
+                parameters["attention_backend"],
                 "--mem-fraction-static",
-                "0.8",
+                str(parameters["mem_fraction_static"]),
                 "--quantization",
-                "w8a8_int8",
+                parameters["quantization"],
                 "--reasoning-parser",
-                "qwen3",
+                parameters["reasoning_parser"],
                 "--served-model-name",
-                "Qwen3.5-397B-A17B-W8A8-INT8",
+                self.test_config["model"]["served_model_name"],
             ],
         )
-        self.assertEqual(answer_expected_hardware(self.test_config), "zw810e-8x96g")
+        # Likewise, provenance depends on the shape of the hardware string, not
+        # on one particular accelerator generation; the rendering rule itself is
+        # pinned by test_expected_hardware_renders_the_declared_topology.
+        self.assertRegex(
+            answer_expected_hardware(self.test_config), r"^[0-9a-z.]+-\d+x[0-9.]+g$"
+        )
         self.assertEqual(len(canonical_digest(self.dataset)), 64)
         self.assertEqual(len({case["id"] for case in self.dataset["cases"]}), 10)
+
+    def test_expected_hardware_renders_the_declared_topology(self):
+        config = {
+            "hardware": {
+                "generation": "zw810e",
+                "visible_devices": [0, 1, 2, 3],
+                "memory_gib_per_device": 96,
+            }
+        }
+        self.assertEqual(answer_expected_hardware(config), "zw810e-4x96g")
+
+        # A capacity that JSON carries as a float must not leak a ".0" into
+        # provenance, while a genuinely fractional capacity must survive.
+        config["hardware"]["memory_gib_per_device"] = 96.0
+        self.assertEqual(answer_expected_hardware(config), "zw810e-4x96g")
+        config["hardware"]["memory_gib_per_device"] = 97.5
+        self.assertEqual(answer_expected_hardware(config), "zw810e-4x97.5g")
+
+        config["hardware"]["generation"] = "btv1.5"
+        config["hardware"]["visible_devices"] = [0, 1, 2, 3, 4, 5, 6, 7]
+        config["hardware"]["memory_gib_per_device"] = 144
+        self.assertEqual(answer_expected_hardware(config), "btv1.5-8x144g")
 
     def test_execution_config_rejects_inconsistent_or_unsafe_values(self):
         invalid = copy.deepcopy(self.test_config)
@@ -131,11 +163,15 @@ class TestPPUAnswerEval(unittest.TestCase):
                     str(model_dir),
                     server_config=self.test_config["server"]["parameters"],
                     generation_config=self.test_config["request"]["generation"],
-                    expected_hardware="zw810e-8x96g",
+                    expected_hardware=answer_expected_hardware(self.test_config),
                 )
         self.assertEqual(provenance["source_revision"], "tested-sha")
         self.assertEqual(provenance["base_image_digest"], "sha256:image")
         self.assertEqual(provenance["checkpoint_name"], model_dir.name)
+        self.assertEqual(
+            provenance["expected_hardware"],
+            answer_expected_hardware(self.test_config),
+        )
         self.assertEqual(len(provenance["checkpoint_config_sha256"]), 64)
         self.assertEqual(
             provenance["generation_config"],
