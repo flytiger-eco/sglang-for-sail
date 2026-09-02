@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from importlib.metadata import version as get_package_version
+from typing import TYPE_CHECKING, Optional
+
+from packaging.version import Version
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -22,9 +25,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# `is_silu_after_clamp` was introduced in acext 2.1.1(i.e. 2010100)
-# pass it unconditionally would break on older runtimes.
-_ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION = 2010100
+# acext runtime version is non-monotonic (acext==1.0.0 but acext.get_version()==1050100);
+# use pip package version (>=1.1.0) instead to ensure act_limit support.
+_ACEXT_SILU_AFTER_CLAMP_MIN_VERSION = Version("1.1.0")
+_ACEXT_SILU_AFTER_CLAMP_SUPPORTED: Optional[bool] = None
+
+
+def _acext_supports_silu_after_clamp() -> bool:
+    global _ACEXT_SILU_AFTER_CLAMP_SUPPORTED
+    if _ACEXT_SILU_AFTER_CLAMP_SUPPORTED is None:
+        try:
+            installed = Version(get_package_version("acext"))
+            _ACEXT_SILU_AFTER_CLAMP_SUPPORTED = (
+                installed >= _ACEXT_SILU_AFTER_CLAMP_MIN_VERSION
+            )
+        except Exception:
+            # Metadata missing or unparsable: stay conservative to avoid
+            # passing unsupported kwargs to older runtimes.
+            _ACEXT_SILU_AFTER_CLAMP_SUPPORTED = False
+    return _ACEXT_SILU_AFTER_CLAMP_SUPPORTED
 
 
 @register_fused_func("none", "acext")
@@ -48,7 +67,6 @@ def fused_experts_none_to_acext(
         fusedmoe_wrapper,
         get_enum_from_booleans,
         get_fusedmoe_status_wrapper,
-        get_version,
     )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
@@ -126,14 +144,21 @@ def fused_experts_none_to_acext(
     else:
         act_limit = swiglu_limit
 
-    # act_limit + is_silu_after_clamp are only used together since 2010100,
-    # so add them conditionally to stay compatible with older acext runtimes.
+    # act_limit + is_silu_after_clamp must only be passed when the acext whl
+    # supports them (>= 1.1.0), so gate on the pip metadata version to stay
+    # compatible with older acext runtimes.
     fused_kwargs = dict(
         routed_scaling_factor=routed_scaling_factor,
     )
-    if get_version() >= _ACEXT_IS_SILU_AFTER_CLAMP_MIN_VERSION:
+    if _acext_supports_silu_after_clamp():
         fused_kwargs["act_limit"] = act_limit
         fused_kwargs["is_silu_after_clamp"] = is_silu_after_clamp
+    elif act_limit is not None:
+        logger.warning(
+            f"Current acext version does not support SwiGLU clamp (act_limit={act_limit}). "
+            f"Clamping is skipped. Please upgrade acext to v1.1.0 or later "
+            f"to avoid potential precision issues."
+        )
 
     output = (
         hidden_states
