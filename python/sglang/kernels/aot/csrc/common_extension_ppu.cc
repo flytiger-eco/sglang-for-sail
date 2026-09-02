@@ -47,27 +47,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/elementwise
    */
-  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
-
-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
-
-  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
-
-  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
-  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
-
-  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
-  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
-
-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
-  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
-
-  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
-  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
-
   m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
@@ -176,14 +155,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From csrc/speculative
    */
   m.def(
-      "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
-      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, Tensor draft_probs, "
-      "float threshold_single, float threshold_acc, "
-      "bool deterministic) -> ()");
-  m.impl("tree_speculative_sampling_target_only", torch::kCUDA, &tree_speculative_sampling_target_only);
-
-  m.def(
       "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
       "Tensor target_predict) -> ()");
@@ -272,15 +243,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
-
-  /*
-   * From FlashInfer
-   */
-  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
-  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
-
-  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
-  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
 
   /*
    * From csrc/grammar

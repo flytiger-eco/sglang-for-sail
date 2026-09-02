@@ -16,11 +16,10 @@
  * limitations under the License.
  */
 
-#include <flashinfer/quantization.cuh>
-
 #include "pytorch_extension_utils.h"
+#include "quantization.cuh"
 
-using namespace flashinfer;
+using namespace sgl;
 
 // bitorder = "little"
 void segment_packbits(

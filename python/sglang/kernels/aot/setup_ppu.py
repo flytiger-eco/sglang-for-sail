@@ -58,13 +58,6 @@ _ACTLIZE_REPO = _RepoInfo(
 
 _ACTLIZE_DIR = Path(os.environ.get("SGL_KERNEL_ACTLIZE_DIR", _ACTLIZE_REPO.source_dir))
 
-_FLASHINFER_REPO = _RepoInfo(
-    name="flashinfer",
-    git_repository="https://github.com/flashinfer-ai/flashinfer.git",
-    git_tag="bc29697ba20b7e6bdb728ded98f04788e16ee021",
-    git_shallow=False,
-)
-
 _TRITON_REPO = _RepoInfo(
     name="triton",
     git_repository="https://github.com/triton-lang/triton",
@@ -74,7 +67,6 @@ _TRITON_REPO = _RepoInfo(
 
 ALL_REPOS = [
     _ACTLIZE_REPO,
-    _FLASHINFER_REPO,
     _TRITON_REPO,
 ]
 
@@ -95,18 +87,6 @@ operator_namespace = "sgl-kernel"
 torch_cxx11_abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
 abi_flag = f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}"
 
-enable_bf16 = os.environ.get("SGL_KERNEL_ENABLE_BF16", "1").lower() in (
-    "1",
-    "true",
-    "on",
-    "yes",
-)
-enable_fp8 = os.environ.get("SGL_KERNEL_ENABLE_FP8", "1").lower() in (
-    "1",
-    "true",
-    "on",
-    "yes",
-)
 compile_threads = int(os.environ.get("SGL_KERNEL_COMPILE_THREADS", "32"))
 if compile_threads < 1:
     compile_threads = 1
@@ -121,7 +101,6 @@ sgl_kernel_cuda_flags = [
     "-gencode=arch=compute_80,code=sm_80",
     "-gencode=arch=compute_89,code=sm_89",
     "-std=c++17",
-    "-DFLASHINFER_ENABLE_F16",
     "-DCUTE_USE_PACKED_TUPLE=1",
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
     "-DCUTLASS_VERSIONS_GENERATED",
@@ -151,26 +130,12 @@ sgl_kernel_cuda_flags = [
 if arch == "aarch64":
     sgl_kernel_cuda_flags.append("-gencode=arch=compute_87,code=sm_87")
 
-if enable_bf16:
-    sgl_kernel_cuda_flags.append("-DFLASHINFER_ENABLE_BF16")
-
-if enable_fp8:
-    sgl_kernel_cuda_flags.extend(
-        [
-            "-DFLASHINFER_ENABLE_FP8",
-            "-DFLASHINFER_ENABLE_FP8_E4M3",
-            "-DFLASHINFER_ENABLE_FP8_E5M2",
-        ]
-    )
-
 # ======================= Include Directories ======================= #
 include_dirs = [
     str(root / "include"),
     str(root / "csrc"),
     str(_ACTLIZE_DIR / "include"),
     str(_ACTLIZE_DIR / "tools" / "util" / "include"),
-    str(_FLASHINFER_REPO.source_dir / "include"),
-    str(_FLASHINFER_REPO.source_dir / "csrc"),
     str(_ACTLIZE_DIR / "examples" / "77_blackwell_fmha"),
     str(_ACTLIZE_DIR / "examples" / "common"),
 ]
@@ -180,10 +145,8 @@ common_sources = [
     "csrc/allreduce/custom_all_reduce.cu",
     "csrc/attention/merge_attn_states.cu",
     "csrc/common_extension_ppu.cc",
-    "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla.cu",
     "csrc/elementwise/copy.cu",
-    "csrc/elementwise/fused_add_rms_norm_kernel.cu",
     "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/topk.cu",
     "csrc/gemm/awq_kernel.cu",
@@ -206,16 +169,7 @@ common_sources = [
     "csrc/speculative/eagle_utils.cu",
     "csrc/speculative/ngram_utils.cu",
     "csrc/speculative/packbit.cu",
-    "csrc/speculative/speculative_sampling.cu",
 ]
-
-# Third-party source files
-flashinfer_sources = [
-    str(_FLASHINFER_REPO.source_dir / "csrc" / "norm.cu"),
-    str(_FLASHINFER_REPO.source_dir / "csrc" / "renorm.cu"),
-]
-
-all_common_sources = common_sources + flashinfer_sources
 
 # Libraries to link
 libraries = ["c10", "cuda", "cublas", "cublasLt"]
@@ -228,7 +182,7 @@ def _make_common_ops():
     nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math"]
     return CUDAExtension(
         name="sgl_kernel.common_ops",
-        sources=all_common_sources,
+        sources=common_sources,
         include_dirs=include_dirs,
         extra_compile_args={
             "nvcc": nvcc_flags,
