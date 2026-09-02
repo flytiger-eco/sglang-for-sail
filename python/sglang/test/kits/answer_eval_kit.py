@@ -1521,6 +1521,65 @@ def render_summary(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _log_safe(text: str) -> str:
+    """Escape what UTF-8 cannot encode, an unpaired surrogate above all.
+
+    Candidate text arrives straight from the model, so it may contain a lone
+    surrogate that no UTF-8 stream accepts.  Escaping it here keeps a malformed
+    character from raising while the log block is being assembled.
+    """
+
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def render_candidates(
+    report: dict[str, Any], dataset: dict[str, Any] | None = None
+) -> str:
+    """Render the candidate answers as plain text for the job log.
+
+    ``render_summary`` carries verdicts only, so explaining a red nightly means
+    downloading the artifact and decoding JSON.  This block puts the answers in
+    the log itself.  It discloses exactly what ``result.raw.json`` does, so
+    callers must gate it on the same ``include_raw_outputs`` switch.
+
+    Passing ``dataset`` prepends each prompt, which makes the block readable
+    without opening the case file alongside it.
+    """
+
+    prompts = (
+        {case["id"]: case["prompt"] for case in dataset["cases"]}
+        if dataset is not None
+        else {}
+    )
+    lines = ["=== Answer candidates (verbatim, one block per case) ==="]
+    for result in report["cases"]:
+        lines.append("")
+        lines.append(f"[{result['verdict']}] {result['case_id']} ({result['kind']})")
+        prompt = prompts.get(result["case_id"])
+        if prompt:
+            lines.append(f"  prompt : {prompt}")
+        answer = result.get("final_answer")
+        if answer:
+            # Indent continuations so a multi-line poem or essay still reads as
+            # one block in a log that carries no other structure.
+            lines.append("  answer : " + answer.replace("\n", "\n           "))
+        else:
+            lines.append("  answer : <empty>")
+        for finding in result["findings"]:
+            detail = [f"{finding['action']}: {finding['reason_code']}"]
+            if finding.get("rule_description"):
+                detail.append(f"rule={finding['rule_description']}")
+            if finding.get("observed") is not None:
+                detail.append(
+                    "observed="
+                    + json.dumps(
+                        finding["observed"], ensure_ascii=False, sort_keys=True
+                    )
+                )
+            lines.append("  " + " | ".join(detail))
+    return _log_safe("\n".join(lines) + "\n")
+
+
 def render_junit(report: dict[str, Any]) -> bytes:
     summary = report["summary"]
     suite = ET.Element(

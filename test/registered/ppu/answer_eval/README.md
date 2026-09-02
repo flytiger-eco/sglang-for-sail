@@ -101,12 +101,23 @@ public general knowledge that already lives in this directory, the answers are
 this project's own model output, and a red nightly is otherwise not diagnosable
 without occupying eight devices for a second run. `result.json` stays redacted
 so the schema-stable report keeps one shape whether or not raw collection is
-enabled; the raw files are the only place candidate text appears, so set the
-switch back to `0` for any dataset whose prompts or answers cannot be published.
+enabled.
+
+The same switch also prints the candidates into the job log, so a failure can be
+read without downloading anything: after the summary table the test emits one
+block per case with the prompt, the answer, and the observed value that tripped
+each rule. `ci_utils.run_unittest_files` runs the test file as a plain
+subprocess with an inherited stdout, so the block reaches the log whether the
+run ends green or red. Because both the artifact and the log carry candidate
+text, set the switch back to `0` for any dataset whose prompts or answers cannot
+be published — one switch covers both surfaces.
 
 Both raw files are written with escaped non-ASCII (`\uXXXX`) so that an unpaired
 surrogate in a candidate answer cannot fail the write. Read them with a JSON
-tool, which decodes the escapes: `jq '.cases[] | select(.case_id=="...")'`.
+tool, which decodes the escapes: `jq '.cases[] | select(.case_id=="...")'`, or
+`jq -r '.cases[] | "[\(.verdict)] \(.case_id)\n  \(.final_answer)\n"'` for every
+answer at once. The log block, in contrast, is already plain text: only
+characters that UTF-8 cannot encode stay escaped there.
 
 Public data belongs here:
 

@@ -27,6 +27,7 @@ from sglang.test.kits.answer_eval_kit import (
     normalize_answer,
     parse_thinking_blocks,
     redact_report,
+    render_candidates,
     render_junit,
     request_chat_completion,
     validate_annotation_record,
@@ -693,6 +694,41 @@ class TestPPUAnswerEval(unittest.TestCase):
             "<redacted-unexpected-model-name>",
         )
         self.assertNotIn("returned_model_sha256", public["cases"][0])
+
+    def test_candidates_render_for_the_job_log(self):
+        # Whoever opens a red nightly reads the log first, so the block has to
+        # carry the answer text, the prompt it answered, and the observed value
+        # that tripped the rule.  A candidate that UTF-8 cannot encode must come
+        # out escaped rather than raise while the block is being built.
+        responses = {
+            case["id"]: {
+                "content": (
+                    "3个" if case["id"] == "deepseek-letter-count" else "候选回答\ud800"
+                ),
+                "finish_reason": "stop",
+                "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            }
+            for case in self.dataset["cases"]
+        }
+        report = build_report(
+            self.dataset,
+            self.profile,
+            responses,
+            {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
+        )
+        rendered = render_candidates(report, self.dataset)
+        self.assertIn("3个", rendered)
+        self.assertIn("[failed] deepseek-letter-count", rendered)
+        self.assertIn("observed=", rendered)
+        first_prompt = self.dataset["cases"][0]["prompt"]
+        self.assertIn(first_prompt, rendered)
+        # The lone surrogate survives as an escape and the block stays writable
+        # to a UTF-8 stream.
+        self.assertNotIn("\ud800", rendered)
+        self.assertIn("\\ud800", rendered)
+        rendered.encode("utf-8")
+        # Without the dataset the block still renders, only without prompts.
+        self.assertNotIn(first_prompt, render_candidates(report))
 
     def test_raw_outputs_land_next_to_the_redacted_report(self):
         # The nightly workflow publishes these two file names as its only record

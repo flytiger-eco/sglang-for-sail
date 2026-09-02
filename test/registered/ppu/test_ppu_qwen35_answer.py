@@ -8,6 +8,7 @@ recorded explicitly in every result.
 
 import json
 import os
+import sys
 import unittest
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from sglang.test.kits.answer_eval_kit import (
     canonical_digest,
     default_provenance,
     load_json,
+    render_candidates,
     render_summary,
     request_chat_completion,
     validate_test_config,
@@ -195,6 +197,16 @@ class TestPPUQwen35Answer(unittest.TestCase):
             report, self.output_dir, include_raw_outputs=include_raw_outputs
         )
         print(render_summary(report), flush=True)
+        if include_raw_outputs:
+            # The log is a disclosure surface like the artifact, so the same
+            # switch governs both.  ci_utils runs this file as a plain
+            # subprocess with an inherited stdout, so the block lands in the job
+            # log whether or not the assertion below fails.  Relaxing the error
+            # handler keeps a candidate that stdout cannot encode from turning
+            # the nightly red over log formatting alone.
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(errors="backslashreplace")
+            print(render_candidates(report, self.dataset), flush=True)
 
         self.assertEqual(
             report["summary"]["failed"],
