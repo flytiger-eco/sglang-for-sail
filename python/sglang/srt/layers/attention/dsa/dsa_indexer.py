@@ -147,6 +147,7 @@ else:
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import (
         fused_q_indexer_rope_first_fp4_quant,
+        fused_q_indexer_rope_first_int8_quant,
         fused_q_indexer_rope_first_quant,
     )
     from sglang.kernels.ops.quantization.dsv32 import (
@@ -903,6 +904,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if (
             not self.use_fp4
+            and not self.use_int8
             and not _is_fp8_fnuz
             and out_cache_loc is not None
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
@@ -979,7 +981,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_quant_func = (
                 fused_q_indexer_rope_first_fp4_quant
                 if self.use_fp4
-                else fused_q_indexer_rope_first_quant
+                else (
+                    fused_q_indexer_rope_first_int8_quant
+                    if self.use_int8
+                    else fused_q_indexer_rope_first_quant
+                )
             )
             return q_quant_func(
                 q.contiguous(),
@@ -1011,7 +1017,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_quant_func = (
             fused_q_indexer_rope_first_fp4_quant
             if self.use_fp4
-            else fused_q_indexer_rope_first_quant
+            else (
+                fused_q_indexer_rope_first_int8_quant
+                if self.use_int8
+                else fused_q_indexer_rope_first_quant
+            )
         )
         q_quant, weights = q_quant_func(
             q.contiguous(),
@@ -1966,6 +1976,20 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
+        # int8 path: per-token int8 quantization + store (no fused FP8 store kernel).
+        if self.use_int8:
+            key_2d = key.view(-1, key.shape[-1]) if key.dim() != 2 else key
+            k_int8, k_scale = per_token_quant_int8(key_2d.contiguous())
+            if not out_cache_loc.is_contiguous():
+                out_cache_loc = out_cache_loc.contiguous()
+            pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=out_cache_loc,
+                index_k=k_int8,
+                index_k_scale=k_scale,
+            )
             return
 
         if (
