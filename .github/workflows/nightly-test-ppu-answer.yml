@@ -139,7 +139,7 @@ jobs:
             -e GITHUB_SHA \
             -e PPU_BASE_IMAGE \
             -e SGLANG_PPU_ANSWER_TEST_CONFIG \
-            -e SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=0 \
+            -e SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1 \
             -e SGLANG_PPU_ANSWER_RESULTS_DIR=/workspace/ppu-answer-artifacts \
             -e SGLANG_PPU_SOURCE_REVISION \
             -e PPU_BASE_IMAGE_DIGEST \
@@ -160,6 +160,14 @@ jobs:
         # default because server startup alone is budgeted 3600s for a 397B
         # checkpoint. No --continue-on-error: an Answer-quality regression must
         # turn the nightly red.
+        #
+        # INCLUDE_RAW_OUTPUTS is 1, so the artifact also carries result.raw.json
+        # and label_candidates.jsonl with the candidate answers verbatim. The
+        # prompts are public general knowledge that already lives in the repo and
+        # the candidates are this project's own model output, so there is nothing
+        # to withhold, while a red nightly is otherwise undiagnosable without
+        # occupying eight devices for a second run. Set it back to 0 for any
+        # dataset whose prompts or answers cannot be published.
 
       - name: Publish Answer summary
         if: always()
@@ -169,7 +177,7 @@ jobs:
             cat ppu-answer-artifacts/summary.md >> "${GITHUB_STEP_SUMMARY}"
           fi
 
-      - name: Upload redacted Answer evidence
+      - name: Upload Answer evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:

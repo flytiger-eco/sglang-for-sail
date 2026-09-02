@@ -93,12 +93,20 @@ revised upstream.
 
 ## Results and annotations
 
-The public workflow uploads only redacted rule findings, provenance, a
-Markdown summary, and JUnit XML. It removes candidate text and all stable
-answer-derived hashes because short answers can be recovered by enumeration.
-`SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1` may only be set in a separate,
-access-controlled collection job whose output is written to the private
-annotation system of record. The public workflow pins this switch to `0`.
+The workflow uploads `result.json` (rule findings and provenance), `summary.md`,
+`junit.xml`, and — because `SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS` is set to
+`1` — `result.raw.json` and `label_candidates.jsonl`, which carry the candidate
+answers verbatim. Publishing the candidates is deliberate: the prompts are
+public general knowledge that already lives in this directory, the answers are
+this project's own model output, and a red nightly is otherwise not diagnosable
+without occupying eight devices for a second run. `result.json` stays redacted
+so the schema-stable report keeps one shape whether or not raw collection is
+enabled; the raw files are the only place candidate text appears, so set the
+switch back to `0` for any dataset whose prompts or answers cannot be published.
+
+Both raw files are written with escaped non-ASCII (`\uXXXX`) so that an unpaired
+surrogate in a candidate answer cannot fail the write. Read them with a JSON
+tool, which decodes the escapes: `jq '.cases[] | select(.case_id=="...")'`.
 
 Public data belongs here:
 
@@ -106,7 +114,8 @@ Public data belongs here:
 - synthetic mutations that are safe to disclose;
 - explicitly released calibration snapshots.
 
-Pending blind reviews, adjudication records, raw nightly answers, and unrevealed
-holdout samples belong in a private annotation repository. Records should
-conform to `data/annotation_record.schema.json`. GitHub artifacts are evidence
-for a run, not the long-term annotation system of record.
+Pending blind reviews, adjudication records, and unrevealed holdout samples
+belong in a private annotation repository. Records should conform to
+`data/annotation_record.schema.json`. GitHub artifacts are evidence for a run,
+not the long-term annotation system of record, so promote a candidate into that
+repository rather than relying on the 30-day artifact retention.

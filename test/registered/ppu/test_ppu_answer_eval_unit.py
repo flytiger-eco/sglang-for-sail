@@ -694,6 +694,50 @@ class TestPPUAnswerEval(unittest.TestCase):
         )
         self.assertNotIn("returned_model_sha256", public["cases"][0])
 
+    def test_raw_outputs_land_next_to_the_redacted_report(self):
+        # The nightly workflow publishes these two file names as its only record
+        # of what the model actually answered, so a rename has to break here
+        # rather than quietly ship an artifact with no candidate text in it.
+        responses = {
+            case["id"]: {
+                "content": "答案是3",
+                "finish_reason": "stop",
+                "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            }
+            for case in self.dataset["cases"]
+        }
+        report = build_report(
+            self.dataset,
+            self.profile,
+            responses,
+            {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            write_report_files(report, output_dir, include_raw_outputs=True)
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                {
+                    "result.json",
+                    "summary.md",
+                    "junit.xml",
+                    "result.raw.json",
+                    "label_candidates.jsonl",
+                },
+            )
+            raw = json.loads((output_dir / "result.raw.json").read_text())
+            public = json.loads((output_dir / "result.json").read_text())
+            candidates = [
+                json.loads(line)
+                for line in (output_dir / "label_candidates.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+
+        self.assertEqual({case["final_answer"] for case in raw["cases"]}, {"答案是3"})
+        self.assertNotIn("final_answer", public["cases"][0])
+        self.assertEqual({row["candidate_answer"] for row in candidates}, {"答案是3"})
+
 
 if __name__ == "__main__":
     unittest.main()

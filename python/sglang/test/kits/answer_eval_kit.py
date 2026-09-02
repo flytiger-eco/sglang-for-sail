@@ -2,8 +2,8 @@
 
 The module intentionally does not call an embedding model or an LLM judge.  It
 implements the L0/L1 gate and emits records that can be labelled later.  The
-public report is redacted by default; raw candidate answers are only written
-when the caller explicitly opts in to a private output.
+schema-stable report is redacted; raw candidate answers are written next to it
+as separate files when the caller opts in through ``include_raw_outputs``.
 """
 
 from __future__ import annotations
@@ -1571,6 +1571,11 @@ def write_report_files(
     )
     (output_dir / "junit.xml").write_bytes(render_junit(public_report))
     if include_raw_outputs:
+        # ensure_ascii escapes candidate text rather than encoding it, which is
+        # what keeps these two writes from raising UnicodeEncodeError when a
+        # model emits an unpaired surrogate.  Any JSON reader (jq, json.load)
+        # decodes the escapes back into the original characters, so the files
+        # stay readable.
         (output_dir / "label_candidates.jsonl").write_text(
             "".join(
                 json.dumps(item, ensure_ascii=True) + "\n"
@@ -1578,7 +1583,7 @@ def write_report_files(
             ),
             encoding="utf-8",
         )
-        (output_dir / "result.private.json").write_text(
+        (output_dir / "result.raw.json").write_text(
             json.dumps(report, ensure_ascii=True, indent=2) + "\n",
             encoding="utf-8",
         )
@@ -1595,6 +1600,25 @@ def checkpoint_config_digest(model_path: str) -> str | None:
     return digest.hexdigest()
 
 
+def _sglang_version() -> str | None:
+    """Return the version the imported sglang reports for itself.
+
+    Distribution metadata is not trustworthy for this package: CI imports
+    sglang from the checked-out tree while ``importlib.metadata`` resolves
+    whichever dist-info comes first on ``sys.path``, which is how run
+    33587101038 recorded ``0.0.0`` for a 0.5.13 image.  ``__version__``
+    describes the package that was actually imported, so prefer it.
+    """
+
+    try:
+        import sglang
+
+        version = sglang.__version__
+    except Exception:
+        return None
+    return version if isinstance(version, str) and version else None
+
+
 def _installed_package_versions() -> dict[str, str | None]:
     versions = {}
     for package in ("sglang", "sglang-kernel", "torch", "transformers"):
@@ -1602,6 +1626,7 @@ def _installed_package_versions() -> dict[str, str | None]:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
             versions[package] = None
+    versions["sglang"] = _sglang_version() or versions["sglang"]
     return versions
 
 
