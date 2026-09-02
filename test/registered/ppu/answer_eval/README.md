@@ -345,6 +345,15 @@ evidence step also tried to delete the NAS copy after taking it, which fails wit
 `EPERM` on every file and turned the step red on both entries even though the copy
 and the upload had succeeded. The step now only reads.
 
+The fix was re-run on the same cluster (run `33690732486`, both entries against
+`2f48d78`): `Collect Answer evidence` and `Upload Answer evidence` are green on
+both, each artifact carries all five files, and the verdicts and failing cases are
+unchanged — 7/10 and 9/10, same case ids. The remaining red step is the suite's own
+assertion, which is the intended signal. That run also shows what the warm buys:
+with the checkpoints already in the node's page cache from the run above, the jobs
+took 10m56s and 18m15s instead of 19m06s and 26m39s. The table above keeps the cold
+numbers, since a nightly on an otherwise idle board is the cold case.
+
 ## Results and annotations
 
 The workflow uploads `result.json` (rule findings and provenance), `summary.md`,
