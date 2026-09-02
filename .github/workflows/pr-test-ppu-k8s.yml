@@ -97,7 +97,9 @@ jobs:
       !failure() &&
       !cancelled() &&
       needs.check-changes.outputs.changes_exist == 'true'
-    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -150,7 +152,9 @@ jobs:
       !failure() &&
       !cancelled() &&
       needs.check-changes.outputs.changes_exist == 'true'
-    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -203,7 +207,9 @@ jobs:
       !failure() &&
       !cancelled() &&
       needs.check-changes.outputs.changes_exist == 'true'
-    runs-on: [self-hosted, k8s-runner-group-cpu-flytiger]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 120
     steps:
       - name: Checkout code
