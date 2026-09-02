@@ -4422,6 +4422,16 @@ class ServerArgs:
 
     def _handle_ppu_backends(self):
         if is_ppu():
+            # K3's Blackwell-specific fused paths cannot run on PPU. Keep the
+            # flags false so an explicit environment setting cannot re-enable them.
+            for field in (
+                envs.SGLANG_K3_AR_FUSION,
+                envs.SGLANG_K3_SP_COLLECTIVE,
+                envs.SGLANG_K3_SP_ATTN_RES,
+                envs.SGLANG_K3_GEMM_AR,
+                envs.SGLANG_K3_FUSED_FRONT,
+            ):
+                field.set(False)
             # acext init
             if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
                 envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
