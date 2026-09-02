@@ -56,6 +56,7 @@ else:
     from sgl_kernel.gemm import (
         awq_dequantize,
         fp8_scaled_mm,
+        gptq_dequantize,
         gptq_gemm,
         gptq_shuffle,
         int8_scaled_mm,
