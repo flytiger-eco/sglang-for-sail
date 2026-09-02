@@ -152,8 +152,10 @@ everything around the test differs, while the test itself does not:
   report travels over the NAS that both sides mount: the pod writes
   `SGLANG_PPU_ANSWER_RESULTS_DIR` under `/mnt/wl_nas/devops/<run>/<job>/`, and the
   orchestration shell reads the same bytes under `/wl_nas/...`, publishes the
-  summary, uploads the artifact, and then discards the NAS copy. The suite name is
-  part of the path because `github.job` is identical for every matrix entry.
+  summary, and uploads the artifact. The suite name is part of the path because
+  `github.job` is identical for every matrix entry. The NAS copy is read and left
+  in place rather than moved: the pod writes as root and the orchestration shell
+  is a different, non-root uid, so it can read those bytes but not unlink them.
 - **Provenance.** `base_image_digest` is null on this path. The orchestration
   shell has no Docker daemon to inspect the image with and the pod cannot see its
   own digest, so only the image tag is recorded; on the bare-metal line the digest
@@ -177,8 +179,8 @@ hardware reported. Board type alone would not have settled the capacity in any
 case: the internal plans schedule this same board in both a 96GiB and a 144GiB
 configuration.
 
-No verdict has been recorded on this board yet, so the measured baseline below is
-ZW810E only.
+Both entries have since been run on this board; see
+[Measured baseline (ZW-M890P)](#measured-baseline-zw-m890p).
 
 ## Relation to the internal test cases
 
@@ -291,6 +293,57 @@ tolerance nor the severity classification is changed, so `12.5` and a rounded
 accepts changes the judging standard, so `dataset/answer_cases_zh_v1.json` is now
 `revision` 2: an annotation keyed on revision 1 must not be read as though it had
 been produced under the current standard.
+
+## Measured baseline (ZW-M890P)
+
+Both entries were run on the btv1.5 cluster on 2026-09-02 (run `33645062958`,
+eight ZW-M890P devices of 144GiB, torch 2.11.0). The verdicts are the ZW810E ones,
+case for case:
+
+| Suite | Passed | Failing cases | Job | Test body |
+| --- | --- | --- | --- | --- |
+| `nightly-answer-1-ppu` (27B, 1 device) | 7/10 | `deepseek-letter-count`, `henan-bordering-provinces`, `red-ball-probability` | 19m06s | 399.8s |
+| `nightly-answer-8-ppu` (397B, 8 devices) | 9/10 | `deepseek-letter-count` | 26m39s | 770.6s |
+
+The failing answers are the ZW810E ones character for character: `2`, the same
+Henan sentence that includes 湖南 and omits 河北, and `12.5` from the 27B; `3` from
+the 397B. At temperature 0 that is the expected result, and it is what makes the
+board a controlled variable — the `-144g` configs differ from the `-96g` ones only
+in `hardware` and, for the 397B, in the checkpoint's parent directory, and no
+verdict moves.
+
+Where the board does show is in capacity and in the cost of using it:
+
+| Phase | 27B, 1 device | 397B, 8 devices | ZW810E counterpart |
+| --- | --- | --- | --- |
+| Free device memory before load | 143.98 GB | 143.07 GB per rank | 96GiB board |
+| Weight load | 3.8s, 51.05 GB | 21.9–24.5s, 47.35 GB per rank | 11.4s / 66s |
+| CUDA graph capture | 260.8s, batch sizes to 78 | 621.7s | 87.5s (to 33) / ~3m |
+| Launch to ready | 6m08s | 12m23s | 2m43s / — |
+| `max_total_num_tokens` | 616103 | 2467089 | 264724 / — |
+| Free memory after capture | 20.88 GB | 26.33 GB | 13.96 GB / 18.66 GB |
+
+Capture is what grew. `mem_fraction_static` is a fraction, so the same 0.85 on a
+144GiB device yields a KV pool 2.3× the 96GiB one; the captured batch-size list is
+capped by `max_running_requests`, which the pool raises from 33 to 78 for the 27B,
+and every additional batch size is another graph to record. Both entries still
+reach ready far inside the 1800s `startup_timeout_seconds` and finish well inside
+their step budgets. The 397B also reproduces the soft `Scheduler watchdog timeout`
+record on each of the eight ranks during capture that the ZW810E line reports, with
+the same absence of consequence.
+
+Dependency install and the page-cache warm cannot be separated in these logs — the
+pod's stdout reaches the runner in batches, so both land on a single flush
+timestamp — but together they account for roughly 12 minutes for the 27B and 13.5
+for the 397B. The install dominates: a worker pod starts from the base image and
+re-resolves the wheels on every run, where the bare-metal host reuses what is
+already installed. That is a property of the K8s path rather than of the test, and
+it is why this line's pod budgets are 120 and 330 minutes.
+
+One defect surfaced in that run and is fixed in the workflow as it now stands: the
+evidence step also tried to delete the NAS copy after taking it, which fails with
+`EPERM` on every file and turned the step red on both entries even though the copy
+and the upload had succeeded. The step now only reads.
 
 ## Results and annotations
 

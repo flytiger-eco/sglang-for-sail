@@ -145,28 +145,23 @@ jobs:
         # register_ppu_ci declares. No --continue-on-error: an Answer-quality
         # regression must turn the run red.
 
+      # The NAS copy is read, not moved. The pod writes the report as root and
+      # this orchestration shell is a different, non-root uid, so it can read
+      # those bytes but cannot unlink them: an rm here fails with EPERM on every
+      # file and turns this step red even when the suite passed, which is how the
+      # first run on this board reported itself. What is left behind is the
+      # report itself, a few kilobytes under a directory this run already owns
+      # exclusively, and it doubles as the on-cluster record once the artifact
+      # has expired.
       - name: Collect Answer evidence
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          # The path is built from the run identifiers above; refuse to touch
-          # anything that does not look like it before removing a directory.
-          case "${ANSWER_RESULTS_ON_RUNNER}" in
-            /wl_nas/devops/*/answer-results/*) ;;
-            *)
-              echo "::error::unexpected results path ${ANSWER_RESULTS_ON_RUNNER}"
-              exit 1
-              ;;
-          esac
           destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
           mkdir -p "${destination}"
           if [ -d "${ANSWER_RESULTS_ON_RUNNER}" ]; then
             cp -a "${ANSWER_RESULTS_ON_RUNNER}/." "${destination}/"
-            # The NAS is shared and this workflow is the only reader of its own
-            # run directory, so it also owns discarding it once the evidence is
-            # in the workspace and on its way to the artifact.
-            rm -rf "${ANSWER_RESULTS_ON_RUNNER}"
           else
             echo "::warning::the pod produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
           fi
