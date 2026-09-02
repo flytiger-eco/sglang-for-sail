@@ -66,6 +66,32 @@ def poll_and_all_reduce_pp(
     ]
 
 
+def _resolve_speculative_backend_type(server_args: ServerArgs, backend_name: str):
+    backend_type = (
+        server_args.speculative_draft_attention_backend
+        if server_args.speculative_draft_attention_backend
+        else getattr(server_args, backend_name)
+    )
+    if backend_type is None:
+        backend_type = server_args.attention_backend
+    return backend_type
+
+
+def dsa_seed_backend_enabled(server_args: ServerArgs) -> bool:
+    decode_backend = _resolve_speculative_backend_type(
+        server_args, "decode_attention_backend"
+    )
+    draft_extend_backend_name = (
+        "decode_attention_backend"
+        if server_args.speculative_attention_mode == "decode"
+        else "prefill_attention_backend"
+    )
+    draft_extend_backend = _resolve_speculative_backend_type(
+        server_args, draft_extend_backend_name
+    )
+    return decode_backend in ("dsa", "nsa") and draft_extend_backend in ("dsa", "nsa")
+
+
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
