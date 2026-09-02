@@ -49,14 +49,14 @@ class _RepoInfo:
         self.source_dir = third_party / name
 
 
-_CUTLASS_REPO = _RepoInfo(
-    name="cutlass",
-    git_repository="https://github.com/NVIDIA/cutlass",
-    git_tag="57e3cfb47a2d9e0d46eb6335c3dc411498efa198",
+_ACTLIZE_REPO = _RepoInfo(
+    name="actlize",
+    git_repository="https://github.com/t-head/actlize",
+    git_tag="129651181ed29ec3d3e61df786f610926b739a9b",
     git_shallow=False,
 )
 
-_CUTLASS_DIR = Path(os.environ.get("SGL_KERNEL_CUTLASS_DIR", _CUTLASS_REPO.source_dir))
+_ACTLIZE_DIR = Path(os.environ.get("SGL_KERNEL_ACTLIZE_DIR", _ACTLIZE_REPO.source_dir))
 
 _FLASHINFER_REPO = _RepoInfo(
     name="flashinfer",
@@ -73,7 +73,7 @@ _TRITON_REPO = _RepoInfo(
 )
 
 ALL_REPOS = [
-    _CUTLASS_REPO,
+    _ACTLIZE_REPO,
     _FLASHINFER_REPO,
     _TRITON_REPO,
 ]
@@ -167,12 +167,12 @@ if enable_fp8:
 include_dirs = [
     str(root / "include"),
     str(root / "csrc"),
-    str(_CUTLASS_DIR / "include"),
-    str(_CUTLASS_DIR / "tools" / "util" / "include"),
+    str(_ACTLIZE_DIR / "include"),
+    str(_ACTLIZE_DIR / "tools" / "util" / "include"),
     str(_FLASHINFER_REPO.source_dir / "include"),
     str(_FLASHINFER_REPO.source_dir / "csrc"),
-    str(_CUTLASS_DIR / "examples" / "77_blackwell_fmha"),
-    str(_CUTLASS_DIR / "examples" / "common"),
+    str(_ACTLIZE_DIR / "examples" / "77_blackwell_fmha"),
+    str(_ACTLIZE_DIR / "examples" / "common"),
 ]
 
 # ======================= Source Files ======================= #
