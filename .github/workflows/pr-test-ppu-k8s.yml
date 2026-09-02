@@ -121,7 +121,13 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
           command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
             cd /workspace/source &&
             bash scripts/ci/ppu/ppu_install_dependency.sh &&
             git config --global --add safe.directory /workspace/source &&
@@ -141,12 +147,7 @@ jobs:
 
   # ==================== Stage B: 1-GPU body ==================== #
   stage-b-test-1-gpu-ppu:
-    needs:
-      [
-        check-changes,
-        build-sgl-kernel,
-        stage-a-test-1-gpu-ppu,
-      ]
+    needs: [check-changes, build-sgl-kernel]
     if: |
       always() &&
       !failure() &&
@@ -176,7 +177,13 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
+          node_selector: "board-type=OAM-810E"
           command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
             cd /workspace/source &&
             bash scripts/ci/ppu/ppu_install_dependency.sh &&
             git config --global --add safe.directory /workspace/source &&
@@ -196,12 +203,7 @@ jobs:
 
   # ==================== Stage C: 2-GPU ==================== #
   stage-c-test-2-gpu-ppu:
-    needs:
-      [
-        check-changes,
-        build-sgl-kernel,
-        stage-b-test-1-gpu-ppu,
-      ]
+    needs: [check-changes, build-sgl-kernel]
     if: |
       always() &&
       !failure() &&
@@ -231,7 +233,13 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 2
+          node_selector: "board-type=OAM-810E"
           command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
             export CUDA_VISIBLE_DEVICES=0,1 &&
             cd /workspace/source &&
             bash scripts/ci/ppu/ppu_install_dependency.sh &&
