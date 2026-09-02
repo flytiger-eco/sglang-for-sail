@@ -14,7 +14,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 #include <type_traits>
 
 namespace sglang {
@@ -40,7 +40,7 @@ SGL_DEVICE float GroupReduceMax(float val) {
 SGL_DEVICE float silu(const float& val) {
   // Match the AOT v2 kernel: tanh-based silu on SM100+ (Blackwell), exp-based
   // elsewhere, so the fused silu+mul output stays bit-identical to the AOT op.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 1000)
   float half = 0.5f * val;
   float t = __tanhf(half);
   return half * (1.0f + t);
@@ -51,7 +51,7 @@ SGL_DEVICE float silu(const float& val) {
 
 SGL_DEVICE float2 fmul2_rn(float2 a, float2 b) {
   // Match the AOT v2 kernel: use the __fmul2_rn intrinsic on SM100+.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 1000)
   return __fmul2_rn(a, b);
 #else
   float2 result;
@@ -322,14 +322,14 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
         int4 output_buf;
         if constexpr (std::is_same_v<DST_DTYPE, fp8_e4m3_t>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+          const auto output_buf_ptr = reinterpret_cast<__hg_fp8x2_storage_t*>(&output_buf);
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
             float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
             float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
             outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
             outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __HG_SATFINITE, __HG_E4M3);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);

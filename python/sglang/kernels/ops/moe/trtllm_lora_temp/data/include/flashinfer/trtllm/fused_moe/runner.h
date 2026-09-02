@@ -160,7 +160,7 @@ public:
            int32_t *numNonExitingCtas, batchedGemm::trtllm::gen::Dtype dtypeElt,
            batchedGemm::trtllm::gen::Dtype dtypeBias,
            bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-           RoutingMethodType routingMethodType, cudaStream_t stream,
+           RoutingMethodType routingMethodType, hggcStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits,
            bool normTopkProb = true, int16_t *routing_replay_out = nullptr);
 
@@ -257,7 +257,7 @@ public:
            int32_t *ptrNumNonExitingCtas, int32_t *ptrTotalNumPaddedTokens,
            int32_t *ptrCtaIdxXyToBatchIdx, int32_t *ptrCtaIdxXyToMnLimit,
            void *bmm1Workspace, bool useRoutingScalesOnInput, int device,
-           cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           hggcStream_t stream, int32_t configIndex, bool enable_pdl);
 
 private:
   friend class MoE::Runner;
@@ -306,7 +306,7 @@ public:
            int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t *ptrNumNonExitingCtas, int32_t *ptrTotalNumPaddedTokens,
            int32_t *ptrCtaIdxXyToBatchIdx, int32_t *ptrCtaIdxXyToMnLimit,
-           void *bmm2Workspace, int device, cudaStream_t stream,
+           void *bmm2Workspace, int device, hggcStream_t stream,
            int32_t configIndex, bool enable_pdl);
 
 private:
@@ -493,7 +493,7 @@ public:
          bool usePerChannelScalingGemm2 = false);
 
   void run(MoERunnerArgs const &args, MoEWorkspace const &workspace, int device,
-           cudaStream_t stream, int64_t configIndex, bool enable_pdl);
+           hggcStream_t stream, int64_t configIndex, bool enable_pdl);
 
   [[nodiscard]] std::tuple<int32_t, int32_t>
   getWorkspaceSizeInBytes(MoERunnerArgs const &args, int64_t configIndex) const;

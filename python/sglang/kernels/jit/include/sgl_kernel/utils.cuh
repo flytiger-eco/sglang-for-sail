@@ -24,10 +24,10 @@
 #include <cstddef>
 #include <type_traits>
 #ifndef USE_ROCM
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -35,21 +35,21 @@
 #ifndef __grid_constant__
 #define __grid_constant__
 #endif
-using cudaError_t = hipError_t;
-using cudaStream_t = hipStream_t;
-using cudaLaunchConfig_t = hipLaunchConfig_t;
-using cudaLaunchAttribute = hipLaunchAttribute;
-inline constexpr auto cudaSuccess = hipSuccess;
-#define cudaStreamPerThread hipStreamPerThread
-#define cudaGetErrorString hipGetErrorString
-#define cudaGetLastError hipGetLastError
-#define cudaLaunchKernel hipLaunchKernel
-#define cudaMemcpyAsync hipMemcpyAsync
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define cudaDeviceGetAttribute hipDeviceGetAttribute
-#define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
-#define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
+using hggcError_t = hipError_t;
+using hggcStream_t = hipStream_t;
+using hggcLaunchConfig_t = hipLaunchConfig_t;
+using hggcLaunchAttribute = hipLaunchAttribute;
+inline constexpr auto hggcSuccess = hipSuccess;
+#define hggcStreamPerThread hipStreamPerThread
+#define hggcGetErrorString hipGetErrorString
+#define hggcGetLastError hipGetLastError
+#define hggcLaunchKernel hipLaunchKernel
+#define hggcMemcpyAsync hipMemcpyAsync
+#define hggcMemcpyHostToDevice hipMemcpyHostToDevice
+#define hggcMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define hggcDeviceGetAttribute hipDeviceGetAttribute
+#define hggcDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
+#define hggcDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #endif
 
 namespace sglang {
@@ -57,17 +57,17 @@ namespace sglang {
 #ifndef USE_ROCM
 using fp32_t = float;
 using fp16_t = __half;
-using bf16_t = __nv_bfloat16;
-using fp8_e4m3_t = __nv_fp8_e4m3;
-using fp8_e5m2_t = __nv_fp8_e5m2;
+using bf16_t = __ppu_bfloat16;
+using fp8_e4m3_t = __hg_fp8_e4m3;
+using fp8_e5m2_t = __hg_fp8_e5m2;
 
 using fp32x2_t = float2;
 using fp16x2_t = __half2;
-using bf16x2_t = __nv_bfloat162;
-using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
-using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
-using fp8x4_e4m3_t = __nv_fp8x4_e4m3;
-using fp8x4_e5m2_t = __nv_fp8x4_e5m2;
+using bf16x2_t = __ppu_bfloat162;
+using fp8x2_e4m3_t = __hg_fp8x2_e4m3;
+using fp8x2_e5m2_t = __hg_fp8x2_e5m2;
+using fp8x4_e4m3_t = __hg_fp8x4_e4m3;
+using fp8x4_e5m2_t = __hg_fp8x4_e5m2;
 
 using fp32x4_t = float4;
 #else
@@ -116,12 +116,12 @@ namespace device {
 #if !defined(SGL_CUDA_ARCH)
 #error "SGL_CUDA_ARCH is not defined. JIT compilation must inject -DSGL_CUDA_ARCH via load_jit()."
 #endif
-#if defined(__CUDA_ARCH__)
+#if defined(COMPATIBLE_ARCH)
 static_assert(
-    __CUDA_ARCH__ == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
+    COMPATIBLE_ARCH == SGL_CUDA_ARCH, "SGL_CUDA_ARCH mismatch: injected arch flag does not match device target");
 #endif
 #define SGL_ARCH_HOPPER_OR_GREATER (SGL_CUDA_ARCH >= 900)
-#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (CUDA_VERSION >= 12090))
+#define SGL_ARCH_BLACKWELL_OR_GREATER ((SGL_CUDA_ARCH >= 1000) && (COMPATIBLE_VERSION >= 12090))
 #else  // USE_ROCM
 #define SGL_ARCH_HOPPER_OR_GREATER 0
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
@@ -224,7 +224,7 @@ SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
 
 /// PTX pragma that lets the compiler spill registers into shared memory
 SGL_DEVICE void enable_smem_spilling() {
-#if defined(__CUDA_ARCH__) && CUDART_VERSION >= 13000
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_RT_VERSION >= 13000
   asm(".pragma \"enable_smem_spilling\";");
 #endif
 }
@@ -236,16 +236,16 @@ namespace host {
 /**
  * \brief Check the CUDA error code and panic with location info on failure.
  */
-inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
-  if (error != ::cudaSuccess) {
+inline void RuntimeDeviceCheck(::hggcError_t error, DebugInfo location = {}) {
+  if (error != ::hggcSuccess) {
     [[unlikely]];
-    host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
+    host::panic(location, "CUDA error: ", ::hggcGetErrorString(error));
   }
 }
 
 /// \brief Check the last CUDA error (calls `cudaGetLastError`).
 inline void RuntimeDeviceCheck(DebugInfo location = {}) {
-  return RuntimeDeviceCheck(::cudaGetLastError(), location);
+  return RuntimeDeviceCheck(::hggcGetLastError(), location);
 }
 
 /**
@@ -282,7 +282,7 @@ struct LaunchKernel {
   explicit LaunchKernel(
       dim3 grid_dim,
       dim3 block_dim,
-      cudaStream_t stream,
+      hggcStream_t stream,
       std::size_t dynamic_shared_mem_bytes = 0,
       DebugInfo location = {}) noexcept
       : m_config(s_make_config(grid_dim, block_dim, stream, dynamic_shared_mem_bytes)), m_location(location) {}
@@ -290,8 +290,8 @@ struct LaunchKernel {
   LaunchKernel(const LaunchKernel&) = delete;
   LaunchKernel& operator=(const LaunchKernel&) = delete;
 
-  static auto resolve_device(DLDevice device) -> cudaStream_t {
-    return static_cast<cudaStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
+  static auto resolve_device(DLDevice device) -> hggcStream_t {
+    return static_cast<hggcStream_t>(::TVMFFIEnvGetStream(device.device_type, device.device_id));
   }
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
@@ -301,7 +301,7 @@ struct LaunchKernel {
 #else
     if (enabled) {
       auto& attr = m_attrs[m_config.numAttrs++];
-      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.id = hggcLaunchAttributeProgrammaticStreamSerialization;
       attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
     }
@@ -314,7 +314,7 @@ struct LaunchKernel {
     (void)cluster_dim;
 #else
     auto& attr = m_attrs[m_config.numAttrs++];
-    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.id = hggcLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
 #endif
@@ -347,7 +347,7 @@ struct LaunchKernel {
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
 #else
-    RuntimeDeviceCheck(::cudaLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
+    RuntimeDeviceCheck(::hggcLaunchKernelEx(&m_config, kernel, std::forward<Args>(args)...), m_location);
 #endif
   }
 
@@ -360,9 +360,9 @@ struct LaunchKernel {
   static auto s_make_config(  // Make a config for kernel launch
       dim3 grid_dim,
       dim3 block_dim,
-      cudaStream_t stream,
-      std::size_t smem) -> cudaLaunchConfig_t {
-    auto config = ::cudaLaunchConfig_t{};
+      hggcStream_t stream,
+      std::size_t smem) -> hggcLaunchConfig_t {
+    auto config = ::hggcLaunchConfig_t{};
     config.gridDim = grid_dim;
     config.blockDim = block_dim;
     config.dynamicSmemBytes = smem;
@@ -371,17 +371,17 @@ struct LaunchKernel {
     return config;
   }
 
-  cudaLaunchConfig_t m_config;
+  hggcLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  hggcLaunchAttribute m_attrs[2];
 };
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
 // bound to the user's `if`, not to the macro's.
 #define CHECK_CUDA(COND)                                              \
-  if (const auto error = (COND); error == ::cudaSuccess) [[likely]] { \
+  if (const auto error = (COND); error == ::hggcSuccess) [[likely]] { \
   } else                                                              \
-    host::Error() << "CUDA error: " << ::cudaGetErrorString(error) << ". "
+    host::Error() << "CUDA error: " << ::hggcGetErrorString(error) << ". "
 
 }  // namespace host
 

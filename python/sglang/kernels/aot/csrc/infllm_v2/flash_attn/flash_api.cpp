@@ -160,7 +160,7 @@ void set_params_fprop(
   params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 }
 
-void run_mha_fwd_split_stage1(Flash_fwd_params& params, cudaStream_t stream) {
+void run_mha_fwd_split_stage1(Flash_fwd_params& params, hggcStream_t stream) {
   FP16_SWITCH(!params.is_bf16, [&] {
     HEADDIM_SWITCH(params.d, [&] {
       BOOL_SWITCH(params.is_causal, Is_causal, [&] {

@@ -10,7 +10,7 @@ namespace sglang {
 
 namespace device::marlin {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 template <int const num_threads, int const num_bits>
 __global__ void awq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr, int size_k, int size_n) {
@@ -222,16 +222,16 @@ void awq_marlin_repack(
 
   // Get device attributes
   int blocks = 0;
-  cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, device.device_id);
+  hggcDeviceGetAttribute(&blocks, hggcDevAttrMultiProcessorCount, device.device_id);
 
   int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device.device_id);
+  hggcDeviceGetAttribute(&max_shared_mem, hggcDevAttrMaxSharedMemoryPerBlockOptin, device.device_id);
   RuntimeCheck(max_shared_mem > 0, "max_shared_mem must be > 0");
 
   // Dispatch based on num_bits
   if (num_bits == 4) {
-    cudaFuncSetAttribute(
-        awq_marlin_repack_kernel<repack_threads, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+    hggcFuncSetAttribute(
+        awq_marlin_repack_kernel<repack_threads, 4>, hggcFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
     LaunchKernel(blocks, repack_threads, stream, max_shared_mem)(
         awq_marlin_repack_kernel<repack_threads, 4>,
         b_q_weight_ptr,
@@ -239,8 +239,8 @@ void awq_marlin_repack(
         static_cast<int>(size_k),
         static_cast<int>(size_n));
   } else if (num_bits == 8) {
-    cudaFuncSetAttribute(
-        awq_marlin_repack_kernel<repack_threads, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+    hggcFuncSetAttribute(
+        awq_marlin_repack_kernel<repack_threads, 8>, hggcFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
     LaunchKernel(blocks, repack_threads, stream, max_shared_mem)(
         awq_marlin_repack_kernel<repack_threads, 8>,
         b_q_weight_ptr,

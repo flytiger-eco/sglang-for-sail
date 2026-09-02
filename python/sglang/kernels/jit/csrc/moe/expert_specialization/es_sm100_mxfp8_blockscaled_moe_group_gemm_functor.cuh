@@ -1,7 +1,7 @@
 #pragma once
 #include "cute/tensor.hpp"
 #include "es_sm100_mxfp8_blockscaled_moe_group_gemm_traits.cuh"
-#include <cuda.h>
+#include <hggc.h>
 
 namespace expert_specialization {
 

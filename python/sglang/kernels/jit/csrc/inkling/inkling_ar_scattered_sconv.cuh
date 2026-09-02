@@ -50,7 +50,7 @@
 #include "inkling_ar_barrier.cuh"
 #include <bit>
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -120,10 +120,10 @@ struct ArScatteredSconvParams {
 // pass 2 re-reads the just-written bf16 residual (register pressure would
 // otherwise spill the conv phases).
 __device__ __forceinline__ void ss_fused_norm_tail(const ArScatteredSconvParams& p) {
-  const auto* outp = static_cast<const __nv_bfloat16*>(p.out_local);
-  const auto* gamma = static_cast<const __nv_bfloat16*>(p.norm_gamma);
-  auto* resid = static_cast<__nv_bfloat16*>(p.norm_residual);
-  auto* nout = static_cast<__nv_bfloat16*>(p.norm_out);
+  const auto* outp = static_cast<const __ppu_bfloat16*>(p.out_local);
+  const auto* gamma = static_cast<const __ppu_bfloat16*>(p.norm_gamma);
+  auto* resid = static_cast<__ppu_bfloat16*>(p.norm_residual);
+  auto* nout = static_cast<__ppu_bfloat16*>(p.norm_out);
   const uint32_t hvecs = p.H / kSsVecElems;
   __shared__ float red[32];
   for (uint32_t r = blockIdx.x; r < p.T; r += gridDim.x) {
@@ -133,9 +133,9 @@ __device__ __forceinline__ void ss_fused_norm_tail(const ArScatteredSconvParams&
       const uint32_t c = i * kSsVecElems;
       const uint4 ov = *reinterpret_cast<const uint4*>(outp + base + c);
       const uint4 rv = *reinterpret_cast<const uint4*>(resid + base + c);
-      const auto* oh = reinterpret_cast<const __nv_bfloat16*>(&ov);
-      const auto* rh = reinterpret_cast<const __nv_bfloat16*>(&rv);
-      __nv_bfloat16 sb[kSsVecElems];
+      const auto* oh = reinterpret_cast<const __ppu_bfloat16*>(&ov);
+      const auto* rh = reinterpret_cast<const __ppu_bfloat16*>(&rv);
+      __ppu_bfloat16 sb[kSsVecElems];
 #pragma unroll
       for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
         const float v = __bfloat162float(oh[j]) + __bfloat162float(rh[j]);
@@ -165,9 +165,9 @@ __device__ __forceinline__ void ss_fused_norm_tail(const ArScatteredSconvParams&
       const uint32_t c = i * kSsVecElems;
       const uint4 sv = *reinterpret_cast<const uint4*>(resid + base + c);
       const uint4 gv = *reinterpret_cast<const uint4*>(gamma + c);
-      const auto* sh = reinterpret_cast<const __nv_bfloat16*>(&sv);
-      const auto* gh = reinterpret_cast<const __nv_bfloat16*>(&gv);
-      __nv_bfloat16 ob[kSsVecElems];
+      const auto* sh = reinterpret_cast<const __ppu_bfloat16*>(&sv);
+      const auto* gh = reinterpret_cast<const __ppu_bfloat16*>(&gv);
+      __ppu_bfloat16 ob[kSsVecElems];
 #pragma unroll
       for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
         ob[j] = __float2bfloat16(__bfloat162float(sh[j]) * rms * __bfloat162float(gh[j]));
@@ -181,23 +181,23 @@ __device__ __forceinline__ void ss_fused_norm_tail(const ArScatteredSconvParams&
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
 __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_constant__ ArScatteredSconvParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
 
   // ---- Weight staging: the [Hc, W] taps into smem BEFORE the entry
   // barrier, so the global loads complete under the barrier spin. Stage B
   // otherwise re-loads every channel's taps per (token, cvec) item.
-  __shared__ alignas(16) __nv_bfloat16 smem_w[kSsMaxHcW];
+  __shared__ alignas(16) __ppu_bfloat16 smem_w[kSsMaxHcW];
   // Tile stage: the reduced (halo + tile) lives in smem in chunked mode --
   // the global x_scratch round-trip (plus its 4x tap-read amplification,
   // ~60 MB/site at T=4096) was eating the fusion's HBM savings vs the
   // unfused chain. Phase 3 re-ld_reduces its few rows instead.
-  __shared__ alignas(16) __nv_bfloat16 smem_x[kSsTileElems];
+  __shared__ alignas(16) __ppu_bfloat16 smem_x[kSsTileElems];
   // Below ~8K tokens the per-block copy outweighs the stage-B savings
   // (little barrier spin to hide it under); read taps from global there.
   const bool use_smw = p.T >= 8192;
   if (use_smw) {
-    const auto* wg = static_cast<const __nv_bfloat16*>(p.weight);
+    const auto* wg = static_cast<const __ppu_bfloat16*>(p.weight);
     const uint32_t nw = p.Hc * W;
     for (uint32_t i = threadIdx.x; i < nw; i += blockDim.x)
       smem_w[i] = wg[i];
@@ -216,10 +216,10 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
   const auto* cu = static_cast<const int64_t*>(p.cu);
   const auto* safe_idx = static_cast<const int64_t*>(p.safe_idx);
   const auto* cmask = static_cast<const bool*>(p.cache_mask);
-  const auto* cache = static_cast<const __nv_bfloat16*>(p.cache);
-  const auto* mc_in = static_cast<const __nv_bfloat16*>(p.mc_in);
-  auto* mc_out = static_cast<__nv_bfloat16*>(p.mc_out);
-  auto* scratch = static_cast<__nv_bfloat16*>(p.x_scratch);
+  const auto* cache = static_cast<const __ppu_bfloat16*>(p.cache);
+  const auto* mc_in = static_cast<const __ppu_bfloat16*>(p.mc_in);
+  auto* mc_out = static_cast<__ppu_bfloat16*>(p.mc_out);
+  auto* scratch = static_cast<__ppu_bfloat16*>(p.x_scratch);
 
   // PIPELINED CHUNK design (single grid sync). The conv's only cross-thread
   // dependency is W-1 token rows backward, so each CTA owns a contiguous
@@ -258,7 +258,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
         const uint32_t t = h0 + i / ncv;
         const uint32_t cv = i % ncv;
         const uint32_t lc = (c0 + cv) * kSsVecElems;
-        const __nv_bfloat16* addr = mc_in + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + lc;
+        const __ppu_bfloat16* addr = mc_in + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + lc;
         uint4 v;
         asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -307,7 +307,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
 
         // Taps from the smem stage: one 8B vector per channel at W == 4
         // (vs 32 scalar global loads), converted at use.
-        const auto* wsrc = use_smw ? smem_w : static_cast<const __nv_bfloat16*>(p.weight);
+        const auto* wsrc = use_smw ? smem_w : static_cast<const __ppu_bfloat16*>(p.weight);
         uint2 wraw[kSsVecElems];
 #pragma unroll
         for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
@@ -317,13 +317,13 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
         }
         const auto wt = [&](int j, int w) -> float {
           if constexpr (W == 4) {
-            return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&wraw[j])[w]);
+            return __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&wraw[j])[w]);
           } else {
             return __bfloat162float(wsrc[(lc + j) * W + w]);
           }
         };
-        const auto* xh = reinterpret_cast<const __nv_bfloat16*>(&xt);
-        __nv_bfloat162 yb[4];
+        const auto* xh = reinterpret_cast<const __ppu_bfloat16*>(&xt);
+        __ppu_bfloat162 yb[4];
 #pragma unroll
         for (int j2 = 0; j2 < 4; ++j2) {
           float yj[2];
@@ -334,7 +334,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
             float acc = xj * wt(j, W1);
 #pragma unroll
             for (int k = 0; k < W1; ++k) {
-              const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&taps[k])[j]);
+              const float tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&taps[k])[j]);
               acc += tap * wt(j, k);
             }
             if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
@@ -344,7 +344,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
           yb[j2] = __floats2bfloat162_rn(yj[0], yj[1]);
         }
 
-        __nv_bfloat16* addr = mc_out + static_cast<int64_t>(t) * p.H + col;
+        __ppu_bfloat16* addr = mc_out + static_cast<int64_t>(t) * p.H + col;
         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(addr),
                      "r"(reinterpret_cast<const uint32_t*>(yb)[0]),
                      "r"(reinterpret_cast<const uint32_t*>(yb)[1]),
@@ -378,7 +378,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
   // (sequence, channel-vec) pair -- RAW-safe load-all-then-store, mirroring
   // the standalone kernel.
   {
-    auto* wcache = static_cast<__nv_bfloat16*>(p.cache);
+    auto* wcache = static_cast<__ppu_bfloat16*>(p.cache);
     const auto* cip = static_cast<const int32_t*>(p.ci);
     const auto* hinit = static_cast<const bool*>(p.has_init);
     // Full-width mode spans all H columns (replicated cache -- every rank
@@ -413,7 +413,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
               // are per-CTA and scratch wasn't written. Re-reduce from the
               // pristine multicast input (bit-identical on a fixed
               // NVSwitch topology).
-              const __nv_bfloat16* a3 = mc_in + row * p.H + mcol;
+              const __ppu_bfloat16* a3 = mc_in + row * p.H + mcol;
               asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                            : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                            : "l"(a3));
@@ -453,7 +453,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
               const int64_t row = trows[static_cast<int64_t>(b) * W1 + w];
               uint4 nv;
               if (p.full_update || (p.use_tile && !p.need_scratch)) {
-                const __nv_bfloat16* a4 = mc_in + row * p.H + mcol;
+                const __ppu_bfloat16* a4 = mc_in + row * p.H + mcol;
                 asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                              : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                              : "l"(a4));
@@ -488,7 +488,7 @@ uint32_t ss_max_resident_blocks(Kernel kernel, uint32_t block_size, DLDevice dev
     if (auto it = cache.find(key); it != cache.end()) return it->second;
   }
   int sm_count = 0;
-  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device.device_id);
+  hggcDeviceGetAttribute(&sm_count, hggcDevAttrMultiProcessorCount, device.device_id);
   RuntimeCheck(sm_count > 0, "failed to query multiProcessorCount");
   const uint32_t bps = runtime::get_blocks_per_sm(kernel, block_size);
   RuntimeCheck(bps > 0, "kernel has zero occupancy at block_size ", block_size);
@@ -512,7 +512,7 @@ uint32_t ss_max_resident_blocks(Kernel kernel, uint32_t block_size, DLDevice dev
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
 __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_constant__ ArScatteredSconvParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
 
   if constexpr (kPerBlockBarrier) {
@@ -525,11 +525,11 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
   const auto* cu = static_cast<const int64_t*>(p.cu);
   const auto* safe_idx = static_cast<const int64_t*>(p.safe_idx);
   const auto* cmask = static_cast<const bool*>(p.cache_mask);
-  const auto* cache = static_cast<const __nv_bfloat16*>(p.cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.weight);
-  const auto* mc_in = static_cast<const __nv_bfloat16*>(p.mc_in);
-  auto* mc_out = static_cast<__nv_bfloat16*>(p.mc_out);
-  auto* scratch = static_cast<__nv_bfloat16*>(p.x_scratch);
+  const auto* cache = static_cast<const __ppu_bfloat16*>(p.cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.weight);
+  const auto* mc_in = static_cast<const __ppu_bfloat16*>(p.mc_in);
+  auto* mc_out = static_cast<__ppu_bfloat16*>(p.mc_out);
+  auto* scratch = static_cast<__ppu_bfloat16*>(p.x_scratch);
 
   const uint32_t cvecs = p.Hc / kSsVecElems;
   const uint32_t L = p.chunk_rows;  // walk length (tokens per thread-walk)
@@ -553,7 +553,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
     for (int k = 0; k < W1; ++k) {
       const int64_t pos = static_cast<int64_t>(tw0) - (W1 - k);
       if (pos >= 0) {
-        const __nv_bfloat16* a = mc_in + pos * p.H + col;
+        const __ppu_bfloat16* a = mc_in + pos * p.H + col;
         asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                      : "=r"(taps[k].x), "=r"(taps[k].y), "=r"(taps[k].z), "=r"(taps[k].w)
                      : "l"(a));
@@ -572,7 +572,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
     }
     const auto wt = [&](int j, int w) -> float {
       if constexpr (W == 4) {
-        return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&wraw[j])[w]);
+        return __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&wraw[j])[w]);
       } else {
         return __bfloat162float(wp[(lc + j) * W + w]);
       }
@@ -582,7 +582,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
       const int sq = si[t];
       const int64_t bos = cu[sq];
       uint4 v;
-      const __nv_bfloat16* a = mc_in + static_cast<int64_t>(t) * p.H + col;
+      const __ppu_bfloat16* a = mc_in + static_cast<int64_t>(t) * p.H + col;
       asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                    : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
                    : "l"(a));
@@ -605,8 +605,8 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
         }
       }
 
-      const auto* xh = reinterpret_cast<const __nv_bfloat16*>(&v);
-      __nv_bfloat162 yb[4];
+      const auto* xh = reinterpret_cast<const __ppu_bfloat16*>(&v);
+      __ppu_bfloat162 yb[4];
 #pragma unroll
       for (int j2 = 0; j2 < 4; ++j2) {
         float yj[2];
@@ -617,7 +617,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
           float acc = xj * wt(j, W1);
 #pragma unroll
           for (int k = 0; k < W1; ++k) {
-            const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&tp[k])[j]);
+            const float tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&tp[k])[j]);
             acc += tap * wt(j, k);
           }
           if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
@@ -626,7 +626,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
         }
         yb[j2] = __floats2bfloat162_rn(yj[0], yj[1]);
       }
-      __nv_bfloat16* ao = mc_out + static_cast<int64_t>(t) * p.H + col;
+      __ppu_bfloat16* ao = mc_out + static_cast<int64_t>(t) * p.H + col;
       asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(ao),
                    "r"(reinterpret_cast<const uint32_t*>(yb)[0]),
                    "r"(reinterpret_cast<const uint32_t*>(yb)[1]),
@@ -652,7 +652,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
     inkling_ar::grid_local_sync(p.state);
   }
   {
-    auto* wcache = static_cast<__nv_bfloat16*>(p.cache);
+    auto* wcache = static_cast<__ppu_bfloat16*>(p.cache);
     const auto* cip = static_cast<const int32_t*>(p.ci);
     const auto* hinit = static_cast<const bool*>(p.has_init);
     // Full-width mode spans all H columns (replicated cache); see the
@@ -682,7 +682,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
           uint4 nv;
           if (qlen >= W1 - w) {
             const int64_t row = cu[b + 1] - W1 + w;
-            const __nv_bfloat16* a3 = mc_in + row * p.H + mcol;
+            const __ppu_bfloat16* a3 = mc_in + row * p.H + mcol;
             asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                          : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                          : "l"(a3));
@@ -716,7 +716,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
             for (int w = 0; w < W1; ++w) {
               const int64_t row = trows[static_cast<int64_t>(b) * W1 + w];
               uint4 nv;
-              const __nv_bfloat16* a4 = mc_in + row * p.H + mcol;
+              const __ppu_bfloat16* a4 = mc_in + row * p.H + mcol;
               asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                            : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                            : "l"(a4));
@@ -976,7 +976,7 @@ struct ColDecodeParams {
 
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, int VPT>
 __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __grid_constant__ ColDecodeParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
   const uint32_t vecs = p.H / kSsVecElems;    // full-row vecs (norm)
@@ -1000,8 +1000,8 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
   const bool valid = ci != kSsPadSlot;
   const int slot = valid ? ci : 0;
   const float cm = static_cast<const bool*>(p.cache_mask)[t] ? 1.0f : 0.0f;
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.weight);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.weight);
   uint4 hist[W1];
   if (own) {
     const int64_t cb = static_cast<int64_t>(slot) * p.cache_stride_slot + olc;
@@ -1025,7 +1025,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
   for (int i = 0; i < VPT; ++i) {
     if (act[i]) {
       res_raw[i] = *reinterpret_cast<const uint4*>(
-          static_cast<const __nv_bfloat16*>(p.residual_in) + static_cast<int64_t>(t) * p.H + c0[i]);
+          static_cast<const __ppu_bfloat16*>(p.residual_in) + static_cast<int64_t>(t) * p.H + c0[i]);
     }
   }
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -1034,16 +1034,16 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
   inkling_ar::block_system_barrier<kNumGPU>(p.state, p.flag_ptrs, p.rank);
 
   // ---- 2. reduce own columns + conv from registers + broadcast ----
-  const auto* mc_in = static_cast<const __nv_bfloat16*>(p.mc_in);
-  auto* mc_out = static_cast<__nv_bfloat16*>(p.mc_out);
+  const auto* mc_in = static_cast<const __ppu_bfloat16*>(p.mc_in);
+  auto* mc_out = static_cast<__ppu_bfloat16*>(p.mc_out);
   uint4 xb;
   if (own) {
-    const __nv_bfloat16* a = mc_in + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + olc;
+    const __ppu_bfloat16* a = mc_in + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + olc;
     asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                  : "=r"(xb.x), "=r"(xb.y), "=r"(xb.z), "=r"(xb.w)
                  : "l"(a));
-    const auto* xh = reinterpret_cast<const __nv_bfloat16*>(&xb);
-    __nv_bfloat162 yb[4];
+    const auto* xh = reinterpret_cast<const __ppu_bfloat16*>(&xb);
+    __ppu_bfloat162 yb[4];
 #pragma unroll
     for (int j2 = 0; j2 < 4; ++j2) {
       float yj[2];
@@ -1053,7 +1053,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
         const float xj = __bfloat162float(xh[j]);
         const auto wt = [&](int w) -> float {
           if constexpr (W == 4) {
-            return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&wr8[j])[w]);
+            return __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&wr8[j])[w]);
           } else {
             return __bfloat162float(wp[(olc + j) * W + w]);
           }
@@ -1061,7 +1061,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
         float acc = xj * wt(W1);
 #pragma unroll
         for (int k = 0; k < W1; ++k) {
-          const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&hist[k])[j]);
+          const float tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&hist[k])[j]);
           acc += tap * cm * wt(k);
         }
         if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
@@ -1070,7 +1070,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
       }
       yb[j2] = __floats2bfloat162_rn(yj[0], yj[1]);
     }
-    __nv_bfloat16* ao = mc_out + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + olc;
+    __ppu_bfloat16* ao = mc_out + static_cast<int64_t>(t) * p.H + p.rank * p.Hc + olc;
     asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(ao),
                  "r"(reinterpret_cast<const uint32_t*>(yb)[0]),
                  "r"(reinterpret_cast<const uint32_t*>(yb)[1]),
@@ -1103,15 +1103,15 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
   inkling_ar::block_system_barrier<kNumGPU>(p.state, p.flag_ptrs, p.rank);
 
   // ---- 5. full-row add+RMSNorm (flashinfer semantics) ----
-  const auto* outp = static_cast<const __nv_bfloat16*>(p.out_local);
+  const auto* outp = static_cast<const __ppu_bfloat16*>(p.out_local);
   float r[VPT][kSsVecElems];
   float sumsq = 0.0f;
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
     const uint4 ov4 = *reinterpret_cast<const uint4*>(outp + static_cast<int64_t>(t) * p.H + c0[i]);
-    const auto* oh = reinterpret_cast<const __nv_bfloat16*>(&ov4);
-    const auto* rh = reinterpret_cast<const __nv_bfloat16*>(&res_raw[i]);
+    const auto* oh = reinterpret_cast<const __ppu_bfloat16*>(&ov4);
+    const auto* rh = reinterpret_cast<const __ppu_bfloat16*>(&res_raw[i]);
 #pragma unroll
     for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
       const float v = __bfloat162float(oh[j]) + __bfloat162float(rh[j]);
@@ -1138,13 +1138,13 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
   }
   __syncthreads();
   const float inv = s_inv;
-  const auto* gw = static_cast<const __nv_bfloat16*>(p.norm_weight);
-  auto* ro = static_cast<__nv_bfloat16*>(p.residual_out) + static_cast<int64_t>(t) * p.H;
-  auto* ho = static_cast<__nv_bfloat16*>(p.hs_out) + static_cast<int64_t>(t) * p.H;
+  const auto* gw = static_cast<const __ppu_bfloat16*>(p.norm_weight);
+  auto* ro = static_cast<__ppu_bfloat16*>(p.residual_out) + static_cast<int64_t>(t) * p.H;
+  auto* ho = static_cast<__ppu_bfloat16*>(p.hs_out) + static_cast<int64_t>(t) * p.H;
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
-    __nv_bfloat162 rr[4], hh2[4];
+    __ppu_bfloat162 rr[4], hh2[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float g0 = __bfloat162float(gw[c0[i] + 2 * j]);
@@ -1307,7 +1307,7 @@ struct ArBandedSconvParams {
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, bool kPerBlockBarrier>
 __global__
 __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_constant__ ArBandedSconvParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem path is bf16-only");
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>, "multimem path is bf16-only");
   constexpr int W1 = W - 1;
   const bool scattered = p.Hc < p.H;
 
@@ -1318,8 +1318,8 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
     const uint32_t pstride = gridDim.x * blockDim.x;
     const uint32_t ptid = blockIdx.x * blockDim.x + threadIdx.x;
     const auto* sidx = static_cast<const int64_t*>(p.safe_idx);
-    const auto* csh = static_cast<const __nv_bfloat16*>(p.cache);
-    auto* wst = static_cast<__nv_bfloat16*>(p.mc_wstage);
+    const auto* csh = static_cast<const __ppu_bfloat16*>(p.cache);
+    auto* wst = static_cast<__ppu_bfloat16*>(p.mc_wstage);
     const uint32_t cvecs = p.Hc / kSsVecElems;
     const uint32_t items = p.B * W1 * cvecs;
     for (uint32_t it = ptid; it < items; it += pstride) {
@@ -1327,7 +1327,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
       const uint32_t w = (it / cvecs) % W1;
       const uint32_t lc = (it % cvecs) * kSsVecElems;
       const uint4 v = *reinterpret_cast<const uint4*>(&csh[sidx[b] * p.cache_stride_slot + w * p.cache_stride_w + lc]);
-      __nv_bfloat16* addr = wst + (static_cast<int64_t>(b) * W1 + w) * p.H + p.rank * p.Hc + lc;
+      __ppu_bfloat16* addr = wst + (static_cast<int64_t>(b) * W1 + w) * p.H + p.rank * p.Hc + lc;
       asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(addr),
                    "r"(v.x),
                    "r"(v.y),
@@ -1356,18 +1356,18 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
   const auto* cu = static_cast<const int64_t*>(p.cu);
   const auto* safe_idx = static_cast<const int64_t*>(p.safe_idx);
   const auto* cmask = static_cast<const bool*>(p.cache_mask);
-  auto* cache = static_cast<__nv_bfloat16*>(p.cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.weight);
-  const auto* mc_in = static_cast<const __nv_bfloat16*>(p.mc_in);
-  auto* mc_out = static_cast<__nv_bfloat16*>(p.mc_out);
-  auto* scratch = static_cast<__nv_bfloat16*>(p.scratch);
+  auto* cache = static_cast<__ppu_bfloat16*>(p.cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.weight);
+  const auto* mc_in = static_cast<const __ppu_bfloat16*>(p.mc_in);
+  auto* mc_out = static_cast<__ppu_bfloat16*>(p.mc_out);
+  auto* scratch = static_cast<__ppu_bfloat16*>(p.scratch);
 
   // ---- Phase 1: contiguous streamed reduce of [halo_lo, t_hi) x H ----
   {
     const uint32_t v0 = halo_lo * vrow;
     const uint32_t v1 = t_hi * vrow;
     for (uint32_t i = v0 + gtid; i < v1; i += stride) {
-      const __nv_bfloat16* addr = mc_in + static_cast<int64_t>(i) * kSsVecElems;
+      const __ppu_bfloat16* addr = mc_in + static_cast<int64_t>(i) * kSsVecElems;
       uint4 v;
       asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                    : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
@@ -1389,7 +1389,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
       if (p.debug_phase == 2) {  // raw copy broadcast: no conv/taps/weights
         const int64_t srow2 = static_cast<int64_t>(t) - base;
         const uint4 xr = *reinterpret_cast<const uint4*>(scratch + (srow2 * vrow + i % vrow) * kSsVecElems);
-        __nv_bfloat16* addr2 = mc_out + static_cast<int64_t>(t) * p.H + c;
+        __ppu_bfloat16* addr2 = mc_out + static_cast<int64_t>(t) * p.H + c;
         asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(addr2),
                      "r"(xr.x),
                      "r"(xr.y),
@@ -1407,7 +1407,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
 
       // Scattered mode: prefix taps come from the staged full-width windows
       // (published pre-barrier); the persistent cache holds only Hc columns.
-      const auto* wstage = static_cast<const __nv_bfloat16*>(p.wstage);
+      const auto* wstage = static_cast<const __ppu_bfloat16*>(p.wstage);
       uint4 taps[W1];
 #pragma unroll
       for (int k = 0; k < W1; ++k) {
@@ -1434,8 +1434,8 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
           wt[j][w] = __bfloat162float(wp[static_cast<int64_t>(c + j) * W + w]);
         }
       }
-      const auto* xh = reinterpret_cast<const __nv_bfloat16*>(&xt);
-      __nv_bfloat162 yb[4];
+      const auto* xh = reinterpret_cast<const __ppu_bfloat16*>(&xt);
+      __ppu_bfloat162 yb[4];
 #pragma unroll
       for (int j2 = 0; j2 < 4; ++j2) {
         float yj[2];
@@ -1446,7 +1446,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
           float acc = xj * wt[j][W1];
 #pragma unroll
           for (int k = 0; k < W1; ++k) {
-            const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&taps[k])[j]);
+            const float tap = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&taps[k])[j]);
             acc += tap * wt[j][k];
           }
           if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
@@ -1456,7 +1456,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
         yb[j2] = __floats2bfloat162_rn(yj[0], yj[1]);
       }
 
-      __nv_bfloat16* addr = mc_out + static_cast<int64_t>(t) * p.H + c;
+      __ppu_bfloat16* addr = mc_out + static_cast<int64_t>(t) * p.H + c;
       asm volatile("multimem.st.relaxed.sys.global.v4.bf16x2 [%0], {%1,%2,%3,%4};" ::"l"(addr),
                    "r"(reinterpret_cast<const uint32_t*>(yb)[0]),
                    "r"(reinterpret_cast<const uint32_t*>(yb)[1]),
@@ -1504,7 +1504,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
           uint4 nv;
           if (qlen >= W1 - w) {
             const int64_t row = cu[b + 1] - W1 + w;
-            const __nv_bfloat16* addr = mc_in + row * p.H + c;
+            const __ppu_bfloat16* addr = mc_in + row * p.H + c;
             asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                          : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                          : "l"(addr));
@@ -1530,7 +1530,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
           for (int w = 0; w < W1; ++w) {
             const int64_t row = trows[static_cast<int64_t>(b) * W1 + w];
             uint4 nv;
-            const __nv_bfloat16* addr = mc_in + row * p.H + c;
+            const __ppu_bfloat16* addr = mc_in + row * p.H + c;
             asm volatile("multimem.ld_reduce.relaxed.sys.global.add.v4.bf16x2 {%0,%1,%2,%3}, [%4];"
                          : "=r"(nv.x), "=r"(nv.y), "=r"(nv.z), "=r"(nv.w)
                          : "l"(addr));
@@ -1712,7 +1712,7 @@ struct SsconvNormDecodeParams {
 template <typename DType, uint32_t kNumGPU, int W, bool USE_SILU, bool USE_RESIDUAL, int VPT>
 __global__
 __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __grid_constant__ SsconvNormDecodeParams p) {
-  static_assert(std::is_same_v<DType, __nv_bfloat16>, "multimem push path is bf16-only");
+  static_assert(std::is_same_v<DType, __ppu_bfloat16>, "multimem push path is bf16-only");
   constexpr int W1 = W - 1;
   const uint32_t t = blockIdx.x;
   const uint32_t vecs = p.D / kSsVecElems;
@@ -1734,10 +1734,10 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
   const bool valid = ci != kSsPadSlot;
   const int slot_id = valid ? ci : 0;
   const float cm = static_cast<const bool*>(p.cache_mask)[t] ? 1.0f : 0.0f;
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
-  const auto* wp = static_cast<const __nv_bfloat16*>(p.conv_weight);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
+  const auto* wp = static_cast<const __ppu_bfloat16*>(p.conv_weight);
   uint4 hist_raw[VPT][W1];  // MY shard's window (mine[i] lanes only)
-  __nv_bfloat16 wtaps[VPT][kSsVecElems][W];
+  __ppu_bfloat16 wtaps[VPT][kSsVecElems][W];
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
@@ -1765,9 +1765,9 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
 
   // ---- 1. push: this rank's partial row + its window shard ----
   asm volatile("griddepcontrol.wait;" ::: "memory");
-  const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
-  auto* slot = static_cast<__nv_bfloat16*>(p.mc_stage) + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D;
-  auto* wslot = static_cast<__nv_bfloat16*>(p.mc_wstage) + static_cast<uint64_t>(t) * W1 * p.D;
+  const auto* in_row = static_cast<const __ppu_bfloat16*>(p.in) + t * p.in_stride_t;
+  auto* slot = static_cast<__ppu_bfloat16*>(p.mc_stage) + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D;
+  auto* wslot = static_cast<__ppu_bfloat16*>(p.mc_wstage) + static_cast<uint64_t>(t) * W1 * p.D;
   uint4 res_raw[VPT];
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
@@ -1793,7 +1793,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
       }
     }
     res_raw[i] = *reinterpret_cast<const uint4*>(
-        static_cast<const __nv_bfloat16*>(p.residual_in) + t * p.res_in_stride_t + c0[i]);
+        static_cast<const __ppu_bfloat16*>(p.residual_in) + t * p.res_in_stride_t + c0[i]);
   }
 
   // ---- 2. per-block barrier: all ranks' row-t pushes have landed locally ----
@@ -1802,8 +1802,8 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
 
   float r[VPT][kSsVecElems];
   float sumsq = 0.0f;
-  const auto* stage = static_cast<const __nv_bfloat16*>(p.stage);
-  const auto* wstage = static_cast<const __nv_bfloat16*>(p.wstage) + static_cast<uint64_t>(t) * W1 * p.D;
+  const auto* stage = static_cast<const __ppu_bfloat16*>(p.stage);
+  const auto* wstage = static_cast<const __ppu_bfloat16*>(p.wstage) + static_cast<uint64_t>(t) * W1 * p.D;
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
@@ -1815,7 +1815,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
 #pragma unroll
     for (uint32_t rr = 0; rr < kNumGPU; ++rr) {
       const uint4 d = *reinterpret_cast<const uint4*>(stage + (static_cast<uint64_t>(rr) * p.T + t) * p.D + c0[i]);
-      const auto* h2 = reinterpret_cast<const __nv_bfloat162*>(&d);
+      const auto* h2 = reinterpret_cast<const __ppu_bfloat162*>(&d);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const float2 f = __bfloat1622float2(h2[j]);
@@ -1823,7 +1823,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
         xf[2 * j + 1] += f.y;
       }
     }
-    __nv_bfloat162 xb2[4];
+    __ppu_bfloat162 xb2[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j)
       xb2[j] = __floats2bfloat162_rn(xf[2 * j], xf[2 * j + 1]);
@@ -1837,11 +1837,11 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
     float y[kSsVecElems];
 #pragma unroll
     for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
-      const float xj = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(xb2)[j]);
+      const float xj = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(xb2)[j]);
       float acc = 0.0f;
 #pragma unroll
       for (int w = 0; w < W1; ++w) {
-        const float h = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&taps[w])[j]);
+        const float h = __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&taps[w])[j]);
         acc += h * cm * __bfloat162float(wtaps[i][j][w]);
       }
       acc += xj * __bfloat162float(wtaps[i][j][W1]);
@@ -1879,7 +1879,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
 #pragma unroll
     for (int j = 0; j < static_cast<int>(kSsVecElems); ++j) {
       const float yb = __bfloat162float(__float2bfloat16_rn(y[j]));
-      r[i][j] = yb + __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&res_raw[i])[j]);
+      r[i][j] = yb + __bfloat162float(reinterpret_cast<const __ppu_bfloat16*>(&res_raw[i])[j]);
       sumsq += r[i][j] * r[i][j];
     }
   }
@@ -1905,13 +1905,13 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
   __syncthreads();
   const float inv = s_inv;
 
-  const auto* gw = static_cast<const __nv_bfloat16*>(p.norm_weight);
-  auto* res_out = static_cast<__nv_bfloat16*>(p.residual_out) + t * p.res_out_stride_t;
-  auto* hs_out = static_cast<__nv_bfloat16*>(p.hs_out) + t * p.hs_stride_t;
+  const auto* gw = static_cast<const __ppu_bfloat16*>(p.norm_weight);
+  auto* res_out = static_cast<__ppu_bfloat16*>(p.residual_out) + t * p.res_out_stride_t;
+  auto* hs_out = static_cast<__ppu_bfloat16*>(p.hs_out) + t * p.hs_stride_t;
 #pragma unroll
   for (int i = 0; i < VPT; ++i) {
     if (!act[i]) continue;
-    __nv_bfloat162 ro[4], ho[4];
+    __ppu_bfloat162 ro[4], ho[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const float g0 = __bfloat162float(gw[c0[i] + 2 * j]);

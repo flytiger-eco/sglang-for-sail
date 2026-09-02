@@ -21,7 +21,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 
@@ -53,36 +53,36 @@ __global__ void update_sconv_cache_kernel(const __grid_constant__ UpdateSconvPar
   if (c0 >= static_cast<int>(p.D)) return;
 
   const bool hs = static_cast<const bool*>(p.has_state)[b];
-  const auto* xp = static_cast<const __nv_bfloat16*>(p.x);
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
+  const auto* xp = static_cast<const __ppu_bfloat16*>(p.x);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
   const int cw = static_cast<int>(p.cache_stride_w);
   const int64_t slot_base = static_cast<int64_t>(ci) * p.cache_stride_slot + c0;
 
   // Load all old-state rows into registers first (RAW-safe against the writes below).
-  __nv_bfloat162 old_reg[W1];
+  __ppu_bfloat162 old_reg[W1];
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
-    old_reg[w] = *reinterpret_cast<const __nv_bfloat162*>(&cp[slot_base + static_cast<int64_t>(w) * cw]);
+    old_reg[w] = *reinterpret_cast<const __ppu_bfloat162*>(&cp[slot_base + static_cast<int64_t>(w) * cw]);
   }
-  const __nv_bfloat162 zero = __float2bfloat162_rn(0.0f);
+  const __ppu_bfloat162 zero = __float2bfloat162_rn(0.0f);
 
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
-    __nv_bfloat162 nv;
+    __ppu_bfloat162 nv;
     if (qlen >= (W1 - w)) {
       // current token from x: index end - W1 + w >= start >= 0
       const int x_idx = end - W1 + w;
-      nv = *reinterpret_cast<const __nv_bfloat162*>(&xp[static_cast<int64_t>(x_idx) * p.x_stride_t + c0]);
+      nv = *reinterpret_cast<const __ppu_bfloat162*>(&xp[static_cast<int64_t>(x_idx) * p.x_stride_t + c0]);
     } else {
       // shifted state old_cache[w + qlen] (w+qlen in [0, W1)), gated by has_state
-      __nv_bfloat162 shift = zero;
+      __ppu_bfloat162 shift = zero;
 #pragma unroll
       for (int src = 0; src < W1; ++src) {
         if (src == w + qlen) shift = old_reg[src];
       }
       nv = hs ? shift : zero;
     }
-    *reinterpret_cast<__nv_bfloat162*>(&cp[slot_base + static_cast<int64_t>(w) * cw]) = nv;
+    *reinterpret_cast<__ppu_bfloat162*>(&cp[slot_base + static_cast<int64_t>(w) * cw]) = nv;
   }
 }
 

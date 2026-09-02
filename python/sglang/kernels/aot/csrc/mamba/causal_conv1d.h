@@ -5,8 +5,8 @@
 // adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d.h
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct ConvParamsBase {
@@ -67,7 +67,7 @@ struct ConvParamsBase {
 
 
 #ifndef USE_ROCM
-    #include <cuda_bf16.h>
+    #include <hggc_bf16.h>
 
     template<typename T>
     __device__ inline T shuffle_xor(T val, int offset) {

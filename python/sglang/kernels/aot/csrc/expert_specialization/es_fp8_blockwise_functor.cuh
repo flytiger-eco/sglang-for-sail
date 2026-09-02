@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda.h>
+#include <hggc.h>
 
 #include <iostream>
 

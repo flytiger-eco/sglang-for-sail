@@ -406,7 +406,7 @@ struct Sm100FmhaMlaKernelTmaWarpspecialized {
     return (sizeof(ElementAcc) * D_latent + sizeof(ElementLSE)) * H * split_kv * B;
   }
   static Status initialize_workspace(
-      Arguments const& /*args*/, void* /*ws*/, cudaStream_t /*stream*/) {
+      Arguments const& /*args*/, void* /*ws*/, hggcStream_t /*stream*/) {
     return Status::kSuccess;
   }
 

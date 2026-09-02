@@ -722,7 +722,7 @@ torch::Tensor int8_scaled_mm(
       }
     }
   } else if (sm_version == 90) {
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12000
     // cutlass 3.x
     if (out_dtype == torch::kBFloat16) {
       sm90_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);

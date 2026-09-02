@@ -29,7 +29,7 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 __device__ __forceinline__ float silu(const float& val) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 1000)
   float half = 0.5f * val;
   float t = __tanhf(half);
   return half * (1.0f + t);
@@ -39,7 +39,7 @@ __device__ __forceinline__ float silu(const float& val) {
 }
 
 __device__ float2 fmul2_rn(float2 a, float2 b) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 1000)
   return __fmul2_rn(a, b);
 #else
   float2 result;
@@ -270,8 +270,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  cudaGridDependencySynchronize();
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 900
+  hggcGridDependencySynchronize();
 #endif
 
   SCHEDULER::execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
@@ -372,8 +372,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
 
         if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+          const auto output_buf_ptr = reinterpret_cast<__hg_fp8x2_storage_t*>(&output_buf);
+          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__hg_fp8x2_storage_t));
           static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
 
 #pragma unroll
@@ -384,7 +384,7 @@ __global__ void per_token_group_quant_8bit_kernel(
             outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
             outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
 
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __HG_SATFINITE, __HG_E4M3);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
@@ -402,8 +402,8 @@ __global__ void per_token_group_quant_8bit_kernel(
             output_buf);
       });
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  cudaTriggerProgrammaticLaunchCompletion();
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 900
+  hggcTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -435,7 +435,7 @@ void sgl_per_token_group_quant_8bit_v2(
 
   const int num_local_experts = masked_layout ? input.size(0) : 1;
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   auto dst_type = output_q.scalar_type();
 
@@ -452,17 +452,17 @@ void sgl_per_token_group_quant_8bit_v2(
     SCHEDULER::compute_exec_config(                                                                                  \
         THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
                                                                                                                      \
-    cudaLaunchConfig_t config;                                                                                       \
+    hggcLaunchConfig_t config;                                                                                       \
     config.gridDim = grid;                                                                                           \
     config.blockDim = block;                                                                                         \
     config.dynamicSmemBytes = 0;                                                                                     \
     config.stream = stream;                                                                                          \
-    cudaLaunchAttribute attrs[1];                                                                                    \
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;                                                \
+    hggcLaunchAttribute attrs[1];                                                                                    \
+    attrs[0].id = hggcLaunchAttributeProgrammaticStreamSerialization;                                                \
     attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();                                         \
     config.numAttrs = 1;                                                                                             \
     config.attrs = attrs;                                                                                            \
-    cudaLaunchKernelEx(                                                                                              \
+    hggcLaunchKernelEx(                                                                                              \
         &config,                                                                                                     \
         per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>,    \
         static_cast<T*>(input.data_ptr()),                                                                           \

@@ -11,7 +11,7 @@
 #include "static_switch.h"
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
 #define ARCH_SUPPORTS_FLASH
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
@@ -112,7 +112,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 }
 
 template <typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+void run_flash_fwd(Flash_fwd_params& params, hggcStream_t stream) {
   constexpr size_t smem_size = Kernel_traits::kSmemSize;
   // printf("smem_size = %d\n", smem_size);
 
@@ -156,7 +156,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
               // int(ReturnSoftmaxConst), int(Is_dropout)); auto kernel = &flash_fwd_kernel<Kernel_traits, false,
               // Is_causal, false, true, true, false>;
               if (smem_size >= 48 * 1024) {
-                C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
               }
               // int ctas_per_sm;
               // cudaError status_ = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -173,7 +173,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 }
 
 template <typename Kernel_traits, bool Is_causal>
-void run_flash_splitkv_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+void run_flash_splitkv_fwd(Flash_fwd_params& params, hggcStream_t stream) {
   static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
   static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
   constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -208,7 +208,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params& params, cudaStream_t stream) {
                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                 if (smem_size >= 48 * 1024) {
-                  C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                  C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                 }
                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -255,7 +255,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 }
 
 template <typename Kernel_traits, bool Is_causal>
-void run_flash_splitkv_fwd_stage1(Flash_fwd_params& params, cudaStream_t stream) {
+void run_flash_splitkv_fwd_stage1(Flash_fwd_params& params, hggcStream_t stream) {
   static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
   static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
   constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -293,7 +293,7 @@ void run_flash_splitkv_fwd_stage1(Flash_fwd_params& params, cudaStream_t stream)
                      IsEvenMNConst && !Append_KV && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128,
                      IsEvenKConst, Is_softcap, Split, Append_KV > ;
                 if (smem_size >= 48 * 1024) {
-                  C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                  C10_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                 }
                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -307,7 +307,7 @@ void run_flash_splitkv_fwd_stage1(Flash_fwd_params& params, cudaStream_t stream)
 }
 
 template <typename T, int Headdim, bool Is_causal>
-void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_dispatch(Flash_fwd_params& params, hggcStream_t stream) {
   if (params.blockmask == nullptr) {
     constexpr static int kBlockM = 64;  // Fixed for all head dimensions
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,

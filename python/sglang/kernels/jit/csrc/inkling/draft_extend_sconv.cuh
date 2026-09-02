@@ -19,7 +19,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 
@@ -47,18 +47,18 @@ __global__ void draft_extend_kernel(const __grid_constant__ DraftExtendParams p)
   if (c0 >= static_cast<int>(p.D)) return;
 
   const int ci = static_cast<const int32_t*>(p.cache_indices)[b];
-  const auto* hp = static_cast<const __nv_bfloat16*>(p.hidden);
-  auto* cp = static_cast<__nv_bfloat16*>(p.cache);
+  const auto* hp = static_cast<const __ppu_bfloat16*>(p.hidden);
+  auto* cp = static_cast<__ppu_bfloat16*>(p.cache);
   const int cw = static_cast<int>(p.cache_stride_w);
   const int T = static_cast<int>(p.T);
   const int b_off = b * T;  // hidden row base for this sequence
   const int64_t src_slot_base = static_cast<int64_t>(ci) * p.cache_stride_slot + c0;
 
   // Initial state -> registers (RAW-safe against the cache[ci] writes below).
-  __nv_bfloat162 init_reg[W1];
+  __ppu_bfloat162 init_reg[W1];
 #pragma unroll
   for (int w = 0; w < W1; ++w) {
-    init_reg[w] = *reinterpret_cast<const __nv_bfloat162*>(&cp[src_slot_base + static_cast<int64_t>(w) * cw]);
+    init_reg[w] = *reinterpret_cast<const __ppu_bfloat162*>(&cp[src_slot_base + static_cast<int64_t>(w) * cw]);
   }
 
   // Select the window at `at` from the virtual stream and write it to cache[dst_base].
@@ -66,7 +66,7 @@ __global__ void draft_extend_kernel(const __grid_constant__ DraftExtendParams p)
 #pragma unroll
     for (int w = 0; w < W1; ++w) {
       const int pos = at + w;
-      __nv_bfloat162 v;
+      __ppu_bfloat162 v;
       if (pos < W1) {
         v = init_reg[0];
 #pragma unroll
@@ -75,9 +75,9 @@ __global__ void draft_extend_kernel(const __grid_constant__ DraftExtendParams p)
         }
       } else {
         const int row = b_off + (pos - W1);
-        v = *reinterpret_cast<const __nv_bfloat162*>(&hp[static_cast<int64_t>(row) * p.hs_stride_t + c0]);
+        v = *reinterpret_cast<const __ppu_bfloat162*>(&hp[static_cast<int64_t>(row) * p.hs_stride_t + c0]);
       }
-      *reinterpret_cast<__nv_bfloat162*>(&cp[dst_base + static_cast<int64_t>(w) * cw]) = v;
+      *reinterpret_cast<__ppu_bfloat162*>(&cp[dst_base + static_cast<int64_t>(w) * cw]) = v;
     }
   };
 

@@ -29,7 +29,7 @@ limitations under the License.
 
 #include "config.h"
 #include "helpers.h"
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 
 // using namespace cute must be at global scope BEFORE including dense_fp8 headers
 // (they use bare Tensor, make_tensor etc. from cute namespace). That mid-file
@@ -176,7 +176,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
   };
 
   struct TmaParams_t {
-    CUtensorMap tensor_map_O;
+    HGtensorMap tensor_map_O;
   };
 
   // ========================================================================
@@ -185,7 +185,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
   template <typename TMAParamType>
   static __device__ __forceinline__ void
   devfunc(const SparseMlaQ8Kv8PrefillParams& params, const TMAParamType& tma_params) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+#if (defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int q_h_idx = blockIdx.x % (params.h_q / B_H);
     const int s_q_idx = blockIdx.x / (params.h_q / B_H);
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
@@ -1018,26 +1018,26 @@ struct SparseMlaQ8Kv8PrefillKernel {
     KU_ASSERT(params.topk > 0);
     KU_ASSERT(params.h_q % B_H == 0);
 
-    CUtensorMap tensor_map_O;
+    HGtensorMap tensor_map_O;
     {
       uint64_t size[3] = {(uint64_t)D_V, (uint64_t)params.h_q, (uint64_t)params.s_q};
       uint64_t stride[2] = {D_V * sizeof(bf16), D_V * params.h_q * sizeof(bf16)};
       uint32_t box_size[3] = {64, B_H, 1};
       uint32_t elem_stride[3] = {1, 1, 1};
-      CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+      HGresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(hgTensorMapEncodeTiled)(
           &tensor_map_O,
-          CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+          HGtensorMapDataType::HG_TENSOR_MAP_DATA_TYPE_BFLOAT16,
           3,
           params.out,
           size,
           stride,
           box_size,
           elem_stride,
-          CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-          CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+          HGtensorMapInterleave::HG_TENSOR_MAP_INTERLEAVE_NONE,
+          HGtensorMapSwizzle::HG_TENSOR_MAP_SWIZZLE_128B,
+          HGtensorMapL2promotion::HG_TENSOR_MAP_L2_PROMOTION_NONE,
+          HGtensorMapFloatOOBfill::HG_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      KU_ASSERT(res == HGresult::HGGC_SUCCESS);
     }
 
     TmaParams_t tma_p = {tensor_map_O};
@@ -1047,7 +1047,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
         TmaParams_t>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    KU_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
     cutlass::ClusterLaunchParams launch_params = {
         dim3((params.h_q / B_H) * params.s_q, 1, 1), dim3(NUM_THREADS, 1, 1), dim3(1, 1, 1), smem_size, params.stream};

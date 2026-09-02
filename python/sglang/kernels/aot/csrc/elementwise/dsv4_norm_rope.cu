@@ -18,10 +18,10 @@ limitations under the License.
 // to sgl-kernel AOT compilation with CUDA + HIP (ROCm) support.
 
 #ifndef USE_ROCM
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -40,9 +40,9 @@ limitations under the License.
 // Platform-compatible type aliases
 // ============================================================================
 #ifndef USE_ROCM
-using bf16_t = __nv_bfloat16;
-using bf16x2_t = __nv_bfloat162;
-using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
+using bf16_t = __ppu_bfloat16;
+using bf16x2_t = __ppu_bfloat162;
+using fp8x2_e4m3_t = __hg_fp8x2_e4m3;
 #else
 using bf16_t = __hip_bfloat16;
 using bf16x2_t = __hip_bfloat162;
@@ -126,7 +126,7 @@ static constexpr float kFP8Max = 448.0f;
 __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
   x = fmaxf(fminf(x, kFP8Max), -kFP8Max);
   y = fmaxf(fminf(y, kFP8Max), -kFP8Max);
-  return __nv_fp8x2_e4m3(float2{x, y});
+  return __hg_fp8x2_e4m3(float2{x, y});
 }
 #else
 // Software float -> FP8 E4M3 conversion for ROCm

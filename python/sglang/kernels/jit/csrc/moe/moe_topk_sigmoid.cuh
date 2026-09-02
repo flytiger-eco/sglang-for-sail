@@ -14,8 +14,8 @@
 #include <tvm/ffi/optional.h>
 
 // CUDA 12.9+ deprecated cub::Max/Min in favour of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
-#include <cuda/functional>
+#if COMPATIBLE_VERSION >= 12090
+#include <hggc/functional>
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else
@@ -55,7 +55,7 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+  } else if constexpr (std::is_same_v<T, __ppu_bfloat16>) {
     return __bfloat162float(x);
   } else {
     return static_cast<float>(x);
@@ -361,7 +361,7 @@ void topkGatingSigmoidLauncherHelper(
     const float* correction_bias,
     double routed_scaling_factor,
     int num_fused_shared_experts,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
   static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
   using Constants = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
@@ -421,7 +421,7 @@ void topkGatingSigmoidKernelLauncher(
     const float* correction_bias,
     double routed_scaling_factor,
     int num_fused_shared_experts,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr int WARPS_PER_TB = 4;
   switch (num_experts) {
     case 1:
@@ -524,7 +524,7 @@ void topk_sigmoid(
   const float* bias_ptr =
       correction_bias.has_value() ? static_cast<const float*>(correction_bias.value().data_ptr()) : nullptr;
 
-  cudaStream_t stream = LaunchKernel::resolve_device(gating_output.device());
+  hggcStream_t stream = LaunchKernel::resolve_device(gating_output.device());
 
   topkGatingSigmoidKernelLauncher<T>(
       gating_ptr,

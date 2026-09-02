@@ -56,7 +56,7 @@ limitations under the License.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 #include <type_traits>
 
 namespace sglang {
@@ -76,9 +76,9 @@ using bf16 = cutlass::bfloat16_t;
 
 #define QPREP_CUDA_CHECK(call)                                                                  \
   do {                                                                                          \
-    cudaError_t err = (call);                                                                   \
-    if (err != cudaSuccess) {                                                                   \
-      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+    hggcError_t err = (call);                                                                   \
+    if (err != hggcSuccess) {                                                                   \
+      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, hggcGetErrorString(err)); \
       exit(1);                                                                                  \
     }                                                                                           \
   } while (0)
@@ -137,7 +137,7 @@ __device__ __forceinline__ uint16_t f32x2_to_e4m3x2_rn_satfinite(float f_lo, flo
 // The exact Triton epilogue rounding chain for the nope half:
 // fp32 accum -> bf16 (rn) -> fp32 (exact) -> fp8_e4m3 (rn, satfinite).
 __device__ __forceinline__ uint16_t f32x2_to_bf16x2_to_e4m3x2(float f0, float f1) {
-  const __nv_bfloat162 b = __float22bfloat162_rn(make_float2(f0, f1));
+  const __ppu_bfloat162 b = __float22bfloat162_rn(make_float2(f0, f1));
   return f32x2_to_e4m3x2_rn_satfinite(__low2float(b), __high2float(b));
 }
 
@@ -350,7 +350,7 @@ struct QprepBf16Fp8Kernel {
         uint16_t packed[4];
         CUTE_UNROLL
         for (int i = 0; i < 4; ++i) {
-          const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
+          const __ppu_bfloat162 v = *reinterpret_cast<const __ppu_bfloat162*>(&w[i]);
           packed[i] = f32x2_to_e4m3x2_rn_satfinite(__low2float(v), __high2float(v));
         }
         // out_vec16 guarantees 16B-aligned rows; N_OUT + 8*cthr keeps 8B
@@ -367,10 +367,10 @@ struct QprepBf16Fp8Kernel {
       if (row >= m_residue) continue;
       const bf16* g = gR + (int64_t)row * p.r_s0 + cthr * 8;
       uint8_t* o = gO + (int64_t)row * p.o_s0 + N_OUT + cthr * 8;
-      const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(g);
+      const __ppu_bfloat16* gh = reinterpret_cast<const __ppu_bfloat16*>(g);
       CUTE_UNROLL
       for (int i = 0; i < 4; ++i) {
-        const __nv_bfloat162 v = __nv_bfloat162(gh[2 * i], gh[2 * i + 1]);
+        const __ppu_bfloat162 v = __ppu_bfloat162(gh[2 * i], gh[2 * i + 1]);
         *reinterpret_cast<uint16_t*>(o + 2 * i) = f32x2_to_e4m3x2_rn_satfinite(__low2float(v), __high2float(v));
       }
     }
@@ -380,7 +380,7 @@ struct QprepBf16Fp8Kernel {
   // Main device function
   // -------------------------------------------------------------------------
   static __device__ __forceinline__ void devfunc(const QprepBf16Fp8Sm90Params& p) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH == 900)
     const int m0 = blockIdx.x * BM;
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
@@ -493,14 +493,14 @@ struct QprepBf16Fp8Kernel {
     auto kernel = &qprep_bf16_fp8_kernel<QprepBf16Fp8Kernel<K_DIM>>;
     constexpr size_t smem_size = sizeof(SharedStorage);
     static bool attr_set = [&]() {
-      QPREP_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      QPREP_CUDA_CHECK(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       return true;
     }();
     (void)attr_set;
 
     dim3 grid(ceil_div_i(p.num_tokens, BM), p.num_heads, 1);
     kernel<<<grid, NUM_THREADS, smem_size, p.stream>>>(p);
-    QPREP_CUDA_CHECK(cudaGetLastError());
+    QPREP_CUDA_CHECK(hggcGetLastError());
   }
 };
 

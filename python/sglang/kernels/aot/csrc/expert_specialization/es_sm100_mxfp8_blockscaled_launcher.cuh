@@ -33,7 +33,7 @@ void es_sm100_mxfp8_blockscaled_group_mm_pre_compute(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& blockscale_offsets,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using OffsetFunctor = Sm100Mxfp8BlockScaledOffsetFunctor<GemmTraits>;
   using ElementA = typename OffsetFunctor::ElementA;
   using ElementB = typename OffsetFunctor::ElementB;
@@ -88,7 +88,7 @@ void es_sm100_mxfp8_blockscaled_group_mm(
     const torch::Tensor& layout_sfa,
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   using Gemm = typename GemmTraits::Gemm;
   using ElementA = typename Gemm::ElementA;
   using ElementB = typename Gemm::ElementB;
@@ -158,7 +158,7 @@ void es_sm100_mxfp8_blockscaled_group_mm_dispatch_out_dtype(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& blockscale_offsets,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   int num_experts = (int)problem_sizes.size(0);
   torch::TensorOptions options_int64 = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::TensorOptions options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(a.device());

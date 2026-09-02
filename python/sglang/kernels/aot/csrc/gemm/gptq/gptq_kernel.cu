@@ -5,8 +5,8 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hggc_fp16.h>
+#include <hggc_runtime.h>
 #include <torch/all.h>
 
 #include <cstdint>
@@ -752,7 +752,7 @@ void gemm_half_q_half_cuda_part(
 
   fp_gemm_half_q_half_gptq_kernel kernel = pick_gemm_half_q_half_gptq_kernel(true, m_count, bit);
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, 0, stream>>>(
       a, b_q_weight, b_gptq_qzeros, b_gptq_scales, c, size_m, size_n, size_k, groups, b_q_perm);
 }
@@ -1237,7 +1237,7 @@ void reconstruct_exllama(
     reconstruct_exllama_kernel = reconstruct_exllama_8bit_kernel;
   }
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   reconstruct_exllama_kernel<<<gridDim, blockDim, 0, stream>>>(
       b_q_weight, b_q_perm, b_gptq_qzeros, b_gptq_scales, height, width, groups, out);
 }
@@ -1437,7 +1437,7 @@ void gemm_half_q_half_alt(
     kernel = gemm_half_q_half_alt_8bit_kernel;
   }
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, 0, stream>>>(
       (const half2*)a, b_q_weight, c, b_gptq_scales, b_gptq_qzeros, b_g_idx, size_m, size_k / 32 * bit, size_n);
 }
@@ -1551,13 +1551,13 @@ void reconstruct_gptq(
     gridDim.y = DIVIDE(height, 32);
   }
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   kernel<<<gridDim, blockDim, 0, stream>>>(
       b_q_weight, b_gptq_scales, b_gptq_qzeros, b_g_idx, height, width, groups, out);
 }
 
 void gemm_half_q_half_cuda(
-    cublasHandle_t cublas_handle,
+    acblasHandle_t cublas_handle,
     const half* a,
     const uint32_t* b_q_weight,
     const uint32_t* b_gptq_qzeros,
@@ -1589,10 +1589,10 @@ void gemm_half_q_half_cuda(
 
     const half alpha = __float2half(1.0f);
     const half beta = __float2half(0.0f);
-    cublasHgemm(
+    acblasHgemm(
         cublas_handle,
-        CUBLAS_OP_N,
-        CUBLAS_OP_N,
+        ACBLAS_OP_N,
+        ACBLAS_OP_N,
         size_n,
         size_m,
         size_k,
@@ -1863,7 +1863,7 @@ __global__ void make_sequential_8bit_kernel(
 void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height, int width, int bit) {
   if (q_perm) {
     uint32_t* new_qweight = NULL;
-    cudaMalloc(&new_qweight, height / 32 * bit * width * sizeof(uint32_t));
+    hggcMalloc(&new_qweight, height / 32 * bit * width * sizeof(uint32_t));
 
     dim3 blockDim, gridDim;
     blockDim.x = THREADS_X;
@@ -1880,13 +1880,13 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height, int wid
     } else if (bit == 8) {
       kernel = make_sequential_8bit_kernel;
     }
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
     kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, new_qweight, q_perm, width);
     // Replace qweights
-    cudaMemcpyAsync(q_weight, new_qweight, height / 32 * bit * width * sizeof(uint32_t), cudaMemcpyDeviceToDevice);
+    hggcMemcpyAsync(q_weight, new_qweight, height / 32 * bit * width * sizeof(uint32_t), hggcMemcpyDeviceToDevice);
     // Cleanup
-    cudaDeviceSynchronize();
-    cudaFree(new_qweight);
+    hggcDeviceSynchronize();
+    hggcFree(new_qweight);
   }
   dim3 blockDim, gridDim;
   blockDim.x = THREADS_X;
@@ -1901,7 +1901,7 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height, int wid
   } else if (bit == 8) {
     shuffle_kernel = shuffle_8bit_kernel;
   }
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   shuffle_kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, height, width);
 }
 

@@ -15,13 +15,13 @@
  */
 
 #include <cub/cub.cuh>
-#include <cuda/functional>
-#include <cuda/std/functional>
-#include <cuda/std/type_traits>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <hggc/functional>
+#include <hggc/std/functional>
+#include <hggc/std/type_traits>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/DevKernel.h"
@@ -61,12 +61,12 @@ template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // immediately trigger the secondary kernel when using PDL, then wait on
   // primary
   if constexpr (KernelParams::UsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    hggcTriggerProgrammaticLaunchCompletion();
+    hggcGridDependencySynchronize();
   }
 #endif
 
@@ -333,12 +333,12 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
   __shared__ float s_scaleOutArr[NumTokensPerCta];
   __shared__ typename BlockReduce::TempStorage tempStorage;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // immediately trigger the secondary kernel when using PDL, then wait on
   // primary
   if constexpr (KernelParams::UsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    hggcTriggerProgrammaticLaunchCompletion();
+    hggcGridDependencySynchronize();
   }
 #endif
 
@@ -514,9 +514,9 @@ void run(Data const &data, void *stream) {
     constexpr int NUM_ELTS_PER_SF = 128;
 
     int device{-1};
-    cudaGetDevice(&device);
+    hggcGetDevice(&device);
     int numSms = 0;
-    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+    hggcDeviceGetAttribute(&numSms, hggcDevAttrMultiProcessorCount, device);
 
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
@@ -552,7 +552,7 @@ void run(Data const &data, void *stream) {
         data.actGridXOverride > 0 ? data.actGridXOverride : defaultGx;
     const dim3 grid(gridX, data.topK, std::min(8192, data.numTokens));
 
-    activationKernelOpt<<<grid, numThreads, 0, (cudaStream_t)stream>>>(
+    activationKernelOpt<<<grid, numThreads, 0, (hggcStream_t)stream>>>(
         static_cast<cutlass::bfloat16_t const *>(data.inPtr),
         static_cast<cutlass::bfloat16_t *>(data.outPtr),
         data.gateUpLoraDeltaPtr, data.activationLoraInputOutPtr,
@@ -695,12 +695,12 @@ __device__ void convertSfCommon(KernelParams params) {
   using VecType = uint32_t;
   static_assert(sizeof(VecType) == VecSize);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // Immediately trigger the secondary kernel when using PDL, then wait on
   // primary.
   if constexpr (KernelParams::UsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    hggcTriggerProgrammaticLaunchCompletion();
+    hggcGridDependencySynchronize();
   }
 #endif
 
@@ -781,12 +781,12 @@ template <typename KernelParams>
 __global__ void permuteKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // immediately trigger the secondary kernel when using PDL, then wait on
   // primary
   if constexpr (KernelParams::UsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
+    hggcTriggerProgrammaticLaunchCompletion();
+    hggcGridDependencySynchronize();
   }
 #endif
 
@@ -862,10 +862,10 @@ __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // wait on primary kernel when using PDL
   if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
+    hggcGridDependencySynchronize();
   }
 #endif
 
@@ -920,15 +920,15 @@ __device__ float4 vectorizedLoadPtx(float4 const *ptr) {
 
 constexpr int MaxTopK = 64;
 
-typedef struct __CUDA_ALIGN__(4) {
+typedef struct __HGGC_ALIGN__(4) {
   cutlass::bfloat16_t array[2];
 } bfloat16_2;
 
-typedef struct __CUDA_ALIGN__(8) {
+typedef struct __HGGC_ALIGN__(8) {
   cutlass::bfloat16_t array[4];
 } bfloat16_4;
 
-typedef struct __CUDA_ALIGN__(8) {
+typedef struct __HGGC_ALIGN__(8) {
   half array[4];
 } half_4;
 
@@ -1071,10 +1071,10 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   auto *outElemPtr = reinterpret_cast<OutputElem *>(outputPtr);
   auto const *inElemPtr = reinterpret_cast<InputElem const *>(params.inPtr);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // wait on primary kernel when using PDL
   if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
+    hggcGridDependencySynchronize();
   }
 #endif
   __syncthreads();
@@ -1135,10 +1135,10 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
   __shared__ float s_scaleOut;
   __shared__ typename BlockReduce::TempStorage temp_storage;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(COMPATIBLE_ARCH) && (COMPATIBLE_ARCH >= 900)
   // wait on primary kernel when using PDL
   if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
+    hggcGridDependencySynchronize();
   }
 #endif
 

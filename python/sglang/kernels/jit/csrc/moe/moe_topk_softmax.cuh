@@ -20,8 +20,8 @@
 #include <tvm/ffi/optional.h>
 
 // CUDA 12.9+ deprecated cub::Max/Min in favour of cuda::maximum/minimum
-#if CUDA_VERSION >= 12090
-#include <cuda/functional>
+#if COMPATIBLE_VERSION >= 12090
+#include <hggc/functional>
 #endif
 
 #include <cfloat>
@@ -41,7 +41,7 @@ static constexpr int WARP_SIZE = MOE_TOPK_SOFTMAX_WARP_SIZE;
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) __shfl_xor_sync(mask, var, lane_mask, width)
 
 // CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum.
-#if CUDA_VERSION >= 12090
+#if COMPATIBLE_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else
@@ -61,7 +61,7 @@ template <typename T>
 __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
-  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+  } else if constexpr (std::is_same_v<T, __ppu_bfloat16>) {
     return __bfloat162float(x);
   } else if constexpr (std::is_same_v<T, float>) {
     return x;
@@ -501,7 +501,7 @@ void topkGatingSoftmaxLauncherHelper(
     const bool renormalize,
     const float moe_softcapping,
     const float* correction_bias,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
   static constexpr int BYTES_PER_LDG = SGL_MIN(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
@@ -554,7 +554,7 @@ void topkGatingSoftmaxKernelLauncher(
     const bool renormalize,
     const float moe_softcapping,
     const float* correction_bias,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   static constexpr int WARPS_PER_TB = 4;
   switch (num_experts) {
     case 1:
@@ -665,7 +665,7 @@ void topk_softmax(
 
   float* workspace_ptr = (softmax_workspace.numel() > 0) ? static_cast<float*>(softmax_workspace.data_ptr()) : nullptr;
 
-  const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
+  const hggcStream_t stream = LaunchKernel::resolve_device(device.unwrap());
   const float moe_softcapping_f = static_cast<float>(moe_softcapping);
 
   topkGatingSoftmaxKernelLauncher<T>(

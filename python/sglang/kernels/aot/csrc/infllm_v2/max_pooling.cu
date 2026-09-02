@@ -13,9 +13,9 @@
 //     wrappers also allocated a zero-filled output before launching).
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_runtime.h>
 
 #include "utils.h"
 
@@ -123,7 +123,7 @@ void infllm_v2_max_pooling_1d_varlen(
   const int out_len = static_cast<int>(output.size(2));
   const int grid_q = static_cast<int>(total_q > 0 ? total_q : input.size(1));
 
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(grid_q, num_heads);
   const dim3 block(256);
 

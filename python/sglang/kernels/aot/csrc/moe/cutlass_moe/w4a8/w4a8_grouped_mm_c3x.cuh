@@ -19,8 +19,8 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
 #include <torch/all.h>
 
 #include "cutlass/cutlass.h"

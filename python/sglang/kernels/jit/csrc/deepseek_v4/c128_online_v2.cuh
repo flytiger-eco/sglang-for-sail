@@ -896,9 +896,9 @@ inline OnlinePrefillPlan plan_online_prefill(
       if (kNoH2D) return;
       const auto bytes = count * sizeof(CompressPlan);
       if (kSyncH2D) {
-        RuntimeDeviceCheck(::cudaMemcpy(dst, src, bytes, ::cudaMemcpyHostToDevice));
+        RuntimeDeviceCheck(::hggcMemcpy(dst, src, bytes, ::hggcMemcpyHostToDevice));
       } else {
-        RuntimeDeviceCheck(::cudaMemcpyAsync(dst, src, bytes, ::cudaMemcpyHostToDevice, stream));
+        RuntimeDeviceCheck(::hggcMemcpyAsync(dst, src, bytes, ::hggcMemcpyHostToDevice, stream));
       }
     };
     if (num_c_padded) copy_to_device(plan_c_dev_ptr, plan_c_pin.data_ptr(), num_c_padded);

@@ -14,7 +14,7 @@ using namespace cute;
 
 template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type = cutlass::half_t>
 struct Flash_kernel_traits {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   using Element = elem_type;
   static constexpr bool Has_cp_async = true;
 #else
@@ -25,7 +25,7 @@ struct Flash_kernel_traits {
   using ElementAccum = float;
   using index_t = int64_t;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   using MMA_Atom_Arch = std::conditional_t<
       std::is_same_v<elem_type, cutlass::half_t>,
       MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
@@ -34,7 +34,7 @@ struct Flash_kernel_traits {
   using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
 #endif
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 750
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
 #else

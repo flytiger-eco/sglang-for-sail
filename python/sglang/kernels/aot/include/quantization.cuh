@@ -21,8 +21,8 @@ limitations under the License.
 
 #pragma once
 
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
+#include <hggc_runtime.h>
+#include <hggc_runtime_api.h>
 
 #include <cstdint>
 #include <cub/cub.cuh>
@@ -69,25 +69,25 @@ __global__ void SegmentPackBitsKernel(bool* input, uint8_t* output, IdType* inpu
 }
 
 template <typename IdType>
-cudaError_t SegmentPackBits(
+hggcError_t SegmentPackBits(
     bool* input,
     uint8_t* output,
     IdType* input_indptr,
     IdType* output_indptr,
     uint32_t batch_size,
     BitOrder bitorder,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   SGL_DISPATCH_BITORDER(bitorder, BITORDER, {
     auto kernel = SegmentPackBitsKernel<BITORDER, IdType>;
     const dim3 nthrs(256);
     const dim3 nblks(batch_size);
     void* args[] = {&input, &output, &input_indptr, &output_indptr};
-    cudaError_t status = cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
-    if (status != cudaSuccess) {
+    hggcError_t status = hggcLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream);
+    if (status != hggcSuccess) {
       return status;
     }
   });
-  return cudaSuccess;
+  return hggcSuccess;
 }
 
 }  // namespace quantization

@@ -19,14 +19,14 @@
  */
 
 // clang-format off
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_runtime.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 
 
-#if !defined(USE_ROCM) && (!defined(CUDA_VERSION) || CUDA_VERSION < 12040)
+#if !defined(USE_ROCM) && (!defined(COMPATIBLE_VERSION) || COMPATIBLE_VERSION < 12040)
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt) {
   TORCH_CHECK(false, "CUDA version must be >= 12.4 for ApplyTokenBitmaskInplace");
 }
@@ -62,9 +62,9 @@ __device__ __half NegativeInfinity<__half>() {
 }
 
 template <>
-__device__ __nv_bfloat16 NegativeInfinity<__nv_bfloat16>() {
+__device__ __ppu_bfloat16 NegativeInfinity<__ppu_bfloat16>() {
 #ifdef USE_ROCM
-  return __nv_bfloat16(-INFINITY);
+  return __ppu_bfloat16(-INFINITY);
 #else
   return -CUDART_INF_BF16;
 #endif
@@ -149,7 +149,7 @@ void ApplyTokenBitmaskInplaceDispatchToBitsPerThread(
   const int32_t num_bits_per_thread = CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * num_blocks_per_row);
 
   const dim3 block(THREADS_PER_THREAD_BLOCK);
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   if (num_bits_per_thread <= 4 && kAlignment <= 4) {
     const dim3 grid(CeilDiv(vocab_size, THREADS_PER_THREAD_BLOCK * 4), num_rows);
@@ -253,7 +253,7 @@ void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optiona
     }
     case torch::kBFloat16: {
       ApplyTokenBitmaskInplaceDispatchToPackedT(
-          reinterpret_cast<__nv_bfloat16*>(logits.data_ptr<torch::BFloat16>()),
+          reinterpret_cast<__ppu_bfloat16*>(logits.data_ptr<torch::BFloat16>()),
           bitmask.data_ptr<int32_t>(),
           indices_ptr,
           vocab_size,

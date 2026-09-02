@@ -63,7 +63,7 @@ void Runner::run(void *routingLogits, void *routingBias, int32_t numTokens,
                  int32_t *numNonExitingCtas, btg::Dtype dtypeElt,
                  btg::Dtype dtypeBias, bool useRoutingScalesOnInput,
                  bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-                 cudaStream_t stream, btg::Dtype dtypeLogits, bool normTopkProb,
+                 hggcStream_t stream, btg::Dtype dtypeLogits, bool normTopkProb,
                  int16_t *routing_replay_out) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // DeepSeek no-groups case: use routingCustom with SigmoidBias preprocess
@@ -460,7 +460,7 @@ void Runner::run(void *hiddenState, void *hiddenStateScale, void *weights,
                  int32_t *ptrTotalNumPaddedTokens,
                  int32_t *ptrCtaIdxXyToBatchIdx, int32_t *ptrCtaIdxXyToMnLimit,
                  void *bmm1Workspace, bool useRoutingScalesOnInput, int device,
-                 cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 hggcStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(
       numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
@@ -567,7 +567,7 @@ void Runner::run(void *permutedHiddenState, void *permutedHiddenStateScale,
                  int32_t *ptrNumNonExitingCtas,
                  int32_t *ptrTotalNumPaddedTokens,
                  int32_t *ptrCtaIdxXyToBatchIdx, int32_t *ptrCtaIdxXyToMnLimit,
-                 void *bmm2Workspace, int device, cudaStream_t stream,
+                 void *bmm2Workspace, int device, hggcStream_t stream,
                  int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim = Routing::getMaxNumCtasInBatchDim(
       numTokens, topK, numExperts, mTileTokensDim);
@@ -806,7 +806,7 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
 }
 
 void Runner::run(MoERunnerArgs const &args, MoEWorkspace const &workspace,
-                 int device, cudaStream_t stream, int64_t configIndex,
+                 int device, hggcStream_t stream, int64_t configIndex,
                  bool enable_pdl) {
   FLASHINFER_CHECK(
       configIndex >= 0 &&
@@ -852,8 +852,8 @@ void Runner::run(MoERunnerArgs const &args, MoEWorkspace const &workspace,
     // above overlapped the side-stream LoRA shrink/expand. nullptr event = no
     // wait (serial / non-overlap path).
     if (args.lora_ready_event != nullptr) {
-      cudaStreamWaitEvent(stream,
-                          static_cast<cudaEvent_t>(args.lora_ready_event), 0);
+      hggcStreamWaitEvent(stream,
+                          static_cast<hggcEvent_t>(args.lora_ready_event), 0);
     }
     // Run activation
     moe::dev::activation::run(activationData, stream);
@@ -881,9 +881,9 @@ void Runner::run(MoERunnerArgs const &args, MoEWorkspace const &workspace,
         tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
       globalScaleInv = 1.f / (256.f * 6.f);
     }
-    invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
+    invokeNvfp4QuantAndPerTokenScale<__ppu_bfloat16>(
         args.num_tokens * args.top_k, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const *>(workspace.gemm1_output),
+        reinterpret_cast<__ppu_bfloat16 const *>(workspace.gemm1_output),
         globalScaleInv, workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t *>(workspace.activation_output),
         reinterpret_cast<uint8_t *>(workspace.activation_output_scale),
@@ -910,7 +910,7 @@ void Runner::run(MoERunnerArgs const &args, MoEWorkspace const &workspace,
   // stream can start the down-proj LoRA shrink/expand concurrent with the
   // finalize below. 0 = no-op.
   if (args.gemm2_done_event != nullptr) {
-    cudaEventRecord(static_cast<cudaEvent_t>(args.gemm2_done_event), stream);
+    hggcEventRecord(static_cast<hggcEvent_t>(args.gemm2_done_event), stream);
   }
 
   // Run finalize

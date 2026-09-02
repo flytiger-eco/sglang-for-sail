@@ -27,8 +27,8 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cmath>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
@@ -77,13 +77,13 @@ __device__ inline float compute_freq(float base, int rotary_dim, int half_dim, f
 //   halving powf + __sincosf calls vs a naive per-element approach.
 template <int head_dim, bool interleave, bool yarn>
 __global__ void fusedQKNormRopeKernel(
-    __nv_bfloat16* qkv,  // [num_tokens, (nq+nk+nv)*head_dim], in-place
+    __ppu_bfloat16* qkv,  // [num_tokens, (nq+nk+nv)*head_dim], in-place
     int const num_heads_q,
     int const num_heads_k,
     int const num_heads_v,
     float const eps,
-    __nv_bfloat16 const* q_weight,  // [head_dim]
-    __nv_bfloat16 const* k_weight,  // [head_dim]
+    __ppu_bfloat16 const* q_weight,  // [head_dim]
+    __ppu_bfloat16 const* k_weight,  // [head_dim]
     float const base,
     int const* position_ids,  // [num_tokens]
     int const num_tokens,
@@ -311,7 +311,7 @@ void fused_qk_norm_rope(
   bool use_yarn = (factor != 1.0f);
   RuntimeCheck(use_yarn == static_cast<bool>(JIT_YARN), "yarn mismatch with JIT-compiled kernel");
 
-  cudaStream_t stream = LaunchKernel::resolve_device(qkv.device());
+  hggcStream_t stream = LaunchKernel::resolve_device(qkv.device());
 
   constexpr int blockSize = 256;
   int warpsPerBlock = blockSize / 32;
@@ -319,9 +319,9 @@ void fused_qk_norm_rope(
   int totalWarps = num_tokens * totalQKHeads;
   int gridSize = div_ceil(totalWarps, warpsPerBlock);
 
-  auto* qkv_ptr = reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr());
-  auto const* qw_ptr = reinterpret_cast<__nv_bfloat16 const*>(q_weight.data_ptr());
-  auto const* kw_ptr = reinterpret_cast<__nv_bfloat16 const*>(k_weight.data_ptr());
+  auto* qkv_ptr = reinterpret_cast<__ppu_bfloat16*>(qkv.data_ptr());
+  auto const* qw_ptr = reinterpret_cast<__ppu_bfloat16 const*>(q_weight.data_ptr());
+  auto const* kw_ptr = reinterpret_cast<__ppu_bfloat16 const*>(k_weight.data_ptr());
   auto const* pos_ptr = reinterpret_cast<int const*>(position_ids.data_ptr());
 
   fusedQKNormRopeKernel<JIT_HEAD_DIM, static_cast<bool>(JIT_INTERLEAVE), static_cast<bool>(JIT_YARN)>

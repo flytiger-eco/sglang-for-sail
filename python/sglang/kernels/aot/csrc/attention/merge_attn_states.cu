@@ -14,7 +14,7 @@ inline __device__ float to_float(float u) {
 inline __device__ float to_float(half u) {
   return __half2float(u);
 }
-inline __device__ float to_float(__nv_bfloat16 u) {
+inline __device__ float to_float(__ppu_bfloat16 u) {
   return __bfloat162float(u);
 }
 inline __device__ void from_float(float& d, float s) {
@@ -23,7 +23,7 @@ inline __device__ void from_float(float& d, float s) {
 inline __device__ void from_float(half& d, float s) {
   d = __float2half(s);
 }
-inline __device__ void from_float(__nv_bfloat16& d, float s) {
+inline __device__ void from_float(__ppu_bfloat16& d, float s) {
   d = __float2bfloat16(s);
 }
 
@@ -115,7 +115,7 @@ __global__ void merge_attn_states_kernel(
     } else if (scalar_dtype == at::ScalarType::Half) {                  \
       fn(half);                                                         \
     } else if (scalar_dtype == at::ScalarType::BFloat16) {              \
-      fn(__nv_bfloat16);                                                \
+      fn(__ppu_bfloat16);                                               \
     } else {                                                            \
       TORCH_CHECK(false, "Unsupported data type of O: ", scalar_dtype); \
     }                                                                   \

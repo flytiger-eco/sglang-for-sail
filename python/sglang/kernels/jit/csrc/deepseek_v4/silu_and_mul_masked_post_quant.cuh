@@ -12,7 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 #include <type_traits>
 
 namespace sglang {

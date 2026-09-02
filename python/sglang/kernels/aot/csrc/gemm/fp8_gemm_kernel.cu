@@ -19,7 +19,6 @@ limitations under the License.
 // https://github.com/NVIDIA/TensorRT-LLM/blob/v0.16.0/cpp/tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cudaTypedefs.h>
 #include <cutlass/arch/arch.h>
 #include <cutlass/arch/memory.h>
 #include <cutlass/arch/mma.h>
@@ -37,6 +36,7 @@ limitations under the License.
 #include <cutlass/matrix_coord.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/tensor_ref.h>
+#include <hggcTypedefs.h>
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
@@ -54,7 +54,7 @@ limitations under the License.
 
 using namespace cute;
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12040
 template <
     typename ElementType,
     typename OutElementType,
@@ -438,7 +438,7 @@ void sm89_fp8_dispatch_shape(
 }
 #endif
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12080
 template <
     typename ElementType,
     typename OutElementType,
@@ -1153,10 +1153,10 @@ torch::Tensor fp8_scaled_mm(
       " elements for M=",
       mat_a.size(0));
   bool scalar_a_scale_supported = false;
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12000
   scalar_a_scale_supported = sm_version == 90;
 #endif
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12080
   scalar_a_scale_supported = scalar_a_scale_supported || sm_version >= 100;
 #endif
   TORCH_CHECK(
@@ -1180,7 +1180,7 @@ torch::Tensor fp8_scaled_mm(
   torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12080
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12080
   if (sm_version >= 120) {
     if (out_dtype == torch::kBFloat16) {
       sm120_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
@@ -1198,14 +1198,14 @@ torch::Tensor fp8_scaled_mm(
   }
 #endif
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12000
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12000
   if (sm_version >= 90) {
     cutlass_scaled_mm_sm90_fp8(out, mat_a, mat_b, scales_a, scales_b, bias);
     return out;
   }
 #endif
 
-#if defined CUDA_VERSION && CUDA_VERSION >= 12040
+#if defined COMPATIBLE_VERSION && COMPATIBLE_VERSION >= 12040
   if (sm_version == 89) {
     if (out_dtype == torch::kBFloat16) {
       sm89_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);

@@ -82,7 +82,7 @@ struct Sm100FmhaMlaReductionKernel {
   }
 
   static Status initialize_workspace(
-      Arguments const& /*args*/, void* /*ws*/, cudaStream_t /*stream*/) {
+      Arguments const& /*args*/, void* /*ws*/, hggcStream_t /*stream*/) {
     return Status::kSuccess;
   }
 

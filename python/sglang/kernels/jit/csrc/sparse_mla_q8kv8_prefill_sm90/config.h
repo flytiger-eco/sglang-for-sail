@@ -24,7 +24,7 @@ limitations under the License.
 #include "params.h"
 #include <cstdio>
 #include <cstdlib>
-#include <math_constants.h>
+#include <hggc_math_constants.h>
 
 #define KU_ASSERT(cond)                                                             \
   do {                                                                              \
@@ -36,14 +36,14 @@ limitations under the License.
 
 #define KU_CUDA_CHECK(call)                                                                     \
   do {                                                                                          \
-    cudaError_t err = (call);                                                                   \
-    if (err != cudaSuccess) {                                                                   \
-      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+    hggcError_t err = (call);                                                                   \
+    if (err != hggcSuccess) {                                                                   \
+      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, hggcGetErrorString(err)); \
       exit(1);                                                                                  \
     }                                                                                           \
   } while (0)
 
-#define KU_CHECK_KERNEL_LAUNCH() KU_CUDA_CHECK(cudaGetLastError())
+#define KU_CHECK_KERNEL_LAUNCH() KU_CUDA_CHECK(hggcGetLastError())
 
 namespace ku {
 

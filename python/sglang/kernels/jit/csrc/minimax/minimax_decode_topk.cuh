@@ -12,7 +12,7 @@
 #ifdef USE_ROCM
 static constexpr unsigned long long kWarpSyncMask = 0xFFFFFFFFFFFFFFFFull;
 #else
-#include <math_constants.h>
+#include <hggc_math_constants.h>
 static constexpr unsigned int kWarpSyncMask = 0xFFFFFFFFu;
 #endif
 

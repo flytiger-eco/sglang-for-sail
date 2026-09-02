@@ -25,7 +25,7 @@ void es_sm100_mxfp8_blockscaled_grouped_quant(
 
   auto stream = at::cuda::getCurrentCUDAStream();
   if (input.dtype() == torch::kBFloat16) {
-    expert_specialization::launch_es_sm100_mxfp8_blockscaled_grouped_quant<__nv_bfloat16>(
+    expert_specialization::launch_es_sm100_mxfp8_blockscaled_grouped_quant<__ppu_bfloat16>(
         input, problem_sizes, expert_offsets, blockscale_offsets, quant_output, scale_factor);
   } else if (input.dtype() == torch::kFloat16) {
     expert_specialization::launch_es_sm100_mxfp8_blockscaled_grouped_quant<__half>(

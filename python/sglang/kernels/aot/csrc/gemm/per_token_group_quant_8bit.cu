@@ -1,5 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp8.h>
+#include <hggc_fp8.h>
 
 #include <cmath>
 
@@ -130,7 +130,7 @@ void sgl_per_token_group_quant_8bit(
   CHECK_EQ(input.numel() % group_size, 0);
   CHECK_EQ(output_s.dim(), 2);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   constexpr int THREADS_PER_GROUP = 16;
 
@@ -207,7 +207,7 @@ void sgl_per_token_group_quant_8bit(
       LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
     } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
-      LAUNCH_KERNEL(scalar_t, __nv_fp8_e4m3);
+      LAUNCH_KERNEL(scalar_t, __hg_fp8_e4m3);
       return true;
     }
     return false;

@@ -1,5 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
-#include <cudaTypedefs.h>
+#include <hggcTypedefs.h>
 #include <torch/all.h>
 
 #include <iostream>
@@ -207,8 +207,8 @@ __global__ void shuffleRowsKernel(
 
 DECLARE_SHUFFLE_ROWS(float);
 DECLARE_SHUFFLE_ROWS(half);
-DECLARE_SHUFFLE_ROWS(__nv_bfloat16);
-DECLARE_SHUFFLE_ROWS(__nv_fp8_e4m3);
+DECLARE_SHUFFLE_ROWS(__ppu_bfloat16);
+DECLARE_SHUFFLE_ROWS(__hg_fp8_e4m3);
 DECLARE_SHUFFLE_ROWS(uint8_t);
 
 #define SHUFFLE_ROWS(T)                                    \
@@ -240,9 +240,9 @@ void shuffle_rows_caller(
   void* output = output_tensor.data_ptr();
   switch (input_tensor.scalar_type()) {
     DTYPE_DISPATCH_CASE(torch::kFloat16, half);
-    DTYPE_DISPATCH_CASE(torch::kBFloat16, __nv_bfloat16);
+    DTYPE_DISPATCH_CASE(torch::kBFloat16, __ppu_bfloat16);
     DTYPE_DISPATCH_CASE(torch::kFloat32, float);
-    DTYPE_DISPATCH_CASE(torch::kFloat8_e4m3fn, __nv_fp8_e4m3);
+    DTYPE_DISPATCH_CASE(torch::kFloat8_e4m3fn, __hg_fp8_e4m3);
     DTYPE_DISPATCH_CASE(torch::kUInt8, uint8_t);
     default:
       TORCH_CHECK(false, "[moe replicate input] data type dispatch fail!");

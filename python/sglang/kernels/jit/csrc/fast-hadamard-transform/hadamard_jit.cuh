@@ -200,7 +200,7 @@ inline void set_max_dynamic_smem() {
   constexpr int kSmemSize = Ktraits::kSmemSize;
   if constexpr (kSmemSize >= 48 * 1024) {
     auto kernel = &fast_hadamard_transform_kernel<Ktraits>;
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+    host::RuntimeDeviceCheck(hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
   }
 }
 

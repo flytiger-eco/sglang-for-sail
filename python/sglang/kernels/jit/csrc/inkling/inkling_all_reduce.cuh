@@ -444,7 +444,7 @@ uint32_t max_resident_blocks(Kernel kernel, uint32_t block_size, DLDevice device
     if (auto it = cache.find(key); it != cache.end()) return it->second;
   }
   int sm_count = 0;
-  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device.device_id);
+  hggcDeviceGetAttribute(&sm_count, hggcDevAttrMultiProcessorCount, device.device_id);
   RuntimeCheck(sm_count > 0, "failed to query multiProcessorCount");
   const uint32_t bps = runtime::get_blocks_per_sm(kernel, block_size);
   RuntimeCheck(bps > 0, "kernel has zero occupancy at block_size ", block_size);

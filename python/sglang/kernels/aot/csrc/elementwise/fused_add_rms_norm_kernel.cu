@@ -38,10 +38,10 @@ void sgl_fused_add_rmsnorm(
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
-  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+  hggcStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   // support float16, bfloat16 and float32
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
-    cudaError_t status = norm::FusedAddRMSNorm(
+    hggcError_t status = norm::FusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()),
         static_cast<c_type*>(residual.data_ptr()),
         static_cast<c_type*>(weight.data_ptr()),
@@ -53,7 +53,7 @@ void sgl_fused_add_rmsnorm(
         enable_pdl,
         torch_current_stream);
     TORCH_CHECK(
-        status == cudaSuccess, "FusedAddRMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
+        status == hggcSuccess, "FusedAddRMSNorm failed with error code " + std::string(hggcGetErrorString(status)));
     return true;
   });
 }

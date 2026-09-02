@@ -583,7 +583,7 @@ __launch_bounds__(kNormRowVecs, 1) void all_reduce_pull_norm_kernel(const __grid
 inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   static const uint32_t kNumSM = [] {
     int device = 0;
-    CHECK_CUDA(cudaGetDevice(&device));
+    CHECK_CUDA(hggcGetDevice(&device));
     return host::runtime::get_sm_count(device);
   }();
   for (const uint32_t block_size : {128u, 256u, 512u}) {

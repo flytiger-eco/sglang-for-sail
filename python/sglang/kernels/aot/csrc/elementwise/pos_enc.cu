@@ -175,7 +175,7 @@ void rotary_embedding(
   dim3 grid(num_tokens);
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_FLOAT_TYPES(query.scalar_type(), "rotary_embedding", [&] {
     if (is_neox) {
       rotary_embedding_kernel<scalar_t, true><<<grid, block, 0, stream>>>(

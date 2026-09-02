@@ -1,9 +1,9 @@
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hggc.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
 #include <torch/all.h>
 
 #include <cuda/ptx>
@@ -44,7 +44,7 @@ __inline__ __device__ uint8_t cvt_warp_fp16_to_mxfp8(FragmentS& fragment_s, Frag
 
   constexpr int eles_per_thr = 16;
   using ValType = typename FragmentS::element_type;
-  using VecType = std::conditional_t<std::is_same_v<ValType, __nv_bfloat16>, __nv_bfloat162, __half2>;
+  using VecType = std::conditional_t<std::is_same_v<ValType, __ppu_bfloat16>, __ppu_bfloat162, __half2>;
   VecType vec[8];
   // Assign vals
   vec[0].x = fragment_s(Int<0>{});
@@ -72,7 +72,7 @@ __inline__ __device__ uint8_t cvt_warp_fp16_to_mxfp8(FragmentS& fragment_s, Frag
 
   // Get the final absolute maximum values.
   float block_max(0.0f);
-  if constexpr (std::is_same_v<ValType, __nv_bfloat16>) {
+  if constexpr (std::is_same_v<ValType, __ppu_bfloat16>) {
     block_max = __bfloat162float(__hmax(local_max.x, local_max.y));
   } else {
     block_max = __half2float(__hmax(local_max.x, local_max.y));
@@ -82,8 +82,8 @@ __inline__ __device__ uint8_t cvt_warp_fp16_to_mxfp8(FragmentS& fragment_s, Frag
   // 8 bits representation of the SF.
   uint8_t fp8_sf_val;
 
-  __nv_fp8_e8m0 tmp_sf_val;
-  tmp_sf_val.__x = __nv_cvt_float_to_e8m0(sf_val, __NV_SATFINITE, cudaRoundPosInf);
+  __hg_fp8_e8m0 tmp_sf_val;
+  tmp_sf_val.__x = __nv_cvt_float_to_e8m0(sf_val, __HG_SATFINITE, cudaRoundPosInf);
   sf_val = static_cast<float>(tmp_sf_val);
   fp8_sf_val = tmp_sf_val.__x;
   // Get the output scale (reciprocal of the SFValue).
@@ -104,16 +104,16 @@ __inline__ __device__ uint8_t cvt_warp_fp16_to_mxfp8(FragmentS& fragment_s, Frag
   }
   union {
     uint8_t bytes[16];
-    __nv_fp8x2_e4m3 elts[8];
+    __hg_fp8x2_e4m3 elts[8];
   } u;
-  u.elts[0] = __nv_fp8x2_e4m3(fp2_vals[0]);
-  u.elts[1] = __nv_fp8x2_e4m3(fp2_vals[1]);
-  u.elts[2] = __nv_fp8x2_e4m3(fp2_vals[2]);
-  u.elts[3] = __nv_fp8x2_e4m3(fp2_vals[3]);
-  u.elts[4] = __nv_fp8x2_e4m3(fp2_vals[4]);
-  u.elts[5] = __nv_fp8x2_e4m3(fp2_vals[5]);
-  u.elts[6] = __nv_fp8x2_e4m3(fp2_vals[6]);
-  u.elts[7] = __nv_fp8x2_e4m3(fp2_vals[7]);
+  u.elts[0] = __hg_fp8x2_e4m3(fp2_vals[0]);
+  u.elts[1] = __hg_fp8x2_e4m3(fp2_vals[1]);
+  u.elts[2] = __hg_fp8x2_e4m3(fp2_vals[2]);
+  u.elts[3] = __hg_fp8x2_e4m3(fp2_vals[3]);
+  u.elts[4] = __hg_fp8x2_e4m3(fp2_vals[4]);
+  u.elts[5] = __hg_fp8x2_e4m3(fp2_vals[5]);
+  u.elts[6] = __hg_fp8x2_e4m3(fp2_vals[6]);
+  u.elts[7] = __hg_fp8x2_e4m3(fp2_vals[7]);
   fragment_d(Int<0>{}) = cutlass::float_e4m3_t::bitcast(u.bytes[0]);
   fragment_d(Int<1>{}) = cutlass::float_e4m3_t::bitcast(u.bytes[1]);
   fragment_d(Int<2>{}) = cutlass::float_e4m3_t::bitcast(u.bytes[2]);
@@ -270,7 +270,7 @@ __global__ void mxfp8_group_quant(
     TiledCopyG2R tiled_copy_g2r,
     TiledCopyR2G tiled_copy_r2g,
     TiledCopyR2S tiled_copy_r2s) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 1000
   __shared__ __align__(512) uint8_t shared_memory[512];
   ScaleFactorTileLayout scale_factor_tile_layout{};
   auto scale_factor_shared = make_tensor(
@@ -384,7 +384,7 @@ void launch_es_sm100_mxfp8_blockscaled_grouped_quant(
   auto tiled_copy_r2s = cute::make_tiled_copy(CopyAtomR2S{}, r2s_thr_layout, r2s_val_layout);  // Tiler_MN: (16, 4)
 
   int max_active_blocks_per_sm = -1;
-  AT_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+  AT_CUDA_CHECK(hggcOccupancyMaxActiveBlocksPerMultiprocessor(
       &max_active_blocks_per_sm,
       mxfp8_group_quant<T_IN, decltype(tiled_copy_g2r), decltype(tiled_copy_r2g), decltype(tiled_copy_r2s)>,
       THREAD_BLOCK_SIZE,

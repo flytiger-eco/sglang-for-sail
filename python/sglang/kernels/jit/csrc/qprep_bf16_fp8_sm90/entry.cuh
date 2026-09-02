@@ -21,7 +21,7 @@ limitations under the License.
 
 #include "kernel.cuh"
 #include <cstdint>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 
 namespace sglang {
 
@@ -65,8 +65,8 @@ void qprep_bf16_fp8_dispatch(
   params.out_vec16 = (bool)out_vec16;
 
   DLDevice dev = q_nope.device();
-  cudaSetDevice(dev.device_id);
-  params.stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  hggcSetDevice(dev.device_id);
+  params.stream = reinterpret_cast<hggcStream_t>(cuda_stream);
 
   switch (k_dim) {
     case 128:

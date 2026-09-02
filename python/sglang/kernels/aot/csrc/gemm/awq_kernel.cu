@@ -1,11 +1,11 @@
 // Adapted from
 // https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
 #include <c10/cuda/CUDAGuard.h>
-#include <cuda.h>
-#include <cuda_fp16.h>
+#include <hggc.h>
+#include <hggc_fp16.h>
 #include <torch/all.h>
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#include <cuda_bf16.h>
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
+#include <hggc_bf16.h>
 #endif
 
 template <int lut>
@@ -16,7 +16,7 @@ __device__ inline int lop3(int a, int b, int c) {
 }
 
 __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 750
   uint4 result;
 
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
@@ -80,8 +80,8 @@ __device__ uint4 dequantize_s4_to_fp16x2(uint32_t const& source) {
 }
 
 __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
-#if CUDA_VERSION >= 12000
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if COMPATIBLE_VERSION >= 12000
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 800
   uint4 result;
   uint32_t* h = reinterpret_cast<uint32_t*>(&result);
   uint32_t const i4s = source;
@@ -97,23 +97,23 @@ __device__ uint4 dequantize_s4_to_bf16x2(uint32_t const& source) {
   int lo1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 8, MASK, EX);
   int hi1 = lop3<(0xf0 & 0xcc) | 0xaa>(i4s >> 12, MASK, EX);
 
-  nv_bfloat162* res = reinterpret_cast<nv_bfloat162*>(h);
+  ppu_bfloat162* res = reinterpret_cast<ppu_bfloat162*>(h);
   res[0] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&lo0),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&lo0),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[1] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&hi0),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&hi0),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[2] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&lo1),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&lo1),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
   res[3] = __hfma2(
-      *reinterpret_cast<nv_bfloat162*>(&hi1),
-      *reinterpret_cast<const nv_bfloat162*>(&MUL),
-      *reinterpret_cast<const nv_bfloat162*>(&ADD));
+      *reinterpret_cast<ppu_bfloat162*>(&hi1),
+      *reinterpret_cast<const ppu_bfloat162*>(&MUL),
+      *reinterpret_cast<const ppu_bfloat162*>(&ADD));
 
   return result;
 #else
@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     int group_size,
     int qweight_cols,
     int qweight_rows) {
-#if CUDA_VERSION >= 12000
+#if COMPATIBLE_VERSION >= 12000
   int col = blockIdx.x * blockDim.x + threadIdx.x;
   int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (col >= qweight_cols || row >= qweight_rows) return;
@@ -159,15 +159,15 @@ __global__ void __launch_bounds__(256) dequantize_weights(
 
     OutputT* output_ptr = output + 8 * col + 8 * row * qweight_cols;
     *(uint4*)output_ptr = weight_fp16;
-  } else if constexpr (std::is_same<OutputT, __nv_bfloat16>::value) {
+  } else if constexpr (std::is_same<OutputT, __ppu_bfloat16>::value) {
     uint4 weight_raw = dequantize_s4_to_bf16x2(qweight[col + row * qweight_cols]);
     uint4 zero_raw = dequantize_s4_to_bf16x2(qzeros[col + group_idx * qweight_cols]);
     uint4 scale_raw = *reinterpret_cast<uint4*>(scales + scale_offset);
 
     // Vectorized processing (each uint4 contains 4 nv_bfloat162)
-    nv_bfloat162* weight_vec = reinterpret_cast<nv_bfloat162*>(&weight_raw);
-    nv_bfloat162* zero_vec = reinterpret_cast<nv_bfloat162*>(&zero_raw);
-    nv_bfloat162* scale_vec = reinterpret_cast<nv_bfloat162*>(&scale_raw);
+    ppu_bfloat162* weight_vec = reinterpret_cast<ppu_bfloat162*>(&weight_raw);
+    ppu_bfloat162* zero_vec = reinterpret_cast<ppu_bfloat162*>(&zero_raw);
+    ppu_bfloat162* scale_vec = reinterpret_cast<ppu_bfloat162*>(&scale_raw);
 
 // Single instruction dual-channel operation
 #pragma unroll
@@ -203,7 +203,7 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
 
   dim3 num_blocks(x_blocks, y_blocks);
   dim3 threads_per_block(x_num_threads, y_num_threads);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (scales.scalar_type() == at::ScalarType::Half) {
     auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
@@ -211,9 +211,9 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
     dequantize_weights<half><<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
   } else {
-    auto _scales = reinterpret_cast<__nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
-    auto _output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
-    dequantize_weights<__nv_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
+    auto _scales = reinterpret_cast<__ppu_bfloat16*>(scales.data_ptr<at::BFloat16>());
+    auto _output = reinterpret_cast<__ppu_bfloat16*>(output.data_ptr<at::BFloat16>());
+    dequantize_weights<__ppu_bfloat16><<<num_blocks, threads_per_block, 0, stream>>>(
         _qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
   }
 

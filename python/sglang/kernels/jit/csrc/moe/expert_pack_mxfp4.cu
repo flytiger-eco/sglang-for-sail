@@ -5,8 +5,8 @@
 #include <torch/extension.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
 #include <tuple>
 
 namespace {
@@ -29,7 +29,7 @@ template <typename scalar_t>
 __device__ __forceinline__ float load_scalar(const scalar_t* input, int index);
 
 template <>
-__device__ __forceinline__ float load_scalar<__nv_bfloat16>(const __nv_bfloat16* input, int index) {
+__device__ __forceinline__ float load_scalar<__ppu_bfloat16>(const __ppu_bfloat16* input, int index) {
   return __bfloat162float(input[index]);
 }
 
@@ -42,7 +42,7 @@ template <typename scalar_t>
 __device__ __forceinline__ scalar_t store_scalar(float value);
 
 template <>
-__device__ __forceinline__ __nv_bfloat16 store_scalar<__nv_bfloat16>(float value) {
+__device__ __forceinline__ __ppu_bfloat16 store_scalar<__ppu_bfloat16>(float value) {
   return __float2bfloat16_rn(value);
 }
 
@@ -458,7 +458,7 @@ torch::Tensor mxfp4_matvec(
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (input.scalar_type() == at::kBFloat16) {
     mxfp4_matvec_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __ppu_bfloat16*>(input.data_ptr()),
         cache.data_ptr<uint8_t>(),
         cache.stride(0),
         slot_ids.data_ptr<int32_t>(),
@@ -467,7 +467,7 @@ torch::Tensor mxfp4_matvec(
         output_size,
         records,
         records_per_input,
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()));
+        reinterpret_cast<__ppu_bfloat16*>(output.data_ptr()));
   } else {
     mxfp4_matvec_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const half*>(input.data_ptr()),
@@ -525,7 +525,7 @@ std::tuple<torch::Tensor, torch::Tensor> mxfp4_matvec_dual(
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (input.scalar_type() == at::kBFloat16) {
     mxfp4_matvec_dual_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
+        reinterpret_cast<const __ppu_bfloat16*>(input.data_ptr()),
         cache.data_ptr<uint8_t>(),
         cache.stride(0),
         slot_ids.data_ptr<int32_t>(),
@@ -535,8 +535,8 @@ std::tuple<torch::Tensor, torch::Tensor> mxfp4_matvec_dual(
         output_size,
         records,
         records_per_input,
-        reinterpret_cast<__nv_bfloat16*>(output_a.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(output_b.data_ptr()));
+        reinterpret_cast<__ppu_bfloat16*>(output_a.data_ptr()),
+        reinterpret_cast<__ppu_bfloat16*>(output_b.data_ptr()));
   } else {
     mxfp4_matvec_dual_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const half*>(input.data_ptr()),

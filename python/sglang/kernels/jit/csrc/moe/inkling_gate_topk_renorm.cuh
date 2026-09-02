@@ -9,7 +9,7 @@
 #include <cfloat>
 #include <climits>
 #include <cstdint>
-#include <cuda_bf16.h>
+#include <hggc_bf16.h>
 
 namespace sglang {
 

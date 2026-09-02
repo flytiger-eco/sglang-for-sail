@@ -42,8 +42,8 @@
 
 #include <cstdint>
 #include <cstdlib>
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 
 // Local PTX primitives (cp.async / mbarrier / async-proxy fence)
 
@@ -145,11 +145,11 @@ constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
 
-SGL_DEVICE float bf16_load(const __nv_bfloat16* ptr, int idx) {
+SGL_DEVICE float bf16_load(const __ppu_bfloat16* ptr, int idx) {
   return __bfloat162float(ptr[idx]);
 }
 
-SGL_DEVICE __nv_bfloat16 bf16_store(float value) {
+SGL_DEVICE __ppu_bfloat16 bf16_store(float value) {
   return __float2bfloat16(value);
 }
 
@@ -186,7 +186,7 @@ cp_async_state_chunk(float* s_state, const float* state, int slot, int i_hv, int
   cp_async_state_chunk_for<kThreads>(s_state, state, slot, i_hv, state_slot_stride, chunk);
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH >= 900
 #define KDA_FUSED_DECODE_HAS_TMA 1
 #else
 #define KDA_FUSED_DECODE_HAS_TMA 0
@@ -393,43 +393,43 @@ template <
 // (post-padding, under kUseStaticDecodeLayout) decode batch size; slots is the
 // recurrent-state / conv-cache pool capacity, addressed by ssm_state_indices, not B.
 __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kernel(
-    const __nv_bfloat16* __restrict__ x_q,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv q-segment
-    const __nv_bfloat16* __restrict__ x_k,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv k-segment
-    const __nv_bfloat16* __restrict__ x_v,  // [B, HV*128] row bos*x_row_stride + hvv, sliced from mixed_qkv v-segment
-    const float* __restrict__ w_q_t,        // [kKernelWidth=4, H*128] dense conv taps for q, indexed w*hkv_dim + hk
-    const float* __restrict__ w_k_t,        // [4, H*128] dense conv taps for k
-    const float* __restrict__ w_v_t,        // [4, HV*128] dense conv taps for v
-    const float* __restrict__ bias_q,       // [H*128] conv bias for q, sliced from conv_bias
-    const float* __restrict__ bias_k,       // [H*128] conv bias for k
-    const float* __restrict__ bias_v,       // [HV*128] conv bias for v
-    __nv_bfloat16* __restrict__ cs_q,     // [slots, kConvStateWidth=3, H*128] q shift-register, sliced from conv_states
-    __nv_bfloat16* __restrict__ cs_k,     // [slots, 3, H*128] k shift-register
-    __nv_bfloat16* __restrict__ cs_v,     // [slots, 3, HV*128] v shift-register
-    const float* __restrict__ a_log,      // [H] per-head log-decay base, indexed by i_h
-    const __nv_bfloat16* __restrict__ g,  // [B, HV*128] raw forget gate, row bos*g_row_stride + i_hv*kDimK + k
-    const float* __restrict__ dt_bias,    // [H*128] gate bias added to g before the decay nonlinearity
-    const __nv_bfloat16* __restrict__ beta,     // [B, HV] raw beta logit, row bos*beta_row_stride + i_hv
-    const __nv_bfloat16* __restrict__ onorm_g,  // [B, HV*128] onorm sigmoid gate, row i_n*onormg_row_stride + i_hv*128
-                                                // + v
-    const float* __restrict__ onorm_weight,     // [128] onorm RMSNorm scale, shared across all heads
+    const __ppu_bfloat16* __restrict__ x_q,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv q-segment
+    const __ppu_bfloat16* __restrict__ x_k,  // [B, H*128] row bos*x_row_stride + hk, sliced from mixed_qkv k-segment
+    const __ppu_bfloat16* __restrict__ x_v,  // [B, HV*128] row bos*x_row_stride + hvv, sliced from mixed_qkv v-segment
+    const float* __restrict__ w_q_t,         // [kKernelWidth=4, H*128] dense conv taps for q, indexed w*hkv_dim + hk
+    const float* __restrict__ w_k_t,         // [4, H*128] dense conv taps for k
+    const float* __restrict__ w_v_t,         // [4, HV*128] dense conv taps for v
+    const float* __restrict__ bias_q,        // [H*128] conv bias for q, sliced from conv_bias
+    const float* __restrict__ bias_k,        // [H*128] conv bias for k
+    const float* __restrict__ bias_v,        // [HV*128] conv bias for v
+    __ppu_bfloat16* __restrict__ cs_q,  // [slots, kConvStateWidth=3, H*128] q shift-register, sliced from conv_states
+    __ppu_bfloat16* __restrict__ cs_k,  // [slots, 3, H*128] k shift-register
+    __ppu_bfloat16* __restrict__ cs_v,  // [slots, 3, HV*128] v shift-register
+    const float* __restrict__ a_log,    // [H] per-head log-decay base, indexed by i_h
+    const __ppu_bfloat16* __restrict__ g,        // [B, HV*128] raw forget gate, row bos*g_row_stride + i_hv*kDimK + k
+    const float* __restrict__ dt_bias,           // [H*128] gate bias added to g before the decay nonlinearity
+    const __ppu_bfloat16* __restrict__ beta,     // [B, HV] raw beta logit, row bos*beta_row_stride + i_hv
+    const __ppu_bfloat16* __restrict__ onorm_g,  // [B, HV*128] onorm sigmoid gate, row i_n*onormg_row_stride + i_hv*128
+                                                 // + v
+    const float* __restrict__ onorm_weight,      // [128] onorm RMSNorm scale, shared across all heads
     const int* __restrict__ ssm_state_indices,  // [B] recurrent-state slot per token; <0 marks a padded cuda-graph slot
     const int* __restrict__ cu_seqlens,         // [B+1] token offsets into x_q/x_k/x_v/g/beta; unused under
                                                 // kUseStaticDecodeLayout
     float* __restrict__ state,  // [slots, HV, 128, 128] recurrent KDA state h, inner [V,K] contiguous, slot pitch =
                                 // state_slot_stride
-    __nv_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
-    int B,                            // live decode batch size (token count for this launch)
-    int H,                            // local key/query heads on this TP rank
-    int HV,                           // local value heads on this TP rank (H==HV since KDA is MHA not GQA)
-    float lower_bound,                // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
-    float scale,                      // query scale applied after L2-normalization
-    float onorm_eps,                  // onorm RMSNorm epsilon
-    int64_t x_row_stride,             // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
-    int64_t g_row_stride,             // element stride between consecutive tokens' rows in g (>= HV*128)
-    int64_t beta_row_stride,          // element stride between consecutive tokens' rows in beta (>= HV)
-    int64_t onormg_row_stride,        // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
-    int64_t cs_slot_stride,           // element stride between consecutive slots in cs_q/cs_k/cs_v
-    int64_t cs_w_stride,              // element stride between shift-register taps (w=0..2) within a slot
+    __ppu_bfloat16* __restrict__ out,  // [B, hv_count*128] fused-decode output, row i_n, col i_hv*128 + v
+    int B,                             // live decode batch size (token count for this launch)
+    int H,                             // local key/query heads on this TP rank
+    int HV,                            // local value heads on this TP rank (H==HV since KDA is MHA not GQA)
+    float lower_bound,                 // linear_attn_config.gate_lower_bound (-5.0 for K3) when kUseLowerBound
+    float scale,                       // query scale applied after L2-normalization
+    float onorm_eps,                   // onorm RMSNorm epsilon
+    int64_t x_row_stride,              // element stride between consecutive tokens' rows in x_q/x_k/x_v (>= 3*H*128)
+    int64_t g_row_stride,              // element stride between consecutive tokens' rows in g (>= HV*128)
+    int64_t beta_row_stride,           // element stride between consecutive tokens' rows in beta (>= HV)
+    int64_t onormg_row_stride,         // element stride between consecutive tokens' rows in onorm_g (>= HV*128)
+    int64_t cs_slot_stride,            // element stride between consecutive slots in cs_q/cs_k/cs_v
+    int64_t cs_w_stride,               // element stride between shift-register taps (w=0..2) within a slot
     int64_t state_slot_stride) {  // element stride between consecutive slots in state (dense HV*128*128, or larger for
                                   // shared pools)
   device::PDLWaitPrimary<kUsePDL>();
@@ -531,14 +531,14 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
 
       float q_acc = bias_q[hk];
       float k_acc = bias_k[hk];
-      __nv_bfloat16 q_shift0 = __float2bfloat16(0.0f);
-      __nv_bfloat16 q_shift1 = __float2bfloat16(0.0f);
-      __nv_bfloat16 k_shift0 = __float2bfloat16(0.0f);
-      __nv_bfloat16 k_shift1 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 q_shift0 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 q_shift1 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 k_shift0 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 k_shift1 = __float2bfloat16(0.0f);
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
-        const __nv_bfloat16 q_state = cs_q[cs_base + w * cs_w_stride];
-        const __nv_bfloat16 k_state = cs_k[cs_base + w * cs_w_stride];
+        const __ppu_bfloat16 q_state = cs_q[cs_base + w * cs_w_stride];
+        const __ppu_bfloat16 k_state = cs_k[cs_base + w * cs_w_stride];
         q_acc += __bfloat162float(q_state) * fp32_at(w_q_t, w * hkv_dim + hk);
         k_acc += __bfloat162float(k_state) * fp32_at(w_k_t, w * hkv_dim + hk);
         if (w == 1) {
@@ -549,8 +549,8 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           k_shift1 = k_state;
         }
       }
-      const __nv_bfloat16 q_new = x_q[xq_idx];
-      const __nv_bfloat16 k_new = x_k[xq_idx];
+      const __ppu_bfloat16 q_new = x_q[xq_idx];
+      const __ppu_bfloat16 k_new = x_k[xq_idx];
       q_acc += __bfloat162float(q_new) * fp32_at(w_q_t, (kKernelWidth - 1) * hkv_dim + hk);
       k_acc += __bfloat162float(k_new) * fp32_at(w_k_t, (kKernelWidth - 1) * hkv_dim + hk);
 
@@ -608,11 +608,11 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
       const int64_t xv_idx = bos * x_row_stride + hvv;
 
       float v_acc = bias_v[hvv];
-      __nv_bfloat16 v_shift0 = __float2bfloat16(0.0f);
-      __nv_bfloat16 v_shift1 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 v_shift0 = __float2bfloat16(0.0f);
+      __ppu_bfloat16 v_shift1 = __float2bfloat16(0.0f);
 #pragma unroll
       for (int w = 0; w < kConvStateWidth; ++w) {
-        const __nv_bfloat16 v_state = cs_v[cs_base + w * cs_w_stride];
+        const __ppu_bfloat16 v_state = cs_v[cs_base + w * cs_w_stride];
         v_acc += __bfloat162float(v_state) * fp32_at(w_v_t, w * hvv_dim + hvv);
         if (w == 1) {
           v_shift0 = v_state;
@@ -620,7 +620,7 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
           v_shift1 = v_state;
         }
       }
-      const __nv_bfloat16 v_new = x_v[xv_idx];
+      const __ppu_bfloat16 v_new = x_v[xv_idx];
       v_acc += __bfloat162float(v_new) * fp32_at(w_v_t, (kKernelWidth - 1) * hvv_dim + hvv);
       cs_v[cs_base + 0] = v_shift0;
       cs_v[cs_base + cs_w_stride] = v_shift1;
@@ -988,8 +988,8 @@ struct KdaFusedDecodeKernel {
     const auto B = static_cast<int>(B_.unwrap());
     if (B == 0) return;
 
-    const auto* mixed_ptr = static_cast<const __nv_bfloat16*>(mixed_qkv.data_ptr());
-    auto* cs_ptr = static_cast<__nv_bfloat16*>(conv_states.data_ptr());
+    const auto* mixed_ptr = static_cast<const __ppu_bfloat16*>(mixed_qkv.data_ptr());
+    auto* cs_ptr = static_cast<__ppu_bfloat16*>(conv_states.data_ptr());
     const auto* bias_ptr = static_cast<const float*>(conv_bias.data_ptr());
     // Real per-slot pitch of the ssm/temporal pool (elements): dense kH*128*128
     // for a local pool, the multi-layer envelope for the unified / page-major
@@ -1018,7 +1018,7 @@ struct KdaFusedDecodeKernel {
     const int smem_stages = tma_stages == 0 ? 2 : tma_stages;
     const size_t smem_bytes = static_cast<size_t>(smem_stages) * kChunkV * kDimK * sizeof(float);
     host::RuntimeDeviceCheck(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
+        hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
 
     LaunchKernel(dim3(B, kH), dim3(kThreads), device.unwrap(), smem_bytes)
         .enable_pdl(kUsePDL)(
@@ -1036,15 +1036,15 @@ struct KdaFusedDecodeKernel {
             /*cs_k=*/cs_ptr + kSeg,
             /*cs_v=*/cs_ptr + 2 * kSeg,
             static_cast<const fp32_t*>(A_log.data_ptr()),
-            /*g=*/static_cast<const __nv_bfloat16*>(a.data_ptr()),
+            /*g=*/static_cast<const __ppu_bfloat16*>(a.data_ptr()),
             static_cast<const fp32_t*>(dt_bias.data_ptr()),
-            /*beta=*/static_cast<const __nv_bfloat16*>(b.data_ptr()),
-            static_cast<const __nv_bfloat16*>(onorm_g.data_ptr()),
+            /*beta=*/static_cast<const __ppu_bfloat16*>(b.data_ptr()),
+            static_cast<const __ppu_bfloat16*>(onorm_g.data_ptr()),
             static_cast<const fp32_t*>(onorm_weight.data_ptr()),
             static_cast<const int32_t*>(indices.data_ptr()),
             /*cu_seqlens=*/static_cast<const int32_t*>(nullptr),
             static_cast<fp32_t*>(state.data_ptr()),
-            static_cast<__nv_bfloat16*>(out.data_ptr()),
+            static_cast<__ppu_bfloat16*>(out.data_ptr()),
             B,
             /*H=*/static_cast<int>(kH),
             /*HV=*/static_cast<int>(kH),

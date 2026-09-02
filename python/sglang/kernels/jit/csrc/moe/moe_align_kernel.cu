@@ -127,7 +127,7 @@ __global__ void moe_align_block_size_kernel(
     scan_buf[tid] = padded_count;
   }
 
-#ifndef __CUDA_ARCH__  // HIP
+#ifndef COMPATIBLE_ARCH  // HIP
 
   if (tid >= num_experts && tid < scan_size) {
     scan_buf[tid] = 0;
@@ -470,7 +470,7 @@ struct MoeAlignBlockSizeKernel {
     using namespace host;
 
     auto device = topk_ids.device();
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+    const hggcStream_t stream = LaunchKernel::resolve_device(device);
 
     int threads = 1024;
     threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;

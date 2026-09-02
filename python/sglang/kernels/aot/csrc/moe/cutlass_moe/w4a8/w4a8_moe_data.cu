@@ -1,5 +1,5 @@
 #include <c10/cuda/CUDAGuard.h>
-#include <cudaTypedefs.h>
+#include <hggcTypedefs.h>
 #include <torch/all.h>
 
 #include <cub/block/block_reduce.cuh>
@@ -95,7 +95,7 @@ __global__ void compute_expert_offsets_w4a8_kernel(
 }
 
 void compute_expert_offsets_w4a8(
-    cudaStream_t stream, const int32_t* problem_sizes1, int32_t* expert_offsets, int n, int stride = 1, int off = 0) {
+    hggcStream_t stream, const int32_t* problem_sizes1, int32_t* expert_offsets, int n, int stride = 1, int off = 0) {
 #define compute_expert_offsets_w4a8_call(BLOCK_SIZE) \
   compute_expert_offsets_w4a8_kernel<BLOCK_SIZE>     \
       <<<1, BLOCK_SIZE, 0, stream>>>(problem_sizes1 + off, expert_offsets, n, stride);

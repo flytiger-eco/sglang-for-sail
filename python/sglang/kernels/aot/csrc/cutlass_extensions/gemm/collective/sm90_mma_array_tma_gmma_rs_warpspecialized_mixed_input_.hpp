@@ -608,7 +608,7 @@ struct CollectiveMmaArrayMixedInput<
       ProblemShape const& problem_shape,
       Arguments const& args,
       void* workspace,
-      cudaStream_t stream,
+      hggcStream_t stream,
       CudaHostAdapter* cuda_adapter = nullptr) {
     return cutlass::Status::kSuccess;
   }

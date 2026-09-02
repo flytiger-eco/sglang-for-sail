@@ -28,7 +28,7 @@ __device__ __forceinline__ float sigmoid_accurate(float x) {
 __device__ __forceinline__ float to_float(float x) {
   return x;
 }
-__device__ __forceinline__ float to_float(__nv_bfloat16 x) {
+__device__ __forceinline__ float to_float(__ppu_bfloat16 x) {
   return __bfloat162float(x);
 }
 __device__ __forceinline__ float to_float(__half x) {
@@ -49,10 +49,10 @@ struct VecLoader<float> {
 };
 
 template <>
-struct VecLoader<__nv_bfloat16> {
-  __device__ __forceinline__ static float4 load(const __nv_bfloat16* base, int vec_idx) {
+struct VecLoader<__ppu_bfloat16> {
+  __device__ __forceinline__ static float4 load(const __ppu_bfloat16* base, int vec_idx) {
     float2 raw = reinterpret_cast<const float2*>(base)[vec_idx];  // 4 bf16 = 8 bytes
-    const __nv_bfloat162* packed = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    const __ppu_bfloat162* packed = reinterpret_cast<const __ppu_bfloat162*>(&raw);
     float2 lo = __bfloat1622float2(packed[0]);
     float2 hi = __bfloat1622float2(packed[1]);
     return make_float4(lo.x, lo.y, hi.x, hi.y);

@@ -36,7 +36,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 
 __global__ void permute_cols_kernel(
     int4 const* __restrict__ a_int4_ptr,
@@ -535,7 +535,7 @@ void marlin_mm(
     int num_groups,
     int group_size,
     int dev,
-    cudaStream_t stream,
+    hggcStream_t stream,
     int thread_k_init,
     int thread_n_init,
     int sms,
@@ -606,7 +606,7 @@ void marlin_mm(
   }
 
   int max_shared_mem = 0;
-  host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  host::RuntimeDeviceCheck(hggcDeviceGetAttribute(&max_shared_mem, hggcDevAttrMaxSharedMemoryPerBlockOptin, dev));
   host::RuntimeCheck(max_shared_mem > 0);
 
   int max_par = 16;
@@ -753,7 +753,7 @@ void marlin_mm(
     }
 
     host::RuntimeDeviceCheck(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new));
+        hggcFuncSetAttribute(kernel, hggcFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new));
 
     bool part_use_atomic_add = use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
@@ -955,10 +955,10 @@ void gptq_marlin_gemm(
 
   DLDevice dl_device = device.unwrap();
   int dev = dl_device.device_id;
-  cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
+  hggcStream_t stream = LaunchKernel::resolve_device(dl_device);
 
   int sms = -1;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  RuntimeDeviceCheck(hggcDeviceGetAttribute(&sms, hggcDevAttrMultiProcessorCount, dev));
 
   RuntimeCheck(
       workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);

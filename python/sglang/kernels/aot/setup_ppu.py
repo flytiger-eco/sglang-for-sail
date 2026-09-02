@@ -37,6 +37,29 @@ cuda_version_tuple = tuple(int(x) for x in cuda_version.split(".")[:2])
 print(f"Detected CUDA version: {cuda_version} ({cuda_version_tuple})")
 
 
+# ======================= PPU SDK Detection ======================= #
+# The sailify-converted sources include the PPU SDK's native headers
+# (<hggc_runtime.h>, <hggc_bf16.h>, <hggcTypedefs.h>, <hggc.h>, ...), and
+# actlize's cutlass/half.h pulls <hggc_fp16.h>. Those live only in the PPU SDK
+# tree -- CUDA_SDK/include ships just three hggc_* headers, none of which
+# declares the runtime API -- so the SDK's include dir has to be on the search
+# path or every such translation unit fails with "No such file or directory".
+#
+# Resolved the way the SDK's own envsetup.sh exports it, falling back to the
+# default install prefix.
+_PPU_SDK_DIR = Path(
+    os.environ.get("PPU_SDK") or os.environ.get("PPU_PATH") or "/usr/local/PPU_SDK"
+)
+_PPU_SDK_INCLUDE = _PPU_SDK_DIR / "include"
+if not (_PPU_SDK_INCLUDE / "hggc_runtime_api.h").exists():
+    raise RuntimeError(
+        f"PPU SDK headers not found under {_PPU_SDK_INCLUDE}. "
+        "Set PPU_SDK (or PPU_PATH) to the SDK install prefix, e.g. "
+        "/usr/local/PPU_SDK."
+    )
+print(f"Detected PPU SDK: {_PPU_SDK_DIR}")
+
+
 # ======================= Third-Party Repository Info ======================= #
 class _RepoInfo:
     """Configuration for a third-party git repository."""
@@ -131,9 +154,21 @@ if arch == "aarch64":
     sgl_kernel_cuda_flags.append("-gencode=arch=compute_87,code=sm_87")
 
 # ======================= Include Directories ======================= #
+# Ordering matters. torch appends -I$CUDA_HOME/include (the CUDA-compat
+# surface) *after* these, so the PPU SDK listed here wins for the 15 headers
+# that exist under both prefixes -- most importantly hggc_runtime.h, where only
+# the PPU SDK copy declares hggcError_t/hggcStream_t/hggcGetDevice, and the
+# angle-bracket sub-includes it performs (<driver_types.h>, <vector_types.h>)
+# which must come from the same tree to stay self-consistent.
+#
+# This does not shadow anything CUDA needs: CUDA's own headers reach those same
+# 15 names through quoted includes, which resolve next to the including file in
+# CUDA_SDK/include first, and no header in torch, actlize or csrc/ includes any
+# of them with angle brackets directly.
 include_dirs = [
     str(root / "include"),
     str(root / "csrc"),
+    str(_PPU_SDK_INCLUDE),
     str(_ACTLIZE_DIR / "include"),
     str(_ACTLIZE_DIR / "tools" / "util" / "include"),
     str(_ACTLIZE_DIR / "examples" / "77_blackwell_fmha"),

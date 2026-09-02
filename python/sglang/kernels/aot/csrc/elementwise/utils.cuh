@@ -2,8 +2,8 @@
 
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_runtime.h>
 
 #include <cstdint>
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <c10/cuda/CUDAStream.h>
-#include <cuda.h>
+#include <hggc.h>
 #include <torch/all.h>
 
 #include "cutlass/bfloat16.h"

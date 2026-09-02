@@ -42,7 +42,7 @@ __global__ void count_and_sort_expert_tokens_kernel(
   }
 }
 
-#ifdef __CUDA_ARCH__
+#ifdef COMPATIBLE_ARCH
 __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
   int original = v;
 #pragma unroll
@@ -112,7 +112,7 @@ __global__ void moe_align_block_size_kernel(
     scan_buf[tid] = padded_count;
   }
 
-#ifndef __CUDA_ARCH__  // HIP
+#ifndef COMPATIBLE_ARCH  // HIP
 
   if (tid >= num_experts && tid < scan_size) {
     scan_buf[tid] = 0;
@@ -331,7 +331,7 @@ void moe_align_block_size(
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids,
     bool ignore_invalid_expert) {
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hggcStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int threads = 1024;
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;

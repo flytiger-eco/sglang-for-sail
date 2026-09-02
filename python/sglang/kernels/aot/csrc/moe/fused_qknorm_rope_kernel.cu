@@ -19,10 +19,10 @@
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_runtime.h>
+#include <hggc_bf16.h>
+#include <hggc_fp16.h>
+#include <hggc_fp8.h>
+#include <hggc_runtime.h>
 #include <torch/all.h>
 #include <torch/cuda.h>
 
@@ -106,16 +106,16 @@ __device__ inline float compute_freq_yarn(float base, int head_dim, int half_dim
 // interleave: interleave=!is_neox.
 template <int head_dim, bool interleave>
 __global__ void fusedQKNormRopeKernel(
-    __nv_bfloat16* qkv,             // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    int const num_heads_q,          // Number of query heads
-    int const num_heads_k,          // Number of key heads
-    int const num_heads_v,          // Number of value heads
-    float const eps,                // Epsilon for RMS normalization
-    __nv_bfloat16 const* q_weight,  // RMSNorm weights for query
-    __nv_bfloat16 const* k_weight,  // RMSNorm weights for key
-    float const base,               // Base for RoPE computation
-    int const* position_ids,        // Position IDs for RoPE
-    int const num_tokens,           // Number of tokens
+    __ppu_bfloat16* qkv,             // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int const num_heads_q,           // Number of query heads
+    int const num_heads_k,           // Number of key heads
+    int const num_heads_v,           // Number of value heads
+    float const eps,                 // Epsilon for RMS normalization
+    __ppu_bfloat16 const* q_weight,  // RMSNorm weights for query
+    __ppu_bfloat16 const* k_weight,  // RMSNorm weights for key
+    float const base,                // Base for RoPE computation
+    int const* position_ids,         // Position IDs for RoPE
+    int const num_tokens,            // Number of tokens
     // parameters for yarn
     float factor,  // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
     float low,     // threshold for high frequency
@@ -148,7 +148,7 @@ __global__ void fusedQKNormRopeKernel(
       "elements)");
   constexpr int numElemsPerThread = head_dim / 32;
   float elements[numElemsPerThread];
-  constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
+  constexpr int elemSizeBytes = numElemsPerThread * sizeof(__ppu_bfloat16);
   static_assert(elemSizeBytes % 4 == 0, "numSizeBytes must be a multiple of 4");
   constexpr int vecSize = elemSizeBytes / 4;  // Use packed_as<uint, vecSize> to perform loading/saving.
   using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
@@ -170,7 +170,7 @@ __global__ void fusedQKNormRopeKernel(
   {
     vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
     for (int i = 0; i < vecSize; i++) {
-      float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
+      float2 vals = __bfloat1622float2(*reinterpret_cast<__ppu_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
       sumOfSquares += vals.x * vals.x;
       sumOfSquares += vals.y * vals.y;
       elements[2 * i] = vals.x;
@@ -244,8 +244,8 @@ __global__ void fusedQKNormRopeKernel(
   {
     vec_T vec;
     for (int i = 0; i < vecSize; i++) {
-      __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-      reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
+      __ppu_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
+      reinterpret_cast<__ppu_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
     }
     vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
     *outputPtr = vec;
@@ -279,7 +279,7 @@ void launchFusedQKNormRope(
     float high,
     float attention_factor,
     int const rotary_dim,
-    cudaStream_t stream) {
+    hggcStream_t stream) {
   constexpr int blockSize = 256;
   int const warpsPerBlock = blockSize / 32;
   int const totalQKHeads = num_heads_q + num_heads_k;
@@ -293,13 +293,13 @@ void launchFusedQKNormRope(
     case 64:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
         fusedQKNormRopeKernel<64, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(qkv),
+            reinterpret_cast<__ppu_bfloat16*>(qkv),
             num_heads_q,
             num_heads_k,
             num_heads_v,
             eps,
-            reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-            reinterpret_cast<__nv_bfloat16 const*>(k_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(q_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(k_weight),
             base,
             position_ids,
             num_tokens,
@@ -313,13 +313,13 @@ void launchFusedQKNormRope(
     case 128:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
         fusedQKNormRopeKernel<128, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(qkv),
+            reinterpret_cast<__ppu_bfloat16*>(qkv),
             num_heads_q,
             num_heads_k,
             num_heads_v,
             eps,
-            reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-            reinterpret_cast<__nv_bfloat16 const*>(k_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(q_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(k_weight),
             base,
             position_ids,
             num_tokens,
@@ -333,13 +333,13 @@ void launchFusedQKNormRope(
     case 256:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
         fusedQKNormRopeKernel<256, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(qkv),
+            reinterpret_cast<__ppu_bfloat16*>(qkv),
             num_heads_q,
             num_heads_k,
             num_heads_v,
             eps,
-            reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-            reinterpret_cast<__nv_bfloat16 const*>(k_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(q_weight),
+            reinterpret_cast<__ppu_bfloat16 const*>(k_weight),
             base,
             position_ids,
             num_tokens,
@@ -407,15 +407,15 @@ void fused_qk_norm_rope(
   auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
   tensorrt_llm::kernels::launchFusedQKNormRope(
-      reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16*>(qkv.data_ptr()),
       static_cast<int>(num_tokens),
       static_cast<int>(num_heads_q),
       static_cast<int>(num_heads_k),
       static_cast<int>(num_heads_v),
       static_cast<int>(head_dim),
       static_cast<float>(eps),
-      reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16*>(q_weight.data_ptr()),
+      reinterpret_cast<__ppu_bfloat16*>(k_weight.data_ptr()),
       static_cast<float>(base),
       !is_neox,  // interleave
       reinterpret_cast<int const*>(position_ids.data_ptr()),

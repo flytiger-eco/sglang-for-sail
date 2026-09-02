@@ -11,8 +11,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
-#include <cuda.h>
-#include <cuda_fp16.h>
+#include <hggc.h>
+#include <hggc_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -420,14 +420,14 @@ void setup_kernel_smem_once() {
     // hipify will turn cudaFuncSetAttribute -> hipFuncSetAttribute. On ROCm,
     // hipFuncSetAttribute expects `const void*` and hipcc does not accept passing
     // a function pointer directly, so cast explicitly.
-    return ::cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+    return ::hggcFuncSetAttribute(
+        reinterpret_cast<const void*>(f), ::hggcFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #else
     // CUDA: keep original behavior (no cast needed).
-    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+    return ::hggcFuncSetAttribute(f, ::hggcFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
 #endif
   }();
-  TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+  TORCH_CHECK(result == hggcSuccess, "set_up_kernel_once failed:", ::hggcGetErrorString(result));
 }
 
 }  // namespace
@@ -449,8 +449,8 @@ void fast_topk_interface(
   const auto block = dim3{kThreadsPerBlock};
   setup_kernel_smem_once<topk_kernel, kSmem>();
   topk_kernel<<<grid, block, kSmem, stream>>>(params);
-  const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  const auto result = hggcGetLastError();
+  TORCH_CHECK(result == hggcSuccess, "topk kernel failed:", ::hggcGetErrorString(result));
 }
 
 void fast_topk_transform_interface(
@@ -505,8 +505,8 @@ void fast_topk_transform_interface(
         prefill_bs);
   }
 
-  const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  const auto result = hggcGetLastError();
+  TORCH_CHECK(result == hggcSuccess, "topk kernel failed:", ::hggcGetErrorString(result));
 }
 
 void fast_topk_transform_ragged_interface(
@@ -541,6 +541,6 @@ void fast_topk_transform_ragged_interface(
   topk_transform_prefill_ragged_kernel<<<grid, block, kSmem, stream>>>(
       params, topk_indices_ragged.data_ptr<int32_t>(), topk_indices_offset.data_ptr<int32_t>());
 
-  const auto result = cudaGetLastError();
-  TORCH_CHECK(result == cudaSuccess, "topk kernel failed:", ::cudaGetErrorString(result));
+  const auto result = hggcGetLastError();
+  TORCH_CHECK(result == hggcSuccess, "topk kernel failed:", ::hggcGetErrorString(result));
 }

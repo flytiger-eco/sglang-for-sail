@@ -15,7 +15,7 @@ limitations under the License.
 
 #include "tvm_ffi_utils.h"
 #include <algorithm>
-#include <cuda_runtime.h>
+#include <hggc_runtime.h>
 #include <limits>
 
 namespace sglang {
@@ -101,8 +101,8 @@ void moe_permute_prepare(
     CHECK_INPUT_TYPE(expert_offsets, dl_int32);
   }
 
-  cudaSetDevice(sorted_topk_ids.device().device_id);
-  cudaStream_t stream = get_stream(sorted_topk_ids.device());
+  hggcSetDevice(sorted_topk_ids.device().device_id);
+  hggcStream_t stream = get_stream(sorted_topk_ids.device());
   int32_t numel = static_cast<int32_t>(sorted_topk_ids.size(0));
   int32_t num_experts_i32 = static_cast<int32_t>(num_experts);
   constexpr int threads = 256;
@@ -118,8 +118,8 @@ void moe_permute_prepare(
       use_int64_offset,
       is_ep);
 
-  cudaError_t err = cudaGetLastError();
-  TVM_FFI_ICHECK(err == cudaSuccess) << "moe_permute_prepare launch failed: " << cudaGetErrorString(err);
+  hggcError_t err = hggcGetLastError();
+  TVM_FFI_ICHECK(err == hggcSuccess) << "moe_permute_prepare launch failed: " << hggcGetErrorString(err);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_permute_prepare, moe_permute_prepare);

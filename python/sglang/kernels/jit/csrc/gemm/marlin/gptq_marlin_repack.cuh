@@ -31,7 +31,7 @@ namespace sglang {
 
 namespace device::marlin {
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+#if defined(COMPATIBLE_ARCH) && COMPATIBLE_ARCH < 800
 template <int const num_threads, int const num_bits, bool const has_perm>
 __global__ void gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
@@ -275,9 +275,9 @@ __global__ void gptq_marlin_repack_kernel(
 
 #define CALL_IF_REPACK(NUM_BITS, HAS_PERM)                                                                        \
   else if (num_bits == NUM_BITS && has_perm == HAS_PERM) {                                                        \
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(                                                                \
+    host::RuntimeDeviceCheck(hggcFuncSetAttribute(                                                                \
         device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,            \
-        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                              \
+        hggcFuncAttributeMaxDynamicSharedMemorySize,                                                              \
         max_shared_mem));                                                                                         \
     host::LaunchKernel(blocks, device::marlin::repack_threads, stream, static_cast<std::size_t>(max_shared_mem))( \
         device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,            \
@@ -342,12 +342,12 @@ void gptq_marlin_repack(
   // Get dev info
   DLDevice dl_device = device_.unwrap();
   int dev = dl_device.device_id;
-  cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
+  hggcStream_t stream = LaunchKernel::resolve_device(dl_device);
   int blocks;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev));
+  RuntimeDeviceCheck(hggcDeviceGetAttribute(&blocks, hggcDevAttrMultiProcessorCount, dev));
 
   int max_shared_mem = 0;
-  RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  RuntimeDeviceCheck(hggcDeviceGetAttribute(&max_shared_mem, hggcDevAttrMaxSharedMemoryPerBlockOptin, dev));
   RuntimeCheck(max_shared_mem > 0, "max_shared_mem must be > 0");
 
   if (false) {
