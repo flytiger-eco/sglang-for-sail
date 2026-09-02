@@ -28,12 +28,13 @@ on:
         type: string
         default: 'feat/ppu-answer-nightly'
       mode:
-        description: 'answer = run the Answer nightly; discover = read-only NAS inspection; inventory-k8s = read-only M890P device inspection.'
+        description: 'answer = run the Answer nightly; answer-k8s = run the Answer suites on the btv1.5 cluster; discover = read-only NAS inspection; inventory-k8s = read-only M890P device inspection.'
         required: false
         type: choice
         default: answer
         options:
           - answer
+          - answer-k8s
           - discover
           - inventory-k8s
 
@@ -46,6 +47,19 @@ jobs:
     uses: ./.github/workflows/nightly-test-ppu-answer.yml
     with:
       ref: ${{ inputs.ref || 'feat/ppu-answer-nightly' }}
+
+  # Same borrowing, for the K8s Answer workflow. `uses: ./` resolves the callee
+  # from this branch's commit rather than from `ref`, so this branch must be
+  # rebased onto the tip under test before dispatching; the callee's own
+  # actions/checkout then reads the tree from `ref`. Since this branch is that
+  # tip plus these launcher commits, the file executed here is byte-identical to
+  # the one under review.
+  answer-k8s:
+    if: inputs.mode == 'answer-k8s'
+    uses: ./.github/workflows/test-ppu-answer-k8s.yml
+    with:
+      ref: ${{ inputs.ref || 'feat/ppu-answer-nightly' }}
+    secrets: inherit
 
   # Porting the Answer suites to the K8s btv1.5 cluster needs two facts that no
   # document can supply: the device identity string that will be recorded as
