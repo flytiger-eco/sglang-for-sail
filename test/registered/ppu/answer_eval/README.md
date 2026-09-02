@@ -119,6 +119,22 @@ tool, which decodes the escapes: `jq '.cases[] | select(.case_id=="...")'`, or
 answer at once. The log block, in contrast, is already plain text: only
 characters that UTF-8 cannot encode stay escaped there.
 
+In provenance, `source_revision` is the authoritative identifier of what ran: it
+is the full commit SHA of the checkout, injected by the workflow.
+`package_versions.sglang` reads `0.0.0`, which is a property of the CI install
+path rather than a collection defect. `ppu_install_dependency.sh` swaps in
+`pyproject_other.toml`, whose version is dynamic, and installs with
+`--no-build-isolation`, so `setuptools-scm` is never present to supply one; had
+it run and found no tag, the configured `fallback_version` would have produced
+`0.0.0.dev0` instead. The checkout is `--no-tags --depth=2` in any case, so no
+tag is reachable on the machine to describe against. Recover the version number
+from the SHA in a full clone:
+
+```bash
+git checkout <source_revision>
+python3 python/tools/get_version_tag.py   # e.g. 0.5.13+v0.1.0-121-g5c9c6bce54
+```
+
 Public data belongs here:
 
 - prompts, reviewed reference facts, and quality profiles;
