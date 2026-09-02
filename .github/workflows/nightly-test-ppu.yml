@@ -28,23 +28,106 @@ on:
         type: string
         default: 'feat/ppu-answer-nightly'
       mode:
-        description: 'answer = run the Answer nightly; discover = read-only NAS inspection.'
+        description: 'answer = run the Answer nightly; discover = read-only NAS inspection; inventory-k8s = read-only M890P device inspection.'
         required: false
         type: choice
         default: answer
         options:
           - answer
           - discover
+          - inventory-k8s
 
 permissions:
   contents: read
 
 jobs:
   answer:
-    if: inputs.mode != 'discover'
+    if: inputs.mode == 'answer'
     uses: ./.github/workflows/nightly-test-ppu-answer.yml
     with:
       ref: ${{ inputs.ref || 'feat/ppu-answer-nightly' }}
+
+  # Porting the Answer suites to the K8s btv1.5 cluster needs two facts that no
+  # document can supply: the device identity string that will be recorded as
+  # hardware.generation, and the per-device memory, which the board type does not
+  # determine because M890P is planned internally in both a 96 GiB and a 144 GiB
+  # configuration. This job reads them from a node that carries the label the
+  # ported workflow will select, which also proves the label resolves at all.
+  #
+  # It requests one device, installs nothing, and never touches the weights, so
+  # it costs a couple of minutes and cannot disturb a concurrent job. No
+  # actions/checkout: the source tree is not needed, and skipping it keeps the
+  # action from staging the whole repository to NAS.
+  inventory-k8s:
+    if: inputs.mode == 'inventory-k8s'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 30
+    steps:
+      - name: Inspect one M890P device and the checkpoints it can reach
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: "board-type=ZW-M890P"
+          timeout_minutes: 20
+          container_options: |
+            privileged: true
+            host_ipc: true
+          command: |
+            echo "===== identity"
+            echo "node: ${NODE_NAME}"
+            echo "pod:  $(hostname)"
+            echo "===== device special files"
+            ls -l /dev/alixpu* 2>&1 | head -20 || true
+            echo "===== vendor tooling"
+            if command -v ppu-smi >/dev/null 2>&1; then ppu-smi 2>&1 | head -40; else echo "ppu-smi absent"; fi
+            echo "===== torch view of the device"
+            python3 -c "
+            import torch
+            def report(tag):
+                n = torch.cuda.device_count()
+                print(tag, 'device_count =', n)
+                for i in range(n):
+                    p = torch.cuda.get_device_properties(i)
+                    print(tag, i, 'name =', torch.cuda.get_device_name(i))
+                    print(tag, i, 'total_memory_bytes =', p.total_memory)
+                    print(tag, i, 'total_memory_gib =', round(p.total_memory / 1024**3, 3))
+                    print(tag, i, 'properties =', p)
+                return n
+            if report('[plain torch]') == 0:
+                try:
+                    import acext
+                    print('[acext] imported', getattr(acext, '__version__', 'no __version__'))
+                    report('[after acext]')
+                except Exception as exc:
+                    print('[acext] import failed:', type(exc).__name__, exc)
+            print('torch', torch.__version__)
+            " 2>&1 || echo "torch inspection failed"
+            echo "===== checkpoints this cluster exposes"
+            echo "-- org directories holding a v3.5 or v3.8 tree --"
+            ls -d /nas_aisw/datasets/checkpoints/LLM/*/v3.5 /nas_aisw/datasets/checkpoints/LLM/*/v3.8 2>/dev/null || true
+            for p in /nas_aisw/datasets/checkpoints/LLM/*/v3.5/Qwen3.5-397B-A17B-W8A8-INT8 /nas_aisw/datasets/checkpoints/LLM/*/v3.8/Qwen3.8-27B; do
+              if [ -d "$p" ]; then
+                echo "present: $p ($(ls "$p"/*.safetensors 2>/dev/null | wc -l) shards)"
+              else
+                echo "absent:  $p"
+              fi
+            done
+            echo "===== evidence return channel"
+            probe="/mnt/wl_nas/devops/inventory-probe-$$"
+            if mkdir -p "$probe" && echo ok > "$probe/write-test"; then
+              echo "writable: $probe"
+              rm -f "$probe/write-test"
+              rmdir "$probe" || true
+            else
+              echo "NOT writable: $probe"
+            fi
+            echo "===== jit and hf caches"
+            ls -d /nas_aisw/cache/sglang-jit-ci /nas_aisw/datasets/hf_cache/hub 2>&1 || true
+            echo "===== inventory complete"
 
   # Porting a second model needs three facts that only exist on the runner: the
   # checkpoint path and its exact capitalisation, the architecture its
