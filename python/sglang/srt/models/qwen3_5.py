@@ -679,10 +679,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        # Use an explicit flatten instead of `reshape(*shape[:-2], -1)`: for a
+        # 0-token batch the target shape becomes [0, -1], which torch rejects as
+        # ambiguous.
+        core_attn_out = core_attn_out.flatten(-2, -1)
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+
+def _layer_input_num_tokens(hidden_states) -> int:
+    """Row count of a layer input that may be a fused AR+quant tuple."""
+    hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    return hs.shape[0]
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
@@ -786,7 +795,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        # Guard against empty (zero-token) batches under DP attention: a DP rank
+        # can receive a non-idle batch with 0 tokens. The attention kernels do not
+        # accept 0 rows (GemmaRMSNorm launches grid=(num_tokens,), the GDN output
+        # reshape becomes ambiguous, ...). Skipping only the attention part is safe
+        # because `out_proj` uses reduce_results=False, so no collective is
+        # short-circuited; the MLP/MoE part below still runs and participates in
+        # the a2a / all-reduce collectives.
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _layer_input_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1181,7 +1200,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        # Same zero-token guard as in Qwen3_5LinearDecoderLayer: a non-idle DP-attention
+        # rank can carry 0 tokens, which the QK-norm / attention kernels reject.
+        # `o_proj` has reduce_results=False, so skipping cannot deadlock the attn-TP group.
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _layer_input_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
