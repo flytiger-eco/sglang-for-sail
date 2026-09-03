@@ -62,6 +62,7 @@ jobs:
       - name: Probe the cross-node data path
         uses: flytiger-eco/ppu-distributed-action@main
         with:
+          image: ${{ env.PPU_BASE_IMAGE }}
           # Two nodes, whole boards. Two is the smallest group that crosses a
           # node boundary, and the board is claimed whole for the same reason
           # the Answer entry claims it: nothing else may land on a board this
