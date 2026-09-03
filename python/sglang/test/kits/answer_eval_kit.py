@@ -168,25 +168,46 @@ def validate_test_config(config: dict[str, Any]) -> None:
         "reasoning_parser",
         "watchdog_timeout",
     }
+    # pp_size is optional because pure tensor parallelism is the shape every
+    # existing entry uses, and a config that omits it keeps the command line it
+    # has today. It is not decoration: a checkpoint whose per-expert
+    # intermediate size is not divisible by the tensor-parallel degree times the
+    # quantization block size cannot be sharded by TP alone, and pipelining the
+    # layers is how the remaining devices are put to work.
+    optional_server_parameters = {"pp_size"}
+    supported_server_parameters = (
+        required_server_parameters | optional_server_parameters
+    )
     if (
         not isinstance(parameters, dict)
-        or set(parameters) != required_server_parameters
+        or not required_server_parameters <= set(parameters)
+        or not set(parameters) <= supported_server_parameters
     ):
         raise AnswerEvalError(
             "server.parameters must contain exactly the supported SGLang parameters"
         )
     if not isinstance(parameters["trust_remote_code"], bool):
         raise AnswerEvalError("server.parameters.trust_remote_code must be boolean")
-    if (
-        not isinstance(parameters["tp_size"], int)
-        or isinstance(parameters["tp_size"], bool)
-        or parameters["tp_size"] <= 0
+    for field in ("tp_size", "pp_size"):
+        if field not in parameters:
+            continue
+        if (
+            not isinstance(parameters[field], int)
+            or isinstance(parameters[field], bool)
+            or parameters[field] <= 0
+        ):
+            raise AnswerEvalError(
+                f"server.parameters.{field} must be a positive integer"
+            )
+    # SGLang's own check is tp_size * pp_size against the node count, so the
+    # product is what has to match the devices the job actually holds; a config
+    # that got this wrong would start a server whose ranks never all arrive.
+    if parameters["tp_size"] * parameters.get("pp_size", 1) != (
+        len(visible_devices) * nnodes
     ):
-        raise AnswerEvalError("server.parameters.tp_size must be a positive integer")
-    if parameters["tp_size"] != len(visible_devices) * nnodes:
         raise AnswerEvalError(
-            "server.parameters.tp_size must equal the visible device count "
-            "summed over hardware.nnodes nodes"
+            "server.parameters.tp_size times pp_size must equal the visible "
+            "device count summed over hardware.nnodes nodes"
         )
     mem_fraction = parameters["mem_fraction_static"]
     if (
@@ -456,13 +477,18 @@ def build_answer_server_args(
         args.append("--trust-remote-code")
     for name in (
         "tp_size",
+        "pp_size",
         "attention_backend",
         "mem_fraction_static",
         "quantization",
         "reasoning_parser",
         "watchdog_timeout",
     ):
-        value = parameters[name]
+        # An absent optional parameter and an explicit null are the same
+        # instruction -- leave the flag off -- so a config that stays on pure
+        # tensor parallelism produces the command line it produced before
+        # pp_size existed, rather than an explicit --pp-size 1.
+        value = parameters.get(name)
         # A null leaves the flag off the command line entirely, which for
         # quantization is the difference between letting the checkpoint declare
         # its own format and overriding that declaration.

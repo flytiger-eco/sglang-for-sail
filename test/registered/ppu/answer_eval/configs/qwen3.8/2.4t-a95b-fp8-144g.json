@@ -22,7 +22,8 @@
     "startup_timeout_seconds": 5400,
     "parameters": {
       "trust_remote_code": true,
-      "tp_size": 32,
+      "tp_size": 8,
+      "pp_size": 4,
       "attention_backend": "fa3",
       "mem_fraction_static": 0.8,
       "quantization": null,

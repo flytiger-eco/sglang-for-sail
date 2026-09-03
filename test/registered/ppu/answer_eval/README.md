@@ -114,9 +114,9 @@ SGLANG_PPU_ANSWER_TEST_CONFIG=test/registered/ppu/answer_eval/configs/qwen3.5/39
 
 Each test file also names its own config as the default, so the variable is only
 needed to depart from it. A config handed to the wrong file still fails loudly
-rather than silently testing something else: validation ties `tp_size` to the
-declared devices and the preflight ties the checkpoint to the devices actually
-visible.
+rather than silently testing something else: validation ties the parallel
+degrees to the declared devices and the preflight ties the checkpoint to the
+devices actually visible.
 
 For local pytest users, `test/registered/ppu/conftest.py` exposes the same
 selection as `--answer-test-config <path>`; that option is not part of the CI
@@ -211,11 +211,51 @@ that only one of them can grade the result.
 **The config states the topology, the environment states the rendezvous.**
 `hardware.nnodes` is the reviewed fact — it says the checkpoint is served across
 four nodes — and `hardware.visible_devices` keeps meaning *per node*, so
-`validate_test_config` requires `tp_size == len(visible_devices) * nnodes`. There
+`validate_test_config` requires `tp_size * pp_size == len(visible_devices) *
+nnodes`, which is the same product SGLang's own `check_server_args` measures
+against the node count. There
 is deliberately no `devices_per_node` field: it would restate the length of a
 list that is already there, and two spellings of one number drift. `nnodes`
 defaults to 1, so every existing config and the string
 `answer_expected_hardware` renders for it are untouched.
+
+**The 32 devices are 8-way tensor parallel over 4 pipeline stages, not 32-way
+tensor parallel.** This is the one place the entry departs from the number the
+internal case states, and the reason is arithmetic in the checkpoint rather than
+a preference. `config.json` declares `moe_intermediate_size: 2048` and
+`quantization_config.weight_block_size: [128, 128]`, and the FP8 path shards the
+expert weight column-wise before it lays out the scales, so
+`create_weights` in `layers/quantization/fp8.py` requires
+`2048 / tp_size` to be a multiple of 128 — satisfied up to `tp_size` 16, and
+`tp_size` 32 gives 64. Run `33813065317` is that failure, reached only after the
+cross-node group had formed and weight loading had begun:
+
+```
+ValueError: The output_size of gate's and up's weight = 64 is not divisible by
+weight quantization block_n = 128.
+```
+
+A second constraint is independent of quantization: the hybrid layers declare
+`linear_num_key_heads: 16`, which 32 does not divide, so the linear-attention
+heads cannot be split 32 ways either. Both are satisfied by `tp_size` 8, and the
+remaining factor of four goes to the 92 layers: `pp_size` 4. SGLang lays a rank
+out as `pp_rank * tp_size + tp_rank`, so each node ends up holding exactly one
+pipeline stage — every tensor-parallel collective stays inside a node, and the
+only cross-node traffic is the pipeline's point-to-point hand-off. That is a
+lighter demand on the fabric than `tp_size` 32 would have made, not a heavier
+one.
+
+This is also the shape the vendor documents for this checkpoint on four nodes:
+`server_cmds/LLM_Serving/BTV1.5/Qwen3.8-2.4T-A95B.md` in `model-test-cases`
+gives `--tp-size 8 --pp-size 4` for the FP8 weights, and its 32-way command is a
+different configuration entirely — expert parallel over DeepEP with data-parallel
+attention, which needs a transport PPU does not have here. The vendor's own
+evaluation command for the sibling MXFP4 checkpoint reads `--nnodes 2 --tp-size
+16`, where `2048 / 16` is exactly 128.
+
+`pp_size` is optional in the schema and absent from every other config, so those
+entries emit the command line they emitted before the field existed; a config
+that names it emits `--pp-size` immediately after `--tp-size`.
 
 Which node a given process is, and where the group meets, are not reviewable
 facts: they are decided by whatever launched the four pods. `resolve_distributed_runtime`
@@ -432,7 +472,10 @@ flag by flag; what follows is what that established.
 `python3 -m sglang.launch_server`. Both reach a group through
 `--dist-init-addr host:port`, `--nnodes`, and `--node-rank`, and both emit those
 three only when the node count exceeds one, so a single-node launch is given no
-rendezvous on either side. Both derive `--tp-size` from the case's `tp`.
+rendezvous on either side. Both derive `--tp-size` from the case's `tp`, with the
+one deliberate exception recorded above: the 2.4T FP8 entry splits the group as
+`--tp-size 8 --pp-size 4`, because 32-way tensor parallelism cannot shard that
+checkpoint's FP8 blocks at all.
 
 **Quantization, which was a defect here.** `model_mate` does not derive the flag
 from the case's `data_type` — that field only names the log directory — so a case

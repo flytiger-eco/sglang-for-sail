@@ -164,13 +164,24 @@ class TestPPUAnswerEval(unittest.TestCase):
                 args = build_answer_server_args(
                     config, distributed=self.rendezvous_for(config)
                 )
+                # The group a launch claims is tp_size * pp_size, which is what
+                # SGLang itself checks against the node count, so the product is
+                # what has to account for every device the job holds.
+                parameters = config["server"]["parameters"]
                 self.assertEqual(
-                    args[args.index("--tp-size") + 1],
-                    str(
-                        len(config["hardware"]["visible_devices"])
-                        * answer_node_count(config)
+                    int(args[args.index("--tp-size") + 1])
+                    * (
+                        int(args[args.index("--pp-size") + 1])
+                        if "--pp-size" in args
+                        else 1
                     ),
+                    len(config["hardware"]["visible_devices"])
+                    * answer_node_count(config),
                 )
+                # A config that stays on pure tensor parallelism must not grow an
+                # explicit --pp-size 1, so the flag appears exactly when the
+                # config asks for the layers to be split.
+                self.assertEqual("--pp-size" in args, "pp_size" in parameters)
                 # The schema only requires a non-empty string, so a value that
                 # argparse would reject would otherwise surface as a server that
                 # never starts. server_args is imported here rather than at
@@ -347,6 +358,61 @@ class TestPPUAnswerEval(unittest.TestCase):
             build_answer_server_args(self.test_config, distributed=distributed)
         with self.assertRaisesRegex(AnswerEvalError, "spans 2 nodes"):
             build_answer_server_args(config, distributed={**distributed, "nnodes": 2})
+
+    def test_pipeline_parallel_config_splits_the_group_it_declares(self):
+        # Measured on the cluster: tensor parallelism alone cannot serve the
+        # 2.4T FP8 checkpoint across 32 devices.  Its moe_intermediate_size is
+        # 2048 and its FP8 scales are blocked at 128, so 2048 // 32 == 64 is
+        # rejected by the FP8 weight loader, and its linear_num_key_heads is 16,
+        # which 32 does not divide either.  Splitting the layers across the nodes
+        # and keeping tensor parallelism inside each one is the shape the vendor
+        # documents for that checkpoint, and it is the reason pp_size exists
+        # here at all.
+        config = copy.deepcopy(self.test_config)
+        config["hardware"]["nnodes"] = 4
+        config["server"]["parameters"]["pp_size"] = 4
+        validate_test_config(config)
+
+        tp_size = config["server"]["parameters"]["tp_size"]
+        args = build_answer_server_args(config, distributed=self.rendezvous_for(config))
+        index = args.index("--tp-size")
+        self.assertEqual(
+            args[index : index + 4],
+            ["--tp-size", str(tp_size), "--pp-size", "4"],
+        )
+        # The parameter is optional, and an entry that does not name it keeps the
+        # command line it had before pp_size was a field at all.
+        self.assertNotIn("--pp-size", build_answer_server_args(self.test_config))
+
+        # A degree that leaves devices unaccounted for, or claims more than the
+        # job holds, is the failure this check exists to catch before the boards
+        # are claimed: the server would otherwise wait for ranks that never come.
+        for pp_size in (2, 8):
+            invalid = copy.deepcopy(config)
+            invalid["server"]["parameters"]["pp_size"] = pp_size
+            with self.subTest(pp_size=pp_size):
+                with self.assertRaisesRegex(AnswerEvalError, "visible device count"):
+                    validate_test_config(invalid)
+
+        for pp_size in (0, -1, 2.0, True, "4", None):
+            invalid = copy.deepcopy(config)
+            invalid["server"]["parameters"]["pp_size"] = pp_size
+            with self.subTest(pp_size=pp_size):
+                with self.assertRaisesRegex(AnswerEvalError, "pp_size"):
+                    validate_test_config(invalid)
+
+        # Admitting one optional parameter must not turn the schema into an open
+        # set: a parameter the kit does not translate would be read as honoured
+        # and silently dropped from the command line.
+        invalid = copy.deepcopy(config)
+        invalid["server"]["parameters"]["ep_size"] = 8
+        with self.assertRaisesRegex(AnswerEvalError, "exactly the supported"):
+            validate_test_config(invalid)
+
+        invalid = copy.deepcopy(config)
+        del invalid["server"]["parameters"]["tp_size"]
+        with self.assertRaisesRegex(AnswerEvalError, "exactly the supported"):
+            validate_test_config(invalid)
 
     def test_execution_config_rejects_inconsistent_or_unsafe_values(self):
         invalid = copy.deepcopy(self.test_config)
