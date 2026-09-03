@@ -259,6 +259,72 @@ jobs:
             sgl-kernel-wheel
           timeout_minutes: 110
 
+  # ==================== Benchmark: 4-node 890P ==================== #
+  benchmark-4node-890p:
+    name: "890P 4机性能测试 (4×8 PPU)"
+    needs: [check-changes, build-sgl-kernel]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.check-changes.outputs.changes_exist == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Download prebuilt sgl-kernel wheel
+        if: needs.build-sgl-kernel.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-python3.12-cuda13.0
+          path: ${{ github.workspace }}/sgl-kernel-wheel
+
+      - name: "890P 4机性能测试 (4 nodes × 8 PPU)"
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: "reg.docker.alibaba-inc.com/ai-tmp/llm:pytorch2.10.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312-ppu202607222103"
+          nnodes: 4
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          timeout_minutes: 90
+          source_dir: /workspace/source
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          artifact_paths: |
+            sgl-kernel-wheel
+          container_options: |
+            privileged: true
+            host_ipc: true
+            shm_size: 8Gi
+          extra_env: "DG_USE_MOE_DYNAMIC_TILE=1,SGLANG_SAIL_DEEPEP_RECV_HOOK=0,HGGC_EMBEDDED_COPY_THRESHOLD=0x10000,SGLANG_WARMUP_TIMEOUT=3600,NCCL_CUMEM_ENABLE=1,SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1,SGLANG_DG_CACHE_DIR=/wl_nas/devops/sglang_cache,DG_JIT_CACHE_DIR=/wl_nas/devops/sglang_cache,DG_CACHE_DIR=/wl_nas/devops/sglang_cache,SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
+          command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            cd /workspace/source
+            git config --global --add safe.directory /workspace/source
+            if [ -d "/workspace/source/sgl-kernel-wheel" ]; then python3 -m pip install /workspace/source/sgl-kernel-wheel/*.whl --force --no-deps; fi
+            find sgl-kernel -exec touch -t $(date +%Y%m%d%H%M.%S) {} + 2>/dev/null || true
+            python3 -m pip install z3-solver==4.13.0
+            MODEL=/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Pro
+            python3 -m sglang.launch_server --host 0.0.0.0 --port 12345 --dist-init-addr $MASTER_ADDR:$MASTER_PORT --nnodes 4 --node-rank $RANK \
+              --disable-radix-cache --trust-remote-code --model-path ${MODEL} --tp-size 32 \
+              --mem-fraction-static 0.7 --dist-timeout 3600 --watchdog-timeout 3600 --page-size 64 \
+              --speculative-algorithm EAGLE --speculative-attention-mode decode --speculative-num-steps 2 \
+              --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
+              --disable-custom-all-reduce --disable-shared-experts-fusion --log-level info \
+              --enable-metrics --stream-interval 128 --cuda-graph-max-bs 32 --chunked-prefill-size 8192 \
+              --max-running-requests 1280 --mamba-scheduler-strategy no_buffer --reasoning-parser deepseek-v4 \
+              --tool-call-parser deepseekv4 --moe-a2a-backend deepep \
+              --deepep-mode low_latency --moe-dense-tp-size 1 --enable-dp-lm-head --enable-dp-attention --dp-size 32 --decode-log-interval 1 --enable-deepseek-v4-fp4-indexer
+
   # ==================== Finish ==================== #
   pr-test-ppu-finish:
     needs:
@@ -268,6 +334,7 @@ jobs:
         stage-a-test-1-gpu-ppu,
         stage-b-test-1-gpu-ppu,
         stage-c-test-2-gpu-ppu,
+        benchmark-4node-890p,
       ]
     if: always()
     runs-on: ubuntu-latest
