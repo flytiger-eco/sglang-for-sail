@@ -494,6 +494,7 @@ def deepgemm_moe_permute(
     block_align: int = 1,
     block_k: int = 1,
     is_block_wise=False,
+    column_major_scales: bool = False,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
@@ -525,9 +526,14 @@ def deepgemm_moe_permute(
         ).t()  # [M_sum, S//2] with stride(0)=1, stride(1)=M_sum
     else:
         scale_hidden = (H + block_k - 1) // block_k
-        aq_scale_out = torch.empty(
-            (M_sum, scale_hidden), device=device, dtype=torch.float32
-        )
+        if column_major_scales:
+            aq_scale_out = torch.empty(
+                (scale_hidden, M_sum), device=device, dtype=torch.float32
+            ).t()  # [M_sum, scale_hidden] with stride(0)=1, stride(1)=M_sum
+        else:
+            aq_scale_out = torch.empty(
+                (M_sum, scale_hidden), device=device, dtype=torch.float32
+            )
 
     expert_ids = torch.empty((M_sum), device=device, dtype=torch.int32)
     inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
@@ -624,6 +630,9 @@ def deep_moe_impl_fused(
     use_tp_fused = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
     use_fused_path = use_tp_fused and not use_int4_w4a16
 
+    # Only the FP8 block-wise path emits column-major activation scales.
+    act_scale_col_major = False
+
     if use_int8:
         assert (
             per_channel_quant and block_shape is None
@@ -644,8 +653,9 @@ def deep_moe_impl_fused(
             ), f"Block-shape:{block_shape} mismatch for FP8 block-wise quant!"
             block_n, block_k = block_shape[0], block_shape[1]
             hidden_states, hidden_states_scale = sglang_per_token_group_quant_fp8(
-                hidden_states, block_k, column_major_scales=False
+                hidden_states, block_k, column_major_scales=True
             )
+            act_scale_col_major = True
     elif use_mxfp4:
         # hidden_states: torch.uint8, hidden_states_scale: torch.uint16
         hidden_states, hidden_states_scale = downcast_to_mxfp4(
@@ -708,6 +718,7 @@ def deep_moe_impl_fused(
                 block_align=block_align,
                 block_k=block_k,
                 is_block_wise=(block_shape is not None),
+                column_major_scales=act_scale_col_major,
             )
         )
         assert a.size(0) == num_tokens_padded
@@ -822,7 +833,7 @@ def deep_moe_impl_fused(
                 a, a_scale = sglang_per_token_quant_fp8(out2)
             else:
                 a, a_scale = sglang_per_token_group_quant_fp8(
-                    out2, block_k, column_major_scales=False
+                    out2, block_k, column_major_scales=True
                 )
         elif use_mxfp4:
             a, a_scale = downcast_to_mxfp4(out2, axis=1)
