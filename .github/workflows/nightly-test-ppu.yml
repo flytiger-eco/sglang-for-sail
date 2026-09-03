@@ -69,7 +69,11 @@ jobs:
         env:
           OBSERVED_RUN: ${{ inputs.observe_run }}
         run: |
-          set -uo pipefail
+          # No pipefail here: every log read below ends in `| head`, and head
+          # closing the pipe early leaves the producer killed by SIGPIPE, which
+          # under pipefail turned the whole observer red at exit 141 even though
+          # it had printed everything asked of it.
+          set -u
           base="/wl_nas/devops"
           if [ ! -d "${base}" ]; then
             echo "::error::${base} is not mounted on this runner"
@@ -95,6 +99,11 @@ jobs:
             echo "=== rendezvous ==="
             cat "${ranks_dir}/rendezvous"
           fi
+          for report in "${ranks_dir}"/node-*-net.txt; do
+            [ -f "${report}" ] || continue
+            echo "=== ${report} ==="
+            cat "${report}"
+          done
           for inventory in "${ranks_dir}"/rank-*-devices.json; do
             [ -f "${inventory}" ] || continue
             echo "=== ${inventory} ==="
@@ -104,11 +113,11 @@ jobs:
           for log in "${ranks_dir}"/rank-*.log; do
             [ -f "${log}" ] || continue
             echo "=== ${log} ($(wc -l < "${log}") lines) : head ==="
-            head -70 "${log}"
-            echo "=== ${log} : launch, transport and progress lines ==="
-            grep -nE 'launch_server|dist.init.addr|nnodes|node.rank|tp.size|dist.timeout|watchdog|PCCL|pccl|NCCL|nccl|Traceback|rror|WARNING|Loading|loading weight|Load weight|init_torch_distributed|initialize_model_parallel|Init torch distr|server is fired|The server is|health' "${log}" | head -60
+            head -30 "${log}"
+            echo "=== ${log} : transport and progress lines ==="
+            grep -nE 'NCCL INFO|NCCL WARN|Bootstrap|GID|ibv|IB |NET/|Socket|transport|Ring |Channel |Connected|P2P|Init torch distr|initialize_model_parallel|Traceback|rror|watchdog|Loading|server is fired|The server is' "${log}" | head -140
             echo "=== ${log} : tail ==="
-            tail -25 "${log}"
+            tail -30 "${log}"
           done
           for status in "${ranks_dir}"/rank-*.status; do
             [ -f "${status}" ] || continue
