@@ -119,6 +119,12 @@ jobs:
             tail -40 "${log}"
             echo "=== ${log} : transport and progress lines ==="
             grep -nE 'Connected all|NET/IB : Using|NCCL WARN|PCCL WARN|Traceback|rror|watchdog|Load(ing)? weight|init_torch_distributed|Init torch distributed ends|server is fired|The server is|Capture cuda graph|KV Cache' "${log}" | head -50
+            # pccl's own monitor reports a stalled collective and dumps state
+            # after it; that dump is what says which peer never answered.
+            if grep -q 'RAS trigger' "${log}"; then
+              echo "=== ${log} : from the first RAS dump ==="
+              sed -n '/RAS trigger/,$p' "${log}" | head -120
+            fi
           done
           for status in "${ranks_dir}"/rank-*.status; do
             [ -f "${status}" ] || continue
