@@ -124,8 +124,51 @@ jobs:
               echo "-- ibv_devices --"; ibv_devices || true
               echo "-- ibv_devinfo --"; ibv_devinfo | head -80 || true
               echo "-- locked memory --"; ulimit -l || true
+              grep -i 'locked\|Max locked' /proc/self/limits || true
+              # ibv_devinfo is absent from this image, so the GID table has to be
+              # read out of sysfs. If the index chosen below turns out to be wrong,
+              # this is what says which one carries RoCE v2 over the bond's IPv4
+              # address, without spending another four-board run to find out.
+              echo "-- GID tables --"
+              for dev in /sys/class/infiniband/*/ports/*/gid_attr/types/*; do
+                idx=$(basename "$dev"); port_dir=$(dirname "$(dirname "$dev")")
+                dev_name=$(basename "$(dirname "$(dirname "$port_dir")")")
+                echo "$dev_name port $(basename "$port_dir") gid $idx type=$(cat "$dev" 2>/dev/null) ndev=$(cat "$port_dir/gid_attr/ndevs/$idx" 2>/dev/null) gid=$(cat "$port_dir/gids/$idx" 2>/dev/null)"
+              done
               echo "-- transport env --"; env | grep -iE 'nccl|pccl|master|node_rank|nnodes|hggc' | sort || true
             } > "$NET_REPORT" 2>&1 || true
+            # The reviewed run set no NCCL_* at all and let pccl choose, and its
+            # collective kernel then polled channel 0 forever for data that never
+            # came, with rings and trees both reporting connected -- connection
+            # state travels over the OOB socket, so it says nothing about whether
+            # RDMA frames arrive. Multi-node training on this cluster does not
+            # leave the choice open: its PcclConfig pins the GID index, the queue
+            # pair count, the IB timeout and cross-NIC. That set is adopted here.
+            #
+            # The GID index is resolved from the device rather than hardcoded to
+            # PcclConfig's 7: a stale index is either rejected outright or, worse,
+            # points at a RoCE v1 entry the fabric drops, and either way costs a
+            # four-board run to discover. The entry wanted is RoCE v2 over the
+            # bond's IPv4 address, which sysfs shows as an IPv4-mapped GID.
+            gid_idx=""
+            for types_dir in /sys/class/infiniband/*/ports/1/gid_attr/types; do
+              port_dir=$(dirname "$(dirname "$types_dir")")
+              # mlx5 exposes a long GID table, so the entries are walked in
+              # numeric and not glob order -- otherwise index 10 would be reached
+              # before index 2.
+              for idx in $(ls "$types_dir" 2>/dev/null | sort -n); do
+                entry="$types_dir/$idx"
+                case "$(cat "$entry" 2>/dev/null)" in *v2*) ;; *) continue ;; esac
+                case "$(cat "$port_dir/gids/$idx" 2>/dev/null)" in
+                  0000:0000:0000:0000:0000:ffff:*) gid_idx="$idx" ;;
+                  *) continue ;;
+                esac
+                break
+              done
+              if [ -n "$gid_idx" ]; then break; fi
+            done
+            export NCCL_IB_GID_INDEX="${gid_idx:-7}"
+            echo "-- resolved NCCL_IB_GID_INDEX=$NCCL_IB_GID_INDEX (empty probe means fallback) --" >> "$NET_REPORT"
             bash scripts/ci/ppu/ppu_install_dependency.sh
             JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
             if [ "$JIT_MTIME" != 0 ]; then
@@ -149,7 +192,7 @@ jobs:
             bash ../scripts/ci/ppu/run_answer_suite_node.sh \
               ${{ env.ANSWER_SUITE }} 14400 "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks"
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }},NCCL_DEBUG=INFO"
+          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }},NCCL_DEBUG=INFO,NCCL_IB_QPS_PER_CONNECTION=8,NCCL_IB_TIMEOUT=25,NCCL_CROSS_NIC=1"
           container_options: |
             privileged: true
             host_ipc: true
