@@ -69,10 +69,13 @@ jobs:
         env:
           OBSERVED_RUN: ${{ inputs.observe_run }}
         run: |
-          # No pipefail here: every log read below ends in `| head`, and head
-          # closing the pipe early leaves the producer killed by SIGPIPE, which
-          # under pipefail turned the whole observer red at exit 141 even though
-          # it had printed everything asked of it.
+          # The runner invokes this with `bash -e -o pipefail`, and a `set -u`
+          # inside the script does not undo flags given on the command line. Every
+          # log read below ends in `| head`, head closing the pipe leaves the
+          # producer killed by SIGPIPE, pipefail surfaces that as 141 and -e then
+          # kills the script -- which silently truncated earlier observations to
+          # the first log's first 140 matches. Both flags are cleared here.
+          set +e +o pipefail
           set -u
           base="/wl_nas/devops"
           if [ ! -d "${base}" ]; then
@@ -112,15 +115,15 @@ jobs:
           done
           for log in "${ranks_dir}"/rank-*.log; do
             [ -f "${log}" ] || continue
-            echo "=== ${log} ($(wc -l < "${log}") lines) : head ==="
-            head -30 "${log}"
+            echo "=== ${log} ($(wc -l < "${log}") lines) : tail ==="
+            tail -40 "${log}"
             echo "=== ${log} : transport and progress lines ==="
-            grep -nE 'NCCL INFO|NCCL WARN|Bootstrap|GID|ibv|IB |NET/|Socket|transport|Ring |Channel |Connected|P2P|Init torch distr|initialize_model_parallel|Traceback|rror|watchdog|Loading|server is fired|The server is' "${log}" | head -140
-            echo "=== ${log} : tail ==="
-            tail -30 "${log}"
+            grep -nE 'Connected all|NET/IB : Using|NCCL WARN|PCCL WARN|Traceback|rror|watchdog|Load(ing)? weight|init_torch_distributed|Init torch distributed ends|server is fired|The server is|Capture cuda graph|KV Cache' "${log}" | head -50
           done
           for status in "${ranks_dir}"/rank-*.status; do
             [ -f "${status}" ] || continue
             echo "=== ${status} ==="
             cat "${status}"
           done
+          echo "=== observation complete ==="
+          exit 0
