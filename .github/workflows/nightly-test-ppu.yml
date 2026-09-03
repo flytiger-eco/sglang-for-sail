@@ -5,11 +5,15 @@ name: Nightly Test (PPU)
 # GitHub indexes workflow_dispatch by file name on the default branch, so a
 # workflow file that exists only on a version branch cannot be dispatched, no
 # matter which ref is asked for. This branch therefore borrows an already indexed
-# file name and, on this branch alone, replaces its body with a single call to the
+# file name and, on this branch alone, replaces its body with a call to the
 # workflow under review. `uses: ./` resolves the callee from the caller's commit,
 # so the file that executes is byte-identical to the reviewed one, and `ref` is
 # pinned to the reviewed commit so the source the pods check out is that commit
 # and not this shim.
+#
+# The second mode is an observer: the four pods tee their own logs to the NAS as
+# they go, and this runner group mounts the same NAS, so a CPU-only job can read
+# a run that is still in flight. It claims no board.
 #
 # The nightly jobs this file carries on the version branches are deliberately
 # absent here: keeping them would spend hours of PPU time to launch one entry.
@@ -17,14 +21,29 @@ name: Nightly Test (PPU)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'run = launch the four-node Answer entry; observe = read the NAS evidence of a run already in flight.'
+        required: false
+        type: choice
+        default: run
+        options:
+          - run
+          - observe
       ref:
         description: 'Reviewed commit to check out inside the pods.'
         required: false
         type: string
         default: '6bd8bce0dbb793c9ceed805eadaec466af2fa288'
+      observe_run:
+        description: 'For mode=observe: the run id whose evidence directory to read.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
-  group: nightly-test-ppu-${{ inputs.ref || github.ref }}
+  # The mode is part of the key on purpose: an observer must not queue behind the
+  # multi-hour run it exists to look at.
+  group: nightly-test-ppu-${{ inputs.mode }}-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -32,7 +51,63 @@ permissions:
 
 jobs:
   answer-32-k8s:
+    if: inputs.mode == 'run'
     uses: ./.github/workflows/test-ppu-answer-32-k8s.yml
     with:
       ref: ${{ inputs.ref }}
     secrets: inherit
+
+  observe:
+    if: inputs.mode == 'observe'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 10
+    steps:
+      - name: Read the four-node evidence directory
+        shell: bash
+        env:
+          OBSERVED_RUN: ${{ inputs.observe_run }}
+        run: |
+          set -uo pipefail
+          base="/wl_nas/devops"
+          if [ ! -d "${base}" ]; then
+            echo "::error::${base} is not mounted on this runner"
+            exit 1
+          fi
+          echo "=== candidate run directories ==="
+          ls -1 "${base}" | grep -F "${OBSERVED_RUN}" || echo "(none matching ${OBSERVED_RUN})"
+          # The job id the evidence path is built from is whatever the runner
+          # reports for github.job in a called workflow, so the depth is found
+          # rather than assumed.
+          ranks_dir=$(find "${base}" -maxdepth 5 -type d -path "*${OBSERVED_RUN}*" -name ranks | head -1)
+          if [ -z "${ranks_dir}" ]; then
+            echo "::warning::no ranks/ directory under ${base} for run ${OBSERVED_RUN}"
+            find "${base}" -maxdepth 5 -type d -path "*${OBSERVED_RUN}*" | head -40
+            exit 0
+          fi
+          results_dir=$(dirname "${ranks_dir}")
+          echo "=== ${results_dir} ==="
+          ls -la "${results_dir}" || true
+          echo "=== ${ranks_dir} ==="
+          ls -la "${ranks_dir}" || true
+          if [ -f "${ranks_dir}/rendezvous" ]; then
+            echo "=== rendezvous ==="
+            cat "${ranks_dir}/rendezvous"
+          fi
+          for inventory in "${ranks_dir}"/rank-*-devices.json; do
+            [ -f "${inventory}" ] || continue
+            echo "=== ${inventory} ==="
+            head -c 400 "${inventory}"
+            echo
+          done
+          for log in "${ranks_dir}"/rank-*.log; do
+            [ -f "${log}" ] || continue
+            echo "=== ${log} ($(wc -l < "${log}") lines) ==="
+            tail -40 "${log}"
+          done
+          for status in "${ranks_dir}"/rank-*.status; do
+            [ -f "${status}" ] || continue
+            echo "=== ${status} ==="
+            cat "${status}"
+          done
