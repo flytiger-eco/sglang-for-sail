@@ -338,12 +338,41 @@ def resolve_distributed_runtime(
     if nnodes == 1:
         return None
 
+    _check_launcher_group_size(environ, nnodes)
     node_rank = _distributed_node_rank(environ, nnodes)
     return {
         "nnodes": nnodes,
         "node_rank": node_rank,
         "dist_init_addr": _distributed_init_addr(environ),
     }
+
+
+def _check_launcher_group_size(environ: dict[str, str], nnodes: int) -> None:
+    """Refuse a launcher that started a different number of nodes than reviewed.
+
+    A launcher that starts too few pods leaves every rank it did start with a
+    valid rank, and the shortfall then surfaces only as a rendezvous that never
+    completes: the group would sit on the boards it did get for the whole 5400s
+    startup budget before failing.  Checked rather than trusted because the group
+    size is stated twice, once in the reviewed config and once in the workflow
+    that asks the cluster for boards, and nothing else compares them.
+
+    Silent when the launcher does not state a group size, which is the bare-metal
+    and local case; the rank is what is required there, not this.
+    """
+
+    raw = environ.get("NNODES")
+    if raw is None or raw == "":
+        return
+    try:
+        launched = int(raw)
+    except ValueError:
+        raise AnswerEvalError(f"NNODES must be an integer, not {raw!r}") from None
+    if launched != nnodes:
+        raise AnswerEvalError(
+            f"the launcher started {launched} node(s) and this config is served "
+            f"across {nnodes}"
+        )
 
 
 def _distributed_node_rank(environ: dict[str, str], nnodes: int) -> int:

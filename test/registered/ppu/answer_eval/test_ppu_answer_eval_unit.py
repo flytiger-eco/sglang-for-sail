@@ -282,6 +282,30 @@ class TestPPUAnswerEval(unittest.TestCase):
         self.assertEqual(overridden["dist_init_addr"], "215.193.196.51:29500")
         self.assertEqual(overridden["node_rank"], 3)
 
+        # A launcher that states its group size has to agree with the reviewed
+        # one. The action states it, as NNODES, and a single-node launch of it
+        # states 1, which is why the disagreement is worth catching here rather
+        # than after the boards have been claimed.
+        agreeing = dict(environ, NNODES="4")
+        self.assertEqual(resolve_distributed_runtime(config, agreeing), overridden)
+        for launched, message in (
+            ("2", "started 2 node"),
+            ("1", "started 1 node"),
+            ("four", "must be an integer"),
+        ):
+            with self.subTest(NNODES=launched):
+                with self.assertRaisesRegex(AnswerEvalError, message):
+                    resolve_distributed_runtime(config, dict(environ, NNODES=launched))
+        # An empty value is a launcher that says nothing, not one that says zero.
+        self.assertEqual(
+            resolve_distributed_runtime(config, dict(environ, NNODES="")),
+            overridden,
+        )
+        # And a single-node config is never asked about its group size, so the
+        # NNODES=1 the action injects for every single-board entry cannot make
+        # one of those fail.
+        self.assertIsNone(resolve_distributed_runtime(single_node, {"NNODES": "1"}))
+
     def test_multi_node_launch_refuses_an_unusable_rendezvous(self):
         config = copy.deepcopy(self.test_config)
         config["hardware"]["nnodes"] = 4

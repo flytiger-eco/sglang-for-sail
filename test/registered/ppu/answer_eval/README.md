@@ -39,7 +39,8 @@ reviewed config.
 
 `nightly-answer-32-ppu` has one config and one board. Its checkpoint is 2324.7
 GiB over 213 shards, which no 96GiB node count this cluster can gang-schedule
-would hold, so there is no ZW810E sibling to compare against; see
+would hold, so there is no ZW810E sibling to compare against; it has a workflow
+of its own, `test-ppu-answer-32-k8s.yml`, dispatch only — see
 [The four-node line](#the-four-node-line).
 
 The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
@@ -223,9 +224,19 @@ reads them from the environment and returns `None` for a single-node config:
 | Variable | Meaning |
 | --- | --- |
 | `NODE_RANK` | this pod's rank, injected per pod by `ppu-distributed-action` |
+| `NNODES` | the group size the launcher started, checked against `hardware.nnodes` |
 | `MASTER_ADDR`, `MASTER_PORT` | rank 0's address, composed into `--dist-init-addr` |
 | `SGLANG_PPU_ANSWER_NODE_RANK` | overrides the rank |
 | `SGLANG_PPU_ANSWER_DIST_INIT_ADDR` | overrides the address, as `host:port` |
+
+`NNODES` is checked rather than used: the group size is stated twice, once in the
+reviewed config and once in the workflow that asks the cluster for boards, and a
+launcher that started too few pods leaves every rank it did start with a valid
+one. The shortfall would then surface only as a rendezvous that never completes,
+after the group had held the boards it did get for the whole 5400s startup
+budget. A launcher that states nothing is left alone, which is the bare-metal
+case, and a single-node config is never asked, so the `NNODES=1` the action
+injects for every single-board entry cannot fail one of those.
 
 The two overrides are not conveniences. `ppu-distributed-action` asks for host
 networking while leaving `spec.dnsPolicy` at ClusterFirst, so the pods get the
@@ -272,6 +283,11 @@ pod write to its own copy of the same name. Underneath it, `ranks/` carries:
 - `rank0-complete`, written when rank 0 is done. Workers poll it with a
   `listdir` rather than an `exists`, since a readdir revalidates the negative
   lookup NFS would otherwise cache.
+- `rendezvous`, the address rank 0 published for the group to meet at, written by
+  `scripts/ci/ppu/answer_rendezvous.sh` before anything else and read by the
+  other three. Also staged and renamed, for the same reason.
+- `rank-<n>.log` and `rank-<n>.status`, each node's own output and its own exit
+  code, written by `scripts/ci/ppu/run_answer_suite_node.sh`.
 
 Rank 0 writes its report where the workflow collects it; a worker writes its own
 under `ranks/rank-<n>/`, so a worker's view of a run it did not grade cannot
@@ -290,12 +306,55 @@ reported nothing, the release, the three worker outcomes, and the teardown order
 It skips itself where torch is absent, since the driver needs it and the evaluator
 does not.
 
-This entry has no measured baseline yet, and no workflow entry either: the four-node
-matrix entry, the rank fan-out, and the worker log collection are the next change.
-`startup_timeout_seconds` 5400 and `est_time` 7200 are estimates: the node's
-2266 GiB of memory is smaller than the checkpoint tree, so the page-cache warm the
-single-node entries rely on cannot help, and the first run on the cluster is what
-will replace both numbers.
+This entry has no measured baseline yet. `startup_timeout_seconds` 5400 and
+`est_time` 7200 are estimates, and the first run on the cluster is what will
+replace both.
+
+**The workflow is its own file, and dispatch only.**
+`.github/workflows/test-ppu-answer-32-k8s.yml` claims four whole boards, so it is
+not a third entry in the btv1.5 matrix — sharing that matrix would make every
+routine btv1.5 dispatch ask the cluster for four more boards — and it is not
+wired into any nightly caller until it has passed once. `nnodes: 4` is what makes
+the action gang-schedule: it creates a PodGroup with `minMember: 4`, so the group
+either gets all four boards or waits, rather than half a group holding sixteen
+devices while the rest never arrives. `nproc_per_node: 8` is the whole board on
+each, which is both what TP=32 across four nodes needs and the only fence that
+keeps a second pod off a board this run has claimed.
+
+Three things differ from the single-board entries, each for a measured reason.
+
+**Rank 0 publishes the rendezvous, first thing.**
+`scripts/ci/ppu/answer_rendezvous.sh` runs before the dependency install: rank 0
+detects its own address and writes it into `ranks/rendezvous`, and the other three
+read it there and export it as `SGLANG_PPU_ANSWER_DIST_INIT_ADDR`. It has to be
+done this way because the name the action injects as `MASTER_ADDR` does not
+resolve in these pods, and it is done *early* so a worker waits only on its own
+install rather than on rank 0's. The address is detected in the order SGLang's own
+`get_local_ip_auto` uses — explicit host IP, then the source address the kernel
+would pick for an outbound route, then the hostname — so the group meets at the
+address the server would have chosen for itself. The detection is written against
+the standard library rather than imported from `sglang`, because it runs before the
+editable install and the rendezvous of a test should not need the tree under test
+to be importable.
+
+**No page-cache warm.** A warm reads the whole checkpoint tree, and at 2324.7 GiB
+that is larger than one node's 2266 GiB of memory, so the beginning of it is
+already evicted by the time the read ends; run on all four nodes it would also
+read four times what the group needs, since each node loads roughly its own
+quarter. It would cost hours of NAS traffic to leave the cache no warmer than it
+started. The single-board entries keep their warm, where the checkpoint does fit.
+
+**Each node keeps its own log and its own exit code.** The action streams
+worker-0's log and no other pod's, and a worker is exactly the node that would
+report a device shortfall or a lost server, so
+`scripts/ci/ppu/run_answer_suite_node.sh` tees each node's output into `ranks/`
+and records its status there. `tee` rather than a redirect, so rank 0's log still
+arrives live over a run this long; `PIPESTATUS` rather than the pipeline's status,
+because handing back `tee`'s exit code would turn every failed suite green. The
+collect step turns those status files into annotations: rank 0's verdict is
+written before the workers are released, so a worker that failed afterwards is
+visible in nothing else. The suite itself still runs through `run_suite.py`, so
+the executed set is what `register_ppu_ci` declares.
 
 ## Relation to the internal test cases
 
