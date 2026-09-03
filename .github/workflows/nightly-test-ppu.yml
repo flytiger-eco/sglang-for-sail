@@ -82,6 +82,25 @@ jobs:
             echo "::error::${base} is not mounted on this runner"
             exit 1
           fi
+          # Reading this costs no board, and the alternative is guessing. The
+          # socket-transport run got past the collective and then died because
+          # sglang's registry has no Qwen3_5MoeForCausalLM entry, so it fell
+          # through to the transformers implementation, which wants fla. Whether
+          # the fix is to register the class that already exists in qwen3_5.py
+          # depends on what config the checkpoint actually carries -- that class
+          # takes a text config, not the top-level one.
+          ckpt="/nas_aisw/datasets/checkpoints/LLM/Qwen/v3.8/Qwen3.8-2.4T-A95B-FP8"
+          echo "=== checkpoint ${ckpt} ==="
+          if [ -d "${ckpt}" ]; then
+            ls -la "${ckpt}" | head -40
+            echo "--- config.json ---"
+            python3 -c "import json,sys; d=json.load(open('${ckpt}/config.json')); d.pop('quantization_config',None); print(json.dumps(d, indent=2)[:6000])" 2>&1 | head -160
+          else
+            echo "not reachable from this runner"
+            for probe in /nas_aisw /nas_aisw/datasets /wl_nas; do
+              echo "-- ${probe} --"; ls -1 "${probe}" 2>&1 | head -10
+            done
+          fi
           echo "=== candidate run directories ==="
           ls -1 "${base}" | grep -F "${OBSERVED_RUN}" || echo "(none matching ${OBSERVED_RUN})"
           # The job id the evidence path is built from is whatever the runner
