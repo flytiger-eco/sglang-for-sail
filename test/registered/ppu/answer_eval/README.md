@@ -321,7 +321,7 @@ devices while the rest never arrives. `nproc_per_node: 8` is the whole board on
 each, which is both what TP=32 across four nodes needs and the only fence that
 keeps a second pod off a board this run has claimed.
 
-Three things differ from the single-board entries, each for a measured reason.
+Four things differ from the single-board entries, each for a measured reason.
 
 **Rank 0 publishes the rendezvous, first thing.**
 `scripts/ci/ppu/answer_rendezvous.sh` runs before the dependency install: rank 0
@@ -336,6 +336,39 @@ address the server would have chosen for itself. The detection is written agains
 the standard library rather than imported from `sglang`, because it runs before the
 editable install and the rendezvous of a test should not need the tree under test
 to be importable.
+
+**The group is told which RoCE GID to use.** `scripts/ci/ppu/answer_gid_index.sh`
+runs next and exports `NCCL_IB_GID_INDEX`. Left to itself pccl picks index 0 on
+these hosts, which is the link-local `fe80::<EUI-64>` address formed from the
+bond's MAC: it does not cross the L3 fabric between two nodes, so the group
+builds its queue pairs over the out-of-band TCP channel, logs `Connected all
+rings`, and then dies on its first payload with `IBV_WC_RETRY_EXC_ERR` — packets
+leave and the peer never acknowledges them. What the bonds do carry is a global
+ULA under `fd03::/8`, present as a consecutive GID pair, RoCE v1 then v2. A
+two-node sweep of all six indices on these boards measured exactly one that
+works:
+
+| GID | address | result |
+| --- | --- | --- |
+| 0 | `fe80:…:<MAC>`, link-local | hang, then `SIGABRT` — **this is what pccl picks by itself** |
+| 1 | `fe80:…:<MAC>`, link-local | `ibv_modify_qp` fails, connection timed out |
+| 2 | `fd03:45c2:1:XXXX::1`, global | `IBV_WC_RETRY_EXC_ERR` |
+| 3 | `fd03:45c2:1:XXXX::1`, global | `all_reduce` completes, checksum correct |
+| 4, 5 | `fe80:45c2:…` | `IBV_WC_RETRY_EXC_ERR` |
+
+The script derives the index — highest non-link-local GID, which is the v2 entry
+of the routable pair — rather than writing `3` down, because the table is built
+in whatever order the kernel added the addresses, and a node that ordered them
+differently would otherwise fall silently back to a GID that drops every packet.
+It exits non-zero if a device exposes no routable GID or if the four devices
+disagree, both being conditions under which the group must not start: failing at
+the entrance costs seconds, failing on the fabric costs the whole run.
+
+Note the boundary: this compensates for a *host* condition, RoCE bonds with no
+IPv4, which is what leads pccl's own preference — a v2 GID derived from the
+device's IPv4 — to find no match and fall back. On a host whose bonds carry
+IPv4, the automatic choice is already correct and this script would simply agree
+with it.
 
 **No page-cache warm.** A warm reads the whole checkpoint tree, and at 2324.7 GiB
 that is larger than one node's 2266 GiB of memory, so the beginning of it is

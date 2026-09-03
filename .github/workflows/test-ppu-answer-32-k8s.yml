@@ -102,6 +102,18 @@ jobs:
             # rendezvous actually uses -- see the script's own header.
             SGLANG_PPU_ANSWER_DIST_INIT_ADDR=$(bash scripts/ci/ppu/answer_rendezvous.sh "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks")
             export SGLANG_PPU_ANSWER_DIST_INIT_ADDR
+            # And the GID the RoCE data path must use. Left to itself pccl picks
+            # index 0 here, the link-local address formed from the bond's MAC,
+            # which does not cross the fabric between two nodes: the group
+            # builds its queue pairs over the out-of-band TCP channel, logs
+            # "Connected all rings", then dies on its first payload with
+            # IBV_WC_RETRY_EXC_ERR. Measured on these boards, only the RoCE v2
+            # entry of the routable fd03::/8 address carries traffic, and the
+            # script derives its index rather than hard-coding it -- see the
+            # script's own header for the full sweep. It fails loudly rather
+            # than letting the group start on a GID that silently drops.
+            NCCL_IB_GID_INDEX=$(bash scripts/ci/ppu/answer_gid_index.sh)
+            export NCCL_IB_GID_INDEX
             CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
             export CUDA_VISIBLE_DEVICES
             ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
@@ -109,6 +121,7 @@ jobs:
             echo "test config:     $SGLANG_PPU_ANSWER_TEST_CONFIG"
             echo "node rank:       ${NODE_RANK:-0} of ${NNODES:-1} on ${NODE_NAME:-an unnamed node}"
             echo "rendezvous:      $SGLANG_PPU_ANSWER_DIST_INIT_ADDR"
+            echo "RoCE GID index:  $NCCL_IB_GID_INDEX"
             echo "visible devices: $CUDA_VISIBLE_DEVICES"
             echo "checkpoint:      $ANSWER_MODEL_PATH"
             bash scripts/ci/ppu/ppu_install_dependency.sh
