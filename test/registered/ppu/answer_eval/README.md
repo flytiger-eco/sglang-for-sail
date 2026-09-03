@@ -131,7 +131,10 @@ and at most 2048 output tokens. The 397B server configuration is TP=8, FA3
 attention, static memory fraction 0.8, and `w8a8_int8` quantization; the 27B is
 TP=1, FA3, static memory fraction 0.85, and `unquant`, which is how
 `server_args` spells an explicit opt-out for a BF16 checkpoint; the 2.4T is
-TP=32, FA3, static memory fraction 0.8, and `fp8`.
+TP=32, FA3, static memory fraction 0.8, and no quantization flag at all, so the
+checkpoint's own declaration stands — see
+[Parity with the internal launcher](#parity-with-the-internal-launcher). All
+three carry `watchdog_timeout` 600, the value the internal answer cases use.
 
 ## The ZW-M890P line
 
@@ -306,8 +309,8 @@ quantization intent, and deliberately departs in two places:
   0, top-p 1) instead of the sampling values the internal cases carry, because a
   rule-based verdict must be reproducible;
 - serving parameters that the reviewed schema does not model — `page_size`,
-  `watchdog_timeout`, `stream_interval`, `max_running_requests`,
-  `cuda_graph_max_bs_decode`, `dist_timeout`, and the `disable_*` flags — are
+  `stream_interval`, `max_running_requests`, `cuda_graph_max_bs_decode`,
+  `dist_timeout`, and the `disable_*` flags — are
   left at SGLang defaults. `validate_test_config` accepts exactly the reviewed
   parameter set, so adding one of them is a schema change with its own review
   rather than a silent config edit.
@@ -325,6 +328,66 @@ by different means. `served_model_name` is `Qwen3.8-2.4T-A95B` while
 `checkpoint_name` is `Qwen3.8-2.4T-A95B-FP8`, which is the internal case's own
 spelling: the served name is what a client asks for and the checkpoint name is
 what was loaded, and the reviewed schema keeps them separate for exactly this.
+
+## Parity with the internal launcher
+
+The internal cases are executed by `model_mate`, whose `SGLangServerCmd`
+(`utils/commands/ServerCmd.py`, branch `sglang/h20_golden`) composes the launch.
+The command it builds and the one `popen_launch_server` builds were compared
+flag by flag; what follows is what that established.
+
+**Identical.** Both invoke `sglang serve` rather than
+`python3 -m sglang.launch_server`. Both reach a group through
+`--dist-init-addr host:port`, `--nnodes`, and `--node-rank`, and both emit those
+three only when the node count exceeds one, so a single-node launch is given no
+rendezvous on either side. Both derive `--tp-size` from the case's `tp`.
+
+**Quantization, which was a defect here.** `model_mate` does not derive the flag
+from the case's `data_type` — that field only names the log directory — so a case
+states a format or does not. Across the 51 internal btv1.5 sglang evalscope and
+answer cases the line is sharp: only `data_type: w8a8-int8` carries
+`quantization: w8a8_int8`, while `fp8`, `fp8-channel`, `mxfp4-fp8`, `awq`,
+`gptq-int4`, `gptq-int8`, and `bf16` all leave it unset. The reason is visible in
+`server_args.py`, where `fp8` is annotated *MOE + linear online quantization*:
+naming it asks for unquantised weights to be quantised at load time, which
+overrides what an already-quantised checkpoint declares in its own
+`config.json`. The 2.4T config therefore states `null`, and
+`build_answer_server_args` omits a null rather than rendering it. `unquant` on
+the two BF16 configs is not the same case: `server_args` maps it to `None` on
+arrival, and the flag it sets alongside is read only under `is_sm100_supported()`,
+so on PPU it is exactly the internal cases' silence, spelled explicitly.
+
+**`watchdog_timeout` 600** is now part of the reviewed schema and matches the
+internal answer cases, which set it almost uniformly.
+
+**`reasoning_parser`, a deliberate departure.** The internal Qwen answer cases do
+not pass it; these configs pass `qwen3` on all five. The requests here ask for
+`separate_reasoning` with `enable_thinking: false`, and the parser is what keeps a
+reasoning block out of the graded text; the two entries with measured baselines
+were produced with it. The internal cases that do pass one are the models whose
+templates need a different parser (`glm45`, `deepseek-v4`, `minimax-append-think`).
+
+**Bind address, unchanged.** `model_mate` binds `--host 0.0.0.0`; here the host
+comes from `DEFAULT_URL_FOR_TEST`, which is the loopback. Nothing off-node
+reaches the HTTP API: the only client runs in rank 0's own pod, and the workers
+coordinate through the rendezvous and the NAS, never over HTTP.
+
+**Group environment variables.** `SGLangServerCmd._config_env` exports
+`MASTER_ADDR`, `NNODES`, and `RANK` around the launch, and `_group_environment`
+now does the same for a multi-node launch — for parity, not for a consumer this
+repository can point at. On the path these configs take SGLang reads the
+rendezvous from `--dist-init-addr` alone: `MASTER_PORT` matters only behind an
+`env://` init-method override, and `MASTER_ADDR` only behind a `nixl` a2a
+backend. What the PPU runtime below reads is not visible here, so the group
+states itself the way the framework whose runs are the baseline states it.
+`MASTER_ADDR` is taken from the rendezvous actually in force rather than copied
+from the injected variable of the same name, since an override exists precisely
+when the injected one does not resolve.
+
+One mechanism has no analogue and needs none: `model_mate` skips any parameter
+whose value is falsy, which is why an internal case's `ep: 0` produces no flag.
+The reviewed schema lists its parameters exhaustively instead, so there is no
+value that silently disappears.
 
 ## Measured baseline (ZW810E)
 

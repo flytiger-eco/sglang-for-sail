@@ -118,6 +118,8 @@ class TestPPUAnswerEval(unittest.TestCase):
                 parameters["quantization"],
                 "--reasoning-parser",
                 parameters["reasoning_parser"],
+                "--watchdog-timeout",
+                str(parameters["watchdog_timeout"]),
                 "--served-model-name",
                 self.test_config["model"]["served_model_name"],
             ],
@@ -175,11 +177,19 @@ class TestPPUAnswerEval(unittest.TestCase):
                 # module scope to keep the evaluator's own import path stdlib
                 # only; "unquant" is that module's spelling for an explicit
                 # opt-out, which is how a BF16 checkpoint satisfies the field.
+                # A null is not a value argparse ever sees: it asks for the flag
+                # to be left off, so the checkpoint's own declaration stands,
+                # and the assertion is that no flag was emitted.
                 from sglang.srt.server_args import QUANTIZATION_CHOICES
 
-                self.assertIn(
-                    config["server"]["parameters"]["quantization"],
-                    QUANTIZATION_CHOICES,
+                quantization = config["server"]["parameters"]["quantization"]
+                if quantization is None:
+                    self.assertNotIn("--quantization", args)
+                else:
+                    self.assertIn(quantization, QUANTIZATION_CHOICES)
+                self.assertEqual(
+                    args[args.index("--watchdog-timeout") + 1],
+                    str(config["server"]["parameters"]["watchdog_timeout"]),
                 )
         self.assertEqual(len(test_ids), len(config_paths), "test_id must be unique")
 
@@ -338,6 +348,27 @@ class TestPPUAnswerEval(unittest.TestCase):
         invalid["evaluation"]["dataset"] = "../private/prompts.json"
         with self.assertRaisesRegex(AnswerEvalError, "relative"):
             validate_test_config(invalid)
+
+        # A null quantization is the one accepted omission, and the flag simply
+        # disappears from the command line.  An empty string is not the same
+        # thing: it would reach argparse and be rejected there, on the machine,
+        # after the checkpoint had been warmed.
+        omitted = copy.deepcopy(self.test_config)
+        omitted["server"]["parameters"]["quantization"] = None
+        validate_test_config(omitted)
+        self.assertNotIn("--quantization", build_answer_server_args(omitted))
+
+        invalid = copy.deepcopy(self.test_config)
+        invalid["server"]["parameters"]["quantization"] = ""
+        with self.assertRaisesRegex(AnswerEvalError, "quantization"):
+            validate_test_config(invalid)
+
+        for watchdog_timeout in (0, -1, "600", True, None):
+            invalid = copy.deepcopy(self.test_config)
+            invalid["server"]["parameters"]["watchdog_timeout"] = watchdog_timeout
+            with self.subTest(watchdog_timeout=watchdog_timeout):
+                with self.assertRaisesRegex(AnswerEvalError, "watchdog_timeout"):
+                    validate_test_config(invalid)
 
     def test_provenance_prefers_the_actual_checked_out_revision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1203,6 +1234,26 @@ class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
                 self.node(node_rank).report_dir,
                 self.root / "ranks" / f"rank-{node_rank}",
             )
+
+    def test_each_node_states_the_group_to_its_own_server(self):
+        # The variables the internal framework exports around the same launch.
+        # MASTER_ADDR comes from the rendezvous in force rather than from the
+        # injected variable of the same name, so an override that exists because
+        # the injected address does not resolve is not undone here.
+        for node_rank in range(4):
+            with self.subTest(node_rank=node_rank):
+                self.assertEqual(
+                    self.node(node_rank)._group_environment(),
+                    {
+                        "MASTER_ADDR": "10.0.0.1",
+                        "NNODES": "4",
+                        "RANK": str(node_rank),
+                    },
+                )
+        # A single-node launch inherits its environment untouched.
+        self.assertIsNone(
+            self.node(0, config=self.single_node)._group_environment(),
+        )
 
     def test_provenance_describes_every_node_the_verdict_was_produced_on(self):
         for node_rank in range(4):

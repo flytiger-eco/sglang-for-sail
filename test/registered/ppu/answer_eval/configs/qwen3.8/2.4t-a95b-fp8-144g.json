@@ -25,8 +25,9 @@
       "tp_size": 32,
       "attention_backend": "fa3",
       "mem_fraction_static": 0.8,
-      "quantization": "fp8",
-      "reasoning_parser": "qwen3"
+      "quantization": null,
+      "reasoning_parser": "qwen3",
+      "watchdog_timeout": 600
     }
   },
   "request": {

@@ -166,6 +166,7 @@ def validate_test_config(config: dict[str, Any]) -> None:
         "mem_fraction_static",
         "quantization",
         "reasoning_parser",
+        "watchdog_timeout",
     }
     if (
         not isinstance(parameters, dict)
@@ -194,11 +195,33 @@ def validate_test_config(config: dict[str, Any]) -> None:
         or not 0 < mem_fraction <= 1
     ):
         raise AnswerEvalError("server.parameters.mem_fraction_static must be in (0, 1]")
-    for field in ("attention_backend", "quantization", "reasoning_parser"):
+    for field in ("attention_backend", "reasoning_parser"):
         if not isinstance(parameters[field], str) or not parameters[field]:
             raise AnswerEvalError(
                 f"server.parameters.{field} must be a non-empty string"
             )
+    # quantization is the one parameter that may be omitted, and null is how a
+    # config says so. A checkpoint quantised offline already declares its format
+    # in its own config.json, and SGLang reads that when the flag is absent;
+    # naming a format here instead overrides that declaration, and several of the
+    # spellings argparse accepts -- "fp8" among them -- mean online quantisation
+    # of unquantised weights, which is not what such a checkpoint needs. The
+    # internal test cases draw the same line: of the Answer cases only the
+    # compressed-tensors ones state a format, and the rest leave it unset.
+    quantization = parameters["quantization"]
+    if quantization is not None and (
+        not isinstance(quantization, str) or not quantization
+    ):
+        raise AnswerEvalError(
+            "server.parameters.quantization must be a non-empty string or null"
+        )
+    watchdog_timeout = parameters["watchdog_timeout"]
+    if (
+        not isinstance(watchdog_timeout, (int, float))
+        or isinstance(watchdog_timeout, bool)
+        or watchdog_timeout <= 0
+    ):
+        raise AnswerEvalError("server.parameters.watchdog_timeout must be positive")
 
     request = config["request"]
     request_timeout = request.get("timeout_seconds")
@@ -408,8 +431,15 @@ def build_answer_server_args(
         "mem_fraction_static",
         "quantization",
         "reasoning_parser",
+        "watchdog_timeout",
     ):
-        args.extend([f"--{name.replace('_', '-')}", str(parameters[name])])
+        value = parameters[name]
+        # A null leaves the flag off the command line entirely, which for
+        # quantization is the difference between letting the checkpoint declare
+        # its own format and overriding that declaration.
+        if value is None:
+            continue
+        args.extend([f"--{name.replace('_', '-')}", str(value)])
     args.extend(["--served-model-name", config["model"]["served_model_name"]])
     if distributed is not None:
         args.extend(

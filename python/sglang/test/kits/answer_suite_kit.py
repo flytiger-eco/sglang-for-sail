@@ -326,6 +326,7 @@ class AnswerSuiteMixin:
                 other_args=build_answer_server_args(
                     cls.test_config, distributed=cls.distributed
                 ),
+                env=cls._group_environment(),
             )
             # A worker rank serves a dummy health endpoint once its own
             # schedulers are ready, so the launch above returns on every node and
@@ -345,6 +346,38 @@ class AnswerSuiteMixin:
                 )
             cls._release_worker_nodes()
             raise
+
+    @classmethod
+    def _group_environment(cls):
+        """The group's own description of itself, for the server's environment.
+
+        None for a single-node config, which leaves the launcher's inherited
+        environment untouched.
+
+        These three variables are what the internal framework exports around the
+        same `sglang serve` invocation, and they are set here for that parity
+        rather than for a consumer this suite can point at: on the path these
+        configs take, SGLang reads the rendezvous from `--dist-init-addr` alone,
+        and its two readers of `MASTER_ADDR` are both gated elsewhere -- the
+        global TCPStore behind a `nixl` a2a backend, and `env://` behind an
+        explicit init-method override.  What the PPU runtime beneath it reads is
+        not visible from this repository, so the group states itself the way the
+        framework whose runs are the baseline states it.
+
+        `MASTER_ADDR` is taken from the rendezvous actually in force, not copied
+        from the injected variable of the same name: when the address came from
+        `SGLANG_PPU_ANSWER_DIST_INIT_ADDR` it did so because the injected one
+        does not resolve, and re-exporting that would defeat the override.
+        """
+
+        if cls.distributed is None:
+            return None
+        master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(":")
+        return {
+            "MASTER_ADDR": master_addr,
+            "NNODES": str(cls.distributed["nnodes"]),
+            "RANK": str(cls.distributed["node_rank"]),
+        }
 
     @classmethod
     def _resolve_rank_dir(cls):
