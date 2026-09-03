@@ -4430,7 +4430,6 @@ class ServerArgs:
                 envs.SGLANG_K3_SP_COLLECTIVE,
                 envs.SGLANG_K3_SP_ATTN_RES,
                 envs.SGLANG_K3_GEMM_AR,
-                envs.SGLANG_K3_FUSED_FRONT,
             ):
                 field.set(False)
             # acext init
@@ -4452,8 +4451,8 @@ class ServerArgs:
                     "Disable custom allreduce and use pccl allreduce on ppu for better perf. Launch server with --enable-custom-all-reduce to force use custom allreduce"
                 )
             # use cuda fla by default on ppu
-            if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
-                envs.SGLANG_SAIL_FLA_CUDA.set(True)
+            if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
+                envs.SGLANG_SAIL_PLA_CUDA.set(True)
             # disable deepseek v4 topk_v2 on PPU
             if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
