@@ -107,6 +107,24 @@ jobs:
             echo "=== ${report} ==="
             cat "${report}"
           done
+          # The four nodes do not see the same set of IB character devices, and
+          # pccl numbers NET/IB/N by its own discovery order, so NET/IB/0 can name
+          # a different physical bond on each node. Four bonds on four isolated
+          # RoCE rails plus a mismatched pair gives exactly the failure under
+          # investigation: the QP is built over the OOB socket and then never
+          # carries a byte. These two sections are what decides that.
+          echo "=== device to netdev mapping, per node, as pccl sees it ==="
+          for log in "${ranks_dir}"/rank-*.log; do
+            [ -f "${log}" ] || continue
+            echo "--- ${log} ---"
+            grep -oE 'NET/IB : Using .*' "${log}" | sort -u
+          done
+          echo "=== cross-node channel assignments, per node ==="
+          for log in "${ranks_dir}"/rank-*.log; do
+            [ -f "${log}" ] || continue
+            echo "--- ${log} ---"
+            grep -oE 'Channel [0-9]+/[0-9]+ : [0-9]+\[[0-9a-f]+\] -> [0-9]+\[[0-9a-f]+\] \[(send|receive)\] via NET/IB/[0-9]+' "${log}" | sort -u | head -40
+          done
           for inventory in "${ranks_dir}"/rank-*-devices.json; do
             [ -f "${inventory}" ] || continue
             echo "=== ${inventory} ==="
