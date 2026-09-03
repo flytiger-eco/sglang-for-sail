@@ -2045,4 +2045,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+# Qwen3_5MoeForCausalLM is also an entry in its own right: the text-only MoE
+# checkpoints declare it in `architectures` and carry the text config at the top
+# level, with no vision tower and no `text_config` nesting. It is the very class
+# Qwen3_5MoeForConditionalGeneration delegates to as its `language_model_cls`,
+# so registering it costs nothing and keeps such checkpoints from falling
+# through to the transformers implementation.
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+]
