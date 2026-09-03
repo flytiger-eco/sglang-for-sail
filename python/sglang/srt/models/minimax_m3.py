@@ -1617,7 +1617,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        if self.is_layer_sparse:
+            hidden_states = self.mlp(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        elif hidden_states.shape[0] != 0:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
