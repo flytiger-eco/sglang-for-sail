@@ -18,22 +18,29 @@ reviewable unit. Nothing about discovery changes: `run_suite.py` and the
 `check-registered-tests` hook both walk `test/registered/**/*.py`, and a suite is
 owned by the `register_ppu_ci` call inside the file, not by its directory.
 
-Two models are covered, one registered file and one suite each because
-`register_ppu_ci` registers per file and the two claim different device counts:
+Three models are covered, one registered file and one suite each because
+`register_ppu_ci` registers per file and the three claim different device counts:
 
 | Suite | Test file | Model | Devices |
 | --- | --- | --- | --- |
 | `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 1 |
 | `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B-W8A8-INT8 | 8 |
+| `nightly-answer-32-ppu` | `test_ppu_qwen38_a95b_answer.py` | Qwen3.8-2.4T-A95B-FP8 | 32, over 4 nodes |
 
-Each suite is executed on two boards. That is a matter of configuration rather
-than of registration: the model, the corpus, and the judging standard are the
-same, so a board is chosen by handing the suite a different reviewed config.
+The first two suites are executed on two boards each. That is a matter of
+configuration rather than of registration: the model, the corpus, and the judging
+standard are the same, so a board is chosen by handing the suite a different
+reviewed config.
 
 | Board | Config suffix | Workflow | Trigger |
 | --- | --- | --- | --- |
 | ZW810E, 96GiB | none | `nightly-test-ppu-answer.yml` | cron 05:00 Beijing, dispatch |
 | ZW-M890P, 144GiB | `-144g` | `test-ppu-answer-k8s.yml` | dispatch only |
+
+`nightly-answer-32-ppu` has one config and one board. Its checkpoint is 2324.7
+GiB over 213 shards, which no 96GiB node count this cluster can gang-schedule
+would hold, so there is no ZW810E sibling to compare against; see
+[The four-node line](#the-four-node-line).
 
 The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
 ZW810E entries as a `max-parallel: 1` matrix. It has its own workflow instead of
@@ -64,7 +71,8 @@ carrying no board suffix: `configs/qwen3.8/27b-bf16.json` is
 suffix is the per-device capacity rather than the board name, which is how the
 internal plans separate these same two boards (`answer_96g`, `answer_144g`) and
 what `answer_expected_hardware` renders into provenance (`zw810e-8x96g`,
-`zw-m890p-8x144g`). The workflow reads the same file the test will read to select
+`zw-m890p-8x144g`, and `zw-m890p-4nx8x144g` for the four-node entry). The
+workflow reads the same file the test will read to select
 the visible devices and to warm the checkpoint page cache, then exports its path
 as `SGLANG_PPU_ANSWER_TEST_CONFIG`. This keeps the Python tests generic and makes
 the exact execution contract visible in the workflow log.
@@ -118,11 +126,12 @@ before starting SGLang. The test configuration digest and checkpoint
 configuration digest are included in provenance; the first on-machine run must
 establish the reviewed checkpoint digest baseline.
 
-Candidate generation is deterministic for both models: temperature 0, top-p 1,
+Candidate generation is deterministic for every model: temperature 0, top-p 1,
 and at most 2048 output tokens. The 397B server configuration is TP=8, FA3
 attention, static memory fraction 0.8, and `w8a8_int8` quantization; the 27B is
 TP=1, FA3, static memory fraction 0.85, and `unquant`, which is how
-`server_args` spells an explicit opt-out for a BF16 checkpoint.
+`server_args` spells an explicit opt-out for a BF16 checkpoint; the 2.4T is
+TP=32, FA3, static memory fraction 0.8, and `fp8`.
 
 ## The ZW-M890P line
 
@@ -185,10 +194,111 @@ configuration.
 Both entries have since been run on this board; see
 [Measured baseline (ZW-M890P)](#measured-baseline-zw-m890p).
 
+## The four-node line
+
+`nightly-answer-32-ppu` serves one checkpoint across four ZW-M890P nodes at
+TP=32. Its internal plan,
+`btv1.5_P1_sglang_1node_func_answer_4nodes.csv`, schedules it as `4node8ppu` on
+`M890P`, which is where the topology comes from: the case JSON itself carries only
+`tp: 32`. The suite body is the same ten prompts and the same deterministic
+evaluator; what is new is that four processes have to become one server, and
+that only one of them can grade the result.
+
+**The config states the topology, the environment states the rendezvous.**
+`hardware.nnodes` is the reviewed fact — it says the checkpoint is served across
+four nodes — and `hardware.visible_devices` keeps meaning *per node*, so
+`validate_test_config` requires `tp_size == len(visible_devices) * nnodes`. There
+is deliberately no `devices_per_node` field: it would restate the length of a
+list that is already there, and two spellings of one number drift. `nnodes`
+defaults to 1, so every existing config and the string
+`answer_expected_hardware` renders for it are untouched.
+
+Which node a given process is, and where the group meets, are not reviewable
+facts: they are decided by whatever launched the four pods. `resolve_distributed_runtime`
+reads them from the environment and returns `None` for a single-node config:
+
+| Variable | Meaning |
+| --- | --- |
+| `NODE_RANK` | this pod's rank, injected per pod by `ppu-distributed-action` |
+| `MASTER_ADDR`, `MASTER_PORT` | rank 0's address, composed into `--dist-init-addr` |
+| `SGLANG_PPU_ANSWER_NODE_RANK` | overrides the rank |
+| `SGLANG_PPU_ANSWER_DIST_INIT_ADDR` | overrides the address, as `host:port` |
+
+The two overrides are not conveniences. `ppu-distributed-action` asks for host
+networking while leaving `spec.dnsPolicy` at ClusterFirst, so the pods get the
+host resolver and the cluster-internal name it puts in `MASTER_ADDR` does not
+resolve — measured identically on all four ranks of run `33750074634`. A patch
+is with the action's owners; until it lands, the caller discovers rank 0's
+address another way and passes it through the override. Everything the launch
+needs is otherwise derived: the resolved rendezvous becomes `--nnodes`,
+`--node-rank`, and `--dist-init-addr`, appended to the argument list the
+single-node path already produced, and `build_answer_server_args` refuses a
+multi-node config launched without one — the alternative is four independent rank
+0 processes each trying to fit 2324.7 GiB onto eight devices.
+
+**Every node runs the same file.** `AnswerSuiteMixin` does not branch until after
+the server is up, because it does not have to: for `node_rank >= 1`, SGLang's
+`launch_server` brings up its schedulers and then serves a dummy health endpoint,
+so `popen_launch_server` returns on all four nodes and one launch path covers the
+group. The branch is in what happens next.
+
+| | Rank 0 | Ranks 1–3 |
+| --- | --- | --- |
+| Holds | the tokenizer and the HTTP API | its eight devices in the group |
+| Does | generates, grades, writes the report | waits |
+| Passes when | the corpus passes | it held the group until rank 0 was done |
+| Fails when | a case fails or the server dies | its own server dies first, or rank 0 never finishes |
+
+A worker cannot return early: its schedulers own their slice of every request, so
+leaving would tear the group down under rank 0. It also cannot wait forever, so
+the hold is bounded by the reviewed request budget for the whole corpus plus
+`WORKER_HOLD_MARGIN_SECONDS`.
+
+**The nodes address each other through the results directory.** They have no
+other shared surface — the action streams worker-0's log and returns no files —
+so `SGLANG_PPU_ANSWER_RESULTS_DIR` must be an absolute path on the NAS every pod
+mounts, and the multi-node path refuses a relative one rather than letting each
+pod write to its own copy of the same name. Underneath it, `ranks/` carries:
+
+- `rank-<n>-devices.json`, each node's own device inventory, written staged and
+  renamed because a reader on NFS can otherwise observe a partial file. Rank 0
+  reads all four into the report's `accelerator` record, so the provenance
+  describes the thirty-two devices the verdict was produced on rather than the
+  eight rank 0 could see. A node whose inventory never arrived is named in
+  `node_ranks_without_inventory` rather than dropped.
+- `rank0-complete`, written when rank 0 is done. Workers poll it with a
+  `listdir` rather than an `exists`, since a readdir revalidates the negative
+  lookup NFS would otherwise cache.
+
+Rank 0 writes its report where the workflow collects it; a worker writes its own
+under `ranks/rank-<n>/`, so a worker's view of a run it did not grade cannot
+overwrite the verdict. The single-node report is byte-identical to what it was:
+the multi-node keys are additive.
+
+The sentinel is written *before* rank 0 kills its own server. In the other order,
+killing rank 0 makes the workers' schedulers exit, each worker sees its own server
+die, and a healthy run reports three failed pods.
+
+The exchange is under test without a board.
+`TestPPUAnswerMultiNodeExchange` in `test_ppu_answer_eval_unit.py` binds the mixin
+to each of four ranks against a real temporary directory with a stubbed device,
+and covers the report destinations, the inventory round trip including a node that
+reported nothing, the release, the three worker outcomes, and the teardown order.
+It skips itself where torch is absent, since the driver needs it and the evaluator
+does not.
+
+This entry has no measured baseline yet, and no workflow entry either: the four-node
+matrix entry, the rank fan-out, and the worker log collection are the next change.
+`startup_timeout_seconds` 5400 and `est_time` 7200 are estimates: the node's
+2266 GiB of memory is smaller than the checkpoint tree, so the page-cache warm the
+single-node entries rely on cannot help, and the first run on the cluster is what
+will replace both numbers.
+
 ## Relation to the internal test cases
 
-Both suites are ports of internal `llm_infer_sglang_evalscope` answer cases
-(`qwen3.5-397b-a17b-w8a8-int8_3001` and `qwen3.8-27b-bf16_3001`). The port keeps
+All three suites are ports of internal `llm_infer_sglang_evalscope` answer cases
+(`qwen3.5-397b-a17b-w8a8-int8_3001`, `qwen3.8-27b-bf16_3001`, and the btv1.5
+`answer_4nodes/qwen3.8-2.4t-a95b-fp8_3001`). The port keeps
 the checkpoint, device count, attention backend, memory fraction, and
 quantization intent, and deliberately departs in two places:
 
@@ -207,6 +317,14 @@ repository keeps BF16, and no BF16 entry of its own. The port stays on BF16
 deliberately: the two `-144g` configs are the `-96g` ones with a different board,
 and nothing else, so a difference in verdicts has one candidate explanation. An
 FP8 entry is a separate case with its own baseline, not a substitution.
+
+The four-node case departs in one more place, which is not a choice: its internal
+plan reaches the group through the cluster's own launcher, and this repository
+reaches it through `ppu-distributed-action`, so the rank and the rendezvous arrive
+by different means. `served_model_name` is `Qwen3.8-2.4T-A95B` while
+`checkpoint_name` is `Qwen3.8-2.4T-A95B-FP8`, which is the internal case's own
+spelling: the served name is what a client asks for and the checkpoint name is
+what was loaded, and the reviewed schema keeps them separate for exactly this.
 
 ## Measured baseline (ZW810E)
 

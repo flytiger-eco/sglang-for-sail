@@ -100,6 +100,9 @@ def validate_test_config(config: dict[str, Any]) -> None:
         raise AnswerEvalError("hardware.platform must be PPU")
     if not isinstance(hardware.get("generation"), str) or not hardware["generation"]:
         raise AnswerEvalError("hardware.generation must be a non-empty string")
+    # Per node, not per job: every node of a multi-node config sees the same
+    # local device ordinals, and the workflow derives CUDA_VISIBLE_DEVICES from
+    # this list inside each pod.  hardware.nnodes carries the second dimension.
     visible_devices = hardware.get("visible_devices")
     if (
         not isinstance(visible_devices, list)
@@ -120,6 +123,9 @@ def validate_test_config(config: dict[str, Any]) -> None:
         or memory_gib <= 0
     ):
         raise AnswerEvalError("hardware.memory_gib_per_device must be positive")
+    nnodes = hardware.get("nnodes", 1)
+    if not isinstance(nnodes, int) or isinstance(nnodes, bool) or nnodes < 1:
+        raise AnswerEvalError("hardware.nnodes must be a positive integer")
 
     model = config["model"]
     model_path = model.get("path")
@@ -176,9 +182,10 @@ def validate_test_config(config: dict[str, Any]) -> None:
         or parameters["tp_size"] <= 0
     ):
         raise AnswerEvalError("server.parameters.tp_size must be a positive integer")
-    if parameters["tp_size"] != len(visible_devices):
+    if parameters["tp_size"] != len(visible_devices) * nnodes:
         raise AnswerEvalError(
-            "server.parameters.tp_size must equal the visible device count"
+            "server.parameters.tp_size must equal the visible device count "
+            "summed over hardware.nnodes nodes"
         )
     mem_fraction = parameters["mem_fraction_static"]
     if (
@@ -277,10 +284,121 @@ def resolve_evaluation_paths(
     )
 
 
-def build_answer_server_args(config: dict[str, Any]) -> list[str]:
-    """Translate a validated Answer config into SGLang server CLI arguments."""
+def answer_node_count(config: dict[str, Any]) -> int:
+    """The number of nodes the reviewed config serves the checkpoint across."""
+
+    return config["hardware"].get("nnodes", 1)
+
+
+def resolve_distributed_runtime(
+    config: dict[str, Any], environ: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """Bind a multi-node config to the rendezvous this process was handed.
+
+    Returns ``None`` for a single-node config, so a caller can treat the
+    single-node path as "no rendezvous" rather than as "one node of one".
+
+    The node rank and the rendezvous address are runtime facts, not reviewed
+    ones: they come from whatever launched the four pods, so they are read from
+    the environment rather than from the config.  ``NODE_RANK``, ``MASTER_ADDR``
+    and ``MASTER_PORT`` are the variables ppu-distributed-action injects per pod
+    in gang mode.  ``SGLANG_PPU_ANSWER_DIST_INIT_ADDR`` overrides the address it
+    composes, which is not a convenience: that action leaves ``spec.dnsPolicy``
+    at ClusterFirst while asking for host networking, so the pods receive the
+    host resolver and the cluster name in ``MASTER_ADDR`` does not resolve --
+    measured on all four ranks of run 33750074634.  Until that fix lands, the
+    caller has to hand this the rank 0 address it discovered some other way.
+    """
+
+    environ = os.environ if environ is None else environ
+    nnodes = answer_node_count(config)
+    if nnodes == 1:
+        return None
+
+    node_rank = _distributed_node_rank(environ, nnodes)
+    return {
+        "nnodes": nnodes,
+        "node_rank": node_rank,
+        "dist_init_addr": _distributed_init_addr(environ),
+    }
+
+
+def _distributed_node_rank(environ: dict[str, str], nnodes: int) -> int:
+    for name in ("SGLANG_PPU_ANSWER_NODE_RANK", "NODE_RANK"):
+        raw = environ.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            node_rank = int(raw)
+        except ValueError:
+            raise AnswerEvalError(f"{name} must be an integer, not {raw!r}") from None
+        if not 0 <= node_rank < nnodes:
+            raise AnswerEvalError(
+                f"{name} is {node_rank}, outside the [0, {nnodes}) this config declares"
+            )
+        return node_rank
+    raise AnswerEvalError(
+        "a multi-node Answer config needs the rank of this node: set NODE_RANK "
+        "or SGLANG_PPU_ANSWER_NODE_RANK"
+    )
+
+
+def _distributed_init_addr(environ: dict[str, str]) -> str:
+    override = environ.get("SGLANG_PPU_ANSWER_DIST_INIT_ADDR")
+    if override:
+        host, _, port = override.rpartition(":")
+        if not host or not port:
+            raise AnswerEvalError(
+                "SGLANG_PPU_ANSWER_DIST_INIT_ADDR must read host:port, not "
+                f"{override!r}"
+            )
+    else:
+        host = environ.get("MASTER_ADDR") or ""
+        port = environ.get("MASTER_PORT") or ""
+        if not host or not port:
+            raise AnswerEvalError(
+                "a multi-node Answer config needs the rendezvous address: set "
+                "MASTER_ADDR and MASTER_PORT, or "
+                "SGLANG_PPU_ANSWER_DIST_INIT_ADDR"
+            )
+    try:
+        port_number = int(port)
+    except ValueError:
+        raise AnswerEvalError(
+            f"the rendezvous port must be an integer, not {port!r}"
+        ) from None
+    if not 1 <= port_number <= 65535:
+        raise AnswerEvalError(f"the rendezvous port {port_number} is out of range")
+    return f"{host}:{port_number}"
+
+
+def build_answer_server_args(
+    config: dict[str, Any], *, distributed: dict[str, Any] | None = None
+) -> list[str]:
+    """Translate a validated Answer config into SGLang server CLI arguments.
+
+    ``distributed`` is the result of :func:`resolve_distributed_runtime`, and it
+    is required exactly when the config declares more than one node: a caller
+    that forgot it would otherwise launch every pod as an independent rank 0
+    that tries to fit the whole checkpoint on its own eight devices.
+    """
 
     parameters = config["server"]["parameters"]
+    nnodes = answer_node_count(config)
+    if distributed is None and nnodes > 1:
+        raise AnswerEvalError(
+            "a multi-node Answer config must be launched with the resolved "
+            "rendezvous from resolve_distributed_runtime"
+        )
+    if distributed is not None and nnodes == 1:
+        raise AnswerEvalError(
+            "a single-node Answer config must not be handed a rendezvous"
+        )
+    if distributed is not None and distributed["nnodes"] != nnodes:
+        raise AnswerEvalError(
+            f"the rendezvous spans {distributed['nnodes']} nodes and the config "
+            f"declares {nnodes}"
+        )
     args = []
     if parameters["trust_remote_code"]:
         args.append("--trust-remote-code")
@@ -293,6 +411,17 @@ def build_answer_server_args(config: dict[str, Any]) -> list[str]:
     ):
         args.extend([f"--{name.replace('_', '-')}", str(parameters[name])])
     args.extend(["--served-model-name", config["model"]["served_model_name"]])
+    if distributed is not None:
+        args.extend(
+            [
+                "--nnodes",
+                str(distributed["nnodes"]),
+                "--node-rank",
+                str(distributed["node_rank"]),
+                "--dist-init-addr",
+                distributed["dist_init_addr"],
+            ]
+        )
     return args
 
 
@@ -303,9 +432,17 @@ def answer_expected_hardware(config: dict[str, Any]) -> str:
     memory_gib = hardware["memory_gib_per_device"]
     if isinstance(memory_gib, float) and memory_gib.is_integer():
         memory_gib = int(memory_gib)
-    return (
-        f"{hardware['generation']}-" f"{len(hardware['visible_devices'])}x{memory_gib}g"
+    devices_per_node = len(hardware["visible_devices"])
+    nnodes = hardware.get("nnodes", 1)
+    # A single node keeps the string it has always had, so the contract recorded
+    # by the existing entries does not move; a multi-node contract has to state
+    # both dimensions, because 4nx8 and 1nx32 are not the same machine.
+    topology = (
+        f"{devices_per_node}x{memory_gib}g"
+        if nnodes == 1
+        else f"{nnodes}nx{devices_per_node}x{memory_gib}g"
     )
+    return f"{hardware['generation']}-{topology}"
 
 
 def normalize_answer(text: str) -> str:

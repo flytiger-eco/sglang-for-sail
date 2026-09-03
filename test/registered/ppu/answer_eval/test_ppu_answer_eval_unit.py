@@ -17,6 +17,7 @@ from sglang.test.kits.answer_eval_kit import (
     CandidateRequestError,
     _repeated_ngram_coverage,
     answer_expected_hardware,
+    answer_node_count,
     apply_cross_case_checks,
     build_answer_server_args,
     build_report,
@@ -31,6 +32,7 @@ from sglang.test.kits.answer_eval_kit import (
     render_junit,
     render_summary,
     request_chat_completion,
+    resolve_distributed_runtime,
     resolve_evaluation_paths,
     validate_annotation_record,
     validate_dataset,
@@ -38,6 +40,14 @@ from sglang.test.kits.answer_eval_kit import (
     validate_test_config,
     write_report_files,
 )
+
+# The on-machine driver, imported for the multi-node exchange tests at the end of
+# this file.  It needs torch, which the evaluator deliberately does not, so a
+# host without it skips those tests rather than failing to collect this file.
+try:
+    from sglang.test.kits import answer_suite_kit
+except ImportError:
+    answer_suite_kit = None
 
 # Hardware-free (pure stdlib evaluator), so the CPU suite owns it. It is also
 # registered on the PPU per-commit chain: this file is the only guard for the
@@ -71,6 +81,15 @@ class TestPPUAnswerEval(unittest.TestCase):
 
     def reason_codes(self, result):
         return {finding["reason_code"] for finding in result["findings"]}
+
+    @staticmethod
+    def rendezvous_for(config):
+        """A stand-in for what the launcher injects, for configs that need one."""
+
+        return resolve_distributed_runtime(
+            config,
+            {"NODE_RANK": "0", "MASTER_ADDR": "rank0.example", "MASTER_PORT": "29500"},
+        )
 
     def test_data_contract_and_digest_are_stable(self):
         validate_test_config(self.test_config)
@@ -140,10 +159,15 @@ class TestPPUAnswerEval(unittest.TestCase):
                         resolved.is_file(),
                         f"evaluation.{field} does not resolve to a file",
                     )
-                args = build_answer_server_args(config)
+                args = build_answer_server_args(
+                    config, distributed=self.rendezvous_for(config)
+                )
                 self.assertEqual(
                     args[args.index("--tp-size") + 1],
-                    str(len(config["hardware"]["visible_devices"])),
+                    str(
+                        len(config["hardware"]["visible_devices"])
+                        * answer_node_count(config)
+                    ),
                 )
                 # The schema only requires a non-empty string, so a value that
                 # argparse would reject would otherwise surface as a server that
@@ -181,11 +205,134 @@ class TestPPUAnswerEval(unittest.TestCase):
         config["hardware"]["memory_gib_per_device"] = 144
         self.assertEqual(answer_expected_hardware(config), "btv1.5-8x144g")
 
+        # A multi-node contract has to state both dimensions: eight devices on
+        # each of four nodes is not the same machine as thirty-two on one, and a
+        # report that rendered them alike could not be used to tell them apart.
+        config["hardware"]["nnodes"] = 4
+        self.assertEqual(answer_expected_hardware(config), "btv1.5-4nx8x144g")
+        # An explicitly declared single node keeps the original rendering, so the
+        # contract already recorded by the existing entries does not move.
+        config["hardware"]["nnodes"] = 1
+        self.assertEqual(answer_expected_hardware(config), "btv1.5-8x144g")
+
+    def test_multi_node_config_binds_the_rendezvous_it_is_handed(self):
+        single_node = self.test_config
+        self.assertIsNone(resolve_distributed_runtime(single_node, {}))
+        self.assertEqual(answer_node_count(single_node), 1)
+
+        config = copy.deepcopy(single_node)
+        config["hardware"]["nnodes"] = 4
+        config["server"]["parameters"]["tp_size"] = 4 * len(
+            config["hardware"]["visible_devices"]
+        )
+        validate_test_config(config)
+        self.assertEqual(answer_node_count(config), 4)
+
+        # The rank and the address are runtime facts, so they come from the
+        # variables the action injects per pod rather than from the config.
+        environ = {
+            "NODE_RANK": "2",
+            "MASTER_ADDR": "rank0.headless.svc.cluster.local",
+            "MASTER_PORT": "29500",
+        }
+        distributed = resolve_distributed_runtime(config, environ)
+        self.assertEqual(
+            distributed,
+            {
+                "nnodes": 4,
+                "node_rank": 2,
+                "dist_init_addr": "rank0.headless.svc.cluster.local:29500",
+            },
+        )
+
+        args = build_answer_server_args(config, distributed=distributed)
+        self.assertEqual(
+            args[-6:],
+            [
+                "--nnodes",
+                "4",
+                "--node-rank",
+                "2",
+                "--dist-init-addr",
+                "rank0.headless.svc.cluster.local:29500",
+            ],
+        )
+        # The topology flags are purely additive: everything a single-node launch
+        # would pass is still passed, in the same order.
+        without_topology = copy.deepcopy(config)
+        del without_topology["hardware"]["nnodes"]
+        self.assertEqual(args[:-6], build_answer_server_args(without_topology))
+
+        # The measured defect this override exists for: the action asks for host
+        # networking without setting dnsPolicy, so MASTER_ADDR does not resolve
+        # inside the pods and the caller has to supply rank 0's address itself.
+        environ["SGLANG_PPU_ANSWER_DIST_INIT_ADDR"] = "215.193.196.51:29500"
+        environ["SGLANG_PPU_ANSWER_NODE_RANK"] = "3"
+        overridden = resolve_distributed_runtime(config, environ)
+        self.assertEqual(overridden["dist_init_addr"], "215.193.196.51:29500")
+        self.assertEqual(overridden["node_rank"], 3)
+
+    def test_multi_node_launch_refuses_an_unusable_rendezvous(self):
+        config = copy.deepcopy(self.test_config)
+        config["hardware"]["nnodes"] = 4
+        config["server"]["parameters"]["tp_size"] = 4 * len(
+            config["hardware"]["visible_devices"]
+        )
+        address = {"MASTER_ADDR": "rank0.example", "MASTER_PORT": "29500"}
+        for environ, message in (
+            ({}, "rank of this node"),
+            ({"NODE_RANK": "4", **address}, "outside the"),
+            ({"NODE_RANK": "-1", **address}, "outside the"),
+            ({"NODE_RANK": "first", **address}, "must be an integer"),
+            ({"NODE_RANK": "0"}, "rendezvous address"),
+            ({"NODE_RANK": "0", "MASTER_ADDR": "rank0.example"}, "rendezvous address"),
+            (
+                {"NODE_RANK": "0", "MASTER_ADDR": "rank0.example", "MASTER_PORT": "n"},
+                "port must be an integer",
+            ),
+            (
+                {"NODE_RANK": "0", "MASTER_ADDR": "rank0.example", "MASTER_PORT": "0"},
+                "out of range",
+            ),
+            (
+                {"NODE_RANK": "0", "SGLANG_PPU_ANSWER_DIST_INIT_ADDR": "10.0.0.1"},
+                "host:port",
+            ),
+        ):
+            with self.subTest(environ=environ):
+                with self.assertRaisesRegex(AnswerEvalError, message):
+                    resolve_distributed_runtime(config, environ)
+
+        # A caller that forgets the rendezvous must not get four independent
+        # rank 0 servers, each trying to fit the whole checkpoint on eight
+        # devices, and a single-node config must not be handed one either.
+        distributed = self.rendezvous_for(config)
+        with self.assertRaisesRegex(AnswerEvalError, "must be launched with"):
+            build_answer_server_args(config)
+        with self.assertRaisesRegex(AnswerEvalError, "must not be handed"):
+            build_answer_server_args(self.test_config, distributed=distributed)
+        with self.assertRaisesRegex(AnswerEvalError, "spans 2 nodes"):
+            build_answer_server_args(config, distributed={**distributed, "nnodes": 2})
+
     def test_execution_config_rejects_inconsistent_or_unsafe_values(self):
         invalid = copy.deepcopy(self.test_config)
         invalid["server"]["parameters"]["tp_size"] = 4
         with self.assertRaisesRegex(AnswerEvalError, "visible device count"):
             validate_test_config(invalid)
+
+        # tp_size spans the whole group, so a node count that appears without a
+        # matching tp_size is the same inconsistency.
+        invalid = copy.deepcopy(self.test_config)
+        invalid["hardware"]["nnodes"] = 4
+        with self.assertRaisesRegex(AnswerEvalError, "visible device count"):
+            validate_test_config(invalid)
+
+        for nnodes in (0, -1, 2.0, True, "4"):
+            invalid = copy.deepcopy(self.test_config)
+            invalid["hardware"]["nnodes"] = nnodes
+            with self.subTest(nnodes=nnodes):
+                with self.assertRaisesRegex(AnswerEvalError, "nnodes"):
+                    validate_test_config(invalid)
 
         invalid = copy.deepcopy(self.test_config)
         invalid["evaluation"]["dataset"] = "../private/prompts.json"
@@ -963,6 +1110,187 @@ class TestPPUAnswerEval(unittest.TestCase):
         self.assertEqual({case["final_answer"] for case in raw["cases"]}, {"答案是3"})
         self.assertNotIn("final_answer", public["cases"][0])
         self.assertEqual({row["candidate_answer"] for row in candidates}, {"答案是3"})
+
+
+@unittest.skipIf(answer_suite_kit is None, "answer_suite_kit needs torch")
+class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
+    """The four nodes of a group, as far as one host can stand in for them.
+
+    The suite that serves a checkpoint across four boards cannot be run here, but
+    the part of it that is protocol rather than inference can: which node reports
+    where, how the nodes publish what they hold, and how a worker learns that rank
+    0 is done.  Those are the pieces whose mistakes cost an hour of cluster time
+    each, so they are checked against a real directory with a stubbed device.
+
+    `setUpClass` is deliberately not called -- it launches a server -- and the
+    class attributes it would set are assigned directly instead.
+    """
+
+    RENDEZVOUS = {"nnodes": 4, "node_rank": 0, "dist_init_addr": "10.0.0.1:29500"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.four_node = load_json(CONFIG_DIR / "qwen3.8" / "2.4t-a95b-fp8-144g.json")
+        cls.single_node = load_json(CONFIG_DIR / "qwen3.5" / "397b-a17b-w8a8-int8.json")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        # Eight devices per node, whatever this host has: the exchange is what is
+        # under test, and a CPU runner reports none.
+        for name, value in (
+            ("device_count", lambda: 8),
+            ("get_device_name", lambda index: "ZW-M890P"),
+            (
+                "get_device_properties",
+                lambda index: SimpleNamespace(total_memory=147456 * 1024 * 1024),
+            ),
+        ):
+            patcher = mock.patch.object(
+                answer_suite_kit.torch.cuda, name, value, create=True
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def node(self, node_rank, output_dir=None, config=None):
+        config = self.four_node if config is None else config
+        multi_node = config is not self.single_node
+
+        class Node(answer_suite_kit.AnswerSuiteMixin, unittest.TestCase):
+            def test_public_answer_suite(self):
+                return answer_suite_kit.AnswerSuiteMixin.test_public_answer_suite(self)
+
+        Node.test_config = config
+        Node.request_config = config["request"]
+        Node.dataset = {"cases": [{"id": f"case-{index}"} for index in range(10)]}
+        Node.output_dir = Path(self.root if output_dir is None else output_dir)
+        Node.distributed = (
+            {**self.RENDEZVOUS, "node_rank": node_rank} if multi_node else None
+        )
+        Node.node_rank = node_rank if multi_node else 0
+        Node.rank_dir = Node._resolve_rank_dir()
+        Node.report_dir = (
+            Node.output_dir
+            if Node.node_rank == 0
+            else Node.rank_dir / f"rank-{Node.node_rank}"
+        )
+        return Node
+
+    def worker_case(self, node_rank, exit_code=None):
+        node = self.node(node_rank)
+        node.rank_dir.mkdir(parents=True, exist_ok=True)
+        case = node("test_public_answer_suite")
+        case.process = SimpleNamespace(poll=lambda: exit_code)
+        return case
+
+    def test_a_group_refuses_a_results_directory_it_cannot_share(self):
+        # Every pod resolves the relative default against its own working
+        # directory, so the four would never observe each other's files.
+        with self.assertRaises(RuntimeError) as raised:
+            self.node(0, output_dir="ppu-answer-artifacts")
+        self.assertIn("every node of the group shares", str(raised.exception))
+        self.assertIsNone(
+            self.node(
+                0, output_dir="ppu-answer-artifacts", config=self.single_node
+            ).rank_dir
+        )
+
+    def test_only_rank_zero_reports_where_the_workflow_collects(self):
+        self.assertEqual(self.node(0).report_dir, self.root)
+        for node_rank in (1, 2, 3):
+            self.assertEqual(
+                self.node(node_rank).report_dir,
+                self.root / "ranks" / f"rank-{node_rank}",
+            )
+
+    def test_provenance_describes_every_node_the_verdict_was_produced_on(self):
+        for node_rank in range(4):
+            node = self.node(node_rank)
+            node.rank_dir.mkdir(parents=True, exist_ok=True)
+            node._write_node_inventory()
+        accelerator = self.node(0)._accelerator()
+        self.assertEqual(accelerator["visible_device_count"], 8)
+        self.assertEqual(accelerator["total_device_count"], 32)
+        self.assertEqual([n["node_rank"] for n in accelerator["nodes"]], [0, 1, 2, 3])
+        self.assertEqual(accelerator["dist_init_addr"], "10.0.0.1:29500")
+        self.assertNotIn("node_ranks_without_inventory", accelerator)
+        # Staged writes leave nothing a reader could mistake for an inventory.
+        self.assertEqual(
+            sorted(path.name for path in (self.root / "ranks").iterdir()),
+            [f"rank-{index}-devices.json" for index in range(4)],
+        )
+
+    def test_a_node_that_reported_nothing_is_named_rather_than_dropped(self):
+        for node_rank in (0, 1, 3):
+            node = self.node(node_rank)
+            node.rank_dir.mkdir(parents=True, exist_ok=True)
+            node._write_node_inventory()
+        accelerator = self.node(0)._accelerator()
+        self.assertEqual(accelerator["total_device_count"], 24)
+        self.assertEqual(accelerator["node_ranks_without_inventory"], [2])
+
+    def test_a_single_node_report_keeps_the_shape_already_collected(self):
+        accelerator = self.node(0, config=self.single_node)._accelerator()
+        self.assertEqual(set(accelerator), {"visible_device_count", "devices"})
+
+    def test_only_rank_zero_releases_the_group(self):
+        for node_rank in (1, 2, 3):
+            self.node(node_rank)._release_worker_nodes()
+        self.assertFalse((self.root / "ranks" / "rank0-complete").exists())
+        self.node(0, config=self.single_node)._release_worker_nodes()
+        self.assertFalse((self.root / "ranks").exists())
+        rank_zero = self.node(0)
+        # Called from the setup failure path and the teardown both, so twice.
+        rank_zero._release_worker_nodes()
+        rank_zero._release_worker_nodes()
+        self.assertTrue((self.root / "ranks" / "rank0-complete").is_file())
+
+    def test_a_worker_returns_once_rank_zero_releases_it(self):
+        case = self.worker_case(2)
+        self.node(0)._release_worker_nodes()
+        case.test_public_answer_suite()
+
+    def test_a_worker_fails_if_its_own_server_dies_first(self):
+        case = self.worker_case(1, exit_code=1)
+        with self.assertRaises(AssertionError) as raised:
+            case.test_public_answer_suite()
+        self.assertIn("lost its server with exit code 1", str(raised.exception))
+
+    def test_a_worker_gives_up_on_a_rank_zero_that_never_finishes(self):
+        case = self.worker_case(3)
+        # The hold is the reviewed request budget for the whole corpus plus the
+        # margin; the clock is moved rather than waited on.
+        clock = iter([0, 10**9])
+        with mock.patch.object(answer_suite_kit.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(AssertionError) as raised:
+                case.test_public_answer_suite()
+        budget = (
+            self.four_node["request"]["timeout_seconds"] * 10
+            + answer_suite_kit.WORKER_HOLD_MARGIN_SECONDS
+        )
+        self.assertIn(str(budget), str(raised.exception))
+        self.assertIn("never published its completion", str(raised.exception))
+
+    def test_teardown_releases_the_workers_before_killing_the_server(self):
+        # The other order kills rank 0's process, which makes the workers'
+        # schedulers exit, and a healthy run then reports three failed pods.
+        order = []
+        rank_zero = self.node(0)
+        rank_zero.process = SimpleNamespace(pid=4321)
+        release = answer_suite_kit.AnswerSuiteMixin._release_worker_nodes.__func__
+
+        def traced_release(cls):
+            order.append("release")
+            release(cls)
+
+        rank_zero._release_worker_nodes = classmethod(traced_release)
+        with mock.patch.object(
+            answer_suite_kit, "kill_process_tree", lambda pid: order.append("kill")
+        ):
+            rank_zero.tearDownClass()
+        self.assertEqual(order, ["release", "kill"])
+        self.assertTrue((self.root / "ranks" / "rank0-complete").is_file())
 
 
 if __name__ == "__main__":

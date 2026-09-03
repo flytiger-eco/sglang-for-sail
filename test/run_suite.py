@@ -162,6 +162,9 @@ NIGHTLY_SUITES = {
         # run_suite.py / the coverage report account for their tests.
         "nightly-answer-1-ppu",
         "nightly-answer-8-ppu",
+        # Four whole boards, one suite: every node runs the same registered file
+        # and the launcher tells each which rank it is.
+        "nightly-answer-32-ppu",
     ],
 }
 
