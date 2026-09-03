@@ -26,7 +26,7 @@ import requests
 import torch
 
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,6 +35,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
+register_ppu_ci(est_time=150, suite="nightly-1-ppu", nightly=True)
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's

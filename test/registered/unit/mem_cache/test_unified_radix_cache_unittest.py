@@ -63,11 +63,17 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.common import is_ppu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=35, suite="stage-b-test-1-gpu-ppu")
 
 
 @dataclass(frozen=True)
@@ -477,7 +483,10 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
-            hicache_io_backend="direct",
+            # The direct backend transfers KV via cudaMemcpyBatchAsync,
+            # which the PPU runtime does not implement; fall back to the
+            # kernel backend.
+            hicache_io_backend="kernel" if is_ppu() else "direct",
             hicache_write_policy=write_policy,
         )
         set_global_server_args_for_scheduler(server_args)
@@ -538,6 +547,14 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNotNone(split_child.hash_value)
         self.assertEqual(len(split_child.hash_value), 1)
 
+    @unittest.skipIf(
+        is_ppu(),
+        "hicache GPU<->CPU transfers have no working IO backend on PPU: "
+        "the direct backend requires cudaMemcpyBatchAsync, which the PPU "
+        "runtime has not implemented, and the kernel backend's transfer "
+        "kernel raises an invalid-page device exception. Re-enable once "
+        "the SDK closes either gap.",
+    )
     def test_hicache_kv_events_track_gpu_cpu_transitions(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         self._init_hicache(cache)
@@ -2757,6 +2774,16 @@ class UnifiedRadixCacheSuite:
     def _skip_unsupported_hicache_test(self):
         if self.cfg.has_swa and self.cfg.has_mamba:
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
+        if is_ppu():
+            # Every hicache host transfer path on PPU is blocked by runtime
+            # gaps: the direct backend and the write-back staged transfer
+            # (jit_kernel kvcacheio staged_write_back) call
+            # cudaMemcpyBatchAsync, which hggc has not implemented, and the
+            # kernel backend's transfer kernel hits a device-side invalid
+            # page fault while MambaPoolHost rejects its page_first layout.
+            self.skipTest(
+                "hicache GPU<->CPU transfers have no working IO backend on PPU"
+            )
         return False
 
     def _simulate_backup(self, cache, node):
@@ -2793,6 +2820,11 @@ class UnifiedRadixCacheSuite:
         prefetch_threshold: Optional[int] = None,
         prefetch_policy: str = "wait_complete",
     ):
+        # Central guard: every hicache fixture goes through this entry, so
+        # unsupported platform/stack combinations (e.g. Mamba host transfers
+        # on PPU) are skipped uniformly even if an individual test forgets
+        # to call the guard itself.
+        self._skip_unsupported_hicache_test()
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # See _init_hicache: wrap the factory rather than MHATokenToKVPoolHost
@@ -2873,7 +2905,10 @@ class UnifiedRadixCacheSuite:
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
-            hicache_io_backend="direct",
+            # The direct backend transfers KV via cudaMemcpyBatchAsync,
+            # which the PPU runtime does not implement; fall back to the
+            # kernel backend.
+            hicache_io_backend="kernel" if is_ppu() else "direct",
             hicache_write_policy=write_policy,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
