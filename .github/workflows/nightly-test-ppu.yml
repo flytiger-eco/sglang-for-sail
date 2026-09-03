@@ -103,8 +103,12 @@ jobs:
           done
           for log in "${ranks_dir}"/rank-*.log; do
             [ -f "${log}" ] || continue
-            echo "=== ${log} ($(wc -l < "${log}") lines) ==="
-            tail -40 "${log}"
+            echo "=== ${log} ($(wc -l < "${log}") lines) : head ==="
+            head -70 "${log}"
+            echo "=== ${log} : launch, transport and progress lines ==="
+            grep -nE 'launch_server|dist.init.addr|nnodes|node.rank|tp.size|dist.timeout|watchdog|PCCL|pccl|NCCL|nccl|Traceback|rror|WARNING|Loading|loading weight|Load weight|init_torch_distributed|initialize_model_parallel|Init torch distr|server is fired|The server is|health' "${log}" | head -60
+            echo "=== ${log} : tail ==="
+            tail -25 "${log}"
           done
           for status in "${ranks_dir}"/rank-*.status; do
             [ -f "${status}" ] || continue
