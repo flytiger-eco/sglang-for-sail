@@ -121,7 +121,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_server_args,
 )
-from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
+from sglang.srt.utils import (
+    is_blackwell_supported,
+    is_hip,
+    is_npu,
+    is_ppu,
+    make_layers,
+)
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -1421,9 +1427,18 @@ class KimiK3DeltaAttention(nn.Module):
 
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
         # Full-rank K3 also fuses mixed block-FP8 attention projections.
-        self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
-            quant_config is None or self.use_full_rank_gate
+        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
+        # experts; attention linears resolve to UnquantizedLinearMethod, so a
+        # non-None quant_config is fine for the merged projection.
+        self.use_fused_input_projection = (
+            self.use_full_rank_gate
+            and is_ppu()
+            and envs.SGLANG_K3_KDA_INPUT_PROJ_FUSION.get()
         )
+        self.do_fuse_qkvbfg = (
+            self.attn_tp_size == self.tp_size
+            and (quant_config is None or self.use_full_rank_gate)
+        ) or self.use_fused_input_projection
 
         if self.do_fuse_qkvbfg and self.use_full_rank_gate:
             # Fuse only the alignment-friendly wide projections [q, k, v, g]
@@ -1445,8 +1460,8 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
-                3 * projection_size // self.tp_size,
-                projection_size // self.tp_size,
+                3 * projection_size // self.attn_tp_size,
+                projection_size // self.attn_tp_size,
             ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1701,19 +1716,24 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
-        mods = [self.f_a_proj, self.b_proj]
+        if self.use_fused_input_projection:
+            mods = [self.fused_qkvg_proj, self.f_a_proj, self.b_proj]
+            pad_rows_to = 16
+        else:
+            mods = [self.f_a_proj, self.b_proj]
+            pad_rows_to = 8
         if self._bfa_uses_block_fp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
-            pad = (-sum(sizes)) % 8
+            pad = (-sum(sizes)) % pad_rows_to
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
             self._bfa_w = torch.cat(weights, dim=0).contiguous()
             self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
-            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=pad_rows_to)
             self._bfa_f_b_w = self.f_b_proj.weight
-        self._bfa_fa_size, self._bfa_b_size = sizes
+        self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -1731,13 +1751,17 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_npu:
             return
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        num_heads = 12
+        if is_ppu():
+            num_heads = layer.num_v_heads
+            seg = num_heads * 128
         if (
             w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != num_heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
@@ -1768,6 +1792,10 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        if is_ppu():
+            layer._k3_fused_decode_weight = torch.stack(
+                layer._k3_fused_decode_args[:3]
+            ).contiguous()
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
@@ -1776,6 +1804,17 @@ class KimiK3DeltaAttention(nn.Module):
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm as gemm
+
+                if self.use_fused_input_projection:
+                    fused_states = gemm(hidden_states, w)
+                    qkv_end, qkvg_end = self.split_sizes[0], sum(self.split_sizes)
+                    f_a_end = qkvg_end + n_fa
+                    qkv = fused_states[..., :qkv_end]
+                    g_proj_states = fused_states[..., qkv_end:qkvg_end]
+                    f_a = fused_states[..., qkvg_end:f_a_end]
+                    beta = fused_states[..., f_a_end : f_a_end + n_b]
+                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None

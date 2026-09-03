@@ -29,6 +29,20 @@ def situ_and_mul(
     return impl(input, out, beta, linear_beta)
 
 
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    from .activation import situ_and_mul_masked as impl
+
+    return impl(input, out, masked_m, beta, linear_beta, topk, expected_m)
+
+
 def situ_and_mul_masked_post_quant(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -59,6 +73,35 @@ def situ_and_mul_masked_post_quant(
     )
 
 
+def situ_and_mul_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+) -> None:
+    from .moe import situ_and_mul_post_quant_mxfp4 as impl
+
+    return impl(input, output, output_scale, beta, linear_beta)
+
+
+def situ_and_mul_masked_post_quant_mxfp4(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> None:
+    from .moe import situ_and_mul_masked_post_quant_mxfp4 as impl
+
+    return impl(
+        input, output, output_scale, masked_m, beta, linear_beta, topk, expected_m
+    )
+
+
 def kimi_k3_tiny_gemm(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -81,6 +124,9 @@ def kimi_k3_tiny_gemm(
 
 __all__ = [
     "situ_and_mul",
+    "situ_and_mul_masked",
     "situ_and_mul_masked_post_quant",
+    "situ_and_mul_masked_post_quant_mxfp4",
+    "situ_and_mul_post_quant_mxfp4",
     "kimi_k3_tiny_gemm",
 ]
