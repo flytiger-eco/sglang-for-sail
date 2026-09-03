@@ -1,6 +1,5 @@
 import logging
-from typing import Tuple
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -375,7 +374,9 @@ def _silu_and_mul_post_quant_kernel(
 
             inv_s = tl.reshape(1.0 / output_s, (N_GROUPS, 1))
             output_q_2d = tl.clamp(gate_up_2d * inv_s, fp8_min, fp8_max)
-            output_q = tl.reshape(output_q_2d, (BLOCK_N,)).to(output_ptr.dtype.element_ty)
+            output_q = tl.reshape(output_q_2d, (BLOCK_N,)).to(
+                output_ptr.dtype.element_ty
+            )
 
             tl.store(
                 output_ptr_offs + token_index * stride_output_1,
@@ -552,7 +553,17 @@ def silu_and_mul_masked_post_quant_fwd(
         num_warps = 1
         NUM_STAGES = 6
     else:
-        groups_total = size_n // quant_group_size
+        # Channel-wise callers pass quant_group_size == size_n, so after the
+        # next_power_of_2() above, size_n // quant_group_size is 0 for every
+        # model whose moe_intermediate_size is not a power of two (e.g. 1536).
+        # `0 % gpb == 0` then holds for any gpb, the loop never shrinks it, and
+        # BLOCK_N comes out 4x larger than needed. That quadruples shared
+        # memory -- the gemm1_alpha branch keeps gate and up live in fp32 and
+        # then does a 2D reshape/reduce, so 8192-wide blocks ask for ~320KB
+        # against a 256KB budget and Triton dies with OutOfResources -- and it
+        # makes N_GROUPS > 1, which stores several scales per token into the
+        # (E, T, 1) tensor that channel-wise callers allocate.
+        groups_total = max(size_n // quant_group_size, 1)
         gpb = 4
         while gpb > 1:
             block_n = quant_group_size * gpb
@@ -563,12 +574,27 @@ def silu_and_mul_masked_post_quant_fwd(
 
         num_warps = 1
         NUM_STAGES = 6
-    
     if not use_int8:
         hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
     else:
         hidden_dim_split_block_num = 1
     assert BLOCK_N % quant_group_size == 0
+
+    if not use_mxfp4:
+        # scale_base walks the last scale dim by hidden_block * N_GROUPS, and
+        # the GEMM1_ALPHA branch stores N_GROUPS scales per block (the plain
+        # silu branch stores one). So the caller's scale tensor has to hold
+        # hidden_dim_split_block_num * N_GROUPS of them, otherwise the writes
+        # spill into the neighbouring tokens' scales -- silent corruption that
+        # only shows up as degraded output. mxfp4 uses its own [E, S//2, T]
+        # layout and offsets by offs_scale_pairs instead, so it is excluded.
+        n_groups = BLOCK_N // quant_group_size
+        scale_slots = output_scale.shape[-1]
+        assert hidden_dim_split_block_num * n_groups <= scale_slots, (
+            f"output_scale too small: the kernel writes "
+            f"{hidden_dim_split_block_num} hidden block(s) x {n_groups} "
+            f"scale(s) per token, but output_scale.shape[-1] == {scale_slots}"
+        )
 
     grid = (
         hidden_dim_split_block_num,
@@ -765,9 +791,6 @@ def silu_and_mul_masked_post_quant_packed_fwd(
         GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
         E_PADDED=triton.next_power_of_2(E),
         num_warps=1,
-        IS_MXFP4=use_mxfp4,
-        apply_swiglu_limit=apply_swiglu_limit,
-        swiglu_limit=swiglu_limit,
     )
     return
 
