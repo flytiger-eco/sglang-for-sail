@@ -186,7 +186,8 @@ jobs:
                 init_method="env://",
                 world_size=int(os.environ["WORLD_SIZE"]),
                 rank=int(os.environ["RANK"]),
-                timeout=datetime.timedelta(seconds=90),
+                timeout=datetime.timedelta(
+                    seconds=int(os.environ.get("PROBE_TIMEOUT_S", "90"))),
             )
             print("init_process_group returned", flush=True)
             tensor = torch.ones(1024 * 1024, device="cuda")
@@ -201,34 +202,52 @@ jobs:
             export RANK="$RANK"
             export WORLD_SIZE="${NNODES:-2}"
             export NCCL_DEBUG=INFO
+            # Short on purpose: the failure mode being swept is a transport
+            # retry exhaustion that surfaces within seconds of the first
+            # payload, so the only thing a long watchdog buys is a slower
+            # sweep. Twenty-five seconds is still an order of magnitude more
+            # than the working TCP path needs to finish.
+            export PROBE_TIMEOUT_S=25
 
-            # Phase A is the transport under investigation. The hard timeout is
-            # what makes this cheap: a hang costs three minutes, not the pod
-            # budget. Distinct ports per phase so neither meets the other's
-            # TCPStore.
-            echo "=== phase A: RDMA (pccl defaults) ==="
-            MASTER_PORT=29500 timeout 180 python3 /tmp/allreduce_probe.py \
-              > "$PROBE_IN_POD/ranks/node-$RANK-phaseA.log" 2>&1
-            A=$?
-            echo "$A" > "$PROBE_IN_POD/ranks/node-$RANK-phaseA.status"
-            echo "phase A exit $A (124 = timed out, i.e. the hang reproduced)"
-            tail -40 "$PROBE_IN_POD/ranks/node-$RANK-phaseA.log"
+            # The sweep. The previous run established that the group builds its
+            # QPs and then dies on the first data-path completion with
+            # IBV_WC_RETRY_EXC_ERR -- packets leave, the peer never acks. What
+            # it did not establish is which GID pccl picked, and these bonds
+            # offer six: two link-local (from the MAC), two global ULA under
+            # fd03:45c2:1::/48, and two more link-local-shaped ones. If any one
+            # index carries traffic, the fix is a single environment variable;
+            # if none does, the RoCE fabric itself is not carrying these hosts
+            # and that belongs to whoever provisioned them. Ports are derived
+            # from the index so a rank that fails early cannot meet the next
+            # round's TCPStore.
+            SUMMARY=""
+            for GIDX in 0 1 2 3 4 5; do
+              echo "=== gid index $GIDX ==="
+              MASTER_PORT=$(( 29600 + GIDX )) NCCL_IB_GID_INDEX="$GIDX" \
+                timeout 90 python3 /tmp/allreduce_probe.py \
+                > "$PROBE_IN_POD/ranks/node-$RANK-gid$GIDX.log" 2>&1
+              RC=$?
+              echo "$RC" > "$PROBE_IN_POD/ranks/node-$RANK-gid$GIDX.status"
+              echo "gid $GIDX exit $RC"
+              grep -iE "error|WARN|Using \[|Connected all" \
+                "$PROBE_IN_POD/ranks/node-$RANK-gid$GIDX.log" | head -8 || true
+              SUMMARY="$SUMMARY gid$GIDX=$RC"
+            done
 
-            # Phase B is the control: same collective, TCP data path. It is
-            # expected to pass, and it is what says phase A's result is about
-            # RDMA rather than about the group, the boards or this probe.
-            echo "=== phase B: TCP control (NCCL_IB_DISABLE=1) ==="
-            MASTER_PORT=29501 NCCL_IB_DISABLE=1 NCCL_SOCKET_IFNAME=eth0 \
-              timeout 180 python3 /tmp/allreduce_probe.py \
-              > "$PROBE_IN_POD/ranks/node-$RANK-phaseB.log" 2>&1
-            B=$?
-            echo "$B" > "$PROBE_IN_POD/ranks/node-$RANK-phaseB.status"
-            echo "phase B exit $B"
-            tail -40 "$PROBE_IN_POD/ranks/node-$RANK-phaseB.log"
+            # One more round on pccl's own choice, with the subsystems that name
+            # the device and address selection turned up, so the sweep's result
+            # can be read against what the default actually does.
+            echo "=== default gid, verbose selection ==="
+            MASTER_PORT=29620 NCCL_DEBUG_SUBSYS=INIT,NET,ENV,GRAPH \
+              timeout 90 python3 /tmp/allreduce_probe.py \
+              > "$PROBE_IN_POD/ranks/node-$RANK-default.log" 2>&1
+            D=$?
+            echo "$D" > "$PROBE_IN_POD/ranks/node-$RANK-default.status"
+            echo "default exit $D"
 
-            echo "node $RANK: phase A=$A phase B=$B"
-            # The probe's own exit is deliberately 0 whatever the phases did:
-            # a reproduced hang is this run's finding, not its failure, and a
+            echo "node $RANK:$SUMMARY default=$D"
+            # The probe's own exit is deliberately 0 whatever the sweep found:
+            # a reproduced failure is this run's finding, not its failure, and a
             # red job would hide the evidence behind a cancelled group.
             exit 0
           extra_env: "PROBE_IN_POD=${{ env.PROBE_IN_POD }}"
@@ -251,12 +270,13 @@ jobs:
           else
             echo "::warning::the group produced nothing at ${PROBE_ON_RUNNER}"
           fi
-          for phase in A B; do
-            for status_file in "${destination}"/ranks/node-*-phase${phase}.status; do
-              [ -f "${status_file}" ] || continue
-              node=$(basename "${status_file}" ".status")
-              echo "::notice::${node} exited $(cat "${status_file}")"
-            done
+          # Every status the sweep wrote, whatever it is named: one file per
+          # rank per GID index plus the default round. Annotations rather than
+          # the step summary because on this runner GITHUB_STEP_SUMMARY does not
+          # reach the run page.
+          for status_file in "${destination}"/ranks/node-*.status; do
+            [ -f "${status_file}" ] || continue
+            echo "::notice::$(basename "${status_file}" ".status") exited $(cat "${status_file}")"
           done
 
       - name: Upload probe evidence
