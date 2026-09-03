@@ -1,0 +1,296 @@
+name: Release PyPI Nightly Wheels for kernel
+
+on:
+  # Run daily at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+  # Triggered by nightly Docker workflow to use same commit. client_payload is
+  # ignored: each job below pins its own maintenance branch.
+  repository_dispatch:
+    types: [nightly-release]
+  # Manual trigger for testing. No commit input — the refs are pinned per job,
+  # so what gets built is decided by the job, not by the run.
+  workflow_dispatch:
+
+# Must differ from release-pypi-ppu-nightly.yml: concurrency groups are
+# repo-wide across workflows, and both share the same cron and ref, so a shared
+# group name would make the two workflows cancel each other.
+concurrency:
+  group: release-pypi-kernel-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+# ----------------------------v0.5.18--------------------------------
+  build-nightly_kernel-cu130-matrix-v_0_5_18:
+    if: |
+      github.repository == 'flytiger-eco/sglang-for-sail'
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+        cuda-version: ["13.0"]
+        arch: [x86_64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      commit_sha: ${{ steps.build.outputs.commit_sha }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          ref: refs/heads/v0.5.18
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels
+        id: build
+        run: |
+          VERSION=$(cut -d'"' -f2 python/sglang/kernels/aot/python/sgl_kernel/version.py)
+          COMMIT_SHA=$(git rev-parse HEAD)
+          HASH="$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          FORCE_VERSION="${VERSION}.dev${BUILD_DATE}+g${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+
+          # setup_ppu.py reads the version from pyproject_ppu.toml, and build_ppu.sh
+          # builds inside a container that only receives -e ARCH, so rewriting these
+          # files is the only lever on the wheel version (an exported
+          # SETUPTOOLS_SCM_PRETEND_VERSION would not reach the build).
+          # Anchor on the whole assignment: matching on the tag name would never
+          # hit, since the 'v' prefix does not appear in either file.
+          sed -i -E "s/^__version__ = \".*\"/__version__ = \"${FORCE_VERSION}\"/" \
+            python/sglang/kernels/aot/python/sgl_kernel/version.py
+          sed -i -E "s/^version = \".*\"/version = \"${FORCE_VERSION}\"/" \
+            python/sglang/kernels/aot/pyproject_ppu.toml
+          sed -i -E "s/^version = \".*\"/version = \"${FORCE_VERSION}\"/" \
+            python/sglang/kernels/aot/pyproject.toml
+          grep -Fq "\"${FORCE_VERSION}\"" python/sglang/kernels/aot/python/sgl_kernel/version.py
+          grep -Fq "\"${FORCE_VERSION}\"" python/sglang/kernels/aot/pyproject_ppu.toml
+          grep -Fq "\"${FORCE_VERSION}\"" python/sglang/kernels/aot/pyproject.toml
+
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "nightly_version=${FORCE_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${HASH}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+          cd python/sglang/kernels/aot
+          chmod +x ./build_ppu.sh
+          ./build_ppu.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" ${{ matrix.arch == 'aarch64' && 'aarch64' || '' }}
+
+          # Guard against the version rewrites above not reaching the wheel — the
+          # greps only prove the files changed, not that the build honoured them.
+          # Wheel name layout is {name}-{version}-{python}-{abi}-{platform}.whl and
+          # a PEP 440 version never contains '-', so field 2 is the version.
+          WHEEL_VERSION=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          if [ "$WHEEL_VERSION" != "$FORCE_VERSION" ]; then
+            echo "::error::Built wheel version '$WHEEL_VERSION' does not match forced version '$FORCE_VERSION'"
+            exit 1
+          fi
+        env:
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
+
+      # Wheels only: setup_ppu.py also emits an sdist that we do not publish.
+      # The -v0_5_18 suffix keeps this artifact distinct from the v0.5.13 job,
+      # which otherwise resolves to the same name and fails with a 409 conflict.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}-v0_5_18
+          path: python/sglang/kernels/aot/dist/*.whl
+
+  release-nightly_kernel-cu130-matrix-v_0_5_18:
+    permissions:
+      contents: write
+    needs: build-nightly_kernel-cu130-matrix-v_0_5_18
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout: this job only republishes the artifact built above.
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*-v0_5_18
+
+      - name: List downloaded wheels
+        run: ls -lh dist/
+
+      - name: Create GitHub Release for nightly kernel wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          # Branch is part of the tag: the two maintenance branches release on the
+          # same schedule, so without it the tags are indistinguishable at a glance.
+          tag_name: nightly-kernel-v0.5.18-${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.build_date }}-${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.commit_hash }}
+          # Tag the commit that was actually built, not the one that triggered the
+          # run (which is the default branch head on a schedule).
+          target_commitish: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.commit_sha }}
+          name: Nightly Build kernel from branch v0.5.18 ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.build_date }} (${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.commit_hash }})
+          prerelease: true
+          # Fail loudly instead of publishing an empty release when the glob misses.
+          fail_on_unmatched_files: true
+          body: |
+            Nightly build kernel from branch v0.5.18, commit ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.commit_hash }}
+            Build date: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.build_date }}
+            Version: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_18.outputs.nightly_version }}
+          files: |
+            dist/*.whl
+
+
+# ----------------------------v0.5.13--------------------------------
+  build-nightly_kernel-cu130-matrix-v_0_5_13:
+    if: |
+      github.repository == 'flytiger-eco/sglang-for-sail'
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+        cuda-version: ["13.0"]
+        arch: [x86_64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      commit_sha: ${{ steps.build.outputs.commit_sha }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          ref: refs/heads/v0.5.13
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build wheels
+        id: build
+        run: |
+          VERSION=$(cut -d'"' -f2 sgl-kernel/python/sgl_kernel/version.py)
+          COMMIT_SHA=$(git rev-parse HEAD)
+          HASH="$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          FORCE_VERSION="${VERSION}.dev${BUILD_DATE}+g${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+
+          # build_ppu.sh builds inside a container that only receives -e ARCH, so
+          # rewriting these files is the only lever on the wheel version (an
+          # exported SETUPTOOLS_SCM_PRETEND_VERSION would not reach the build).
+          # Anchor on the whole assignment: matching on the tag name would never
+          # hit, since the 'v' prefix does not appear in any of these files.
+          #
+          # version.py only feeds sgl_kernel.__version__ at runtime; the wheel
+          # metadata comes from setup_ppu.py, which passes version=_get_version()
+          # (read from pyproject_ppu.toml) to setup(). pyproject.toml must be
+          # rewritten as well: it declares a static [project] version, and
+          # setuptools>=61 applies that table on top of the setup() kwargs, so it
+          # is what actually decides the wheel version. Without it the wheel comes
+          # out as the unmodified base version (verified: sglang_kernel-0.4.3).
+          sed -i -E "s/^__version__ = \".*\"/__version__ = \"${FORCE_VERSION}\"/" \
+            sgl-kernel/python/sgl_kernel/version.py
+          sed -i -E "s/^version = \".*\"/version = \"${FORCE_VERSION}\"/" \
+            sgl-kernel/pyproject_ppu.toml
+          sed -i -E "s/^version = \".*\"/version = \"${FORCE_VERSION}\"/" \
+            sgl-kernel/pyproject.toml
+          grep -Fq "\"${FORCE_VERSION}\"" sgl-kernel/python/sgl_kernel/version.py
+          grep -Fq "\"${FORCE_VERSION}\"" sgl-kernel/pyproject_ppu.toml
+          grep -Fq "\"${FORCE_VERSION}\"" sgl-kernel/pyproject.toml
+
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "nightly_version=${FORCE_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${HASH}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+          cd sgl-kernel
+          ./build_ppu.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
+
+          # Guard against the version rewrites above not reaching the wheel — the
+          # greps only prove the files changed, not that the build honoured them.
+          # Wheel name layout is {name}-{version}-{python}-{abi}-{platform}.whl and
+          # a PEP 440 version never contains '-', so field 2 is the version.
+          WHEEL_VERSION=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          if [ "$WHEEL_VERSION" != "$FORCE_VERSION" ]; then
+            echo "::error::Built wheel version '$WHEEL_VERSION' does not match forced version '$FORCE_VERSION'"
+            exit 1
+          fi
+        env:
+          BUILD_JOBS: 64
+          NVCC_THREADS: 8
+
+      # Wheels only: setup_ppu.py also emits an sdist that we do not publish.
+      # The -v0_5_13 suffix keeps this artifact distinct from the v0.5.18 job,
+      # which otherwise resolves to the same name and fails with a 409 conflict.
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}-v0_5_13
+          path: sgl-kernel/dist/*.whl
+
+  release-nightly_kernel-cu130-matrix-v_0_5_13:
+    permissions:
+      contents: write
+    needs: build-nightly_kernel-cu130-matrix-v_0_5_13
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout: this job only republishes the artifact built above.
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*-v0_5_13
+
+      - name: List downloaded wheels
+        run: ls -lh dist/
+
+      - name: Create GitHub Release for nightly kernel wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          # Branch is part of the tag: the two maintenance branches release on the
+          # same schedule, so without it the tags are indistinguishable at a glance.
+          tag_name: nightly-kernel-v0.5.13-${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.build_date }}-${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.commit_hash }}
+          # Tag the commit that was actually built, not the one that triggered the
+          # run (which is the default branch head on a schedule).
+          target_commitish: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.commit_sha }}
+          name: Nightly Build kernel from branch v0.5.13 ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.build_date }} (${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.commit_hash }})
+          prerelease: true
+          # Fail loudly instead of publishing an empty release when the glob misses.
+          fail_on_unmatched_files: true
+          body: |
+            Nightly build kernel from branch v0.5.13, commit ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.commit_hash }}
+            Build date: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.build_date }}
+            Version: ${{ needs.build-nightly_kernel-cu130-matrix-v_0_5_13.outputs.nightly_version }}
+          files: |
+            dist/*.whl
