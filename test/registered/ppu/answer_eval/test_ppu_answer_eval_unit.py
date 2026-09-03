@@ -29,6 +29,7 @@ from sglang.test.kits.answer_eval_kit import (
     redact_report,
     render_candidates,
     render_junit,
+    render_summary,
     request_chat_completion,
     resolve_evaluation_paths,
     validate_annotation_record,
@@ -835,6 +836,89 @@ class TestPPUAnswerEval(unittest.TestCase):
         rendered.encode("utf-8")
         # Without the dataset the block still renders, only without prompts.
         self.assertNotIn(first_prompt, render_candidates(report))
+
+    def test_summary_names_the_failing_cases_for_annotations(self):
+        # Both Answer workflows turn every "- `" line of this document into one
+        # GitHub annotation, because a step summary is not always collected --
+        # the K8s runner's container hook drops it -- while an annotation is
+        # shown on the run page either way. The prefix, the one-bullet-per-
+        # failing-case shape, and the presence of the rule sentence are therefore
+        # a contract with two bash snippets that cannot assert it themselves.
+        responses = {
+            case["id"]: {
+                "content": (
+                    "3个" if case["id"] == "deepseek-letter-count" else "候选回答"
+                ),
+                "finish_reason": "stop",
+                "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            }
+            for case in self.dataset["cases"]
+        }
+        report = redact_report(
+            build_report(
+                self.dataset,
+                self.profile,
+                responses,
+                {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
+            )
+        )
+        rendered = render_summary(report)
+        bullets = [line for line in rendered.splitlines() if line.startswith("- `")]
+        failing = [case for case in report["cases"] if case["verdict"] == "failed"]
+        self.assertTrue(failing, "the fixture must fail at least one case")
+        self.assertEqual(
+            [bullet.split("`")[1] for bullet in bullets],
+            [case["case_id"] for case in failing],
+            "one bullet per failing case, in report order, and no other line",
+        )
+        for bullet, case in zip(bullets, failing):
+            for finding in case["findings"]:
+                self.assertIn(finding["reason_code"], bullet)
+                # The reason code names a class of failure; the rule sentence is
+                # what tells a reader which answer was expected.
+                if finding.get("rule_description"):
+                    self.assertIn(finding["rule_description"], bullet)
+        # The workflows also lift this line into a notice, so the counts reach
+        # the run page whether or not anything failed.
+        self.assertIn(
+            f"- Cases: {report['summary']['passed']}/{report['summary']['total']} passed",
+            rendered,
+        )
+        # A case that passes must drop out of the list while its neighbours stay,
+        # or a reader would be sent to a question that answered correctly.
+        report["cases"][1]["verdict"] = "passed"
+        remaining = [
+            line.split("`")[1]
+            for line in render_summary(report).splitlines()
+            if line.startswith("- `")
+        ]
+        self.assertNotIn(report["cases"][1]["case_id"], remaining)
+        self.assertEqual(len(remaining), len(bullets) - 1)
+        # A green report must not carry the section at all, or the workflows
+        # would annotate a run that has nothing to report.
+        green = render_summary(
+            {
+                "summary": {
+                    "verdict": "passed",
+                    "passed": 1,
+                    "total": 1,
+                    "suspect": 0,
+                },
+                "provenance": {"served_model_name": "Qwen3.8-27B"},
+                "cases": [
+                    {
+                        "case_id": "only-case",
+                        "kind": "objective",
+                        "verdict": "passed",
+                        "findings": [],
+                    }
+                ],
+            }
+        )
+        self.assertNotIn("### Failing cases", green)
+        self.assertEqual(
+            [line for line in green.splitlines() if line.startswith("- `")], []
+        )
 
     def test_raw_outputs_land_next_to_the_redacted_report(self):
         # The nightly workflow publishes these two file names as its only record

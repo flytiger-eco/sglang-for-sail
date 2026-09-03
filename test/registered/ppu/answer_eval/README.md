@@ -156,6 +156,9 @@ everything around the test differs, while the test itself does not:
   `github.job` is identical for every matrix entry. The NAS copy is read and left
   in place rather than moved: the pod writes as root and the orchestration shell
   is a different, non-root uid, so it can read those bytes but not unlink them.
+  A step summary does not survive this runner at all, so the failing cases reach
+  the run page as annotations instead; see
+  [Results and annotations](#results-and-annotations).
 - **Provenance.** `base_image_digest` is null on this path. The orchestration
   shell has no Docker daemon to inspect the image with and the pod cannot see its
   own digest, so only the image tag is recorded; on the bare-metal line the digest
@@ -374,6 +377,26 @@ subprocess with an inherited stdout, so the block reaches the log whether the
 run ends green or red. Because both the artifact and the log carry candidate
 text, set the switch back to `0` for any dataset whose prompts or answers cannot
 be published — one switch covers both surfaces.
+
+One step further out, the run page itself names the failures. `summary.md` opens
+with a `### Failing cases` list — one line per failing case carrying the rule
+sentence the dataset declares, for example `deepseek-letter-count` against
+`答案包含数字 4` — and both workflows turn each of those lines into a GitHub
+annotation, plus one notice with the pass count. Annotations were chosen over the
+step summary as the primary channel because **a step summary is not always
+collected**: the K8s runner drives its job through a container hook that does not
+share the job container's filesystem with the runner process, so bytes written to
+`GITHUB_STEP_SUMMARY` there are dropped without an error — the check runs of the
+first two runs on that board reported a summary of length zero while their
+annotations arrived intact. Annotations travel over the step's stdout, which
+reaches the runner on both paths. The step summary is still written, since it is
+the richer surface where it works.
+
+The two workflows read that list back with a `grep` for the bullet prefix, because
+the orchestration container is not guaranteed a JSON parser — no `python3`, no
+`jq`. That prefix appears on no other line of the document, and
+`test_summary_names_the_failing_cases_for_annotations` locks the shape on the
+evaluator's side, which is where a bash snippet cannot.
 
 Both raw files are written with escaped non-ASCII (`\uXXXX`) so that an unpaired
 surrogate in a candidate answer cannot fail the write. Read them with a JSON

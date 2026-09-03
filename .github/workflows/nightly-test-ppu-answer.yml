@@ -198,8 +198,27 @@ jobs:
       - name: Publish Answer summary
         if: always()
         shell: bash
+        env:
+          SUITE: ${{ matrix.suite }}
         run: |
           if [[ -f ppu-answer-artifacts/summary.md ]]; then
+            # One annotation per failing case, so the run page names the question
+            # that broke and the rule it broke against without a reader opening
+            # the artifact. The step summary below carries the same information
+            # in full, but a step summary is not always collected -- the K8s
+            # Answer workflow runs on a runner whose container hook drops it --
+            # whereas annotations travel over this step's stdout.
+            #
+            # render_summary emits one bullet per failing case prefixed with
+            # "- `", a prefix no other line in that document has, and the
+            # evaluator's unit tests lock that shape.
+            while IFS= read -r failure; do
+              echo "::error::${SUITE}: ${failure#- }"
+            done < <(grep '^- `' ppu-answer-artifacts/summary.md || true)
+            counts=$(grep '^- Cases: ' ppu-answer-artifacts/summary.md | head -1 || true)
+            if [[ -n "${counts}" ]]; then
+              echo "::notice::${SUITE}: ${counts#- }"
+            fi
             cat ppu-answer-artifacts/summary.md >> "${GITHUB_STEP_SUMMARY}"
           fi
 

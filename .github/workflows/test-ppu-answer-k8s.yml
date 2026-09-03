@@ -156,6 +156,8 @@ jobs:
       - name: Collect Answer evidence
         if: always()
         shell: bash
+        env:
+          SUITE: ${{ matrix.suite }}
         run: |
           set -euo pipefail
           destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
@@ -166,6 +168,28 @@ jobs:
             echo "::warning::the pod produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
           fi
           if [ -f "${destination}/summary.md" ]; then
+            # Annotations are what a reader of this run page actually gets here.
+            # This runner drives the job through a container hook that does not
+            # share the job container's filesystem with the runner process, so
+            # bytes written to GITHUB_STEP_SUMMARY inside the container are
+            # dropped without an error: the check runs of the first two runs on
+            # this board both reported a summary of length zero while their
+            # annotations arrived intact. Annotations travel over this step's
+            # stdout, which does reach the runner, and they surface on the run
+            # page and in the checks UI without downloading the artifact.
+            #
+            # The failing cases are read back from summary.md rather than from
+            # result.json because this container is not guaranteed a JSON parser
+            # -- no python3, no jq. render_summary emits one bullet per failing
+            # case prefixed with "- `", a prefix no other line in that document
+            # has, and the evaluator's unit tests lock that shape.
+            while IFS= read -r failure; do
+              echo "::error::${SUITE}: ${failure#- }"
+            done < <(grep '^- `' "${destination}/summary.md" || true)
+            counts=$(grep '^- Cases: ' "${destination}/summary.md" | head -1 || true)
+            if [ -n "${counts}" ]; then
+              echo "::notice::${SUITE}: ${counts#- }"
+            fi
             cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           fi
 

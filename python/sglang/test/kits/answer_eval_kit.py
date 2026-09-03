@@ -1570,6 +1570,29 @@ def redact_report(report: dict[str, Any]) -> dict[str, Any]:
     return public
 
 
+def describe_findings(result: dict[str, Any]) -> str:
+    """Say in one line why a case did not pass.
+
+    ``reason_code`` names the class of failure and nothing more, so on its own it
+    cannot tell a reader which answer was wrong.  The dataset already carries a
+    sentence per rule that states what the answer was measured against, and the
+    redaction in :func:`_public_report` keeps it, so it belongs here: it is the
+    part that makes a red suite legible without opening the report.
+    """
+
+    details = []
+    for finding in result["findings"]:
+        detail = finding["reason_code"]
+        description = finding.get("rule_description")
+        if description:
+            detail = f"{detail} ({description})"
+        details.append(detail)
+    # dict.fromkeys rather than sorted(set(...)): a repeated rule says nothing
+    # twice, but the order the rules were evaluated in is the order the dataset
+    # declares them, which is the order a reader of the case file expects.
+    return "; ".join(dict.fromkeys(details)) or "no finding recorded"
+
+
 def render_summary(report: dict[str, Any]) -> str:
     summary = report["summary"]
     # Two suites now publish into the same step summary, so the heading has to
@@ -1583,15 +1606,35 @@ def render_summary(report: dict[str, Any]) -> str:
         f"- Suspect cases: {summary['suspect']}",
         "- Semantic coverage: L0/L1 deterministic checks; LLM-as-Judge deferred",
         "",
-        "| Case | Kind | Verdict | Findings |",
-        "| --- | --- | --- | --- |",
     ]
+    failing = [result for result in report["cases"] if result["verdict"] == "failed"]
+    if failing:
+        # The table below carries every case, which means finding the three that
+        # broke is a scan of ten rows; this list is the answer to "which question
+        # failed, and against what" on its own. The workflows also read it: each
+        # bullet becomes one annotation, matched on the leading "- `", which is a
+        # prefix no other line in this document has. test_ppu_answer_eval_unit
+        # locks that shape, because a workflow cannot.
+        lines.append("### Failing cases")
+        lines.append("")
+        for result in failing:
+            lines.append(
+                f"- `{result['case_id']}` ({result['kind']}): {describe_findings(result)}"
+            )
+        lines.append("")
+    lines.append("| Case | Kind | Verdict | Findings |")
+    lines.append("| --- | --- | --- | --- |")
     for result in report["cases"]:
         reasons = ", ".join(
             sorted({finding["reason_code"] for finding in result["findings"]})
         )
+        # The verdict of a failing row is emphasised so the rows that matter are
+        # visible at a glance rather than read word by word.
+        verdict = result["verdict"]
+        if verdict == "failed":
+            verdict = f"**{verdict}**"
         lines.append(
-            f"| `{result['case_id']}` | {result['kind']} | {result['verdict']} | {reasons or '-'} |"
+            f"| `{result['case_id']}` | {result['kind']} | {verdict} | {reasons or '-'} |"
         )
     return "\n".join(lines) + "\n"
 
