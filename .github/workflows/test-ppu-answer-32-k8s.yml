@@ -22,6 +22,16 @@ on:
         required: false
         type: string
         default: ''
+  # Reached through the dispatch shim on this branch: GitHub indexes
+  # workflow_dispatch by file name on the default branch, and this file is not
+  # there.
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: probe-ppu-net-${{ inputs.ref || github.ref }}
