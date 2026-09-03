@@ -33,7 +33,7 @@ on:
         description: 'Reviewed commit to check out inside the pods.'
         required: false
         type: string
-        default: '6bd8bce0dbb793c9ceed805eadaec466af2fa288'
+        default: '23ebd06217ac5b259483a0fb554dbafac94af2ca'
       observe_run:
         description: 'For mode=observe: the run id whose evidence directory to read.'
         required: false
