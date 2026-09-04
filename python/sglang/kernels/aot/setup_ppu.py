@@ -114,15 +114,18 @@ compile_threads = int(os.environ.get("SGL_KERNEL_COMPILE_THREADS", "32"))
 if compile_threads < 1:
     compile_threads = 1
 
-# ======================= NVCC Flags ======================= #
+# ======================= hgcc (device compiler) Flags ======================= #
+# No `-gencode`: hgcc takes `--gpu-architecture=ppu_XX` instead, and SAIL torch
+# emits that itself from the PYTORCH_SAIL_ARCH environment variable (see
+# torch.utils.cpp_extension._get_cuda_arch_flags). Passing a CUDA `-gencode` here
+# makes hgcc fail outright, so the arch selection is left entirely to
+# PYTORCH_SAIL_ARCH (`ppu_10`, `ppu_15`, or a semicolon-separated list).
 sgl_kernel_cuda_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-gencode=arch=compute_80,code=sm_80",
-    "-gencode=arch=compute_89,code=sm_89",
     "-std=c++17",
     "-DCUTE_USE_PACKED_TUPLE=1",
     "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
@@ -144,14 +147,12 @@ sgl_kernel_cuda_flags = [
     "-Xcompiler=-Wno-terminate",
     "-Xcompiler=-Wfatal-errors",
     "-Xcompiler=-ftemplate-backtrace-limit=1",
-    "-Xcudafe=--diag_suppress=177",
-    "-Xcudafe=--diag_suppress=2361",
+    # `-Xcudafe` is an nvcc-only hand-off to cudafe++, which hgcc has no
+    # counterpart for and rejects. The diagnostics it used to suppress (177
+    # unused-variable, 2361) are nvcc frontend numbers with no hgcc analogue.
     f"-Xcompiler={abi_flag}",
     abi_flag,
 ]
-
-if arch == "aarch64":
-    sgl_kernel_cuda_flags.append("-gencode=arch=compute_87,code=sm_87")
 
 # ======================= Include Directories ======================= #
 # Ordering matters. torch appends -I$CUDA_HOME/include (the CUDA-compat
@@ -206,8 +207,18 @@ common_sources = [
     "csrc/speculative/packbit.cu",
 ]
 
-# Libraries to link
-libraries = ["c10", "cuda", "cublas", "cublasLt"]
+# Libraries to link.
+#
+# The cuda_free PPU SDK ships no libcuda/libcublas/libcublasLt; the sailified
+# sources call the native spellings instead, so link their PPU counterparts:
+#   cudart  -> hggcrt1   (libhggcrt1.so -> libhggcrt.13.0.so; there is no
+#                         unversioned libhggcrt.so to satisfy a plain -lhggcrt)
+#   cublas  -> acblas    (defines acblasHgemm, used by csrc/gemm/gptq)
+#   cublasLt-> acblasLt
+# The CUDA driver API (libcuda) is dropped: no csrc translation unit calls it.
+# `library_paths()` from SAIL torch already contributes $PPU_SDK/lib, so no
+# explicit library_dirs is needed.
+libraries = ["c10", "hggcrt1", "acblas", "acblasLt"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 
 
@@ -244,7 +255,7 @@ def _make_spatial_ops():
             "nvcc": list(sgl_kernel_cuda_flags),
             "cxx": ["-O3", "-std=c++17", abi_flag],
         },
-        libraries=["c10", "cuda"],
+        libraries=["c10", "hggcrt1"],
         extra_link_args=extra_link_args,
         py_limited_api=False,
     )
