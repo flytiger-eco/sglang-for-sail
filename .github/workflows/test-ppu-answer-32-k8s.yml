@@ -1,0 +1,220 @@
+name: Answer Test 32-PPU (PPU K8s)
+
+on:
+  # Dispatch only, and deliberately not wired into any nightly caller yet: this
+  # entry claims four whole ZW-M890P boards, and it has never had a measured
+  # run. It becomes a scheduled line once one has passed, not before.
+  #
+  # It is a workflow of its own rather than a third entry in the btv1.5 matrix
+  # because that matrix is the routinely dispatched path and its two entries
+  # claim one board each. Sharing the matrix would make every btv1.5 dispatch
+  # ask the cluster for four more boards. The pod command below is close to the
+  # one there and is duplicated rather than extracted: extracting it would put
+  # the two verified entries behind an unverified refactor, which is worth doing
+  # once this entry itself has a green run to extract from.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-answer-32-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  ANSWER_SUITE: nightly-answer-32-ppu
+  ANSWER_CONFIG: test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-fp8-144g.json
+
+jobs:
+  answer-32-k8s:
+    name: nightly-answer-32-ppu (btv1.5)
+    # The orchestration shell is CPU-only and holds no device; the action
+    # gang-schedules four worker pods, each onto a board carrying the label.
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # Bounded by the config's own 5400s startup budget, which is what a cold
+    # 2324.7 GiB load off the NAS is allowed to take, plus the ten cases at
+    # their 300s ceiling and the dependency install. The first measured run is
+    # what should replace these numbers.
+    timeout-minutes: 270
+    env:
+      # Same NAS-as-transport arrangement as the single-board workflow: the pod
+      # writes under /mnt/wl_nas and this shell reads the same bytes under
+      # /wl_nas. Here the directory carries a second load -- it is also how the
+      # four nodes address each other, for the rendezvous address, the device
+      # inventories and rank 0's completion -- so it must be the same path in
+      # every pod, which is why the test refuses a relative one.
+      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/nightly-answer-32-ppu
+      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/nightly-answer-32-ppu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+
+      - name: Run nightly-answer-32-ppu via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          # Four nodes of eight, gang-scheduled: the action turns nnodes > 1
+          # into a PodGroup with minMember 4, so the group either gets all four
+          # boards or waits, rather than half a group holding sixteen devices
+          # while the rest never arrives. Eight per node is the whole board,
+          # which is both what TP=32 over four nodes needs and the only fence
+          # that keeps a second pod off a board this run has already claimed.
+          nnodes: 4
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: |
+            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            [global]
+            index-url = https://mirrors.aliyun.com/pypi/simple/
+            trusted-host = mirrors.aliyun.com
+            PIPEOF
+            set -e
+            cd /workspace/source
+            git config --global --add safe.directory /workspace/source
+            SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
+            export SGLANG_PPU_SOURCE_REVISION
+            # First thing after the checkout is in place, and before the install:
+            # rank 0 publishes the address the group meets at, so the other three
+            # never wait on rank 0's install, only on their own. The address the
+            # action injects as MASTER_ADDR is a *.svc.cluster.local name these
+            # hostNetwork pods cannot resolve, so this override is what the
+            # rendezvous actually uses -- see the script's own header.
+            SGLANG_PPU_ANSWER_DIST_INIT_ADDR=$(bash scripts/ci/ppu/answer_rendezvous.sh "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks")
+            export SGLANG_PPU_ANSWER_DIST_INIT_ADDR
+            # And the GID the RoCE data path must use. Left to itself pccl picks
+            # index 0 here, the link-local address formed from the bond's MAC,
+            # which does not cross the fabric between two nodes: the group
+            # builds its queue pairs over the out-of-band TCP channel, logs
+            # "Connected all rings", then dies on its first payload with
+            # IBV_WC_RETRY_EXC_ERR. Measured on these boards, only the RoCE v2
+            # entry of the routable fd03::/8 address carries traffic, and the
+            # script derives its index rather than hard-coding it -- see the
+            # script's own header for the full sweep. It fails loudly rather
+            # than letting the group start on a GID that silently drops.
+            NCCL_IB_GID_INDEX=$(bash scripts/ci/ppu/answer_gid_index.sh)
+            export NCCL_IB_GID_INDEX
+            CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
+            export CUDA_VISIBLE_DEVICES
+            ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
+            echo "source revision: $SGLANG_PPU_SOURCE_REVISION"
+            echo "test config:     $SGLANG_PPU_ANSWER_TEST_CONFIG"
+            echo "node rank:       ${NODE_RANK:-0} of ${NNODES:-1} on ${NODE_NAME:-an unnamed node}"
+            echo "rendezvous:      $SGLANG_PPU_ANSWER_DIST_INIT_ADDR"
+            echo "RoCE GID index:  $NCCL_IB_GID_INDEX"
+            echo "visible devices: $CUDA_VISIBLE_DEVICES"
+            echo "checkpoint:      $ANSWER_MODEL_PATH"
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$JIT_MTIME" != 0 ]; then
+              find python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} +
+              echo 'Pinned JIT source mtimes'
+            fi
+            # No page-cache warm here, unlike the single-board entries. A warm
+            # reads the whole checkpoint tree, and at 2324.7 GiB that is larger
+            # than one node's 2266 GiB of memory, so the beginning of it is
+            # already evicted by the time the read ends; run on all four nodes it
+            # would also read four times what the group needs, since each node
+            # loads roughly its own quarter. It would cost hours of NAS traffic
+            # to leave the cache no warmer than it started.
+            cd test
+            # Routed through run_suite.py, as the single-board entries are, so the
+            # executed set is exactly what register_ppu_ci declares; the wrapper
+            # around it only keeps this node's log and its exit status, both of
+            # which the action would otherwise lose for every node but worker-0.
+            # No --continue-on-error: an Answer-quality regression must turn the
+            # run red.
+            bash ../scripts/ci/ppu/run_answer_suite_node.sh \
+              ${{ env.ANSWER_SUITE }} 14400 "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks"
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 240
+
+      # Read, not moved: the pods write as root and this shell is a different,
+      # non-root uid, so an rm here fails with EPERM on every file and turns the
+      # step red even when the suite passed. What the copy brings back is rank
+      # 0's verdict plus, under ranks/, the address the group met at, one device
+      # inventory per node, each node's own log and each node's exit code.
+      - name: Collect Answer evidence
+        if: always()
+        shell: bash
+        env:
+          SUITE: ${{ env.ANSWER_SUITE }}
+        run: |
+          set -euo pipefail
+          destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
+          mkdir -p "${destination}"
+          if [ -d "${ANSWER_RESULTS_ON_RUNNER}" ]; then
+            cp -a "${ANSWER_RESULTS_ON_RUNNER}/." "${destination}/"
+          else
+            echo "::warning::the group produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
+          fi
+          # A node's exit code is a workflow-level fact the report cannot carry:
+          # rank 0's verdict is written before the workers are released, so a
+          # worker that then failed is only visible here and in its own log.
+          for status_file in "${destination}"/ranks/rank-*.status; do
+            [ -f "${status_file}" ] || continue
+            node=$(basename "${status_file}" .status)
+            code=$(cat "${status_file}" || echo "unreadable")
+            if [ "${code}" = "0" ]; then
+              echo "::notice::${SUITE}: ${node} exited 0"
+            else
+              echo "::error::${SUITE}: ${node} exited ${code}"
+            fi
+          done
+          if [ -f "${destination}/summary.md" ]; then
+            # Annotations are what a reader of this run page actually gets here:
+            # this runner drives the job through a container hook that does not
+            # share the job container's filesystem with the runner process, so
+            # bytes written to GITHUB_STEP_SUMMARY inside the container are
+            # dropped without an error. Annotations travel over this step's
+            # stdout, which does reach the runner.
+            #
+            # The failing cases are read back from summary.md rather than from
+            # result.json because this container is not guaranteed a JSON parser
+            # -- no python3, no jq. render_summary emits one bullet per failing
+            # case prefixed with "- `", a prefix no other line in that document
+            # has, and the evaluator's unit tests lock that shape.
+            while IFS= read -r failure; do
+              echo "::error::${SUITE}: ${failure#- }"
+            done < <(grep '^- `' "${destination}/summary.md" || true)
+            counts=$(grep '^- Cases: ' "${destination}/summary.md" | head -1 || true)
+            if [ -n "${counts}" ]; then
+              echo "::notice::${SUITE}: ${counts#- }"
+            fi
+            cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload Answer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          retention-days: 30

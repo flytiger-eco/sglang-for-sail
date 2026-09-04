@@ -58,6 +58,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -68,7 +69,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -1296,7 +1300,16 @@ class Qwen3_5ForCausalLM(nn.Module):
         )
 
 
-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+class Qwen3_5MoeTextModel(Qwen3_5ForCausalLM):
+    """MoE text backbone: embedding, decoder layers and final norm, no head.
+
+    Despite what its former name (``Qwen3_5MoeForCausalLM``) suggested, this is
+    the module the vision-language entries mount as ``self.model``; its
+    ``load_weights`` is written against ``model.`` prefixed checkpoint names and
+    therefore only resolves when something owns it under that attribute.
+    ``Qwen3_5MoeForCausalLM`` below is that owner for text-only checkpoints.
+    """
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1506,6 +1519,134 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+class Qwen3_5MoeForCausalLM(nn.Module):
+    """Text-only Qwen3.5-MoE entry: the MoE text backbone plus a language head.
+
+    Text-only checkpoints declare ``Qwen3_5MoeForCausalLM`` in ``architectures``,
+    carry the text config at the top level (no ``text_config`` nesting, no vision
+    tower) and store every tensor under ``model.`` -- including the quantization
+    exclusions, which name ``lm_head`` and ``model.layers.0.linear_attn.*``.  So
+    the checkpoint asks for exactly two things the backbone does not provide on
+    its own: the ``model.`` attribute prefix and the head. This class supplies
+    both, which is also what makes the backbone's ``load_weights`` -- written
+    against ``model.`` prefixed names -- resolve against real parameters.
+    """
+
+    packed_modules_mapping = Qwen3_5MoeTextModel.packed_modules_mapping
+    supported_lora_modules = Qwen3_5MoeTextModel.supported_lora_modules
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        self.pp_group = get_pp_group()
+
+        self.model = Qwen3_5MoeTextModel(
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                prefix=add_prefix("lm_head", prefix),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def get_embed_and_head(self):
+        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
+        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        return embed, head
+
+    def set_embed_and_head(self, embed, head):
+        if self.pp_group.is_first_rank and embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if self.pp_group.is_last_rank and head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+        # Non-final pipeline stages hand their activations on as proxy tensors.
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
+        aux_hidden_states = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, aux_hidden_states = hidden_states
+
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
+
+    # The backbone's loader already expects the `model.` prefixed names this
+    # class introduces, so it is the loader for the whole entry, head included.
+    load_weights = Qwen3_5MoeTextModel.load_weights
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return Qwen3_5MoeTextModel.get_model_config_for_expert_location(config)
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
@@ -1672,7 +1813,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         config: Qwen3_5MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        language_model_cls=Qwen3_5MoeForCausalLM,
+        language_model_cls=Qwen3_5MoeTextModel,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
@@ -2045,4 +2186,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+# Qwen3_5MoeForCausalLM is an entry in its own right: the text-only MoE
+# checkpoints declare it in `architectures` and carry the text config at the top
+# level, with no vision tower and no `text_config` nesting. Registering it keeps
+# such checkpoints from falling through to the transformers implementation.
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForCausalLM,
+]
