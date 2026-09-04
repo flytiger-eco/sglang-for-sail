@@ -886,7 +886,7 @@ void transfer_embedding_ranges_direct(
   const int device_id = copy_device.index();
   std::vector<size_t> attrs_idxs(1, 0);
   hggcMemcpyAttributes attrs{};
-  attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attrs.srcAccessOrder = hggcMemcpySrcAccessOrderStream;
   attrs.srcLocHint.type = src.is_cuda() ? hggcMemLocationTypeDevice : hggcMemLocationTypeHost;
   attrs.srcLocHint.id = src.is_cuda() ? device_id : 0;
   attrs.dstLocHint.type = dst.is_cuda() ? hggcMemLocationTypeDevice : hggcMemLocationTypeHost;
@@ -924,7 +924,7 @@ void transfer_embedding_ranges_direct(
            stream);
   }
 
-  if (err == hggcErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+  if (err == hggcErrorNotSupported || err == hggcErrorCallRequiresNewerDriver) {
     (void)hggcGetLastError();
     fallback_to_async_copies();
     return;
@@ -1127,7 +1127,7 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t src_stride0 = src_ptrs[0].stride(0);
     const int64_t elem_size = dst_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
-    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcAccessOrder = hggcMemcpySrcAccessOrderStream;
     attrs.srcLocHint.type = hggcMemLocationTypeDevice;
     attrs.srcLocHint.id = device_id;
     attrs.dstLocHint.type = hggcMemLocationTypeHost;
@@ -1168,7 +1168,7 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t dst_stride0 = dst_ptrs[0].stride(0);
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
-    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcAccessOrder = hggcMemcpySrcAccessOrderStream;
     attrs.srcLocHint.type = hggcMemLocationTypeHost;
     attrs.srcLocHint.id = 0;
     attrs.dstLocHint.type = hggcMemLocationTypeDevice;
@@ -1232,7 +1232,7 @@ inline void transfer_kv_page_first_direct_impl(
              &fail_idx,
              stream);
     }
-    if (err == hggcErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    if (err == hggcErrorNotSupported || err == hggcErrorCallRequiresNewerDriver) {
       fallback_to_page_copy();
       return;
     }

@@ -54,20 +54,12 @@ __device__ T NegativeInfinity() {
 
 template <>
 __device__ __half NegativeInfinity<__half>() {
-#ifdef USE_ROCM
   return __float2half(-INFINITY);
-#else
-  return -CUDART_INF_FP16;
-#endif
 }
 
 template <>
 __device__ __ppu_bfloat16 NegativeInfinity<__ppu_bfloat16>() {
-#ifdef USE_ROCM
-  return __ppu_bfloat16(-INFINITY);
-#else
-  return -CUDART_INF_BF16;
-#endif
+  return __float2bfloat16(-INFINITY);
 }
 
 template <typename T, typename PackedT>

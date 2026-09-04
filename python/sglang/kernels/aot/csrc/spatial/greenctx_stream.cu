@@ -54,7 +54,9 @@ static std::vector<int64_t> create_greenctx_stream_direct_dynamic(HGgreenCtx gct
 }
 
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device) {
-  CUDA_DRV(compatibleDriverGetVersion(&CUDA_DRIVER_VERSION));
+  // compatibleDriverGetVersion() is provided by the PPU compat layer and returns
+  // hggcError_t (runtime error code), so use CUDA_RT instead of CUDA_DRV (HGresult).
+  CUDA_RT(compatibleDriverGetVersion(&CUDA_DRIVER_VERSION));
 
   HGgreenCtx gctx[3];
   HGdevResourceDesc desc[3];
