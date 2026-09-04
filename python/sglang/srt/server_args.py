@@ -2545,6 +2545,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
@@ -2570,9 +2571,13 @@ class ServerArgs:
                         f"{model_arch}"
                     )
 
+            # The text-only MoE checkpoints are the same hybrid GDN backbone as
+            # the vision-language ones, so they need the same mamba radix cache
+            # handling and the same attention backend default.
             if model_arch in [
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5MoeForCausalLM",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]:
