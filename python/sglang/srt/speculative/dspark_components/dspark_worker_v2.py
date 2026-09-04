@@ -96,11 +96,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_graph_allowed = (
             not server_args.disable_cuda_graph and not self._is_pd_prefill
         )
-        if (
-            server_args.enable_dp_attention
-            and self._draft_is_moe
-            and ps.attn_tp_size > 1
-        ):
+        # Effective attention-TP under the resolved parallel layout; under
+        # DSA/NSA prefill CP the hook pins attn_cp == tp so attn_tp collapses
+        # to 1 (replicated attention) even on multi-node TP32 deployments.
+        attn_tp_size = (
+            server_args.tp_size
+            // max(server_args.dp_size, 1)
+            // max(server_args.attn_cp_size, 1)
+        )
+        if server_args.enable_dp_attention and self._draft_is_moe and attn_tp_size > 1:
             raise ValueError(
                 "DSpark + dp attention with a DeepSeek-V4 (MoE) draft requires "
                 "attn_tp == 1 (set --dp-size == --tp). attn_tp > 1 corrupts the "
