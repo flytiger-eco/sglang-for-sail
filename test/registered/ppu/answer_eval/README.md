@@ -496,11 +496,28 @@ so on PPU it is exactly the internal cases' silence, spelled explicitly.
 internal answer cases, which set it almost uniformly.
 
 **`reasoning_parser`, a deliberate departure.** The internal Qwen answer cases do
-not pass it; these configs pass `qwen3` on all five. The requests here ask for
-`separate_reasoning` with `enable_thinking: false`, and the parser is what keeps a
-reasoning block out of the graded text; the two entries with measured baselines
-were produced with it. The internal cases that do pass one are the models whose
-templates need a different parser (`glm45`, `deepseek-v4`, `minimax-append-think`).
+not pass it; these configs pass one on all five. The requests here ask for
+`separate_reasoning`, and the parser is what keeps a reasoning block out of the
+graded text; the two entries with measured baselines were produced with it. The
+internal cases that do pass one are the models whose templates need a different
+parser (`glm45`, `deepseek-v4`, `minimax-append-think`).
+
+Four configs pass `qwen3` and ask their template for `enable_thinking: false`.
+The 2.4T entry cannot: its checkpoint ships a template that answers
+`raise_exception('Disabling thinking is not supported.')` to exactly that
+argument, which is why every request in run 33841139864 came back `400 Bad
+Request` while `/generate` was answering 200. That template grades the pass
+instead of switching it off — `reasoning_effort`, one of `xhigh` (its default),
+`medium`, or `low`, rejected by name otherwise — so the config states `low`, and
+`max_tokens` rises to 8192 with a 600s request timeout because a reasoning pass
+that cannot be disabled still has to fit. The parser becomes `qwen3-thinking`,
+which is the same `Qwen3Detector` with `force_reasoning` set: the template emits
+`<|im_start|>assistant\n<think>\n` itself, so `<think>` arrives in the prompt and
+the completion opens mid-reasoning with only `</think>` to come. `qwen3` decides
+it is looking at reasoning by finding `<think>` in the text, so on this
+checkpoint it would hand the whole reasoning pass to the grader as content.
+Both findings were reproduced against the checkpoint's own template under
+jinja2 3.1.2, in the image the pods run.
 
 **Bind address, unchanged.** `model_mate` binds `--host 0.0.0.0`; here the host
 comes from `DEFAULT_URL_FOR_TEST`, which is the loopback. Nothing off-node

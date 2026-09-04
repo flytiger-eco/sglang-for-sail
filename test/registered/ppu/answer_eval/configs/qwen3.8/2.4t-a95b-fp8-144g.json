@@ -27,19 +27,19 @@
       "attention_backend": "fa3",
       "mem_fraction_static": 0.8,
       "quantization": null,
-      "reasoning_parser": "qwen3",
+      "reasoning_parser": "qwen3-thinking",
       "watchdog_timeout": 600
     }
   },
   "request": {
-    "timeout_seconds": 300,
+    "timeout_seconds": 600,
     "generation": {
       "temperature": 0,
       "top_p": 1,
-      "max_tokens": 2048,
+      "max_tokens": 8192,
       "separate_reasoning": true,
       "chat_template_kwargs": {
-        "enable_thinking": false
+        "reasoning_effort": "low"
       }
     }
   },

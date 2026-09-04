@@ -460,6 +460,36 @@ class TestPPUAnswerEval(unittest.TestCase):
                 with self.assertRaisesRegex(AnswerEvalError, "watchdog_timeout"):
                     validate_test_config(invalid)
 
+    def test_chat_template_kwargs_accept_both_reviewed_spellings(self):
+        # A checkpoint whose template raises on enable_thinking=false is steered
+        # by reasoning_effort instead, so the validator has to accept either
+        # spelling while still refusing anything unreviewed.
+        effort = copy.deepcopy(self.test_config)
+        effort["request"]["generation"]["chat_template_kwargs"] = {
+            "reasoning_effort": "low"
+        }
+        validate_test_config(effort)
+
+        both = copy.deepcopy(self.test_config)
+        both["request"]["generation"]["chat_template_kwargs"] = {
+            "enable_thinking": True,
+            "reasoning_effort": "medium",
+        }
+        validate_test_config(both)
+
+        for kwargs in (
+            {},
+            {"enable_thinking": "false"},
+            {"reasoning_effort": ""},
+            {"reasoning_effort": 1},
+            {"enable_thinking": False, "temperature": 0},
+        ):
+            invalid = copy.deepcopy(self.test_config)
+            invalid["request"]["generation"]["chat_template_kwargs"] = kwargs
+            with self.subTest(chat_template_kwargs=kwargs):
+                with self.assertRaisesRegex(AnswerEvalError, "chat_template_kwargs"):
+                    validate_test_config(invalid)
+
     def test_provenance_prefers_the_actual_checked_out_revision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_dir = Path(temp_dir) / "Qwen3.5-397B-A17B-W8A8-INT8"
@@ -656,6 +686,32 @@ class TestPPUAnswerEval(unittest.TestCase):
                     generation_config=self.test_config["request"]["generation"],
                 )
         self.assertEqual(caught.exception.reason_code, "response_decode_error")
+
+        # A rejected request has to carry the server's own explanation: the
+        # status line alone cannot tell a bad sampling parameter apart from a
+        # chat template that refuses the call, and the server log records
+        # nothing but the status.
+        def rejecting_post(*_args, **_kwargs):
+            return SimpleNamespace(
+                status_code=400,
+                text='{"error": "Disabling thinking is not supported."}',
+                content=b"{}",
+            )
+
+        fake_requests.post = rejecting_post
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            with self.assertRaises(CandidateRequestError) as caught:
+                request_chat_completion(
+                    "http://127.0.0.1:30000",
+                    "model",
+                    "prompt",
+                    "suffix",
+                    timeout_seconds=10,
+                    generation_config=self.test_config["request"]["generation"],
+                )
+        self.assertEqual(caught.exception.reason_code, "request_error")
+        self.assertIn("HTTP 400", str(caught.exception))
+        self.assertIn("Disabling thinking is not supported.", str(caught.exception))
 
     def test_objective_reference_rules_accept_correct_variants(self):
         answers = {

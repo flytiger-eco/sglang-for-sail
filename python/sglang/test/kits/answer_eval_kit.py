@@ -288,13 +288,36 @@ def validate_test_config(config: dict[str, Any]) -> None:
     if not isinstance(generation["separate_reasoning"], bool):
         raise AnswerEvalError("request.generation.separate_reasoning must be boolean")
     chat_template_kwargs = generation["chat_template_kwargs"]
+    # Two reviewed spellings, because the checkpoints disagree on whether the
+    # reasoning pass can be switched off at all. The Qwen3.8-27B template
+    # honours enable_thinking=false; the Qwen3.8-2.4T-A95B template answers
+    # 'Disabling thinking is not supported.' and instead grades the effort, so a
+    # config for it states reasoning_effort. The legal effort names live in the
+    # checkpoint's own template, which rejects the rest by name, so only the
+    # shape is checked here.
+    supported_chat_template_kwargs = {"enable_thinking", "reasoning_effort"}
     if (
         not isinstance(chat_template_kwargs, dict)
-        or set(chat_template_kwargs) != {"enable_thinking"}
-        or not isinstance(chat_template_kwargs["enable_thinking"], bool)
+        or not chat_template_kwargs
+        or not set(chat_template_kwargs) <= supported_chat_template_kwargs
     ):
         raise AnswerEvalError(
-            "request.generation.chat_template_kwargs must define boolean enable_thinking"
+            "request.generation.chat_template_kwargs must set enable_thinking, "
+            "reasoning_effort, or both"
+        )
+    if "enable_thinking" in chat_template_kwargs and not isinstance(
+        chat_template_kwargs["enable_thinking"], bool
+    ):
+        raise AnswerEvalError(
+            "request.generation.chat_template_kwargs.enable_thinking must be boolean"
+        )
+    if "reasoning_effort" in chat_template_kwargs and (
+        not isinstance(chat_template_kwargs["reasoning_effort"], str)
+        or not chat_template_kwargs["reasoning_effort"]
+    ):
+        raise AnswerEvalError(
+            "request.generation.chat_template_kwargs.reasoning_effort must be a "
+            "non-empty string"
         )
 
     for field in ("dataset", "quality_profile"):
@@ -1735,8 +1758,13 @@ def request_chat_completion(
     except requests.RequestException as exc:
         raise CandidateRequestError("request_error", type(exc).__name__) from exc
     if response.status_code != 200:
+        # Carry a slice of the body: the status code alone cannot distinguish a
+        # rejected sampling parameter from a chat template that refuses the
+        # request, and the server log only records the status line.
+        detail = response.text.strip().replace("\n", " ")[:400]
         raise CandidateRequestError(
-            "request_error", f"candidate endpoint returned HTTP {response.status_code}"
+            "request_error",
+            f"candidate endpoint returned HTTP {response.status_code}: {detail}",
         )
     try:
         body = response.content.decode("utf-8", errors="strict")
