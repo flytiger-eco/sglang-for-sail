@@ -36,7 +36,8 @@ limitations under the License.
 
 // Define reduction operators based on CUDA version
 // CUDA 13 (12.9+) deprecated cub::Max/Min in favor of cuda::maximum/minimum
-#if COMPATIBLE_VERSION >= 12090
+// PPU (hgcc) does not provide cuda::maximum/cuda::minimum, use cub::Max/cub::Min instead
+#if !defined(__HGGC__) && COMPATIBLE_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
 #else

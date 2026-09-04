@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
+#include <hggc_fp8.h>
 
 #include <cmath>
 
@@ -384,7 +385,7 @@ __global__ void per_token_group_quant_8bit_kernel(
             outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
             outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
 
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __HG_SATFINITE, __HG_E4M3);
+            output_buf_ptr[j / 2] = __hg_cvt_float2_to_fp8x2(outputx2, __HG_SATFINITE, __HG_E4M3);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);

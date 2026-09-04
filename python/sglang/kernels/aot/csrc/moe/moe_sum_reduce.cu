@@ -27,7 +27,7 @@ __device__ __forceinline__ T from_acc(opmath_t<T> x) {
 
 template <>
 __device__ __forceinline__ opmath_t<at::Half> to_acc<at::Half>(at::Half x) {
-  return __half2float(__nv_half(x));
+  return __half2float(__float2half(x));
 }
 template <>
 __device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
@@ -36,7 +36,7 @@ __device__ __forceinline__ at::Half from_acc<at::Half>(opmath_t<at::Half> x) {
 
 template <>
 __device__ __forceinline__ opmath_t<at::BFloat16> to_acc<at::BFloat16>(at::BFloat16 x) {
-  return __bfloat162float(__ppu_bfloat16(x));
+  return __bfloat162float(__float2bfloat16(x));
 }
 template <>
 __device__ __forceinline__ at::BFloat16 from_acc<at::BFloat16>(opmath_t<at::BFloat16> x) {
