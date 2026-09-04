@@ -346,9 +346,37 @@ reported nothing, the release, the three worker outcomes, and the teardown order
 It skips itself where torch is absent, since the driver needs it and the evaluator
 does not.
 
-This entry has no measured baseline yet. `startup_timeout_seconds` 5400 and
-`est_time` 7200 are estimates, and the first run on the cluster is what will
-replace both.
+**Measured baseline, four nodes.**
+[Run 33849322347](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/33849322347),
+2026-09-04, four ZW-M890P boards (thirty-two devices), driver 1.6.1, SDK 2.1.1,
+at `b7b48ee`. **Ten of ten cases passed**, verdict `passed`, no suspect case, and
+all four ranks exited 0.
+
+| Phase | Cost | Observation |
+| --- | --- | --- |
+| `torch.distributed` init | 29.5s | the group forms across all four boards |
+| Weight load | 14m42s | 213 shards, `type=Qwen3_5MoeForCausalLM`, `quant=fp8`, 72.36 GiB per device |
+| CUDA graph capture | 5m30s | against the 46.4 GiB left free per device |
+| Launch to ready | 22m44s | `/generate` warm-up 200 OK, well inside the 5400s `startup_timeout_seconds` |
+| Ten graded requests | 57s | every one 200 OK; 16:01:35 to 16:02:32 |
+| Registered file, total | 1455s | against `est_time` 7200 |
+
+`max_total_num_tokens` comes out at 3875020 with a 262144 context and
+`max_running_requests` 96. The 503s on `/health_generate` before ready are the
+driver polling a scheduler that has not finished warming, not a fault.
+
+The reasoning split is visible in the report: at `reasoning_effort: low` the
+longest case spends 389 of its 418 completion tokens on reasoning and none of it
+reaches the graded text — `final_answer` for the letter-count case is `4个。` — and
+`reasoning_sha256` records the reasoning separately for every case. The widest
+case uses 418 of the 8192 token budget, so `max_tokens` is not the binding
+constraint at this effort.
+
+`startup_timeout_seconds` 5400 and `est_time` 7200 remain as they were: both hold
+comfortably against these numbers, and leaving headroom for a cold page cache is
+deliberate on a node whose memory is smaller than the checkpoint tree.
+`WORKER_HOLD_MARGIN_SECONDS` 900 was never approached — the workers finished
+within 27s of rank 0.
 
 **The workflow is its own file, and dispatch only.**
 `.github/workflows/test-ppu-answer-32-k8s.yml` claims four whole boards, so it is
