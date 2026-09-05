@@ -3571,6 +3571,19 @@ class SchedulerDisaggregationDecodeMixin:
                     )
         return new_batch
 
+    def fast_flush_transferred_first_tokens(
+        self: Scheduler, transferred_reqs: List[Req]
+    ) -> None:
+        """Flush prefill's first token as soon as its KV transfer completes."""
+        first_token_reqs_by_logprob: Dict[bool, List[Req]] = {}
+        for req in transferred_reqs:
+            if req.send_token_offset != 0 or not req.output_ids_through_stop:
+                continue
+            first_token_reqs_by_logprob.setdefault(req.return_logprob, []).append(req)
+
+        for return_logprob, reqs in first_token_reqs_by_logprob.items():
+            self.output_streamer.stream_output(reqs, return_logprob)
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
@@ -3603,6 +3616,7 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
+            self.fast_flush_transferred_first_tokens(transferred_reqs)
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
