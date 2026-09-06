@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.qsa.kernel import (
     average_pool_qsa_keys,
     expand_qsa_block_indices,
     qsa_fast_topk,
+    qsa_prefill_all_visible_indices,
 )
 from sglang.srt.layers.attention.qsa.metadata import (
     build_group_ring_slots,
@@ -21,21 +22,19 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.runner import get_is_capture_mode
-
 
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
+
+
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
-    max_padded_rows = max(
-        block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row
-    )
+    max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
 
@@ -179,12 +178,9 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+            # ModelRunner expands every RoPE cache to the serving context
+            # bound after loading and before any graph capture. Reading the
+            # maximum position back to the host here serializes every QSA layer.
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -218,9 +214,10 @@ class QSAIndexer(MultiPlatformOp):
         return self.apply_rope(block_positions, normalized)
 
     def _use_fused_compress(self, pool) -> bool:
-        return (
-            getattr(pool, "qsa_rope_position_buffer", None) is not None
-            and self._use_fused_prep(pool.get_qsa_key_state_buffer(self.layer_id))
+        return getattr(
+            pool, "qsa_rope_position_buffer", None
+        ) is not None and self._use_fused_prep(
+            pool.get_qsa_key_state_buffer(self.layer_id)
         )
 
     def _fused_compress_store(
@@ -283,7 +280,6 @@ class QSAIndexer(MultiPlatformOp):
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
         )
-
 
     def update_key_state_and_compress(
         self,
@@ -408,11 +404,13 @@ class QSAIndexer(MultiPlatformOp):
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
-        num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        num_positions = (
+            positions.shape[-1] if positions.ndim == 2 else positions.numel()
+        )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+        # RoPE capacity is reserved once by ModelRunner after model loading.
+        # Keep this per-layer path device-asynchronous.
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the
@@ -433,6 +431,22 @@ class QSAIndexer(MultiPlatformOp):
             self.rotary_emb.is_neox_style,
         )
         return torch.cat([rotated, tensor[..., rotary_dim:]], dim=-1)
+
+    def select_prefill_all_visible_tokens(
+        self,
+        query_positions: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return qsa_prefill_all_visible_indices(
+            query_positions,
+            token_to_batch_idx,
+            sequence_lengths,
+            output,
+            self.token_topk,
+            self.compress_ratio,
+        )
 
     def select_prefill_tokens(
         self,
@@ -540,12 +554,8 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
     ) -> torch.Tensor:
         forward_mode = forward_batch.forward_mode
-        is_target_verify = getattr(
-            forward_mode, "is_target_verify", lambda: False
-        )()
-        is_draft_extend = getattr(
-            forward_mode, "is_draft_extend_v2", lambda: False
-        )()
+        is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
+        is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
             # from the physical paged-KV position.  Compression and sparse
@@ -557,9 +567,7 @@ class QSAIndexer(MultiPlatformOp):
         else:
             logical_positions = getattr(forward_batch, "positions", None)
             if logical_positions is None:
-                logical_positions = (
-                    positions[0] if positions.ndim == 2 else positions
-                )
+                logical_positions = positions[0] if positions.ndim == 2 else positions
             logical_positions = logical_positions.flatten()
         # DP MAX_LEN padding adds token rows without assigning them to a
         # request. token_to_batch_idx is the source of truth for semantic rows.
@@ -633,10 +641,24 @@ class QSAIndexer(MultiPlatformOp):
                 indexer_metadata.get_seqlens_int32(),
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, logical_positions
+        if getattr(indexer_metadata, "prefill_all_visible", False):
+            # fast_topk explicitly leaves result order unspecified. Sparse
+            # attention consumes the selected set, so the ascending canonical
+            # range is a valid representation when every visible token wins.
+            output = indexer_metadata.prefill_all_visible_scratch
+            if output is None:
+                raise RuntimeError(
+                    "QSA all-visible prefill scratch was not initialized"
+                )
+            return self.select_prefill_all_visible_tokens(
+                logical_positions,
+                indexer_metadata.get_token_to_batch_idx(),
+                indexer_metadata.get_seqlens_int32(),
+                output,
             )
+
+        compressed_keys, row_starts, row_ends, sequence_lengths = (
+            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
         )
         query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
         row_sequence_lengths = sequence_lengths.index_select(

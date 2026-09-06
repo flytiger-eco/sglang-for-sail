@@ -22,11 +22,15 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.layers.attention.qsa.kernel import (
+    QSA_PREFILL_ALL_VISIBLE_MAX_BATCH,
+    qsa_sparse_attention,
+)
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
+    build_qsa_row_ranges,
     build_rope_position_matrix,
     compressed_decode_view,
 )
@@ -78,9 +82,7 @@ def _resolve_flash_attn_varlen_func():
     except ImportError:
         pass
     try:
-        from flash_attn.cute.interface import (
-            flash_attn_varlen_func as cute_varlen_func,
-        )
+        from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
 
         def flash_attn_varlen_func(*args, **kwargs):
             output = cute_varlen_func(*args, **kwargs)
@@ -93,7 +95,6 @@ def _resolve_flash_attn_varlen_func():
             "QSA decode requires flash_attn (FA2) or flash-attn-4 "
             "(FA4 cute) for its packed varlen fallback."
         ) from exc
-
 
 
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
@@ -228,6 +229,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             Tuple[int, int, torch.dtype, torch.device],
             Tuple[torch.Tensor, torch.Tensor],
         ] = {}
+        self._qsa_prefill_compressed_scratch: Dict[
+            Tuple[int, int, torch.dtype, torch.device], torch.Tensor
+        ] = {}
+        self._qsa_prefill_indices_scratch: Dict[
+            Tuple[int, torch.device], torch.Tensor
+        ] = {}
         self._graph_seq_lens = None
         self._graph_token_to_batch = None
         self._graph_cu_seqlens_q = None
@@ -252,13 +259,23 @@ class QwenSparseAttnBackend(AttentionBackend):
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
 
+    @staticmethod
+    def _can_use_qsa_prefill_all_visible(
+        max_length: int,
+        num_sequences: int,
+        token_topk: int,
+    ) -> bool:
+        return (
+            max_length <= token_topk
+            and num_sequences <= QSA_PREFILL_ALL_VISIBLE_MAX_BATCH
+        )
+
     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
         if forward_mode is None or not forward_mode.is_target_verify():
             return
         if int(getattr(spec_info, "topk", 1) or 1) != 1:
             raise NotImplementedError(
-                "Qwen QSA target verification supports only "
-                "speculative_eagle_topk=1"
+                "Qwen QSA target verification supports only " "speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if draft_tokens > self.compress_ratio:
@@ -288,9 +305,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = (
-            int(spec_info.draft_token_num) if spec_info is not None else 0
-        )
+        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -378,9 +393,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     extend_lengths = torch.cat(
                         [
                             extend_lengths,
-                            torch.zeros(
-                                bs - extend_lengths.numel(), dtype=torch.int32
-                            ),
+                            torch.zeros(bs - extend_lengths.numel(), dtype=torch.int32),
                         ]
                     )
             else:
@@ -414,9 +427,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 torch.full((int(extend_len),), prefix_len, dtype=torch.int32)
             )
         row_lengths = (
-            torch.cat(row_lengths)
-            if row_lengths
-            else torch.empty(0, dtype=torch.int32)
+            torch.cat(row_lengths) if row_lengths else torch.empty(0, dtype=torch.int32)
         )
         row_prefix_lengths = (
             torch.cat(row_prefix_lengths)
@@ -429,12 +440,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA CUDA graph speculative layout has inconsistent token count: "
                 f"capacity={num_tokens}, actual={actual_rows}"
             )
-        repeats = extend_lengths.to(
-            device=req_pool_indices.device, dtype=torch.long
-        )
-        row_req_pool_indices = torch.repeat_interleave(
-            req_pool_indices[:bs], repeats
-        )
+        repeats = extend_lengths.to(device=req_pool_indices.device, dtype=torch.long)
+        row_req_pool_indices = torch.repeat_interleave(req_pool_indices[:bs], repeats)
         # Draft-extend graphs always execute the captured static token shape,
         # while a replay can contain fewer accepted tokens.  The runner packs
         # real rows first and zero-fills the tail, so give those tail rows safe
@@ -542,9 +549,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # member sits chunk-locally at (block * ratio - prefix).
             member_rows = torch.where(
                 valid,
-                row_token_starts[rows]
-                + blocks * compress_ratio
-                - prefix_lens[rows],
+                row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
                 torch.zeros_like(blocks),
             )
         return write_locs, group_end_positions, rows, member_rows
@@ -609,10 +614,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.device = forward_batch.seq_lens.device
         if not self.max_context_len:
             self.max_context_len = self.req_to_token.shape[1]
-        if (
-            forward_batch.forward_mode.is_idle()
-            or forward_batch.seq_lens.numel() == 0
-        ):
+        if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP attention runs IDLE dummy forwards on ranks without work, and
             # the MTP multi-step wrapper forwards them as zero-row DECODE
             # steps.  Model layers skip attention for these batches, but
@@ -620,9 +622,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # of falling into the extend/decode paths on empty tensors.
             return self._empty_metadata(forward_batch)
         original_mode = getattr(forward_batch, "_original_forward_mode", None)
-        if original_mode is not None and self._is_speculative_paged_mode(
-            original_mode
-        ):
+        if original_mode is not None and self._is_speculative_paged_mode(original_mode):
             # DP MAX_LEN pseudo-extend rewrites the mode to EXTEND with
             # extend_seq_lens == 1 per request, which loses the per-request
             # draft fan-out of target_verify/draft_extend.  Refuse to guess
@@ -632,9 +632,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"speculative mode {original_mode}: token rows would be "
                 "mis-mapped to requests"
             )
-        speculative_paged = self._is_speculative_paged_mode(
-            forward_batch.forward_mode
-        )
+        speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -661,10 +659,43 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
-            if forward_batch.seq_lens_cpu is not None:
-                max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
-            else:
-                max_length = int(sequence_lengths.max())
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is None and not forward_batch.forward_mode.is_decode():
+                prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+                extend_lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+                if (
+                    prefix_lens_cpu is not None
+                    and extend_lens_cpu is not None
+                    and not (
+                        isinstance(prefix_lens_cpu, torch.Tensor)
+                        and prefix_lens_cpu.device.type != "cpu"
+                    )
+                    and not (
+                        isinstance(extend_lens_cpu, torch.Tensor)
+                        and extend_lens_cpu.device.type != "cpu"
+                    )
+                    and len(prefix_lens_cpu) >= batch_size
+                    and len(extend_lens_cpu) >= batch_size
+                ):
+                    seq_lens_cpu = tuple(
+                        int(prefix_lens_cpu[i]) + int(extend_lens_cpu[i])
+                        for i in range(batch_size)
+                    )
+            if seq_lens_cpu is None and not forward_batch.forward_mode.is_decode():
+                raise ValueError(
+                    "QSA prefill metadata requires scheduler-maintained CPU "
+                    "sequence or extend lengths"
+                )
+            if (
+                isinstance(seq_lens_cpu, torch.Tensor)
+                and seq_lens_cpu.device.type != "cpu"
+            ):
+                raise ValueError("QSA seq_lens_cpu must be host-resident")
+            max_length = (
+                int(sequence_lengths.max())
+                if seq_lens_cpu is None
+                else max(int(seq_lens_cpu[i]) for i in range(batch_size))
+            )
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
@@ -690,9 +721,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             else:
                 extend_seq_lens = forward_batch.extend_seq_lens
                 if extend_seq_lens is None:
-                    raise ValueError(
-                        "QSA extend metadata requires extend_seq_lens"
-                    )
+                    raise ValueError("QSA extend metadata requires extend_seq_lens")
                 token_to_batch_idx = torch.repeat_interleave(
                     torch.arange(
                         batch_size,
@@ -781,6 +810,62 @@ class QwenSparseAttnBackend(AttentionBackend):
                             sequence_ids=group_sequence_ids.long(),
                             compress_ratio=self.compress_ratio,
                         )
+        prefill_compressed_cu_seqlens = None
+        prefill_row_starts = None
+        prefill_row_ends = None
+        prefill_compressed_scratch = None
+        prefill_all_visible = False
+        prefill_all_visible_scratch = None
+        if (
+            (
+                self.qsa_profile is None
+                or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
+            )
+            and not speculative_paged
+            and not forward_batch.forward_mode.is_decode()
+        ):
+            num_sequences = int(sequence_lengths.numel())
+            if seq_lens_cpu is None or len(seq_lens_cpu) < num_sequences:
+                raise ValueError(
+                    "QSA prefill pack requires the scheduler's CPU sequence lengths"
+                )
+            pool = self.token_to_kv_pool
+            prefill_all_visible = self._can_use_qsa_prefill_all_visible(
+                max_length,
+                num_sequences,
+                pool.qsa_token_topk,
+            )
+            if prefill_all_visible:
+                prefill_all_visible_scratch = self._get_qsa_prefill_indices_scratch(
+                    token_to_batch_idx.numel(),
+                    pool.qsa_token_topk + self.compress_ratio - 1,
+                    sequence_lengths.device,
+                )
+            else:
+                packed_blocks = sum(
+                    int(seq_lens_cpu[i]) // self.compress_ratio
+                    for i in range(num_sequences)
+                )
+                query_positions = forward_batch.positions.flatten()[
+                    : token_to_batch_idx.numel()
+                ]
+                (
+                    prefill_row_starts,
+                    prefill_row_ends,
+                    prefill_compressed_cu_seqlens,
+                ) = build_qsa_row_ranges(
+                    sequence_lengths,
+                    query_positions,
+                    token_to_batch_idx,
+                    self.compress_ratio,
+                )
+                prefill_compressed_scratch = self._get_qsa_prefill_compressed_scratch(
+                    packed_blocks,
+                    pool.qsa_index_kv_heads,
+                    pool.qsa_index_head_dim,
+                    pool.qsa_compressed_flat.dtype,
+                    pool.qsa_compressed_flat.device,
+                )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
             token_to_batch_idx=token_to_batch_idx,
@@ -800,6 +885,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            prefill_compressed_cu_seqlens=prefill_compressed_cu_seqlens,
+            prefill_row_starts=prefill_row_starts,
+            prefill_row_ends=prefill_row_ends,
+            prefill_compressed_scratch=prefill_compressed_scratch,
+            prefill_all_visible=prefill_all_visible,
+            prefill_all_visible_scratch=prefill_all_visible_scratch,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -912,8 +1003,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_bs, dtype=torch.int32, device=self.device
         )
         self._graph_extend_lens_pin = [
-            torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
-            for _ in range(2)
+            torch.zeros(max_bs, dtype=torch.int32, pin_memory=True) for _ in range(2)
         ]
         self._extend_lens_pin_idx = 0
 
@@ -1064,9 +1154,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         else:
             metadata.sequence_lengths.copy_(seq_lens[:bs].to(torch.int32))
-            metadata.row_req_pool_indices.copy_(
-                req_pool_indices[:bs].to(torch.int32)
-            )
+            metadata.row_req_pool_indices.copy_(req_pool_indices[:bs].to(torch.int32))
             metadata.indexer_metadata.graph_prefix_lengths.copy_(
                 (seq_lens[:bs] - 1).clamp_min(0).to(torch.int32)
             )
@@ -1228,8 +1316,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         row_width_pages = self.req_to_token.shape[1] // full_page
         num_pages = min(max_pages, row_width_pages)
         table = (
-            self.req_to_token[req_indices, : num_pages * full_page : full_page]
-            .long()
+            self.req_to_token[req_indices, : num_pages * full_page : full_page].long()
             // full_page
         ).clamp_min(0)
         page_table[:, :num_pages].copy_(table.to(torch.int32))
@@ -1531,6 +1618,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
 
+    def _get_qsa_prefill_compressed_scratch(
+        self,
+        capacity: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (num_kv_heads, head_dim, dtype, device)
+        buffer = self._qsa_prefill_compressed_scratch.get(key)
+        if buffer is None or buffer.shape[0] < capacity:
+            buffer = torch.empty(
+                (capacity, num_kv_heads, head_dim),
+                dtype=dtype,
+                device=device,
+            )
+            self._qsa_prefill_compressed_scratch[key] = buffer
+        return buffer[:capacity]
+
+    def _get_qsa_prefill_indices_scratch(
+        self,
+        capacity: int,
+        width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (width, device)
+        buffer = self._qsa_prefill_indices_scratch.get(key)
+        if buffer is None or buffer.shape[0] < capacity:
+            buffer = torch.empty(
+                (capacity, width),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._qsa_prefill_indices_scratch[key] = buffer
+        return buffer[:capacity]
 
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
         key = (batch, pages_per_row, device)
@@ -1541,9 +1663,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables = (
                 torch.arange(batch, dtype=torch.int32, device=device)[:, None]
                 * pages_per_row
-                + torch.arange(pages_per_row, dtype=torch.int32, device=device)[
-                    None, :
-                ]
+                + torch.arange(pages_per_row, dtype=torch.int32, device=device)[None, :]
             ).contiguous()
             cached = (cu, block_tables)
             self._trtllm_sparse_tables[key] = cached
@@ -1582,9 +1702,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         cu_strided, block_tables = self._get_trtllm_sparse_tables(
             batch, pages_per_row, page, device
         )
-        capacity_rows = (
-            self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        )
+        capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
@@ -1812,9 +1930,7 @@ class QwenSparseMultiStepDraftBackend:
             .reshape(steps, -1)[step]
         )
 
-    def _make_step_forward_batch(
-        self, forward_batch, step: int, num_padding: int = 0
-    ):
+    def _make_step_forward_batch(self, forward_batch, step: int, num_padding: int = 0):
         step_forward_batch = copy(forward_batch)
         step_forward_batch.forward_mode = ForwardMode.DECODE
         step_forward_batch.seq_lens = (forward_batch.seq_lens + step + 1).to(
@@ -1841,9 +1957,7 @@ class QwenSparseMultiStepDraftBackend:
                 )
                 step_forward_batch.seq_lens_cpu[-num_padding:] = 1
         step_forward_batch.batch_size = int(step_forward_batch.seq_lens.numel())
-        step_forward_batch.out_cache_loc = self._step_out_cache_loc(
-            forward_batch, step
-        )
+        step_forward_batch.out_cache_loc = self._step_out_cache_loc(forward_batch, step)
         return step_forward_batch
 
     def set_mtp_shared_sparse_indices(self, state) -> None:
@@ -1860,9 +1974,7 @@ class QwenSparseMultiStepDraftBackend:
         for backend in self.attn_backends:
             backend.init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_out_graph(
-        self, forward_batch, in_capture: bool = False
-    ):
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture: bool = False):
         if in_capture:
             for step, backend in enumerate(self.attn_backends):
                 # Every capture row is synthetic.  Keep its sequence length
