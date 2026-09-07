@@ -1415,6 +1415,47 @@ class TestPPUAnswerEval(unittest.TestCase):
         with self.assertRaisesRegex(AnswerEvalError, "different reviewers"):
             validate_annotation_record(duplicate_reviewers)
 
+    def test_empty_final_answer_is_graded_but_not_a_label_candidate(self):
+        # A case whose whole output is a reasoning block leaves an empty final
+        # answer.  That is a graded hard failure, but its candidate_answer would
+        # be the empty string, which cannot satisfy the annotation invariant that
+        # exactly one candidate-answer field be non-empty.  build_report must
+        # still return -- the empty answer counts against the verdict and is left
+        # out of the label set rather than raising during report build.
+        responses = {
+            case["id"]: {
+                "content": (
+                    "<think>只在思考块内作答，正文为空</think>"
+                    if case["id"] == "deepseek-letter-count"
+                    else "候选回答"
+                ),
+                "finish_reason": "stop",
+                "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            }
+            for case in self.dataset["cases"]
+        }
+        report = build_report(
+            self.dataset,
+            self.profile,
+            responses,
+            {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
+        )
+        empty = next(
+            case
+            for case in report["cases"]
+            if case["case_id"] == "deepseek-letter-count"
+        )
+        self.assertEqual(empty["final_answer"], "")
+        self.assertEqual(empty["verdict"], "failed")
+        self.assertIn("empty_final_answer", self.reason_codes(empty))
+        self.assertGreaterEqual(report["summary"]["failed"], 1)
+        self.assertNotIn(
+            "deepseek-letter-count",
+            {candidate["case_id"] for candidate in report["label_candidates"]},
+        )
+        for candidate in report["label_candidates"]:
+            validate_annotation_record(candidate)
+
     def test_public_report_and_files_do_not_contain_candidate_text(self):
         responses = {
             case["id"]: {

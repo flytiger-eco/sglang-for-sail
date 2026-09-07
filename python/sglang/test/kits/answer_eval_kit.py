@@ -1763,6 +1763,13 @@ def build_label_candidates(
         # schema.  Keep them in the run report only.
         if not result.get("sample_id") or not result.get("answer_sha256"):
             continue
+        # An empty final answer is a graded hard failure (``empty_final_answer``)
+        # and stays in the run report, but there is no answer text for a human to
+        # review and a null ``candidate_answer`` would fail the annotation
+        # invariant below, so it is excluded from the label set for the same
+        # reason as the infrastructure failures above.
+        if not result.get("final_answer"):
+            continue
         reasons = sorted(
             {
                 finding["reason_code"]
