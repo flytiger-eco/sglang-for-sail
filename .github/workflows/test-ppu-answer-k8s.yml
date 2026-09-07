@@ -71,6 +71,23 @@ permissions:
 # is why the K8s action below works. So the two long shell bodies live in
 # scripts/ci/ppu/, which both sides read out of their own checkout, and what is
 # left here per entry is the K8s action's inputs.
+#
+# Every job checks out twice, the second time only if the first failed, because
+# the fetch to github.com is the least reliable step in the run and a lost one
+# takes the entry down with it. Half the jobs of each eight-wide run so far lost
+# at least one `git fetch` inside the window where the lanes start together --
+# five of ten in run 34085800820, five of eight in run 34091089985 -- and two of
+# those exhausted the three attempts `actions/checkout` makes on its own, so the
+# suite step was skipped and the model was never asked anything. Our own traffic
+# is not the cause: a depth-2 fetch of this repository is 23 MiB, eight of them
+# 190 MiB, and the same pods that could not reach github.com installed their
+# whole dependency set from an internal mirror minutes later. The fault is
+# specific to that egress path and it clears by itself -- the identical fetch
+# took five seconds once the window passed -- and the infrastructure side is
+# being asked about the path separately. What this file can do is keep a
+# self-clearing fault from judging a model: three attempts with 12 and 19 second
+# backoffs span about five minutes, short of the six to eight observed, and a
+# second checkout after a 90 second wait roughly doubles what an entry survives.
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
 
@@ -87,11 +104,23 @@ jobs:
     timeout-minutes: 150
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
       - name: Run qwen3.8-27b-bf16 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -138,6 +167,18 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -184,6 +225,18 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -231,6 +284,18 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -275,6 +340,18 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -321,6 +398,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -367,6 +456,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -412,6 +513,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -458,6 +571,18 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -503,6 +628,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -549,6 +686,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
@@ -595,6 +744,18 @@ jobs:
     timeout-minutes: 300
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}

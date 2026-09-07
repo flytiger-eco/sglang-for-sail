@@ -88,11 +88,25 @@ jobs:
       ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
     steps:
       - name: Checkout code
+        id: checkout
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+      # Second attempt only if the first failed; see the note on the
+      # github.com egress in test-ppu-answer-k8s.yml.
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
 
       - name: Run ${{ matrix.suite }} via K8s
