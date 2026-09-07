@@ -1037,6 +1037,71 @@ with the checkpoints already in the node's page cache from the run above, the jo
 took 10m56s and 18m15s instead of 19m06s and 26m39s. The table above keeps the cold
 numbers, since a nightly on an otherwise idle board is the cold case.
 
+## The twelve-entry eight-wide line
+
+The twelve ported entries run as one eight-wide dispatch. The reference grading is
+[run 34100574370](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34100574370),
+2026-09-07, at `265d498`, which is the first run to carry all three of the
+robustness fixes below. Eleven of the twelve reached a verdict; the results are:
+
+| Entry | Passed | Failing / error | Note |
+| --- | --- | --- | --- |
+| `glm5.2-mxfp4-fp8` | 10/10 | — | |
+| `minimax2.7-w8a8-int8` | 10/10 | — | |
+| `minimax2.7-fp8-channelwise` | 10/10 | — | checkout rescued, then clean |
+| `qwen3.5-397b-w8a8-int8` | 9/10 | `deepseek-letter-count` | |
+| `qwen3.5-397b-mxfp4-fp8` | 9/10 | `deepseek-letter-count` | rescued after 3× GnuTLS |
+| `qwen3.5-397b-fp8-channelwise` | 9/10 | `deepseek-letter-count` | rescued after 4× GnuTLS |
+| `kimi2.6-mxfp4-fp8` | 9/10 | `deepseek-letter-count` | |
+| `glm5.2-fp8-channelwise` | 8/10 | `deepseek-letter-count`, `red-ball-probability` | |
+| `glm5.2-w8a8-int8` | 8/10 | `deepseek-letter-count`, `red-ball-probability` | |
+| `qwen3.8-27b-bf16` | 7/10 | `deepseek-letter-count`, `henan-bordering-provinces`, `red-ball-probability` | |
+| `kimi2.6-w4a8-int8` | error | — | ACEXT W4A8 kernel gap, below |
+| `minimax2.7-mxfp4-fp8` | error | — | empty-answer report crash, below |
+
+The ten graded entries are stable against the eight-wide run before this one,
+[run 34091089985](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34091089985)
+at `17b5aeb`: every case id that failed there fails here and no other, and the
+27B entry is verdict-for-verdict identical across its third, fourth, and fifth
+graded runs. `deepseek-letter-count` is the failing case in eight of the eleven
+reports — it asks for a letter count the models get wrong at temperature 0 — and
+this concentration is a property of the question, not of any one checkpoint.
+
+Three fixes land here and each is confirmed on this run:
+
+- **`dist_timeout` (`63370a8983`, fifteen configs).** Every entry that carries it
+  reaches ready and grades, none regressed; the value is the btv1.5 `server_cmds`
+  one, passed on every launch line there.
+- **`SGLANG_WARMUP_TIMEOUT=3600` (`5adf87868b`, seventeen configs).** Warmup
+  passes on every entry; no entry stalled at the warmup request.
+- **Second checkout attempt (`265d498b75`, twelve jobs, four workflows).** Four
+  entries hit the github.com egress fault this run — `qwen3.5-397b-fp8-channelwise`
+  four times, `qwen3.5-397b-mxfp4-fp8` three, `glm5.2-fp8-channelwise` and
+  `kimi2.6-w4a8-int8` once each — and none died at checkout, where three of the
+  previous run's entries did. The two heaviest cases exhausted the three attempts
+  `actions/checkout` makes on its own and were carried by the second checkout;
+  both then graded 9/10. The lighter two were absorbed by the built-in retry. The
+  mechanism is now confirmed on real traffic, not only by construction.
+
+Two entries error rather than grade, and both are known:
+
+- `kimi2.6-w4a8-int8` is the open W4A8 kernel gap: it clears checkout and weight
+  load and then dies in `Capture cuda graph failed` with an ACEXT `invalid
+  argument` on `compute_occupancy.h`. This is a platform kernel gap, tracked in
+  the gap section above, not a defect in the port.
+- `minimax2.7-mxfp4-fp8` errors on a report-builder invariant, not on serving.
+  All ten cases returned `200 OK`; with `separate_reasoning` on and the `minimax`
+  reasoning parser, one case's whole output was classed as reasoning and its
+  answer `content` came back empty. An empty final answer is already a hard-fail
+  finding (`empty_final_answer`), so the run summary would be 9/10 — but
+  `build_label_candidates` then builds a label record whose `candidate_answer` is
+  that empty string, which violates the annotation invariant that exactly one
+  candidate-answer field be non-empty, and the whole report build raises instead.
+  The fix is to skip an empty final answer when selecting label candidates, the
+  same way infrastructure failures are already skipped there; it is a kit
+  robustness gap unrelated to the three fixes above, none of which touch response
+  parsing or candidate selection.
+
 ## Results and annotations
 
 The workflow uploads `result.json` (rule findings and provenance), `summary.md`,
