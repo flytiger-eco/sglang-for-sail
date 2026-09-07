@@ -314,7 +314,10 @@ everything around the test differs, while the test itself does not:
   entries shared a node, so it is the node's resolver rather than contention.
   Naming the interface takes the resolver out of the path. `lo` is right for this
   script and only this script: its entries are single pods whose ranks are
-  processes in one network namespace. The four-node script must not copy it.
+  processes in one network namespace. The multi-node entries must not copy it;
+  they derive the interface that faces their peers instead, through
+  `scripts/ci/ppu/answer_gloo_iface.sh` — see *The group is told which interface
+  gloo binds to* below.
 
 The board's identity and capacity are measured rather than assumed. An inventory
 probe submitted to this cluster on 2026-09-02 reported eight devices named
@@ -523,7 +526,7 @@ devices while the rest never arrives. `nproc_per_node: 8` is the whole board on
 each, which is both what TP=32 across four nodes needs and the only fence that
 keeps a second pod off a board this run has claimed.
 
-Four things differ from the single-board entries, each for a measured reason.
+Five things differ from the single-board entries, each for a measured reason.
 
 **Rank 0 publishes the rendezvous, first thing.**
 `scripts/ci/ppu/answer_rendezvous.sh` runs before the dependency install: rank 0
@@ -571,6 +574,38 @@ IPv4, which is what leads pccl's own preference — a v2 GID derived from the
 device's IPv4 — to find no match and fall back. On a host whose bonds carry
 IPv4, the automatic choice is already correct and this script would simply agree
 with it.
+
+**The group is told which interface gloo binds to.**
+`scripts/ci/ppu/answer_gloo_iface.sh` runs next and exports
+`GLOO_SOCKET_IFNAME`. Gloo carries the CPU side of every process group SGLang
+creates, and it picks its address by resolving the pod's own hostname — the same
+host condition that costs the single-board entries their ranks, with a second
+failure mode when the group spans nodes. On the two-node entry of run
+34109451085, whose rank 0 landed on `na131t-cloud-swu12`, three ranks logged
+torch's `Unable to resolve hostname to a (local) address ... Manually set the
+network interface to bind to with GLOO_SOCKET_IFNAME` and fell back to loopback,
+advertising `127.0.0.1` to a peer on the other node that can only reach its own;
+the fourth raised out of the resolver instead and killed the server at
+`torch.distributed.new_group` before a weight was read — `[enforce fail at
+.../gloo/transport/tcp/device.cc:99] rv == 0. -5 vs 0`, `EAI_NODATA`, the name
+resolving to no address at all. All ten cases were recorded as
+`server_start_failed`, six minutes in, and the four-node entry shares the cause:
+it had only been landing on nodes whose hostname resolves.
+
+The interface is derived rather than named, because these hosts number their
+bonds differently and a wrong name would put the group back on loopback. The
+derivation is the address the group already agreed to meet at: rank 0 publishes
+it, so on rank 0 it is a local address and on every other node it is the address
+whose route selects the interface facing rank 0 — either way the kernel's own
+source-address choice for that destination names the interface gloo has to use.
+Measured on a node of this fleet with eight interfaces: the rendezvous address
+yields the interface that owns it, an off-fleet destination yields the interface
+its route selects, and a destination that resolves to loopback is refused. That
+refusal is deliberate — the script exits non-zero with its interface inventory on
+stderr rather than letting gloo fall back silently, since a fallback costs the
+whole multi-hour run and the refusal costs seconds. Written against the standard
+library for the same reason as the rendezvous script: it runs before the editable
+install and must not depend on the tree under test.
 
 **No page-cache warm.** A warm reads the whole checkpoint tree, and at 2324.7 GiB
 that is larger than one node's 2266 GiB of memory, so the beginning of it is
@@ -734,7 +769,8 @@ successful run of each is what should replace it.
 `nightly-answer-16-ppu` and `nightly-answer-16-kimi26-ppu` on two ZW-M890P nodes
 each at TP=8 × PP=2, one entry at a time. It is the four-node workflow with
 `nnodes: 2`, so it keeps every mechanism that line established —
-the rendezvous file exchange, the RDMA GID index resolution, `run_answer_suite_node.sh`
+the rendezvous file exchange, the RDMA GID index resolution, the gloo interface
+derivation, `run_answer_suite_node.sh`
 for the non-zero ranks, and the rank status collection — and differs only in the
 group size and the configs it names. The two entries are there for different
 reasons: 1272.1 GiB does not fit one node's static pool at any fraction, while

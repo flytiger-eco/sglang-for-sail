@@ -56,7 +56,8 @@ export SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1
 # swu10/swu12/swu15). Naming the interface takes the resolver out of the path,
 # which torch's own message prescribes. `lo` is correct here and only here: this
 # script serves the single-pod entries, whose ranks are processes in one network
-# namespace. The multi-node script must not copy it.
+# namespace. The multi-node entries must not copy it: they derive the interface
+# facing their peers with answer_gloo_iface.sh instead.
 export GLOO_SOCKET_IFNAME=lo
 
 cd /workspace/source
