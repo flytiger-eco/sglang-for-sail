@@ -5,6 +5,7 @@ from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +83,55 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
             server_args.speculative_draft_model_path,
             "deepseek-ai/some-other-dspark-draft",
         )
+
+
+class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
+    """Gate contract for DSpark + dp attention + MoE all-to-all backends."""
+
+    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_dp_attention = True
+        server_args.enable_dp_lm_head = True
+        server_args.dp_size = 8
+        server_args.tp_size = 8
+        server_args.moe_a2a_backend = moe_a2a_backend
+        return server_args
+
+    def test_a2a_backends_are_admitted_under_static_verify(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for backend in ("none", "deepep", "megamoe"):
+                with self.subTest(backend=backend):
+                    _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_other_a2a_backends_are_rejected_by_name(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            for backend in ("pplx", "flashinfer", "mooncake"):
+                with self.subTest(backend=backend):
+                    with self.assertRaisesRegex(ValueError, backend):
+                        _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_a2a_backend_warns_for_non_static_ragged_verify(self):
+        for mode in ("compact", "cap-accept"):
+            with envs.SGLANG_RAGGED_VERIFY_MODE.override(mode):
+                for backend in ("deepep", "megamoe"):
+                    with self.subTest(mode=mode, backend=backend):
+                        with self.assertLogs(
+                            "sglang.srt.arg_groups.speculative_hook", level="WARNING"
+                        ) as logs:
+                            _handle_dspark(
+                                self._dp_server_args(moe_a2a_backend=backend)
+                            )
+                        warning = "\n".join(logs.output)
+                        self.assertIn("may fail", warning)
+                        self.assertIn(f"SGLANG_RAGGED_VERIFY_MODE={mode}", warning)
+                        self.assertIn("SGLANG_RAGGED_VERIFY_MODE=static", warning)
+
+    def test_tp_moe_keeps_tolerating_compact_ragged_verify(self):
+        """Negative control: TP MoE continues to accept compact verify."""
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            _handle_dspark(self._dp_server_args(moe_a2a_backend="none"))
 
 
 if __name__ == "__main__":
