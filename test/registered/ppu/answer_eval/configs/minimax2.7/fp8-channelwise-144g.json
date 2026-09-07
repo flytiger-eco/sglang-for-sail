@@ -26,6 +26,7 @@
       "mem_fraction_static": 0.8,
       "quantization": null,
       "reasoning_parser": "minimax",
+      "dist_timeout": 6000,
       "watchdog_timeout": 600
     }
   },

@@ -28,6 +28,7 @@
       "mem_fraction_static": 0.8,
       "quantization": "w8a8_int8",
       "reasoning_parser": "glm45",
+      "dist_timeout": 6000,
       "watchdog_timeout": 600,
       "disable_piecewise_cuda_graph": true
     },

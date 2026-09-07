@@ -181,6 +181,24 @@ while the Qwen3.5 one, which already named the format, served the same suite.
 Each config carries the `watchdog_timeout` its source case carries, 600 everywhere
 except the GLM-5.2 channelwise entry's 24000.
 
+`dist_timeout` is set from the btv1.5 `server_cmds` set, which passes it on every
+single command it lists while the `answer_144g` plan these configs were ported
+from passes it on none: 6000 for the Kimi-K2.6, MiniMax-M2.7, Qwen3.5 and two of
+the GLM-5.2 entries, which is what that set's own SGLang eval cases use; 24000 for
+the GLM-5.2 channelwise entry, matching the context-parallel case it was ported
+from, where the value equals its watchdog; and 60000 for the two 2.4T entries, the
+only value that model's file carries — it lists no SGLang eval case, so the figure
+comes from its performance cases. The two 27B entries are left without it, because
+at TP=1 there is no multi-rank group for it to bound. This is alignment with the
+reference commands, **not** a fix for anything measured: the value reaches only the
+device-side groups, since `parallel_state.py` builds every `gloo` companion group
+with its own hard-coded 120-minute `gloo_timeout` instead, so it is unrelated to
+the resolver failure recorded under
+[The ZW-M890P line](#the-zw-m890p-line). Those cases keep `dist_timeout` and
+`watchdog_timeout` equal; outside the channelwise entry these do not, because a
+watchdog is what makes a wedged forward give the board back promptly and 600 has
+been measured to be enough.
+
 ## The ZW-M890P line
 
 `.github/workflows/test-ppu-answer-k8s.yml` runs the single-board suites against
@@ -615,7 +633,7 @@ checkpoint, which is why it is the only Kimi config that states a `quantization`
 at all. It departs from that case in topology instead, for a reason of
 arithmetic recorded under Capacity below.
 
-**Where these ports depart from their sources.** Six departures beyond the
+**Where these ports depart from their sources.** Seven departures beyond the
 deterministic generation line already described in
 [Relation to the internal test cases](#relation-to-the-internal-test-cases):
 
@@ -650,6 +668,10 @@ deterministic generation line already described in
   runtime error: invalid argument` from `compute_occupancy.h:59`, under
   `acext.fusedmoe_wrapper` — which no server parameter this schema carries can
   redirect.
+- `dist_timeout` is carried although the plan's cases pass none, taking the value
+  the btv1.5 `server_cmds` set uses for each model; the reasoning, and the reason
+  it is not paired with `watchdog_timeout` the way those commands pair it, is under
+  [Runner configuration](#runner-configuration) above.
 
 **One value here is a judgement, not a measurement.** The three MiniMax entries
 carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,
