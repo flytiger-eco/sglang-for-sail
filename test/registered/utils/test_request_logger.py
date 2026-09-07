@@ -10,7 +10,11 @@ import requests
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -20,6 +24,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
+register_ppu_ci(est_time=174, suite="nightly-1-ppu", nightly=True)
 
 TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"

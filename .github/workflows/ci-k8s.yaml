@@ -1,0 +1,97 @@
+name: CI Pipeline (K8s)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-k8s-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ─── Stage 1: Precheck (reusable) ───
+  precheck:
+    name: Pre-check & Lint
+    uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
+
+  # ─── Stage 2: Smoke Test & AI Code Review (parallel, after precheck) ───
+  # Lightweight static gate on the PR's own changed files: syntax-check
+  # changed Python modules and YAML-parse changed workflow files. Kept
+  # deliberately cheap (ubuntu-latest, no PPU runner) so it runs on every
+  # PR; the heavy PPU suite only runs after human approval (see `ci` job).
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head diff below resolves both ends.
+          fetch-depth: 0
+
+      - name: Smoke-test PR-changed files
+        run: |
+          set -euo pipefail
+          CHANGED=$(git diff --name-only --diff-filter=ACMR \
+            "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}")
+          if [[ -z "$CHANGED" ]]; then
+            echo "No changed files to check — smoke test passes."
+            exit 0
+          fi
+
+          PY_FILES=$(echo "$CHANGED" | grep -E '\.py$' || true)
+          if [[ -n "$PY_FILES" ]]; then
+            echo "Syntax-checking changed Python files:"
+            echo "$PY_FILES"
+            echo "$PY_FILES" | xargs -d '\n' python3 -m py_compile
+          else
+            echo "No changed Python files."
+          fi
+
+          WORKFLOW_FILES=$(echo "$CHANGED" | grep -E '^\.github/.*\.(ya?ml)$' || true)
+          if [[ -n "$WORKFLOW_FILES" ]]; then
+            python3 -c "import yaml" 2>/dev/null \
+              || python3 -m pip install --quiet --user pyyaml
+            echo "YAML-parsing changed workflow files:"
+            echo "$WORKFLOW_FILES"
+            echo "$WORKFLOW_FILES" | while IFS= read -r f; do
+              python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f"
+            done
+          else
+            echo "No changed workflow files."
+          fi
+
+          echo "Smoke test passed."
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  # ─── Stage 3: Human Review Gate (after smoke-test & ai-code-review) ───
+  human-review:
+    name: Human Review Gate
+    needs: [smoke-test, ai-code-review]
+    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  # ─── Stage 4: Full CI (after human review) ───
+  # Chains the full PPU three-stage suite via workflow_call. The callee
+  # inherits this workflow's pull_request event, so its run-ci label gate
+  # would silently skip everything — bypass it explicitly with
+  # require_run_ci_label: false. Same-repo ./ reference: the callee loads
+  # from this same commit. No ref input is passed: the callee's
+  # `inputs.ref || github.ref` falls back to the PR merge ref.
+  # PPU_ARTIFACTORY credentials flow through `secrets: inherit`.
+  ci:
+    name: Full CI (K8s)
+    needs: human-review
+    uses: ./.github/workflows/pr-test-ppu-k8s.yml
+    with:
+      require_run_ci_label: false
+    secrets: inherit

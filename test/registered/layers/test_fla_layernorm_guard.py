@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.fla.layernorm_gated import (
     layernorm_fn,
     rms_norm_ref,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(
     est_time=60,
@@ -23,6 +23,7 @@ register_cuda_ci(
     runner_config="2-gpu-large",
     disabled="Temporarily disabled",
 )
+register_ppu_ci(est_time=147, suite="nightly-2-ppu", nightly=True)
 
 # Optional dependency in sglang repo; skip collection cleanly if absent.
 custom_all_reduce_utils = pytest.importorskip(

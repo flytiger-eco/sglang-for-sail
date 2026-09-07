@@ -85,15 +85,25 @@ runs:
 
           const totalExpectedJobs = normalizedSpecs.reduce((sum, s) => sum + s.expected_count, 0);
 
+          // Reusable-workflow callers prefix child job names with
+          // "<caller-job> / " (e.g. "Full CI / stage-a-test-1-gpu-ppu").
+          // Standalone runs carry the bare name. Strip the caller prefix so
+          // specs match under both shapes.
+          const normalizeName = jobName => {
+            const idx = jobName.lastIndexOf(' / ');
+            return idx >= 0 ? jobName.slice(idx + 3) : jobName;
+          };
+
           const matchesSpec = (jobName, spec) => {
+            const name = normalizeName(jobName);
             if (spec.exact) {
-              return jobName === spec.prefix;
+              return name === spec.prefix;
             }
             // Match bare prefix or any GHA-rendered shard suffix. Inline matrix
             // produces `<prefix> (<shard>)`; reusable-workflow callers produce
             // `<prefix> / <called-job> (<shard>)`. Both have a space after the
             // prefix, so a single ' '-delimited check covers both.
-            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' ');
+            return name === spec.prefix || name.startsWith(spec.prefix + ' ');
           };
 
           // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
