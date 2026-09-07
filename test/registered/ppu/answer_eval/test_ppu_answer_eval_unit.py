@@ -18,6 +18,7 @@ from sglang.test.kits.answer_eval_kit import (
     _repeated_ngram_coverage,
     answer_expected_hardware,
     answer_node_count,
+    answer_server_environment,
     apply_cross_case_checks,
     build_answer_server_args,
     build_report,
@@ -460,10 +461,325 @@ class TestPPUAnswerEval(unittest.TestCase):
                 with self.assertRaisesRegex(AnswerEvalError, "watchdog_timeout"):
                     validate_test_config(invalid)
 
-    def test_chat_template_kwargs_accept_both_reviewed_spellings(self):
-        # A checkpoint whose template raises on enable_thinking=false is steered
-        # by reasoning_effort instead, so the validator has to accept either
-        # spelling while still refusing anything unreviewed.
+    def test_attention_backends_may_be_named_per_phase(self):
+        # The Kimi-K2.6 case serves prefill and decode with different kernels and
+        # states no unified backend.  SGLang reads the pair as the override of the
+        # unified choice rather than as an addition to it, so a config that named
+        # one as well would describe a backend the run does not use.
+        config = copy.deepcopy(self.test_config)
+        parameters = config["server"]["parameters"]
+        parameters["attention_backend"] = None
+        parameters["prefill_attention_backend"] = "fa3"
+        parameters["decode_attention_backend"] = "flashmla"
+        validate_test_config(config)
+
+        args = build_answer_server_args(config)
+        self.assertNotIn("--attention-backend", args)
+        index = args.index("--prefill-attention-backend")
+        self.assertEqual(
+            args[index : index + 4],
+            [
+                "--prefill-attention-backend",
+                "fa3",
+                "--decode-attention-backend",
+                "flashmla",
+            ],
+        )
+        # Both names have to be ones argparse accepts, or the config would only
+        # fail on the machine, after the checkpoint had been warmed.
+        from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            self.assertIn(parameters[field], ATTENTION_BACKEND_CHOICES)
+
+        # A null with neither phase named is the omission this check exists for:
+        # the server would silently fall back to a default no one reviewed.
+        invalid = copy.deepcopy(self.test_config)
+        invalid["server"]["parameters"]["attention_backend"] = None
+        with self.assertRaisesRegex(AnswerEvalError, "may only be null"):
+            validate_test_config(invalid)
+
+        # Only the unified backend is nullable; a null in the pair states nothing
+        # at all, and an empty string would reach argparse.
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            for value in (None, "", 3):
+                invalid = copy.deepcopy(config)
+                invalid["server"]["parameters"][field] = value
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(AnswerEvalError, field):
+                        validate_test_config(invalid)
+
+    def test_sparse_attention_parameters_need_the_backend_that_reads_them(self):
+        # The GLM cases drive the sparse backend with a prefill kernel, a decode
+        # kernel and, on the context-parallel entry, a split mode.  All three are
+        # read only by that backend, so a config that named them alongside a dense
+        # one would state settings the run ignores.
+        config = copy.deepcopy(self.test_config)
+        parameters = config["server"]["parameters"]
+        parameters["attention_backend"] = "dsa"
+        parameters["dsa_prefill_backend"] = "flashmla_sparse"
+        parameters["dsa_decode_backend"] = "flashmla_kv"
+        parameters["dsa_prefill_cp_mode"] = "round-robin-split"
+        parameters["enable_dsa_prefill_context_parallel"] = True
+        parameters["attn_cp_size"] = len(config["hardware"]["visible_devices"])
+        validate_test_config(config)
+
+        args = build_answer_server_args(config)
+        index = args.index("--attention-backend")
+        self.assertEqual(
+            args[index : index + 10],
+            [
+                "--attention-backend",
+                "dsa",
+                "--dsa-prefill-backend",
+                "flashmla_sparse",
+                "--dsa-decode-backend",
+                "flashmla_kv",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--attn-cp-size",
+                str(parameters["attn_cp_size"]),
+            ],
+        )
+        self.assertIn("--enable-dsa-prefill-context-parallel", args)
+        # And the values are the ones argparse accepts under those names, which
+        # is what makes the `nsa_*` to `dsa_*` rename visible here rather than on
+        # the machine: the old spellings survive only as deprecated aliases.
+        from sglang.srt.server_args import (
+            DSA_CHOICES,
+            DSA_PREFILL_CP_SPLIT_CHOICES,
+        )
+
+        self.assertIn(parameters["dsa_prefill_backend"], DSA_CHOICES)
+        self.assertIn(parameters["dsa_decode_backend"], DSA_CHOICES)
+        self.assertIn(parameters["dsa_prefill_cp_mode"], DSA_PREFILL_CP_SPLIT_CHOICES)
+
+        # `nsa` is accepted as the backend name because SGLang still accepts it,
+        # so a config copied verbatim from an internal case is not rejected here.
+        alias = copy.deepcopy(config)
+        alias["server"]["parameters"]["attention_backend"] = "nsa"
+        validate_test_config(alias)
+
+        invalid = copy.deepcopy(config)
+        invalid["server"]["parameters"]["attention_backend"] = "fa3"
+        with self.assertRaisesRegex(AnswerEvalError, "sparse attention"):
+            validate_test_config(invalid)
+
+        # The split mode describes how prefill context parallelism divides a
+        # sequence, so without that switch it describes nothing.
+        invalid = copy.deepcopy(config)
+        del invalid["server"]["parameters"]["enable_dsa_prefill_context_parallel"]
+        with self.assertRaisesRegex(
+            AnswerEvalError, "enable_dsa_prefill_context_parallel"
+        ):
+            validate_test_config(invalid)
+
+    def test_flag_parameters_are_only_ever_true(self):
+        # These five render as bare flags, so `false` would state an intention the
+        # command line cannot carry and the next reader would have to work out
+        # whether the default it silently accepted was the reviewed one.
+        config = copy.deepcopy(self.test_config)
+        parameters = config["server"]["parameters"]
+        for field in (
+            "disable_piecewise_cuda_graph",
+            "disable_shared_experts_fusion",
+            "disable_custom_all_reduce",
+            "enforce_disable_flashinfer_allreduce_fusion",
+        ):
+            parameters[field] = True
+        validate_test_config(config)
+        args = build_answer_server_args(config)
+        self.assertEqual(
+            args[args.index("--disable-piecewise-cuda-graph") : -2],
+            [
+                "--disable-piecewise-cuda-graph",
+                "--disable-shared-experts-fusion",
+                "--disable-custom-all-reduce",
+                "--enforce-disable-flashinfer-allreduce-fusion",
+            ],
+        )
+
+        for field in (
+            "disable_piecewise_cuda_graph",
+            "disable_shared_experts_fusion",
+            "disable_custom_all_reduce",
+            "enforce_disable_flashinfer_allreduce_fusion",
+            "enable_dsa_prefill_context_parallel",
+        ):
+            for value in (False, None, 1, "true"):
+                invalid = copy.deepcopy(self.test_config)
+                invalid["server"]["parameters"][field] = value
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(AnswerEvalError, "only be set to true"):
+                        validate_test_config(invalid)
+
+    def test_every_reviewed_parameter_renders_in_a_fixed_order(self):
+        # A config that names all of them at once, which none of the reviewed ones
+        # do: what is pinned here is the spelling of each flag and the order they
+        # appear in, so two runs of the same config produce the same command line
+        # in the logs regardless of how the JSON happened to be keyed.
+        config = copy.deepcopy(self.test_config)
+        config["server"]["parameters"] = {
+            "trust_remote_code": True,
+            "watchdog_timeout": 600,
+            "dist_timeout": 24000,
+            "reasoning_parser": "glm45",
+            "quantization": "w8a8_int8",
+            "mem_fraction_static": 0.9,
+            "num_continuous_decode_steps": 1,
+            "max_running_requests": 16,
+            "chunked_prefill_size": 7488,
+            "cuda_graph_max_bs": 16,
+            "attn_cp_size": 4,
+            "dsa_prefill_cp_mode": "round-robin-split",
+            "dsa_decode_backend": "flashmla_kv",
+            "dsa_prefill_backend": "flashmla_sparse",
+            "decode_attention_backend": "flashmla",
+            "prefill_attention_backend": "fa3",
+            "attention_backend": "dsa",
+            "pp_size": 2,
+            "tp_size": 4,
+            "enable_dsa_prefill_context_parallel": True,
+            "disable_piecewise_cuda_graph": True,
+            "disable_shared_experts_fusion": True,
+            "disable_custom_all_reduce": True,
+            "enforce_disable_flashinfer_allreduce_fusion": True,
+        }
+        validate_test_config(config)
+        self.assertEqual(
+            build_answer_server_args(config),
+            [
+                "--trust-remote-code",
+                "--tp-size",
+                "4",
+                "--pp-size",
+                "2",
+                "--attention-backend",
+                "dsa",
+                "--prefill-attention-backend",
+                "fa3",
+                "--decode-attention-backend",
+                "flashmla",
+                "--dsa-prefill-backend",
+                "flashmla_sparse",
+                "--dsa-decode-backend",
+                "flashmla_kv",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--attn-cp-size",
+                "4",
+                "--cuda-graph-max-bs",
+                "16",
+                "--chunked-prefill-size",
+                "7488",
+                "--max-running-requests",
+                "16",
+                "--num-continuous-decode-steps",
+                "1",
+                "--mem-fraction-static",
+                "0.9",
+                "--quantization",
+                "w8a8_int8",
+                "--reasoning-parser",
+                "glm45",
+                "--dist-timeout",
+                "24000",
+                "--watchdog-timeout",
+                "600",
+                # The bare flags follow the kit's declaration order rather than
+                # the config's key order, which is what makes the command line
+                # reproducible: the config above keys the context-parallel flag
+                # first, and it still renders last.
+                "--disable-piecewise-cuda-graph",
+                "--disable-shared-experts-fusion",
+                "--disable-custom-all-reduce",
+                "--enforce-disable-flashinfer-allreduce-fusion",
+                "--enable-dsa-prefill-context-parallel",
+                "--served-model-name",
+                config["model"]["served_model_name"],
+            ],
+        )
+
+        # The counts and the sizes are counts and sizes: a zero or a float would
+        # be rejected by argparse on the machine, and a string would be accepted
+        # there and then compared against an integer here.
+        for field in (
+            "cuda_graph_max_bs",
+            "chunked_prefill_size",
+            "max_running_requests",
+            "num_continuous_decode_steps",
+            "attn_cp_size",
+        ):
+            for value in (0, -1, 2.5, True, "16", None):
+                invalid = copy.deepcopy(config)
+                invalid["server"]["parameters"][field] = value
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(AnswerEvalError, field):
+                        validate_test_config(invalid)
+
+        # A timeout is a duration, so unlike the counts it may be fractional --
+        # the same rule watchdog_timeout already follows.
+        fractional = copy.deepcopy(config)
+        fractional["server"]["parameters"]["dist_timeout"] = 0.5
+        validate_test_config(fractional)
+        for value in (0, -1, True, "24000", None):
+            invalid = copy.deepcopy(config)
+            invalid["server"]["parameters"]["dist_timeout"] = value
+            with self.subTest(dist_timeout=value):
+                with self.assertRaisesRegex(AnswerEvalError, "dist_timeout"):
+                    validate_test_config(invalid)
+
+    def test_server_environment_is_limited_to_names_this_tree_reads(self):
+        # An entry in the whitelist is a name this tree actually reads. The
+        # internal GLM cases also export SGLANG_NSA_DUAL_STREAM=0, which nothing
+        # here reads -- the dual-stream threshold is a module constant, not an
+        # environment lookup -- so accepting it would let a config state a setting
+        # no run honours.
+        config = copy.deepcopy(self.test_config)
+        self.assertEqual(answer_server_environment(config), {})
+
+        config["server"]["env"] = {
+            "SGLANG_WARMUP_TIMEOUT": 3600,
+            "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0",
+        }
+        validate_test_config(config)
+        # An environment is strings, and the internal cases state these as JSON
+        # numbers, so the number is rendered rather than passed through.
+        self.assertEqual(
+            answer_server_environment(config),
+            {
+                "SGLANG_WARMUP_TIMEOUT": "3600",
+                "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0",
+            },
+        )
+
+        for environment in (
+            {},
+            {"SGLANG_NSA_DUAL_STREAM": 0},
+            {"SGLANG_WARMUP_TIMEOUT": True},
+            {"SGLANG_WARMUP_TIMEOUT": ""},
+            {"SGLANG_WARMUP_TIMEOUT": [3600]},
+            [],
+            None,
+        ):
+            invalid = copy.deepcopy(self.test_config)
+            invalid["server"]["env"] = environment
+            with self.subTest(env=environment):
+                with self.assertRaisesRegex(AnswerEvalError, "server.env"):
+                    validate_test_config(invalid)
+
+        # Admitting a third key must not turn the section into an open set.
+        invalid = copy.deepcopy(self.test_config)
+        invalid["server"]["log_level"] = "info"
+        with self.assertRaisesRegex(AnswerEvalError, "reviewed keys"):
+            validate_test_config(invalid)
+
+    def test_chat_template_kwargs_accept_the_reviewed_spellings(self):
+        # Four shapes, one per way a checkpoint's own template steers its
+        # reasoning pass. A checkpoint whose template raises on
+        # enable_thinking=false is steered by reasoning_effort instead, so the
+        # validator has to accept either spelling while still refusing anything
+        # unreviewed.
         effort = copy.deepcopy(self.test_config)
         effort["request"]["generation"]["chat_template_kwargs"] = {
             "reasoning_effort": "low"
@@ -477,12 +793,30 @@ class TestPPUAnswerEval(unittest.TestCase):
         }
         validate_test_config(both)
 
+        # Kimi-K2.6 spells the same switch `thinking`, which is also what
+        # SGLang's kimi_k2 detector declares as its reasoning_default, so that
+        # name is a third accepted one.
+        kimi = copy.deepcopy(self.test_config)
+        kimi["request"]["generation"]["chat_template_kwargs"] = {"thinking": False}
+        validate_test_config(kimi)
+
+        # The MiniMax-M2.7 template reads no switch at all and opens <think>
+        # unconditionally, so a config for it states an empty object and the
+        # request carries nothing the template did not ask for. Empty rather than
+        # absent: the key stays required, so the config says which of the four
+        # shapes it is.
+        neither = copy.deepcopy(self.test_config)
+        neither["request"]["generation"]["chat_template_kwargs"] = {}
+        validate_test_config(neither)
+
         for kwargs in (
-            {},
             {"enable_thinking": "false"},
+            {"thinking": "false"},
+            {"thinking": 0},
             {"reasoning_effort": ""},
             {"reasoning_effort": 1},
             {"enable_thinking": False, "temperature": 0},
+            None,
         ):
             invalid = copy.deepcopy(self.test_config)
             invalid["request"]["generation"]["chat_template_kwargs"] = kwargs
@@ -1332,7 +1666,9 @@ class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
 
     def node(self, node_rank, output_dir=None, config=None):
         config = self.four_node if config is None else config
-        multi_node = config is not self.single_node
+        # From what the config declares, not from which object it is: a test that
+        # varies a copy of one of the two must still get the shape it copied.
+        multi_node = answer_node_count(config) > 1
 
         class Node(answer_suite_kit.AnswerSuiteMixin, unittest.TestCase):
             def test_public_answer_suite(self):
@@ -1389,16 +1725,42 @@ class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
         for node_rank in range(4):
             with self.subTest(node_rank=node_rank):
                 self.assertEqual(
-                    self.node(node_rank)._group_environment(),
+                    self.node(node_rank)._server_environment(),
                     {
                         "MASTER_ADDR": "10.0.0.1",
                         "NNODES": "4",
                         "RANK": str(node_rank),
                     },
                 )
-        # A single-node launch inherits its environment untouched.
+        # A single-node launch that names no variables inherits its environment
+        # untouched.
         self.assertIsNone(
-            self.node(0, config=self.single_node)._group_environment(),
+            self.node(0, config=self.single_node)._server_environment(),
+        )
+
+    def test_a_config_that_names_variables_gets_them_on_a_single_node_too(self):
+        # server.env is not a multi-node facility: the entries ported from the
+        # internal GLM cases set it on one board.  The group's own description of
+        # itself is applied last, so a config cannot displace it.
+        config = copy.deepcopy(self.single_node)
+        config["server"]["env"] = {"SGLANG_WARMUP_TIMEOUT": 3600}
+        self.assertEqual(
+            self.node(0, config=config)._server_environment(),
+            {"SGLANG_WARMUP_TIMEOUT": "3600"},
+        )
+
+        config = copy.deepcopy(self.four_node)
+        config["server"]["env"] = {
+            "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0"
+        }
+        self.assertEqual(
+            self.node(2, config=config)._server_environment(),
+            {
+                "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0",
+                "MASTER_ADDR": "10.0.0.1",
+                "NNODES": "4",
+                "RANK": "2",
+            },
         )
 
     def test_provenance_describes_every_node_the_verdict_was_produced_on(self):

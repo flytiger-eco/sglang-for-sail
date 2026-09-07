@@ -162,8 +162,19 @@ NIGHTLY_SUITES = {
         # run_suite.py / the coverage report account for their tests.
         "nightly-answer-1-ppu",
         "nightly-answer-8-ppu",
-        # Four whole boards, one suite: every node runs the same registered file
+        # One suite per model, not one per entry: a suite is what --suite runs,
+        # and every file in it executes in the same process off the same
+        # SGLANG_PPU_ANSWER_TEST_CONFIG, so two models could not be given
+        # different checkpoints under one name. Several configs of the same model
+        # do share a suite -- the workflow picks which one by naming its config.
+        # Qwen3.5's four configs are why nightly-answer-8-ppu is not split.
+        "nightly-answer-8-glm52-ppu",
+        "nightly-answer-8-kimi26-ppu",
+        "nightly-answer-8-minimax27-ppu",
+        # Whole boards, one suite each: every node runs the same registered file
         # and the launcher tells each which rank it is.
+        "nightly-answer-16-ppu",
+        "nightly-answer-16-kimi26-ppu",
         "nightly-answer-32-ppu",
     ],
 }

@@ -83,6 +83,121 @@ def validate_profile(profile: dict[str, Any]) -> None:
         raise AnswerEvalError("invalid n-gram coverage thresholds")
 
 
+# The reviewed server parameters, grouped by how each one is typed and how it
+# reaches `sglang serve`.  They are module level because the validator and the
+# argument builder have to agree on the set: a name checked here but never
+# rendered would be silent decoration, and a name rendered without being checked
+# would be the untyped pass-through this schema exists to refuse.
+REQUIRED_SERVER_PARAMETERS = {
+    "trust_remote_code",
+    "tp_size",
+    "attention_backend",
+    "mem_fraction_static",
+    "quantization",
+    "reasoning_parser",
+    "watchdog_timeout",
+}
+
+# Everything below is optional because the internal Answer cases these suites are
+# ported from do not all serve their model the same way, and a parameter absent
+# from a config has to keep producing the command line that config produced
+# before the parameter existed.  The names are SGLang's current ones: the tree
+# renamed the whole `nsa_*` family to `dsa_*` and kept the old spellings only as
+# deprecated aliases, so a config written with `nsa_*` would work today and warn,
+# and stop working without notice.
+SERVER_PARAMETER_POSITIVE_INTEGERS = (
+    "tp_size",
+    # A checkpoint whose per-expert intermediate size is not divisible by the
+    # tensor-parallel degree times the quantization block size cannot be sharded
+    # by TP alone, and pipelining the layers is how the remaining devices are put
+    # to work.
+    "pp_size",
+    "cuda_graph_max_bs",
+    "chunked_prefill_size",
+    "max_running_requests",
+    "num_continuous_decode_steps",
+    "attn_cp_size",
+)
+SERVER_PARAMETER_POSITIVE_NUMBERS = ("watchdog_timeout", "dist_timeout")
+SERVER_PARAMETER_STRINGS = (
+    "attention_backend",
+    # A model whose prefill and decode want different kernels names them apart
+    # and leaves the unified backend null; SGLang treats the pair as the override
+    # of the unified choice, not as an addition to it.
+    "prefill_attention_backend",
+    "decode_attention_backend",
+    "dsa_prefill_backend",
+    "dsa_decode_backend",
+    "dsa_prefill_cp_mode",
+    "reasoning_parser",
+    "quantization",
+)
+# Rendered as bare flags, so `true` is the only value they can carry; see the
+# check in validate_test_config for why `false` is refused rather than ignored.
+SERVER_PARAMETER_STORE_TRUE = (
+    "disable_piecewise_cuda_graph",
+    "disable_shared_experts_fusion",
+    "disable_custom_all_reduce",
+    "enforce_disable_flashinfer_allreduce_fusion",
+    "enable_dsa_prefill_context_parallel",
+)
+# Null means "leave the flag off entirely", which for these two is a reviewed
+# instruction rather than an omission: see the quantization comment below, and
+# the attention-backend coherence check for the other.
+SERVER_PARAMETER_NULLABLE = ("attention_backend", "quantization")
+# Only meaningful under the sparse attention backend, which is what the coherence
+# check below enforces.
+DSA_SERVER_PARAMETERS = (
+    "dsa_prefill_backend",
+    "dsa_decode_backend",
+    "dsa_prefill_cp_mode",
+)
+SUPPORTED_SERVER_PARAMETERS = (
+    REQUIRED_SERVER_PARAMETERS
+    | set(SERVER_PARAMETER_POSITIVE_INTEGERS)
+    | set(SERVER_PARAMETER_POSITIVE_NUMBERS)
+    | set(SERVER_PARAMETER_STRINGS)
+    | set(SERVER_PARAMETER_STORE_TRUE)
+)
+
+# The order the value-carrying parameters are rendered in.  Listed explicitly so
+# the command line a config produces is stable across dict orderings, which is
+# what makes two runs of the same config comparable in the logs.
+SERVER_PARAMETER_CLI_ORDER = (
+    "tp_size",
+    "pp_size",
+    "attention_backend",
+    "prefill_attention_backend",
+    "decode_attention_backend",
+    "dsa_prefill_backend",
+    "dsa_decode_backend",
+    "dsa_prefill_cp_mode",
+    "attn_cp_size",
+    "cuda_graph_max_bs",
+    "chunked_prefill_size",
+    "max_running_requests",
+    "num_continuous_decode_steps",
+    "mem_fraction_static",
+    "quantization",
+    "reasoning_parser",
+    "dist_timeout",
+    "watchdog_timeout",
+)
+
+# The environment variables a config may set around the server, and the only
+# ones: an entry here is a name this tree actually reads, checked when it was
+# added.  `SGLANG_WARMUP_TIMEOUT` is declared in `sglang.srt.environ`, and
+# `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` is read through
+# `get_bool_env_var` in `sglang.srt.layers.attention.dsa.utils`.  The internal
+# GLM cases also export `SGLANG_NSA_DUAL_STREAM=0`, which is deliberately not
+# here: nothing in this tree reads that name, so accepting it would let a config
+# state a setting no run honours.
+SUPPORTED_SERVER_ENVIRONMENT = {
+    "SGLANG_WARMUP_TIMEOUT",
+    "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
+}
+
+
 def validate_test_config(config: dict[str, Any]) -> None:
     """Validate the public, data-driven Answer execution contract."""
 
@@ -159,36 +274,17 @@ def validate_test_config(config: dict[str, Any]) -> None:
     ):
         raise AnswerEvalError("server.startup_timeout_seconds must be positive")
     parameters = server.get("parameters")
-    required_server_parameters = {
-        "trust_remote_code",
-        "tp_size",
-        "attention_backend",
-        "mem_fraction_static",
-        "quantization",
-        "reasoning_parser",
-        "watchdog_timeout",
-    }
-    # pp_size is optional because pure tensor parallelism is the shape every
-    # existing entry uses, and a config that omits it keeps the command line it
-    # has today. It is not decoration: a checkpoint whose per-expert
-    # intermediate size is not divisible by the tensor-parallel degree times the
-    # quantization block size cannot be sharded by TP alone, and pipelining the
-    # layers is how the remaining devices are put to work.
-    optional_server_parameters = {"pp_size"}
-    supported_server_parameters = (
-        required_server_parameters | optional_server_parameters
-    )
     if (
         not isinstance(parameters, dict)
-        or not required_server_parameters <= set(parameters)
-        or not set(parameters) <= supported_server_parameters
+        or not REQUIRED_SERVER_PARAMETERS <= set(parameters)
+        or not set(parameters) <= SUPPORTED_SERVER_PARAMETERS
     ):
         raise AnswerEvalError(
             "server.parameters must contain exactly the supported SGLang parameters"
         )
     if not isinstance(parameters["trust_remote_code"], bool):
         raise AnswerEvalError("server.parameters.trust_remote_code must be boolean")
-    for field in ("tp_size", "pp_size"):
+    for field in SERVER_PARAMETER_POSITIVE_INTEGERS:
         if field not in parameters:
             continue
         if (
@@ -198,6 +294,27 @@ def validate_test_config(config: dict[str, Any]) -> None:
         ):
             raise AnswerEvalError(
                 f"server.parameters.{field} must be a positive integer"
+            )
+    for field in SERVER_PARAMETER_POSITIVE_NUMBERS:
+        if field not in parameters:
+            continue
+        if (
+            not isinstance(parameters[field], (int, float))
+            or isinstance(parameters[field], bool)
+            or parameters[field] <= 0
+        ):
+            raise AnswerEvalError(f"server.parameters.{field} must be positive")
+    # `false` is not a second spelling of "absent". Each of these renders as a
+    # bare flag, so a false entry would state an intention the command line
+    # cannot carry, and the next reader would have to work out whether the
+    # default it silently accepted was the reviewed one.
+    for field in SERVER_PARAMETER_STORE_TRUE:
+        if field not in parameters:
+            continue
+        if parameters[field] is not True:
+            raise AnswerEvalError(
+                f"server.parameters.{field} may only be set to true; omit it to "
+                "keep the server default"
             )
     # SGLang's own check is tp_size * pp_size against the node count, so the
     # product is what has to match the devices the job actually holds; a config
@@ -216,33 +333,80 @@ def validate_test_config(config: dict[str, Any]) -> None:
         or not 0 < mem_fraction <= 1
     ):
         raise AnswerEvalError("server.parameters.mem_fraction_static must be in (0, 1]")
-    for field in ("attention_backend", "reasoning_parser"):
-        if not isinstance(parameters[field], str) or not parameters[field]:
-            raise AnswerEvalError(
-                f"server.parameters.{field} must be a non-empty string"
-            )
-    # quantization is the one parameter that may be omitted, and null is how a
-    # config says so. A checkpoint quantised offline already declares its format
-    # in its own config.json, and SGLang reads that when the flag is absent;
-    # naming a format here instead overrides that declaration, and several of the
-    # spellings argparse accepts -- "fp8" among them -- mean online quantisation
-    # of unquantised weights, which is not what such a checkpoint needs. The
+    # Two of these may be null, and null is a reviewed instruction rather than an
+    # omission.
+    #
+    # quantization: a checkpoint quantised offline already declares its format in
+    # its own config.json, and SGLang reads that when the flag is absent; naming a
+    # format here instead overrides that declaration, and several of the spellings
+    # argparse accepts -- "fp8" among them -- mean online quantisation of
+    # unquantised weights, which is not what such a checkpoint needs. The
     # internal test cases draw the same line: of the Answer cases only the
     # compressed-tensors ones state a format, and the rest leave it unset.
-    quantization = parameters["quantization"]
-    if quantization is not None and (
-        not isinstance(quantization, str) or not quantization
+    #
+    # attention_backend: a model whose prefill and decode want different kernels
+    # names them apart instead, and a unified backend alongside them would be
+    # overridden anyway, so stating one would misdescribe the run.
+    for field in SERVER_PARAMETER_STRINGS:
+        if field not in parameters:
+            continue
+        value = parameters[field]
+        if value is None and field in SERVER_PARAMETER_NULLABLE:
+            continue
+        if not isinstance(value, str) or not value:
+            suffix = " or null" if field in SERVER_PARAMETER_NULLABLE else ""
+            raise AnswerEvalError(
+                f"server.parameters.{field} must be a non-empty string{suffix}"
+            )
+    if parameters["attention_backend"] is None and not (
+        "prefill_attention_backend" in parameters
+        or "decode_attention_backend" in parameters
     ):
         raise AnswerEvalError(
-            "server.parameters.quantization must be a non-empty string or null"
+            "server.parameters.attention_backend may only be null when the "
+            "prefill or decode backend is named separately"
         )
-    watchdog_timeout = parameters["watchdog_timeout"]
+    # "nsa" is accepted because SGLang still accepts it, and refusing it here
+    # would reject a config copied verbatim from an internal case; "dsa" is the
+    # spelling a new config should use.
+    if any(field in parameters for field in DSA_SERVER_PARAMETERS) and parameters[
+        "attention_backend"
+    ] not in ("dsa", "nsa"):
+        raise AnswerEvalError(
+            "the dsa_* server parameters only apply to the sparse attention "
+            "backend, so attention_backend must name it"
+        )
     if (
-        not isinstance(watchdog_timeout, (int, float))
-        or isinstance(watchdog_timeout, bool)
-        or watchdog_timeout <= 0
+        "dsa_prefill_cp_mode" in parameters
+        and parameters.get("enable_dsa_prefill_context_parallel") is not True
     ):
-        raise AnswerEvalError("server.parameters.watchdog_timeout must be positive")
+        raise AnswerEvalError(
+            "server.parameters.dsa_prefill_cp_mode describes how prefill context "
+            "parallelism splits a sequence, so it needs "
+            "enable_dsa_prefill_context_parallel"
+        )
+
+    # Optional, and empty is spelled by leaving it out: the variables here are
+    # exported around the server the same way the internal cases export them, and
+    # SUPPORTED_SERVER_ENVIRONMENT says why each name is allowed to be one.
+    if "env" in server:
+        environment = server["env"]
+        if (
+            not isinstance(environment, dict)
+            or not environment
+            or not set(environment) <= SUPPORTED_SERVER_ENVIRONMENT
+        ):
+            raise AnswerEvalError(
+                "server.env must be a non-empty object of supported SGLang "
+                "environment variables"
+            )
+        for name, value in environment.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise AnswerEvalError(f"server.env.{name} must be a string or a number")
+            if isinstance(value, str) and not value:
+                raise AnswerEvalError(f"server.env.{name} must not be empty")
+    if not set(server) <= {"startup_timeout_seconds", "parameters", "env"}:
+        raise AnswerEvalError("server may only carry the reviewed keys")
 
     request = config["request"]
     request_timeout = request.get("timeout_seconds")
@@ -288,29 +452,40 @@ def validate_test_config(config: dict[str, Any]) -> None:
     if not isinstance(generation["separate_reasoning"], bool):
         raise AnswerEvalError("request.generation.separate_reasoning must be boolean")
     chat_template_kwargs = generation["chat_template_kwargs"]
-    # Two reviewed spellings, because the checkpoints disagree on whether the
-    # reasoning pass can be switched off at all. The Qwen3.8-27B template
-    # honours enable_thinking=false; the Qwen3.8-2.4T-A95B template answers
-    # 'Disabling thinking is not supported.' and instead grades the effort, so a
-    # config for it states reasoning_effort. The legal effort names live in the
-    # checkpoint's own template, which rejects the rest by name, so only the
-    # shape is checked here.
-    supported_chat_template_kwargs = {"enable_thinking", "reasoning_effort"}
+    # The checkpoints disagree on whether the reasoning pass can be steered at
+    # all, and on what the switch is called, so the reviewed set is the union of
+    # the names their own templates read:
+    #
+    #   enable_thinking  Qwen3.5/Qwen3.8-27B and GLM-5.2 honour false and emit a
+    #                    closed <think></think> in the generation prompt.
+    #   reasoning_effort Qwen3.8-2.4T-A95B answers 'Disabling thinking is not
+    #                    supported.' and grades the effort instead.
+    #   thinking         Kimi-K2.6 spells the same switch this way; SGLang's own
+    #                    kimi_k2 detector agrees, declaring reasoning_default
+    #                    "thinking".
+    #
+    # An empty object is the fourth shape: the MiniMax-M2.7 template reads no
+    # switch and opens <think> unconditionally, so a config for it asks for
+    # nothing.  Empty is not the same as absent -- the key stays required, so a
+    # config states which shape it is rather than leaving a reader to infer it
+    # from a missing line.  The legal effort names live in the checkpoint's own
+    # template, which rejects the rest by name, so only the shape is checked here.
+    supported_chat_template_kwargs = {"enable_thinking", "thinking", "reasoning_effort"}
     if (
         not isinstance(chat_template_kwargs, dict)
-        or not chat_template_kwargs
         or not set(chat_template_kwargs) <= supported_chat_template_kwargs
     ):
         raise AnswerEvalError(
-            "request.generation.chat_template_kwargs must set enable_thinking, "
-            "reasoning_effort, or both"
+            "request.generation.chat_template_kwargs may only set the reviewed "
+            "reasoning switches: enable_thinking, thinking, reasoning_effort"
         )
-    if "enable_thinking" in chat_template_kwargs and not isinstance(
-        chat_template_kwargs["enable_thinking"], bool
-    ):
-        raise AnswerEvalError(
-            "request.generation.chat_template_kwargs.enable_thinking must be boolean"
-        )
+    for field in ("enable_thinking", "thinking"):
+        if field in chat_template_kwargs and not isinstance(
+            chat_template_kwargs[field], bool
+        ):
+            raise AnswerEvalError(
+                f"request.generation.chat_template_kwargs.{field} must be boolean"
+            )
     if "reasoning_effort" in chat_template_kwargs and (
         not isinstance(chat_template_kwargs["reasoning_effort"], str)
         or not chat_template_kwargs["reasoning_effort"]
@@ -498,26 +673,25 @@ def build_answer_server_args(
     args = []
     if parameters["trust_remote_code"]:
         args.append("--trust-remote-code")
-    for name in (
-        "tp_size",
-        "pp_size",
-        "attention_backend",
-        "mem_fraction_static",
-        "quantization",
-        "reasoning_parser",
-        "watchdog_timeout",
-    ):
+    for name in SERVER_PARAMETER_CLI_ORDER:
         # An absent optional parameter and an explicit null are the same
         # instruction -- leave the flag off -- so a config that stays on pure
         # tensor parallelism produces the command line it produced before
         # pp_size existed, rather than an explicit --pp-size 1.
+        #
+        # For quantization that is the difference between letting the checkpoint
+        # declare its own format and overriding that declaration; for
+        # attention_backend it is the difference between a unified backend and
+        # the prefill/decode pair that replaces it.
         value = parameters.get(name)
-        # A null leaves the flag off the command line entirely, which for
-        # quantization is the difference between letting the checkpoint declare
-        # its own format and overriding that declaration.
         if value is None:
             continue
         args.extend([f"--{name.replace('_', '-')}", str(value)])
+    # Validation has already refused any value but true, so presence is the whole
+    # instruction here.
+    for name in SERVER_PARAMETER_STORE_TRUE:
+        if parameters.get(name):
+            args.append(f"--{name.replace('_', '-')}")
     args.extend(["--served-model-name", config["model"]["served_model_name"]])
     if distributed is not None:
         args.extend(
@@ -531,6 +705,18 @@ def build_answer_server_args(
             ]
         )
     return args
+
+
+def answer_server_environment(config: dict[str, Any]) -> dict[str, str]:
+    """The environment a config asks to be set around the server.
+
+    Empty for a config that names none, which is every entry that predates this
+    block, so those keep launching with the inherited environment untouched.
+    Numbers are rendered rather than passed through because an environment is
+    strings, and the internal cases state these as JSON numbers.
+    """
+
+    return {name: str(value) for name, value in config["server"].get("env", {}).items()}
 
 
 def answer_expected_hardware(config: dict[str, Any]) -> str:
@@ -2062,6 +2248,7 @@ def default_provenance(
     model_path: str,
     *,
     server_config: dict[str, Any] | None = None,
+    server_environment: dict[str, str] | None = None,
     generation_config: dict[str, Any] | None = None,
     expected_hardware: str | None = None,
     accelerator: dict[str, Any] | None = None,
@@ -2088,6 +2275,10 @@ def default_provenance(
         "expected_hardware": expected_hardware,
         "accelerator": accelerator,
         "server_config": server_config,
+        # Recorded separately from server_config because it is a different
+        # surface: two runs of one config can differ here only through the
+        # launcher, and a reader comparing two reports needs to see that.
+        "server_environment": server_environment,
         "generation_config": generation_config,
         "package_versions": _installed_package_versions(),
     }

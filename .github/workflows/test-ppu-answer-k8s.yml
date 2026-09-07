@@ -32,43 +32,117 @@ env:
 
 jobs:
   answer-k8s:
-    name: ${{ matrix.suite }} (btv1.5)
+    name: ${{ matrix.entry }} (btv1.5)
     # The orchestration shell is CPU-only and holds no device; the action
     # submits a worker pod onto a board that carries the requested label.
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    # Same two suites and the same registered files as the bare-metal
-    # workflow; only the reviewed config differs, because the board differs.
-    # max-parallel 1 keeps the two entries from asking the cluster for two
-    # whole boards at once, and puts the cheap single-card entry first so a
-    # break in the shared serving path is visible before the 8-card entry
-    # would report it. fail-fast is off: one model's verdict must not
-    # suppress the other's evidence.
+    # One entry per reviewed config the cluster has weights for. `entry` is what
+    # keeps them apart -- in the job name, in the report path and in the artifact
+    # name -- because `suite` no longer identifies an entry: three GLM configs
+    # and three Qwen3.5 configs each share one suite, differing only in which
+    # checkpoint the config names. A suite is what `--suite` selects, so configs
+    # of one model share a suite and different models never do; see the docstring
+    # of each registered file.
+    #
+    # Ordered cheap first: the single-card entry, then the verified 8-card one,
+    # then the rest roughly by checkpoint size, so a break in the shared serving
+    # path is visible before the long loads would report it. max-parallel 8 is
+    # what the cluster will be asked for at once; each of these entries claims a
+    # whole board. fail-fast is off: one model's verdict must not suppress
+    # another's evidence.
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 8
       matrix:
         include:
-          - suite: nightly-answer-1-ppu
+          - entry: qwen3.8-27b-bf16
+            suite: nightly-answer-1-ppu
             config: test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json
             job_timeout_minutes: 150
             pod_timeout_minutes: 120
             timeout_per_file: 2400
-          - suite: nightly-answer-8-ppu
+          - entry: qwen3.5-397b-w8a8-int8
+            suite: nightly-answer-8-ppu
             config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json
             job_timeout_minutes: 360
             pod_timeout_minutes: 330
+            timeout_per_file: 14400
+          # 116 GiB of weights, and the smallest of the new entries; it also
+          # cannot be asked not to think, so its ten answers are what dominates
+          # its budget rather than its load.
+          - entry: minimax2.7-mxfp4-fp8
+            suite: nightly-answer-8-minimax27-ppu
+            config: test/registered/ppu/answer_eval/configs/minimax2.7/mxfp4-fp8-144g.json
+            job_timeout_minutes: 300
+            pod_timeout_minutes: 270
+            timeout_per_file: 14400
+          - entry: minimax2.7-fp8-channelwise
+            suite: nightly-answer-8-minimax27-ppu
+            config: test/registered/ppu/answer_eval/configs/minimax2.7/fp8-channelwise-144g.json
+            job_timeout_minutes: 300
+            pod_timeout_minutes: 270
+            timeout_per_file: 14400
+          - entry: minimax2.7-w8a8-int8
+            suite: nightly-answer-8-minimax27-ppu
+            config: test/registered/ppu/answer_eval/configs/minimax2.7/w8a8-int8-144g.json
+            job_timeout_minutes: 300
+            pod_timeout_minutes: 270
+            timeout_per_file: 14400
+          - entry: qwen3.5-397b-mxfp4-fp8
+            suite: nightly-answer-8-ppu
+            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json
+            job_timeout_minutes: 240
+            pod_timeout_minutes: 210
+            timeout_per_file: 10800
+          - entry: qwen3.5-397b-fp8-channelwise
+            suite: nightly-answer-8-ppu
+            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json
+            job_timeout_minutes: 240
+            pod_timeout_minutes: 210
+            timeout_per_file: 10800
+          - entry: glm5.2-mxfp4-fp8
+            suite: nightly-answer-8-glm52-ppu
+            config: test/registered/ppu/answer_eval/configs/glm5.2/mxfp4-fp8-144g.json
+            job_timeout_minutes: 240
+            pod_timeout_minutes: 210
+            timeout_per_file: 10800
+          - entry: kimi2.6-w4a8-int8
+            suite: nightly-answer-8-kimi26-ppu
+            config: test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json
+            job_timeout_minutes: 240
+            pod_timeout_minutes: 210
+            timeout_per_file: 10800
+          - entry: kimi2.6-mxfp4-fp8
+            suite: nightly-answer-8-kimi26-ppu
+            config: test/registered/ppu/answer_eval/configs/kimi2.6/mxfp4-fp8-144g.json
+            job_timeout_minutes: 240
+            pod_timeout_minutes: 210
+            timeout_per_file: 10800
+          # 704 GiB each, the largest single-board checkpoints here: the warm
+          # alone reads them for roughly fifty minutes before the load starts.
+          - entry: glm5.2-w8a8-int8
+            suite: nightly-answer-8-glm52-ppu
+            config: test/registered/ppu/answer_eval/configs/glm5.2/w8a8-int8-144g.json
+            job_timeout_minutes: 300
+            pod_timeout_minutes: 270
+            timeout_per_file: 14400
+          - entry: glm5.2-fp8-channelwise
+            suite: nightly-answer-8-glm52-ppu
+            config: test/registered/ppu/answer_eval/configs/glm5.2/fp8-channelwise-144g.json
+            job_timeout_minutes: 300
+            pod_timeout_minutes: 270
             timeout_per_file: 14400
     timeout-minutes: ${{ matrix.job_timeout_minutes }}
     # The action does not carry files back out of the worker pod, only its
     # logs, so the report travels over the NAS both sides already mount: the
     # pod writes under /mnt/wl_nas and the orchestration shell reads the same
     # bytes under /wl_nas. github.job is the job id, identical for every
-    # matrix entry, so the suite name is what keeps the two reports apart.
+    # matrix entry, so the entry name is what keeps the reports apart.
     env:
-      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.suite }}
-      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.suite }}
+      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
+      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -78,7 +152,7 @@ jobs:
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
 
-      - name: Run ${{ matrix.suite }} via K8s
+      - name: Run ${{ matrix.entry }} via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -157,7 +231,9 @@ jobs:
         if: always()
         shell: bash
         env:
-          SUITE: ${{ matrix.suite }}
+          # The entry, not the suite: annotations from eight parallel jobs land on
+          # one run page, and three of them share a suite name.
+          ENTRY: ${{ matrix.entry }}
         run: |
           set -euo pipefail
           destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
@@ -184,11 +260,11 @@ jobs:
             # case prefixed with "- `", a prefix no other line in that document
             # has, and the evaluator's unit tests lock that shape.
             while IFS= read -r failure; do
-              echo "::error::${SUITE}: ${failure#- }"
+              echo "::error::${ENTRY}: ${failure#- }"
             done < <(grep '^- `' "${destination}/summary.md" || true)
             counts=$(grep '^- Cases: ' "${destination}/summary.md" | head -1 || true)
             if [ -n "${counts}" ]; then
-              echo "::notice::${SUITE}: ${counts#- }"
+              echo "::notice::${ENTRY}: ${counts#- }"
             fi
             cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           fi
@@ -197,7 +273,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-answer-k8s-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-answer-k8s-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
           retention-days: 30

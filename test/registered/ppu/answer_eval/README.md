@@ -18,14 +18,32 @@ reviewable unit. Nothing about discovery changes: `run_suite.py` and the
 `check-registered-tests` hook both walk `test/registered/**/*.py`, and a suite is
 owned by the `register_ppu_ci` call inside the file, not by its directory.
 
-Three models are covered, one registered file and one suite each because
-`register_ppu_ci` registers per file and the three claim different device counts:
+Eight suites cover six models. A suite is a file, because `register_ppu_ci`
+registers per file; a file holds only configs that agree on the checkpoint family
+and on the node count, because every test in a suite runs in one process off one
+`SGLANG_PPU_ANSWER_TEST_CONFIG` and a node count decides which workflow can run
+it at all. Configs that agree on both do share a suite — Qwen3.5's four, GLM-5.2's
+three and MiniMax-M2.7's three do — and the caller picks which one by naming its
+config. Two models appear twice for the same reason: the 2.4T checkpoint's two
+quantisations need 2 nodes and 4, and Kimi-K2.6's W8A8-INT8 needs 2 where its
+other two formats need 1.
 
-| Suite | Test file | Model | Devices |
-| --- | --- | --- | --- |
-| `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 1 |
-| `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B-W8A8-INT8 | 8 |
-| `nightly-answer-32-ppu` | `test_ppu_qwen38_a95b_answer.py` | Qwen3.8-2.4T-A95B-FP8 | 32, over 4 nodes |
+| Suite | Test file | Model | Configs | Devices |
+| --- | --- | --- | --- | --- |
+| `nightly-answer-1-ppu` | `test_ppu_qwen38_answer.py` | Qwen3.8-27B, BF16 | 2 | 1 |
+| `nightly-answer-8-ppu` | `test_ppu_qwen35_answer.py` | Qwen3.5-397B-A17B | 4 | 8 |
+| `nightly-answer-8-glm52-ppu` | `test_ppu_glm52_answer.py` | GLM-5.2 | 3 | 8 |
+| `nightly-answer-8-kimi26-ppu` | `test_ppu_kimi_k26_answer.py` | Kimi-K2.6 | 2 | 8 |
+| `nightly-answer-8-minimax27-ppu` | `test_ppu_minimax_m27_answer.py` | MiniMax-M2.7 | 3 | 8 |
+| `nightly-answer-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_answer.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 16, over 2 nodes |
+| `nightly-answer-16-kimi26-ppu` | `test_ppu_kimi_k26_w8a8_answer.py` | Kimi-K2.6-W8A8-INT8 | 1 | 16, over 2 nodes |
+| `nightly-answer-32-ppu` | `test_ppu_qwen38_a95b_answer.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 32, over 4 nodes |
+
+The device count stays in the suite name even where the name also carries a model
+family: it is the scheduling fact a reader needs first, and the four 8-device
+suites differ from each other only in which model they hold. Kimi-K2.6 is the one
+model whose name appears on two different device counts, which is why its
+two-node suite keeps the model in the name as well.
 
 The first two suites are executed on two boards each. That is a matter of
 configuration rather than of registration: the model, the corpus, and the judging
@@ -37,11 +55,20 @@ reviewed config.
 | ZW810E, 96GiB | none | `nightly-test-ppu-answer.yml` | cron 05:00 Beijing, dispatch |
 | ZW-M890P, 144GiB | `-144g` | `test-ppu-answer-k8s.yml` | dispatch only |
 
+The other three 8-device suites, and the two two-node ones, have 144GiB configs
+only: their checkpoints are 116.2 GiB to 1272.1 GiB, and a ZW810E comparison is
+not something this cluster can schedule at those sizes. See
+[The ported 144GiB entries](#the-ported-144gib-entries) for where each config
+came from and what it costs.
+
 `nightly-answer-32-ppu` has one config and one board. Its checkpoint is 2324.7
 GiB over 213 shards, which no 96GiB node count this cluster can gang-schedule
 would hold, so there is no ZW810E sibling to compare against; it has a workflow
 of its own, `test-ppu-answer-32-k8s.yml`, dispatch only — see
-[The four-node line](#the-four-node-line).
+[The four-node line](#the-four-node-line). `nightly-answer-16-ppu` is the same
+checkpoint quantised to MXFP4-FP8, 1272.1 GiB, which two nodes hold, and
+`nightly-answer-16-kimi26-ppu` is Kimi-K2.6-W8A8-INT8 at 968.3 GiB, which one
+node does not; both are entries of `test-ppu-answer-16-k8s.yml`, dispatch only.
 
 The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
 ZW810E entries as a `max-parallel: 1` matrix. It has its own workflow instead of
@@ -127,20 +154,32 @@ before starting SGLang. The test configuration digest and checkpoint
 configuration digest are included in provenance; the first on-machine run must
 establish the reviewed checkpoint digest baseline.
 
-Candidate generation is deterministic for every model: temperature 0, top-p 1,
-and at most 2048 output tokens. The 397B server configuration is TP=8, FA3
-attention, static memory fraction 0.8, and `w8a8_int8` quantization; the 27B is
-TP=1, FA3, static memory fraction 0.85, and `unquant`, which is how
-`server_args` spells an explicit opt-out for a BF16 checkpoint; the 2.4T is
-TP=32, FA3, static memory fraction 0.8, and no quantization flag at all, so the
-checkpoint's own declaration stands — see
-[Parity with the internal launcher](#parity-with-the-internal-launcher). All
-three carry `watchdog_timeout` 600, the value the internal answer cases use.
+Candidate generation is deterministic for every model: temperature 0 and top-p 1
+throughout, so the rule-based verdict is reproducible. Only the output budget
+moves, and only where a checkpoint's own template forces it to: 2048 tokens for
+the eleven entries that can be asked not to think, 8192 for the two 2.4T entries
+whose template grades the reasoning pass instead of switching it off, and 16384
+for the two MiniMax entries, whose template has no off switch at all.
+
+Server parameters follow the internal case each config was ported from, so they
+differ by model rather than by house rule. The 397B is TP=8, FA3 attention, static
+memory fraction 0.8; the 27B is TP=1, FA3, 0.85, and `unquant`, which is how
+`server_args` spells an explicit opt-out for a BF16 checkpoint; the 2.4T FP8 entry
+is TP=8 × PP=4 and the MXFP4-FP8 one TP=8 × PP=2; GLM-5.2 serves through the
+sparse `dsa` backend with `flashmla_sparse` prefill and `flashmla_kv` decode, and
+Kimi-K2.6 names `fa3` prefill against `flashmla` decode with no unified backend at
+all. Eleven of the fifteen configs leave the quantization flag off so the
+checkpoint's own declaration stands; the two Qwen3.5 W8A8-INT8 ones name
+`w8a8_int8`, the one format the internal cases do name, and the two BF16 ones say
+`unquant` — see
+[Parity with the internal launcher](#parity-with-the-internal-launcher). Each
+config carries the `watchdog_timeout` its source case carries, 600 everywhere
+except the GLM-5.2 channelwise entry's 24000.
 
 ## The ZW-M890P line
 
-`.github/workflows/test-ppu-answer-k8s.yml` runs the same two suites against the
-144GiB board, which is reachable only through the K8s cluster. It is a sibling
+`.github/workflows/test-ppu-answer-k8s.yml` runs the single-board suites against
+the 144GiB board, which is reachable only through the K8s cluster. It is a sibling
 workflow rather than a second matrix dimension of the bare-metal one because
 everything around the test differs, while the test itself does not:
 
@@ -152,10 +191,16 @@ everything around the test differs, while the test itself does not:
   `torch.cuda.device_count()` still returns 8, so the preflight — which requires
   the visible device count to equal the configured one — would fail the
   single-card entry outright. `CUDA_VISIBLE_DEVICES` is therefore exported inside
-  the pod from the same config the test reads, and both entries request all eight
+  the pod from the same config the test reads, and every entry requests all eight
   PPUs so that no second pod can land on the board and contend for a device with
   a server that has already claimed most of its memory. The internal btv1.5 plan
-  schedules both answer cases as `1node8ppu` for the same reason.
+  schedules its answer cases as `1node8ppu` for the same reason.
+- **Matrix.** Twelve entries, `max-parallel: 8`, so at most eight boards are held
+  at once. Each carries an `entry` slug distinct from its suite, because three
+  entries share `nightly-answer-8-ppu` and three more share
+  `nightly-answer-8-glm52-ppu`: the slug is what names the NAS results directory
+  and the artifact, and `upload-artifact@v4` fails outright on a repeated name.
+  `--suite` still receives `matrix.suite`, which is the registered name.
 - **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
   rather than under `qwen/v3.5/` as on the ZW810E line; the 27B path is the same
   on both. The path is a per-config field, so this costs nothing beyond the two
@@ -165,7 +210,7 @@ everything around the test differs, while the test itself does not:
   report travels over the NAS that both sides mount: the pod writes
   `SGLANG_PPU_ANSWER_RESULTS_DIR` under `/mnt/wl_nas/devops/<run>/<job>/`, and the
   orchestration shell reads the same bytes under `/wl_nas/...`, publishes the
-  summary, and uploads the artifact. The suite name is part of the path because
+  summary, and uploads the artifact. The entry slug is part of the path because
   `github.job` is identical for every matrix entry. The NAS copy is read and left
   in place rather than moved: the pod writes as root and the orchestration shell
   is a different, non-root uid, so it can read those bytes but not unlink them.
@@ -195,8 +240,9 @@ hardware reported. Board type alone would not have settled the capacity in any
 case: the internal plans schedule this same board in both a 96GiB and a 144GiB
 configuration.
 
-Both entries have since been run on this board; see
-[Measured baseline (ZW-M890P)](#measured-baseline-zw-m890p).
+The two entries that predate this batch have since been run on this board; see
+[Measured baseline (ZW-M890P)](#measured-baseline-zw-m890p). The nine added here
+have not been run yet.
 
 ## The four-node line
 
@@ -457,6 +503,162 @@ written before the workers are released, so a worker that failed afterwards is
 visible in nothing else. The suite itself still runs through `run_suite.py`, so
 the executed set is what `register_ppu_ci` declares.
 
+## The ported 144GiB entries
+
+Twelve configs were added from the internal btv1.5 `answer_144g` plan, against
+checkpoints already staged on this NAS. Each row names the internal
+`llm_infer_sglang_evalscope` case its server parameters came from, and the
+checkpoint as measured on `na131t-ppu810e-test001`, which mounts the same NAS the
+cluster does. Every one of them holds exactly the number of shards its own
+`model.safetensors.index.json` declares, so none is a partial copy — read from the
+index, not from the `-of-NNNNN` suffix the filenames carry, which on
+`MiniMax-M2.7-W8A8-INT8` is stale.
+
+| Entry | Suite | Source case | Checkpoint | Size |
+| --- | --- | --- | --- | --- |
+| `glm5.2-w8a8-int8` | `-8-glm52-` | `glm-5.1-w8a8-int8_3001` | `v5.2/GLM-5.2-W8A8-INT8` | 704.4 GiB, 282 shards |
+| `glm5.2-mxfp4-fp8` | `-8-glm52-` | `glm-5.2-fp8_3001` | `v5.2/GLM-5.2-MXFP4-FP8` | 383.0 GiB, 282 |
+| `glm5.2-fp8-channelwise` | `-8-glm52-` | `glm-5.2-fp8_channel_cp_3001` | `v5.2/GLM-5.2-FP8-Channelwise` | 704.4 GiB, 282 |
+| `kimi2.6-w4a8-int8` | `-8-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-MoE-Quant-W-INT4-PerChannel-A-INT8-PerToken` | 495.7 GiB, 64 |
+| `kimi2.6-mxfp4-fp8` | `-8-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-MXFP4-FP8` | 516.2 GiB, 64 |
+| `kimi2.6-w8a8-int8` | `-16-kimi26-` | `kimi-k2.6-w8a8-int8_3001` | `k2.6/Kimi-K2.6-Quant-W-INT8-PerChannel-A-INT8-PerToken` | 968.3 GiB, 64 |
+| `minimax2.7-fp8-channelwise` | `-8-minimax27-` | `minimax-m3-bf16_3001` | `M2.7/MiniMax-M2.7-FP8-Channelwise` | 214.7 GiB, 86 |
+| `minimax2.7-mxfp4-fp8` | `-8-minimax27-` | `minimax-m3-bf16_3001` | `M2.7/MiniMax-M2.7-MXFP4-FP8` | 116.2 GiB, 86 |
+| `minimax2.7-w8a8-int8` | `-8-minimax27-` | `minimax-m3-bf16_3001` | `m2.7/MiniMax-M2.7-W8A8-INT8` | 214.6 GiB, 125 |
+| `qwen3.5-397b-fp8-channelwise` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-FP8-Channelwise` | 379.0 GiB, 94 |
+| `qwen3.5-397b-mxfp4-fp8` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-MXFP4-FP8` | 215.6 GiB, 94 |
+| `qwen3.8-2.4t-a95b-mxfp4-fp8` | `-16-` | `qwen3.7-mxfp4-fp8_3001` | `v3.8/Qwen3.8-2.4T-A95B-...-MXFP4-...` | 1272.1 GiB, 213 |
+
+Seven of the twelve entries name a source case that does not carry their
+checkpoint, in four groups. That is the plan's own situation rather than a
+substitution:
+
+- **GLM-5.2 W8A8-INT8.** The plan has no GLM-5.2 W8A8 case. The nearest is
+  `glm-5.1-w8a8-int8_3001`, whose parameters are identical to
+  `glm-5-w8a8-int8_3001`, so the W8A8 serving line is stable across those
+  revisions and is what this entry carries.
+- **Kimi-K2.6, the W4A8 and MXFP4 formats.** `kimi-k2.6-w8a8-int8_3001` is the
+  only Kimi answer case, and its own format is the third entry below, so for
+  these two what carries over is everything that is not format-specific — TP=8,
+  `fa3` prefill against `flashmla` decode, memory fraction 0.8 — and the
+  quantization flag is dropped rather than renamed.
+- **MiniMax-M2.7, all three formats.** `minimax-m3-bf16_3001` is the only MiniMax
+  case on the sglang side; `minimax-m3-mxfp4-fp8_3001` exists on the vllm side
+  only. Its parameters are TP=8, `fa3`, 0.8, and `watchdog_timeout` 600, none of
+  which is specific to BF16 or to M3.
+- **Qwen3.8-2.4T MXFP4-FP8.** Server parameters come from
+  `qwen3.7-mxfp4-fp8_3001`; the topology and the template handling come from this
+  repository's four-node FP8 entry, which is the same checkpoint at a different
+  quantization and the only place either has been established.
+
+`kimi2.6-w8a8-int8` is the one entry whose source case names its exact
+checkpoint, which is why it is the only Kimi config that states a `quantization`
+at all. It departs from that case in topology instead, for a reason of
+arithmetic recorded under Capacity below.
+
+**Where these ports depart from their sources.** Four departures beyond the
+deterministic generation line already described in
+[Relation to the internal test cases](#relation-to-the-internal-test-cases):
+
+- The sparse-attention parameters are spelled `dsa_*`, not the `nsa_*` the GLM
+  cases use. This tree renamed the whole family and keeps the old spellings only
+  as deprecated aliases, so an `nsa_*` config would work today, warn, and stop
+  working without notice.
+- `SGLANG_NSA_DUAL_STREAM=0`, which the GLM cases export, is refused by the
+  environment whitelist. Nothing in this tree reads that name — the only
+  `DUAL_STREAM` symbols are the module constants `DUAL_STREAM_TOKEN_THRESHOLD` in
+  `dsa_indexer.py`, `qwen3_5.py`, and `qwen3_next.py` — so accepting it would let
+  a config state a setting no run honours.
+- `enable_metrics` and `tool_call_parser`, which the GLM channelwise case sets,
+  are not carried: nothing collects the metrics endpoint on this path, and no
+  request in this corpus asks for a tool call.
+- Kimi and MiniMax get a `reasoning_parser` their source cases do not pass, for
+  the reason already recorded for the Qwen entries: the requests ask for
+  `separate_reasoning`, and the parser is what keeps a reasoning block out of the
+  graded text.
+
+**One value here is a judgement, not a measurement.** The three MiniMax entries
+carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,
+and the one other entry whose thinking cannot be switched off runs at 8192; 16384
+sits between them because MiniMax-M2.7's template has no off switch at all and a
+truncated candidate is a `length` finish reason rather than a verdict. Whether it
+is enough, and whether 900s covers it, is what the first run of these entries
+settles.
+
+**Capacity.** These are headroom checks against the measured checkpoint sizes, not
+predictions of what the server will actually reserve:
+
+| Group | Static pool at the configured fraction | Largest checkpoint on it |
+| --- | --- | --- |
+| 8 × 144 GiB, fraction 0.8 | 921 GiB | 704.4 GiB (GLM-5.2 W8A8-INT8) |
+| 8 × 144 GiB, fraction 0.9 | 1036 GiB | 704.4 GiB (GLM-5.2 channelwise) |
+| 16 × 144 GiB, fraction 0.8 | 1843 GiB | 1272.1 GiB (2.4T MXFP4-FP8) |
+
+That third row is why `kimi2.6-w8a8-int8` is a two-node entry while its source
+case is a single-node one. Kimi-K2.6-W8A8-INT8 is 968.3 GiB, which is 84 per cent
+of one node's 1152 GiB of device memory: at the source case's own fraction of 0.8
+it exceeds the 921 GiB pool and cannot finish loading, and 0.9 would leave about 8
+GiB per device for the KV cache with nothing measured to say that is workable.
+Two nodes at TP=8 × PP=2 keep the fraction at 0.8 against a 1843 GiB pool. The
+internal plan schedules its `answer_144g` cases as `1node8ppu` and does not list
+this one, which is consistent with the arithmetic above.
+
+**Time.** The measured page-cache warm rate is about 4.15 s/GiB at
+`WARM_PARALLELISM` 8 on both boards — 26m17s for 379.0 GiB on ZW810E, 3m34s for
+51.7 GiB on ZW-M890P — which puts the 704.4 GiB entries near 49 minutes of warm
+before a weight load begins. The matrix budgets follow from that: pod timeouts of
+210 to 330 minutes and `timeout-per-file` of 10800 or 14400 seconds, with the
+larger figures on the GLM and MiniMax entries. `est_time` is 7200 for GLM,
+MiniMax, both 2.4T suites, and the two-node Kimi one, and 5400 for the
+single-board Kimi suite; none of these is measured either, and the first
+successful run of each is what should replace it.
+
+**The two-node line.** `.github/workflows/test-ppu-answer-16-k8s.yml` runs
+`nightly-answer-16-ppu` and `nightly-answer-16-kimi26-ppu` on two ZW-M890P nodes
+each at TP=8 × PP=2, one entry at a time. It is the four-node workflow with
+`nnodes: 2`, so it keeps every mechanism that line established —
+the rendezvous file exchange, the RDMA GID index resolution, `run_answer_suite_node.sh`
+for the non-zero ranks, and the rank status collection — and differs only in the
+group size and the configs it names. The two entries are there for different
+reasons: 1272.1 GiB does not fit one node's static pool at any fraction, while
+968.3 GiB fits neither 0.8 nor, with any credible KV cache left over, 0.9. Like
+the four-node entry neither runs a page-cache warm, but for a different reason:
+both checkpoints would fit in one node's 2266 GiB of host memory, yet under PP=2
+each node loads roughly its own half, so warming the whole tree on both nodes
+would read twice what the group needs and double the run's NAS traffic. Whether
+the halves are clean enough for that to matter is not measured.
+
+**What was not ported.** The NAS stages 25 checkpoints; 15 are covered, the twelve
+ported here plus the three that already had entries. The remaining ten fall into
+two classes. Each architecture below was read from the checkpoint's own
+`config.json` on `na131t-ppu810e-test001`, and each claim of a missing registration
+is that the name appears nowhere under `python/sglang/`.
+
+- **Four architectures this tree does not register**, over five checkpoints:
+  `Glm5NextForConditionalGeneration` (GLM-5.3-Flash),
+  `KimiK3ForConditionalGeneration` (Kimi-K3),
+  `MiniMaxM3SparseForConditionalGeneration` (both MiniMax-M3 formats), and
+  `Qwen4ExpForConditionalGeneration` (Qwen3.8-Flash-Next). A port would fail at
+  load rather than produce a verdict. Registering an architecture is its own change
+  with its own evidence, not part of a config port — as the `Qwen3_5MoeForCausalLM`
+  work in the four-node line shows.
+- **DeepSeek-V4, five checkpoints.** All five are `DeepseekV4ForCausalLM`, which
+  this tree does register, but none carries a chat template: no `chat_template*`
+  file and no `chat_template` key in `tokenizer_config.json`. Every request in this
+  corpus is a chat completion. A template is a decision about how the model is
+  prompted, which belongs with whoever owns the checkpoint. Kimi-K3 is in the same
+  position on top of its missing registration.
+
+`minimax2.7-w8a8-int8`, in the table above, was at one point in a third class here,
+and the reason was wrong. That checkpoint was first reported as an incomplete copy
+missing shards 125 through 130. It is not: its shards are numbered `00000` to
+`00124` against a filename suffix of `-of-00130`, and it is the suffix that is
+stale. The index declares exactly the 125 files that are present, none absent and
+none undeclared, and the tree holds 214.6 GiB of tensors — the same volume as the
+complete FP8-Channelwise copy, which is the expected result for two 8-bit
+quantisations of one model. With the stated reason for skipping it withdrawn, it
+is an entry.
+
 ## Relation to the internal test cases
 
 All three suites are ports of internal `llm_infer_sglang_evalscope` answer cases
@@ -553,7 +755,7 @@ reaches the HTTP API: the only client runs in rank 0's own pod, and the workers
 coordinate through the rendezvous and the NAS, never over HTTP.
 
 **Group environment variables.** `SGLangServerCmd._config_env` exports
-`MASTER_ADDR`, `NNODES`, and `RANK` around the launch, and `_group_environment`
+`MASTER_ADDR`, `NNODES`, and `RANK` around the launch, and `_server_environment`
 now does the same for a multi-node launch — for parity, not for a consumer this
 repository can point at. On the path these configs take SGLang reads the
 rendezvous from `--dist-init-addr` alone: `MASTER_PORT` matters only behind an

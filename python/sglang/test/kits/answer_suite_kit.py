@@ -25,6 +25,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.answer_eval_kit import (
     CandidateRequestError,
     answer_expected_hardware,
+    answer_server_environment,
     build_answer_server_args,
     build_report,
     canonical_digest,
@@ -104,6 +105,7 @@ class AnswerSuiteMixin:
             cls.model_config["served_model_name"],
             cls.model_path or "",
             server_config=cls.server_config,
+            server_environment=answer_server_environment(cls.test_config),
             generation_config=cls.request_config["generation"],
             expected_hardware=answer_expected_hardware(cls.test_config),
             accelerator=accelerator,
@@ -326,7 +328,7 @@ class AnswerSuiteMixin:
                 other_args=build_answer_server_args(
                     cls.test_config, distributed=cls.distributed
                 ),
-                env=cls._group_environment(),
+                env=cls._server_environment(),
             )
             # A worker rank serves a dummy health endpoint once its own
             # schedulers are ready, so the launch above returns on every node and
@@ -348,18 +350,24 @@ class AnswerSuiteMixin:
             raise
 
     @classmethod
-    def _group_environment(cls):
-        """The group's own description of itself, for the server's environment.
+    def _server_environment(cls):
+        """What the server is launched with on top of the inherited environment.
 
-        None for a single-node config, which leaves the launcher's inherited
-        environment untouched.
+        None when the config names no variables and the group is a single node,
+        which leaves the launcher's environment untouched -- the case for every
+        entry that predates either block.
 
-        These three variables are what the internal framework exports around the
-        same `sglang serve` invocation, and they are set here for that parity
-        rather than for a consumer this suite can point at: on the path these
-        configs take, SGLang reads the rendezvous from `--dist-init-addr` alone,
-        and its two readers of `MASTER_ADDR` are both gated elsewhere -- the
-        global TCPStore behind a `nixl` a2a backend, and `env://` behind an
+        The reviewed variables are applied first and the group's description of
+        itself second, so a config cannot rename the rendezvous; the schema does
+        not admit those names anyway, and the ordering says so without relying on
+        that.
+
+        Those three group variables are what the internal framework exports
+        around the same `sglang serve` invocation, and they are set here for that
+        parity rather than for a consumer this suite can point at: on the path
+        these configs take, SGLang reads the rendezvous from `--dist-init-addr`
+        alone, and its two readers of `MASTER_ADDR` are both gated elsewhere --
+        the global TCPStore behind a `nixl` a2a backend, and `env://` behind an
         explicit init-method override.  What the PPU runtime beneath it reads is
         not visible from this repository, so the group states itself the way the
         framework whose runs are the baseline states it.
@@ -370,14 +378,17 @@ class AnswerSuiteMixin:
         does not resolve, and re-exporting that would defeat the override.
         """
 
-        if cls.distributed is None:
-            return None
-        master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(":")
-        return {
-            "MASTER_ADDR": master_addr,
-            "NNODES": str(cls.distributed["nnodes"]),
-            "RANK": str(cls.distributed["node_rank"]),
-        }
+        environment = answer_server_environment(cls.test_config)
+        if cls.distributed is not None:
+            master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(":")
+            environment.update(
+                {
+                    "MASTER_ADDR": master_addr,
+                    "NNODES": str(cls.distributed["nnodes"]),
+                    "RANK": str(cls.distributed["node_rank"]),
+                }
+            )
+        return environment or None
 
     @classmethod
     def _resolve_rank_dir(cls):
