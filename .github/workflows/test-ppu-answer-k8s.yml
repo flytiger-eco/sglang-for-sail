@@ -27,122 +27,53 @@ concurrency:
 permissions:
   contents: read
 
+# One job per entry, and the entries that share a board queue behind each other
+# through `needs` rather than through a matrix. This is not a style choice.
+# flytiger-eco/ppu-distributed-action builds both the NAS path it stages the
+# source to, /wl_nas/devops/<run>-<attempt>/$GITHUB_JOB/, and the name of the
+# K8s job it submits, ppu-<owner>-<run>-<attempt>-<job>, out of the job id --
+# which every leg of one matrix shares, since a matrix leg is not a separate
+# job id. At max-parallel 1 that is harmless, because the action cleans both up
+# before the next leg starts, and that is how the first three entries were
+# verified. At max-parallel 8 all twelve legs staged into one directory and
+# every one of them failed inside two minutes: git's pack files are mode 444,
+# so the second leg to copy one hit EPERM (run 34082162222). Even had the copy
+# succeeded they would have submitted twelve pods under one K8s job name and
+# each leg's cleanup would have deleted the others' pods. A job-level `env:`
+# entry cannot paper over it: GITHUB_JOB is set by the runner and a workflow
+# env of the same name does not win (measured, run 34084233664), and the K8s
+# job name comes from an expression the action fixes at step level, which no
+# caller can reach. So the entries that run at the same time have to be
+# different jobs, and eight lanes give the same eight-wide cluster request the
+# matrix was asking for. `needs` plus `!cancelled()` is the fail-fast: false of
+# this shape -- a lane's second entry runs on its predecessor's verdict, good or
+# bad, so one model's failure never suppresses another's evidence, while a
+# cancelled run stops claiming boards.
+#
+# The lanes pair a long entry with a short one where they can. `entry` is what
+# keeps configs apart -- in the job name, in the report path and in the artifact
+# name -- because `suite` no longer identifies one: three GLM configs and three
+# Qwen3.5 configs each share a suite, differing only in which checkpoint the
+# config names. A suite is what `--suite` selects, so configs of one model share
+# a suite and different models never do; see the docstring of each registered
+# file.
+#
+# Every job body is the same three steps, so they live in a local composite
+# action instead of twelve copies here; what varies is in `with`.
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
 
 jobs:
-  answer-k8s:
-    name: ${{ matrix.entry }} (btv1.5)
+  # Lane A: the single-card entry first, so a break in the shared serving path
+  # shows up in minutes rather than after a 116 GiB load.
+  qwen38-27b-bf16:
+    name: qwen3.8-27b-bf16 (btv1.5)
     # The orchestration shell is CPU-only and holds no device; the action
     # submits a worker pod onto a board that carries the requested label.
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    # One entry per reviewed config the cluster has weights for. `entry` is what
-    # keeps them apart -- in the job name, in the report path and in the artifact
-    # name -- because `suite` no longer identifies an entry: three GLM configs
-    # and three Qwen3.5 configs each share one suite, differing only in which
-    # checkpoint the config names. A suite is what `--suite` selects, so configs
-    # of one model share a suite and different models never do; see the docstring
-    # of each registered file.
-    #
-    # Ordered cheap first: the single-card entry, then the verified 8-card one,
-    # then the rest roughly by checkpoint size, so a break in the shared serving
-    # path is visible before the long loads would report it. max-parallel 8 is
-    # what the cluster will be asked for at once; each of these entries claims a
-    # whole board. fail-fast is off: one model's verdict must not suppress
-    # another's evidence.
-    strategy:
-      fail-fast: false
-      max-parallel: 8
-      matrix:
-        include:
-          - entry: qwen3.8-27b-bf16
-            suite: nightly-answer-1-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json
-            job_timeout_minutes: 150
-            pod_timeout_minutes: 120
-            timeout_per_file: 2400
-          - entry: qwen3.5-397b-w8a8-int8
-            suite: nightly-answer-8-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json
-            job_timeout_minutes: 360
-            pod_timeout_minutes: 330
-            timeout_per_file: 14400
-          # 116 GiB of weights, and the smallest of the new entries; it also
-          # cannot be asked not to think, so its ten answers are what dominates
-          # its budget rather than its load.
-          - entry: minimax2.7-mxfp4-fp8
-            suite: nightly-answer-8-minimax27-ppu
-            config: test/registered/ppu/answer_eval/configs/minimax2.7/mxfp4-fp8-144g.json
-            job_timeout_minutes: 300
-            pod_timeout_minutes: 270
-            timeout_per_file: 14400
-          - entry: minimax2.7-fp8-channelwise
-            suite: nightly-answer-8-minimax27-ppu
-            config: test/registered/ppu/answer_eval/configs/minimax2.7/fp8-channelwise-144g.json
-            job_timeout_minutes: 300
-            pod_timeout_minutes: 270
-            timeout_per_file: 14400
-          - entry: minimax2.7-w8a8-int8
-            suite: nightly-answer-8-minimax27-ppu
-            config: test/registered/ppu/answer_eval/configs/minimax2.7/w8a8-int8-144g.json
-            job_timeout_minutes: 300
-            pod_timeout_minutes: 270
-            timeout_per_file: 14400
-          - entry: qwen3.5-397b-mxfp4-fp8
-            suite: nightly-answer-8-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json
-            job_timeout_minutes: 240
-            pod_timeout_minutes: 210
-            timeout_per_file: 10800
-          - entry: qwen3.5-397b-fp8-channelwise
-            suite: nightly-answer-8-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json
-            job_timeout_minutes: 240
-            pod_timeout_minutes: 210
-            timeout_per_file: 10800
-          - entry: glm5.2-mxfp4-fp8
-            suite: nightly-answer-8-glm52-ppu
-            config: test/registered/ppu/answer_eval/configs/glm5.2/mxfp4-fp8-144g.json
-            job_timeout_minutes: 240
-            pod_timeout_minutes: 210
-            timeout_per_file: 10800
-          - entry: kimi2.6-w4a8-int8
-            suite: nightly-answer-8-kimi26-ppu
-            config: test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json
-            job_timeout_minutes: 240
-            pod_timeout_minutes: 210
-            timeout_per_file: 10800
-          - entry: kimi2.6-mxfp4-fp8
-            suite: nightly-answer-8-kimi26-ppu
-            config: test/registered/ppu/answer_eval/configs/kimi2.6/mxfp4-fp8-144g.json
-            job_timeout_minutes: 240
-            pod_timeout_minutes: 210
-            timeout_per_file: 10800
-          # 704 GiB each, the largest single-board checkpoints here: the warm
-          # alone reads them for roughly fifty minutes before the load starts.
-          - entry: glm5.2-w8a8-int8
-            suite: nightly-answer-8-glm52-ppu
-            config: test/registered/ppu/answer_eval/configs/glm5.2/w8a8-int8-144g.json
-            job_timeout_minutes: 300
-            pod_timeout_minutes: 270
-            timeout_per_file: 14400
-          - entry: glm5.2-fp8-channelwise
-            suite: nightly-answer-8-glm52-ppu
-            config: test/registered/ppu/answer_eval/configs/glm5.2/fp8-channelwise-144g.json
-            job_timeout_minutes: 300
-            pod_timeout_minutes: 270
-            timeout_per_file: 14400
-    timeout-minutes: ${{ matrix.job_timeout_minutes }}
-    # The action does not carry files back out of the worker pod, only its
-    # logs, so the report travels over the NAS both sides already mount: the
-    # pod writes under /mnt/wl_nas and the orchestration shell reads the same
-    # bytes under /wl_nas. github.job is the job id, identical for every
-    # matrix entry, so the entry name is what keeps the reports apart.
-    env:
-      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
-      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -151,129 +82,300 @@ jobs:
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
-
-      - name: Run ${{ matrix.entry }} via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+      - name: Run qwen3.8-27b-bf16
+        uses: ./.github/actions/ppu-answer-entry
         with:
+          entry: qwen3.8-27b-bf16
+          suite: nightly-answer-1-ppu
+          config: test/registered/ppu/answer_eval/configs/qwen3.8/27b-bf16-144g.json
           image: ${{ env.PPU_BASE_IMAGE }}
-          nnodes: 0
-          # Both entries request the whole board. nproc_per_node is a resource
-          # request, not device isolation: a pod that asks for one PPU still
-          # sees all eight /dev/alixpu_ppu* nodes and torch still reports
-          # device_count 8, so asking for one card would let a second pod land
-          # on the same board and contend for device 0 with a run that has
-          # already claimed 85% of its memory. Asking for eight makes the
-          # board's PPU allocatable fully consumed, which is the only fence
-          # available here, and it matches the internal btv1.5 plan, which
-          # schedules both answer cases as 1node8ppu.
-          nproc_per_node: 8
-          node_selector: "board-type=ZW-M890P"
-          command: |
-            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
-            [global]
-            index-url = https://mirrors.aliyun.com/pypi/simple/
-            trusted-host = mirrors.aliyun.com
-            PIPEOF
-            set -e
-            cd /workspace/source
-            git config --global --add safe.directory /workspace/source
-            SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
-            export SGLANG_PPU_SOURCE_REVISION
-            CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
-            export CUDA_VISIBLE_DEVICES
-            ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
-            echo "source revision: $SGLANG_PPU_SOURCE_REVISION"
-            echo "test config:     $SGLANG_PPU_ANSWER_TEST_CONFIG"
-            echo "visible devices: $CUDA_VISIBLE_DEVICES"
-            echo "checkpoint:      $ANSWER_MODEL_PATH"
-            bash scripts/ci/ppu/ppu_install_dependency.sh
-            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-            if [ "$JIT_MTIME" != 0 ]; then
-              find python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} +
-              echo 'Pinned JIT source mtimes'
-            fi
-            bash scripts/ci/warm_page_cache.sh "$ANSWER_MODEL_PATH"
-            cd test
-            python3 run_suite.py --hw ppu --suite ${{ matrix.suite }} --nightly --timeout-per-file ${{ matrix.timeout_per_file }}
-          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ matrix.config }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
-          container_options: |
-            privileged: true
-            host_ipc: true
-            host_network: true
-            shm_size: 8Gi
-          timeout_minutes: ${{ matrix.pod_timeout_minutes }}
-        # The pod derives the visible devices and the checkpoint from the same
-        # reviewed config the test will read, rather than from a second copy in
-        # this file, so the two cannot drift; the device list is also the one
-        # value that must reach the shell, and extra_env is comma-delimited, so
-        # it is exported inside the pod instead of passed as an input.
-        #
-        # The page-cache warm sits immediately before run_suite.py and inside
-        # the pod on purpose. It warms the page cache of the node that will
-        # then load the weights, which an orchestration-shell step could not
-        # do, and the measured bare-metal host reclaims the cache within 30
-        # minutes, so a warm separated from the load is wasted machine time.
-        #
-        # Routed through run_suite.py so the executed set is exactly what
-        # register_ppu_ci declares. No --continue-on-error: an Answer-quality
-        # regression must turn the run red.
+          pod_timeout_minutes: 120
+          timeout_per_file: 2400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
 
-      # The NAS copy is read, not moved. The pod writes the report as root and
-      # this orchestration shell is a different, non-root uid, so it can read
-      # those bytes but cannot unlink them: an rm here fails with EPERM on every
-      # file and turns this step red even when the suite passed, which is how the
-      # first run on this board reported itself. What is left behind is the
-      # report itself, a few kilobytes under a directory this run already owns
-      # exclusively, and it doubles as the on-cluster record once the artifact
-      # has expired.
-      - name: Collect Answer evidence
-        if: always()
-        shell: bash
-        env:
-          # The entry, not the suite: annotations from eight parallel jobs land on
-          # one run page, and three of them share a suite name.
-          ENTRY: ${{ matrix.entry }}
-        run: |
-          set -euo pipefail
-          destination="${GITHUB_WORKSPACE}/ppu-answer-artifacts"
-          mkdir -p "${destination}"
-          if [ -d "${ANSWER_RESULTS_ON_RUNNER}" ]; then
-            cp -a "${ANSWER_RESULTS_ON_RUNNER}/." "${destination}/"
-          else
-            echo "::warning::the pod produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
-          fi
-          if [ -f "${destination}/summary.md" ]; then
-            # Annotations are what a reader of this run page actually gets here.
-            # This runner drives the job through a container hook that does not
-            # share the job container's filesystem with the runner process, so
-            # bytes written to GITHUB_STEP_SUMMARY inside the container are
-            # dropped without an error: the check runs of the first two runs on
-            # this board both reported a summary of length zero while their
-            # annotations arrived intact. Annotations travel over this step's
-            # stdout, which does reach the runner, and they surface on the run
-            # page and in the checks UI without downloading the artifact.
-            #
-            # The failing cases are read back from summary.md rather than from
-            # result.json because this container is not guaranteed a JSON parser
-            # -- no python3, no jq. render_summary emits one bullet per failing
-            # case prefixed with "- `", a prefix no other line in that document
-            # has, and the evaluator's unit tests lock that shape.
-            while IFS= read -r failure; do
-              echo "::error::${ENTRY}: ${failure#- }"
-            done < <(grep '^- `' "${destination}/summary.md" || true)
-            counts=$(grep '^- Cases: ' "${destination}/summary.md" | head -1 || true)
-            if [ -n "${counts}" ]; then
-              echo "::notice::${ENTRY}: ${counts#- }"
-            fi
-            cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
-          fi
-
-      - name: Upload Answer evidence
-        if: always()
-        uses: actions/upload-artifact@v4
+  # 116 GiB of weights, and the smallest of the new entries; it also cannot be
+  # asked not to think, so its ten answers are what dominates its budget rather
+  # than its load.
+  minimax27-mxfp4:
+    name: minimax2.7-mxfp4-fp8 (btv1.5)
+    needs: qwen38-27b-bf16
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          name: ppu-answer-k8s-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ppu-answer-artifacts/
-          if-no-files-found: warn
-          retention-days: 30
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: minimax2.7-mxfp4-fp8
+          suite: nightly-answer-8-minimax27-ppu
+          config: test/registered/ppu/answer_eval/configs/minimax2.7/mxfp4-fp8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 270
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lane B: the one entry already verified on this board, and the longest single
+  # budget here, so it runs alone.
+  qwen35-397b-w8a8:
+    name: qwen3.5-397b-w8a8-int8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-w8a8-int8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: qwen3.5-397b-w8a8-int8
+          suite: nightly-answer-8-ppu
+          config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-w8a8-int8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 330
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lanes C and D: 704 GiB each, the largest single-board checkpoints here. The
+  # warm alone reads them for roughly fifty minutes before the load starts, so
+  # neither shares a lane.
+  glm52-w8a8:
+    name: glm5.2-w8a8-int8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-w8a8-int8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: glm5.2-w8a8-int8
+          suite: nightly-answer-8-glm52-ppu
+          config: test/registered/ppu/answer_eval/configs/glm5.2/w8a8-int8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 270
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  glm52-fp8-chan:
+    name: glm5.2-fp8-channelwise (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: glm5.2-fp8-channelwise
+          suite: nightly-answer-8-glm52-ppu
+          config: test/registered/ppu/answer_eval/configs/glm5.2/fp8-channelwise-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 270
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lane E: the two remaining Qwen3.5 formats, same checkpoint family and the
+  # same 210-minute budget.
+  qwen35-397b-mxfp4:
+    name: qwen3.5-397b-mxfp4-fp8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-mxfp4-fp8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: qwen3.5-397b-mxfp4-fp8
+          suite: nightly-answer-8-ppu
+          config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 210
+          timeout_per_file: 10800
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  qwen35-397b-fp8-chan:
+    name: qwen3.5-397b-fp8-channelwise (btv1.5)
+    needs: qwen35-397b-mxfp4
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-fp8-channelwise
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: qwen3.5-397b-fp8-channelwise
+          suite: nightly-answer-8-ppu
+          config: test/registered/ppu/answer_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 210
+          timeout_per_file: 10800
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lane F: the smaller GLM format, then the remaining MiniMax one.
+  glm52-mxfp4:
+    name: glm5.2-mxfp4-fp8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: glm5.2-mxfp4-fp8
+          suite: nightly-answer-8-glm52-ppu
+          config: test/registered/ppu/answer_eval/configs/glm5.2/mxfp4-fp8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 210
+          timeout_per_file: 10800
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  minimax27-fp8-chan:
+    name: minimax2.7-fp8-channelwise (btv1.5)
+    needs: glm52-mxfp4
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: minimax2.7-fp8-channelwise
+          suite: nightly-answer-8-minimax27-ppu
+          config: test/registered/ppu/answer_eval/configs/minimax2.7/fp8-channelwise-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 270
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lane G: both single-board Kimi formats, one after the other.
+  kimi26-w4a8:
+    name: kimi2.6-w4a8-int8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-w4a8-int8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: kimi2.6-w4a8-int8
+          suite: nightly-answer-8-kimi26-ppu
+          config: test/registered/ppu/answer_eval/configs/kimi2.6/w4a8-int8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 210
+          timeout_per_file: 10800
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  kimi26-mxfp4:
+    name: kimi2.6-mxfp4-fp8 (btv1.5)
+    needs: kimi26-w4a8
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: kimi2.6-mxfp4-fp8
+          suite: nightly-answer-8-kimi26-ppu
+          config: test/registered/ppu/answer_eval/configs/kimi2.6/mxfp4-fp8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 210
+          timeout_per_file: 10800
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+
+  # Lane H: the last MiniMax format, alone, so eight boards are asked for and
+  # not nine.
+  minimax27-w8a8:
+    name: minimax2.7-w8a8-int8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-w8a8-int8
+        uses: ./.github/actions/ppu-answer-entry
+        with:
+          entry: minimax2.7-w8a8-int8
+          suite: nightly-answer-8-minimax27-ppu
+          config: test/registered/ppu/answer_eval/configs/minimax2.7/w8a8-int8-144g.json
+          image: ${{ env.PPU_BASE_IMAGE }}
+          pod_timeout_minutes: 270
+          timeout_per_file: 14400
+          artifactory_user: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          artifactory_password: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}

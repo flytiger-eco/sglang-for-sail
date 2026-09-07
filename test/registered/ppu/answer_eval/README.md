@@ -195,12 +195,33 @@ everything around the test differs, while the test itself does not:
   PPUs so that no second pod can land on the board and contend for a device with
   a server that has already claimed most of its memory. The internal btv1.5 plan
   schedules its answer cases as `1node8ppu` for the same reason.
-- **Matrix.** Twelve entries, `max-parallel: 8`, so at most eight boards are held
-  at once. Each carries an `entry` slug distinct from its suite, because three
-  entries share `nightly-answer-8-ppu` and three more share
+- **Lanes, not a matrix.** Twelve entries, one job id each, arranged into eight
+  lanes so at most eight boards are held at once: four lanes carry two entries,
+  the second declaring `needs` on the first, and four carry one. A matrix would
+  have been the obvious shape and was the first one tried, and it does not work
+  above `max-parallel: 1`. `flytiger-eco/ppu-distributed-action` builds both the
+  NAS directory it stages the source to and the name of the K8s job it submits
+  out of `$GITHUB_JOB`, and a matrix leg is not a separate job id — so twelve
+  legs staged into one directory, and the second leg to copy a git pack file,
+  mode 444, died on `EPERM`; all twelve failed within two minutes of starting
+  (run 34082162222). Had the copy succeeded they would then have submitted twelve
+  pods under one K8s job name, each leg's cleanup deleting the others' pods. The
+  value cannot be redirected from the caller either: `GITHUB_JOB` is set by the
+  runner and a job-level `env:` entry of the same name does not override it
+  (measured, run 34084233664), and the pod name comes from an expression the
+  action fixes at step level. `needs` with `if: ${{ !cancelled() }}` is the
+  `fail-fast: false` of this shape — a lane's second entry runs on its
+  predecessor's verdict whether that verdict was green or red, while a cancelled
+  run stops asking for boards. Each entry carries a slug distinct from its suite,
+  because three entries share `nightly-answer-8-ppu` and three more share
   `nightly-answer-8-glm52-ppu`: the slug is what names the NAS results directory
   and the artifact, and `upload-artifact@v4` fails outright on a repeated name.
-  `--suite` still receives `matrix.suite`, which is the registered name.
+  `--suite` still receives the registered name.
+- **One body, twelve jobs.** The three steps every entry runs are a local
+  composite action, `.github/actions/ppu-answer-entry`, rather than twelve copies
+  in the workflow; each job checks the reviewed ref out and calls it with the
+  entry's own parameters. The secrets the pod needs are inputs there, because a
+  composite action cannot read the `secrets` context.
 - **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
   rather than under `qwen/v3.5/` as on the ZW810E line; the 27B path is the same
   on both. The path is a per-config field, so this costs nothing beyond the two
@@ -210,8 +231,9 @@ everything around the test differs, while the test itself does not:
   report travels over the NAS that both sides mount: the pod writes
   `SGLANG_PPU_ANSWER_RESULTS_DIR` under `/mnt/wl_nas/devops/<run>/<job>/`, and the
   orchestration shell reads the same bytes under `/wl_nas/...`, publishes the
-  summary, and uploads the artifact. The entry slug is part of the path because
-  `github.job` is identical for every matrix entry. The NAS copy is read and left
+  summary, and uploads the artifact. The entry slug is part of the path as well
+  as the job id, so the directory reads without a mapping from one to the other.
+  The NAS copy is read and left
   in place rather than moved: the pod writes as root and the orchestration shell
   is a different, non-root uid, so it can read those bytes but not unlink them.
   A step summary does not survive this runner at all, so the failing cases reach
@@ -426,7 +448,7 @@ within 27s of rank 0.
 
 **The workflow is its own file, and dispatch only.**
 `.github/workflows/test-ppu-answer-32-k8s.yml` claims four whole boards, so it is
-not a third entry in the btv1.5 matrix — sharing that matrix would make every
+not one more lane in the btv1.5 workflow — adding it there would make every
 routine btv1.5 dispatch ask the cluster for four more boards — and it is not
 wired into any nightly caller until it has passed once. `nnodes: 4` is what makes
 the action gang-schedule: it creates a PodGroup with `minMember: 4`, so the group
@@ -606,7 +628,7 @@ this one, which is consistent with the arithmetic above.
 **Time.** The measured page-cache warm rate is about 4.15 s/GiB at
 `WARM_PARALLELISM` 8 on both boards — 26m17s for 379.0 GiB on ZW810E, 3m34s for
 51.7 GiB on ZW-M890P — which puts the 704.4 GiB entries near 49 minutes of warm
-before a weight load begins. The matrix budgets follow from that: pod timeouts of
+before a weight load begins. The per-entry budgets follow from that: pod timeouts of
 210 to 330 minutes and `timeout-per-file` of 10800 or 14400 seconds, with the
 larger figures on the GLM and MiniMax entries. `est_time` is 7200 for GLM,
 MiniMax, both 2.4T suites, and the two-node Kimi one, and 5400 for the
