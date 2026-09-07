@@ -12,10 +12,12 @@ Their server arguments come from the internal btv1.5 answer_144g plan:
 and the GLM-5.x INT8 cases are argument-identical), `glm-5.2-fp8_3001` for the
 MXFP4 entry, and `glm-5.2-fp8_channel_cp_3001` for the channelwise one, which is
 the only entry here that turns on prefill context parallelism.  The deviations
-from those cases are listed in README.md; the substantive one is that
-`quantization` is left unset so each checkpoint's own `quantization_config`
-decides, which is what lets one set of arguments serve three different weight
-formats.
+from those cases are listed in README.md.  Two of the three leave `quantization`
+unset so each checkpoint's own `quantization_config` decides, which is what lets
+one set of arguments serve differently quantized weights; the INT8 entry has to
+name `w8a8_int8` instead, because reading that choice off the checkpoint routes
+its MoE layers into a compressed-tensors scheme built only for NPU (measured, run
+34085800820).
 
 Only one of the three runs per job: the workflow names the config in
 `SGLANG_PPU_ANSWER_TEST_CONFIG` and the class falls back to the default when it

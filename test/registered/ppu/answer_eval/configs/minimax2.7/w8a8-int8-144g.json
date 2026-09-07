@@ -24,7 +24,7 @@
       "tp_size": 8,
       "attention_backend": "fa3",
       "mem_fraction_static": 0.8,
-      "quantization": null,
+      "quantization": "w8a8_int8",
       "reasoning_parser": "minimax",
       "watchdog_timeout": 600
     }

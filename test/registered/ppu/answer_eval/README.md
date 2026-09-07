@@ -168,12 +168,17 @@ memory fraction 0.8; the 27B is TP=1, FA3, 0.85, and `unquant`, which is how
 is TP=8 × PP=4 and the MXFP4-FP8 one TP=8 × PP=2; GLM-5.2 serves through the
 sparse `dsa` backend with `flashmla_sparse` prefill and `flashmla_kv` decode, and
 Kimi-K2.6 names `fa3` prefill against `flashmla` decode with no unified backend at
-all. Eleven of the fifteen configs leave the quantization flag off so the
-checkpoint's own declaration stands; the two Qwen3.5 W8A8-INT8 ones name
-`w8a8_int8`, the one format the internal cases do name, and the two BF16 ones say
-`unquant` — see
-[Parity with the internal launcher](#parity-with-the-internal-launcher). Each
-config carries the `watchdog_timeout` its source case carries, 600 everywhere
+all. Every config whose checkpoint the loader handles unaided leaves the
+quantization flag off so the checkpoint's own declaration stands; the W8A8-INT8
+ones name `w8a8_int8` and the BF16 ones say `unquant` — see
+[Parity with the internal launcher](#parity-with-the-internal-launcher). Naming
+`w8a8_int8` is required rather than cosmetic: read off the checkpoint instead, that
+format resolves to the compressed-tensors path, whose W8A8-INT8 fused-MoE scheme
+raises `NotImplementedError` outside NPU
+(`sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py`), which
+is how the GLM-5.2 and MiniMax-M2.7 INT8 entries first failed (run 34085800820)
+while the Qwen3.5 one, which already named the format, served the same suite.
+Each config carries the `watchdog_timeout` its source case carries, 600 everywhere
 except the GLM-5.2 channelwise entry's 24000.
 
 ## The ZW-M890P line
@@ -263,6 +268,20 @@ everything around the test differs, while the test itself does not:
 - **Warm.** The page-cache warm runs inside the pod, immediately before
   `run_suite.py`. It has to: the cache it warms belongs to the node that will then
   load the weights, which no orchestration-shell step can reach.
+- **Gloo interface.** The board script exports `GLOO_SOCKET_IFNAME=lo`. Gloo picks
+  its address by resolving the pod's own hostname, and on some nodes of this
+  cluster that hostname has no address: across the eight nodes one batch landed
+  on, six ranks logged torch's own `Unable to resolve hostname to a (local)
+  address ... Manually set the network interface to bind to with
+  GLOO_SOCKET_IFNAME` and fell back to loopback, while two raised out of the
+  fallback — `[enforce fail at .../gloo/transport/tcp/device.cc:99] rv == 0. -5 vs
+  0`, `EAI_NODATA` — and killed three entries at `torch.distributed.new_group`
+  before a weight was read (run 34085800820, nodes swu10/swu12/swu15). The failure
+  did not track the attention backend or the checkpoint, and no two of the eight
+  entries shared a node, so it is the node's resolver rather than contention.
+  Naming the interface takes the resolver out of the path. `lo` is right for this
+  script and only this script: its entries are single pods whose ranks are
+  processes in one network namespace. The four-node script must not copy it.
 
 The board's identity and capacity are measured rather than assumed. An inventory
 probe submitted to this cluster on 2026-09-02 reported eight devices named
@@ -569,15 +588,19 @@ Seven of the twelve entries name a source case that does not carry their
 checkpoint, in four groups. That is the plan's own situation rather than a
 substitution:
 
-- **GLM-5.2 W8A8-INT8.** The plan has no GLM-5.2 W8A8 case. The nearest is
-  `glm-5.1-w8a8-int8_3001`, whose parameters are identical to
+- **GLM-5.2 W8A8-INT8.** The plan has no GLM-5.2 W8A8 case, and neither does the
+  btv1.5 `server_cmds` set, which lists only `fp8-channel` and `mxfp4-fp8` for
+  GLM-5.1 and GLM-5.2 alike; this entry exists because the NAS holds the weights.
+  The nearest case is `glm-5.1-w8a8-int8_3001`, whose parameters are identical to
   `glm-5-w8a8-int8_3001`, so the W8A8 serving line is stable across those
-  revisions and is what this entry carries.
+  revisions and is what this entry carries, with `quantization` named for the
+  reason given under the departures below.
 - **Kimi-K2.6, the W4A8 and MXFP4 formats.** `kimi-k2.6-w8a8-int8_3001` is the
   only Kimi answer case, and its own format is the third entry below, so for
   these two what carries over is everything that is not format-specific — TP=8,
-  `fa3` prefill against `flashmla` decode, memory fraction 0.8 — and the
-  quantization flag is dropped rather than renamed.
+  `fa3` prefill against `flashmla` decode, memory fraction 0.8. The MXFP4 entry
+  leaves the quantization flag off, which its checkpoint's own declaration
+  covers; the W4A8 one is the open gap recorded under the departures below.
 - **MiniMax-M2.7, all three formats.** `minimax-m3-bf16_3001` is the only MiniMax
   case on the sglang side; `minimax-m3-mxfp4-fp8_3001` exists on the vllm side
   only. Its parameters are TP=8, `fa3`, 0.8, and `watchdog_timeout` 600, none of
@@ -592,7 +615,7 @@ checkpoint, which is why it is the only Kimi config that states a `quantization`
 at all. It departs from that case in topology instead, for a reason of
 arithmetic recorded under Capacity below.
 
-**Where these ports depart from their sources.** Four departures beyond the
+**Where these ports depart from their sources.** Six departures beyond the
 deterministic generation line already described in
 [Relation to the internal test cases](#relation-to-the-internal-test-cases):
 
@@ -612,6 +635,21 @@ deterministic generation line already described in
   the reason already recorded for the Qwen entries: the requests ask for
   `separate_reasoning`, and the parser is what keeps a reasoning block out of the
   graded text.
+- The GLM-5.2 and MiniMax-M2.7 W8A8-INT8 entries name `quantization` where their
+  source cases leave it to the checkpoint. This is forced, not preferred: those
+  checkpoints declare compressed-tensors, and that path's W8A8-INT8 fused-MoE
+  scheme raises `NotImplementedError` on anything but NPU, which is how both
+  entries failed before the flag was added (run 34085800820). Naming the format
+  routes the MoE layers to the `w8a8_int8` implementation the Qwen3.5 entry has
+  been serving this suite with.
+- `kimi2.6-w4a8-int8` has no equivalent escape and is an open gap. Its checkpoint
+  is W-INT4-per-channel against A-INT8-per-token, `BASE_QUANTIZATION_METHODS`
+  offers no `w4a8_int8`, and `w4afp8` is a different activation type, so the
+  loader's own choice of `mixed_precision_w4` is the only route available. That
+  route reached the board and failed inside the kernel — `[ACEXT][ERROR] CUDA
+  runtime error: invalid argument` from `compute_occupancy.h:59`, under
+  `acext.fusedmoe_wrapper` — which no server parameter this schema carries can
+  redirect.
 
 **One value here is a judgement, not a measurement.** The three MiniMax entries
 carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,

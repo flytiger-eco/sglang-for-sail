@@ -46,6 +46,19 @@ export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
 export PPU_SUPPORTS_FP8=0
 export SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1
 
+# Gloo carries the CPU side of every process group SGLang creates, and it picks
+# its address by resolving the pod's own hostname. On four of the eight nodes
+# this batch landed on, that hostname has no address: six ranks logged torch's
+# "Unable to resolve hostname to a (local) address ... Manually set the network
+# interface to bind to with GLOO_SOCKET_IFNAME" and fell back to loopback, while
+# the other two raised out of the fallback instead, killing three entries at
+# `new_group` before any weight was read (measured, run 34085800820, nodes
+# swu10/swu12/swu15). Naming the interface takes the resolver out of the path,
+# which torch's own message prescribes. `lo` is correct here and only here: this
+# script serves the single-pod entries, whose ranks are processes in one network
+# namespace. The multi-node script must not copy it.
+export GLOO_SOCKET_IFNAME=lo
+
 cd /workspace/source
 git config --global --add safe.directory /workspace/source
 SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)

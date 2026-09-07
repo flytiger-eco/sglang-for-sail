@@ -9,9 +9,12 @@ Three reviewed configs share this file:
 The server arguments come from the internal btv1.5 answer_144g case
 `minimax-m3-bf16_3001`, the only MiniMax entry the sglang plan carries: tp 8, the
 fa3 backend, `mem_fraction_static` 0.8 and a 600-second watchdog.  The
-checkpoints here are quantized rather than BF16, so `quantization` is left unset
-and each one's own `quantization_config` decides.  All three fit one board group
-comfortably: the largest holds 214.6 GiB against a 921 GiB static pool.
+checkpoints here are quantized rather than BF16, so the two whose format the
+loader handles unaided leave `quantization` unset and each one's own
+`quantization_config` decides; the INT8 entry names `w8a8_int8`, because that
+format read off the checkpoint routes its MoE layers into a compressed-tensors
+scheme built only for NPU (measured, run 34085800820).  All three fit one board
+group comfortably: the largest holds 214.6 GiB against a 921 GiB static pool.
 
 This model's chat template reads no reasoning switch at all -- its generation
 prompt opens `<think>` unconditionally -- so the reasoning pass cannot be turned
