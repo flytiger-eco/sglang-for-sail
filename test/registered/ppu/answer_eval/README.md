@@ -199,6 +199,21 @@ the resolver failure recorded under
 watchdog is what makes a wedged forward give the board back promptly and 600 has
 been measured to be enough.
 
+`SGLANG_WARMUP_TIMEOUT` is 3600 on every config, the one value the btv1.5
+`server_cmds` set uses — all 121 commands across its thirteen model files, without
+an exception to carry over. Unlike `dist_timeout` this one has measured headroom
+behind it. It bounds the single warmup request `_wait_and_warmup` sends before the
+server reports itself ready, and unset it is not unbounded: `http_server.py` falls
+back to 600 seconds, and a warmup that overruns kills the process tree rather than
+failing soft. That request is where DeepGEMM compiles the kernels the first real
+forward needs, and on the 144GiB board it took 65 seconds for Kimi-K2.6 MXFP4 and
+299 to 325 for the three Qwen3.5 entries — better than half the default already,
+and not a warm-cache best case either, since those requests log
+`Try DeepGEMM JIT Compiling` while they run (run 34085800820). The much larger
+figures in those logs belong to CUDA-graph capture, 621 to 1009 seconds, which
+finishes before the HTTP server listens and is bounded by
+`startup_timeout_seconds` instead.
+
 ## The ZW-M890P line
 
 `.github/workflows/test-ppu-answer-k8s.yml` runs the single-board suites against
@@ -633,7 +648,7 @@ checkpoint, which is why it is the only Kimi config that states a `quantization`
 at all. It departs from that case in topology instead, for a reason of
 arithmetic recorded under Capacity below.
 
-**Where these ports depart from their sources.** Seven departures beyond the
+**Where these ports depart from their sources.** Eight departures beyond the
 deterministic generation line already described in
 [Relation to the internal test cases](#relation-to-the-internal-test-cases):
 
@@ -672,6 +687,12 @@ deterministic generation line already described in
   the btv1.5 `server_cmds` set uses for each model; the reasoning, and the reason
   it is not paired with `watchdog_timeout` the way those commands pair it, is under
   [Runner configuration](#runner-configuration) above.
+- `SGLANG_WARMUP_TIMEOUT` reaches every config, where only the GLM-5.2 channelwise
+  port carried it from its own source case. The btv1.5 set puts 3600 on every
+  command it lists, and the measurement under
+  [Runner configuration](#runner-configuration) says why that is worth following
+  rather than a formality: the fallback this replaces is 600 seconds, half of which
+  the Qwen3.5 entries already spend.
 
 **One value here is a judgement, not a measurement.** The three MiniMax entries
 carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,

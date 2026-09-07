@@ -35,6 +35,7 @@
       "disable_shared_experts_fusion": true
     },
     "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600,
       "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8": "0"
     }
   },

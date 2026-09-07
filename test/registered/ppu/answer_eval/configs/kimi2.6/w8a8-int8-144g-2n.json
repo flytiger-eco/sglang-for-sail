@@ -33,6 +33,9 @@
       "dist_timeout": 6000,
       "watchdog_timeout": 600,
       "disable_piecewise_cuda_graph": true
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
     }
   },
   "request": {

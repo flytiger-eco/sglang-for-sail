@@ -27,6 +27,9 @@
       "quantization": "unquant",
       "reasoning_parser": "qwen3",
       "watchdog_timeout": 600
+    },
+    "env": {
+      "SGLANG_WARMUP_TIMEOUT": 3600
     }
   },
   "request": {
