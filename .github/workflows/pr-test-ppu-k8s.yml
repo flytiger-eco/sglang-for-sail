@@ -123,6 +123,7 @@ jobs:
           nproc_per_node: 1
           node_selector: "board-type=OAM-810E"
           command: |
+            ppu-smi
             mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
             [global]
             index-url = https://mirrors.aliyun.com/pypi/simple/
@@ -136,9 +137,8 @@ jobs:
             cd test &&
             python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_TEST_MAX_RETRY=0,CUDA_VISIBLE_DEVICES=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
+          extra_env: "SGLANG_IS_IN_CI=true,SGLANG_TEST_MAX_RETRY=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
           container_options: |
-            privileged: true
             host_ipc: true
             shm_size: 8Gi
           artifact_paths: |
@@ -179,6 +179,7 @@ jobs:
           nproc_per_node: 1
           node_selector: "board-type=OAM-810E"
           command: |
+            ppu-smi
             mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
             [global]
             index-url = https://mirrors.aliyun.com/pypi/simple/
@@ -192,9 +193,8 @@ jobs:
             cd test &&
             python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "SGLANG_IS_IN_CI=true,CUDA_VISIBLE_DEVICES=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
+          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
           container_options: |
-            privileged: true
             host_ipc: true
             shm_size: 8Gi
           artifact_paths: |
@@ -235,6 +235,7 @@ jobs:
           nproc_per_node: 2
           node_selector: "board-type=OAM-810E"
           command: |
+            ppu-smi
             mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
             [global]
             index-url = https://mirrors.aliyun.com/pypi/simple/
@@ -251,7 +252,6 @@ jobs:
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
           extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,SGL_KERNEL_WHEEL_DIR=/workspace/source/sgl-kernel-wheel"
           container_options: |
-            privileged: true
             host_ipc: true
             host_network: true
             shm_size: 8Gi
