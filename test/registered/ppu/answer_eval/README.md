@@ -217,11 +217,25 @@ everything around the test differs, while the test itself does not:
   `nightly-answer-8-glm52-ppu`: the slug is what names the NAS results directory
   and the artifact, and `upload-artifact@v4` fails outright on a repeated name.
   `--suite` still receives the registered name.
-- **One body, twelve jobs.** The three steps every entry runs are a local
-  composite action, `.github/actions/ppu-answer-entry`, rather than twelve copies
-  in the workflow; each job checks the reviewed ref out and calls it with the
-  entry's own parameters. The secrets the pod needs are inputs there, because a
-  composite action cannot read the `secrets` context.
+- **One body, twelve jobs.** The two long shell bodies each entry runs — the
+  board-side one that installs, warms and calls `run_suite.py`, and the
+  orchestration-side one that carries the report off the NAS — are
+  `scripts/ci/ppu/run_answer_suite_board.sh` and
+  `scripts/ci/ppu/collect_answer_evidence.sh`, so twelve jobs do not carry twelve
+  copies of them; what the workflow still states per entry is the K8s action's
+  inputs. A local composite action would have been the tidier shape and does not
+  work on this runner group: it drives the job through a container hook, so
+  `actions/checkout` populates a workspace inside the container
+  (`/__w/sglang-for-sail/sglang-for-sail`) while the runner resolves `uses: ./`
+  against its own filesystem (`/home/runner/_work/...`), and all twelve jobs
+  failed on a missing `action.yml` seconds after a checkout that reported success
+  (run 34085102675). A `uses:` naming a published repository is unaffected,
+  because the runner downloads that itself, which is why the K8s action works at
+  all — and it is the same split filesystem that silently drops
+  `GITHUB_STEP_SUMMARY` here. Everything the pod needs that does not vary between
+  entries is exported by the board script rather than repeated in twelve
+  `extra_env` strings; the secrets, the provenance of the run and the four values
+  that do vary are passed.
 - **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
   rather than under `qwen/v3.5/` as on the ZW810E line; the 27B path is the same
   on both. The path is a per-config field, so this costs nothing beyond the two
