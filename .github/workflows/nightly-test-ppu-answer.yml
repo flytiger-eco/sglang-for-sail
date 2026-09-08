@@ -190,6 +190,7 @@ jobs:
               git config --global --add safe.directory /workspace && \
               JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
               { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/jit_kernel -type f -exec touch -d @\$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } && \
+              . scripts/ci/ppu/use_local_jit_cache.sh && \
               cd test && \
               python3 run_suite.py --hw ppu --suite ${{ matrix.suite }} --nightly --timeout-per-file ${{ matrix.timeout_per_file }}
             "

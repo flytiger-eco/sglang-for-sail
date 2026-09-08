@@ -90,6 +90,11 @@ if [ "$JIT_MTIME" != 0 ]; then
   echo 'Pinned JIT source mtimes'
 fi
 
+# The JIT build directory moves off the shared NAS cache before anything can
+# compile; the script it comes from records why.
+# shellcheck source=scripts/ci/ppu/use_local_jit_cache.sh
+. scripts/ci/ppu/use_local_jit_cache.sh
+
 # The warm sits immediately before the load, on the node that will do the
 # loading, which no step of the orchestration shell could do; the measured host
 # reclaims the cache within thirty minutes, so a warm separated from its load is
