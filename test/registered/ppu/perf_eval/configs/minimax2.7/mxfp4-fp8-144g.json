@@ -31,6 +31,7 @@
       "tool_call_parser": "minimax-m2",
       "dist_timeout": 3600,
       "watchdog_timeout": 3600,
+      "disable_radix_cache": true,
       "disable_custom_all_reduce": true
     },
     "env": {

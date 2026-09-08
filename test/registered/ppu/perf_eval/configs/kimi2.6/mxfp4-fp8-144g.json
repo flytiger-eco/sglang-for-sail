@@ -36,6 +36,7 @@
       "quantization": null,
       "dist_timeout": 3600,
       "watchdog_timeout": 3600,
+      "disable_radix_cache": true,
       "disable_piecewise_cuda_graph": true
     },
     "env": {

@@ -47,6 +47,7 @@
       "tool_call_parser": "glm47",
       "dist_timeout": 3600,
       "watchdog_timeout": 3600,
+      "disable_radix_cache": true,
       "disable_shared_experts_fusion": true,
       "disable_custom_all_reduce": true,
       "enforce_disable_flashinfer_allreduce_fusion": true,

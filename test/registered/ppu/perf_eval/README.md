@@ -125,6 +125,30 @@ byte-identical in every reviewed parameter to `glm_5_2_mxfp4-fp8_64000_1_0001.js
 under a second file name, and porting it a second time would only produce a
 duplicate annotation. That is what takes the 21 source cases to 20 measurements.
 
+### Where the case files are not the whole parameter set
+
+btv1.5 carries the parameters twice: once as the case JSON under
+`model-test-cases/testcases/btv1.5/`, and once as the launch command line under
+`model-test-cases/server_cmds/LLM_Serving/BTV1.5/`. The two disagree in both
+directions, so a config that matches only one of them is not aligned.
+
+A case JSON key set to `0` or `false` is *not* passed on the command line, and is
+therefore not a departure when a config omits it. `enable_flashinfer_mla` and
+`enable_flashmla` are `false` in every reviewed case and appear in no config;
+`page_size` is carried only where the command line carries `--page-size` (the two
+Qwen families, at 64) and omitted where the case value is 0.
+
+The reverse case is `--disable-radix-cache`, which appears on the command line
+and has no key in the case JSON at all. All 65 SGLang commands under the
+`Chapter 2: Perf-Cases` heading of the five ported families carry it, and none of
+the `Chapter 3: Eval-Cases` commands do — the prefix cache is off for the
+performance line and on for the accuracy line. Every config therefore sets
+`disable_radix_cache: true`. Measurements taken before this was corrected are not
+invalidated by it: the first shakeout ran with `disable_radix_cache=False` and
+still logged `#cached-token: 0` on all 100 requests, because a `random-ids`
+workload at `random_range_ratio` 1.0 and concurrency 1 shares no prefix. The flag
+is set for parity with the source cases, not to undo an inflated number.
+
 ## Environment
 
 The config's `server.env` is passed through to the server process by name, and

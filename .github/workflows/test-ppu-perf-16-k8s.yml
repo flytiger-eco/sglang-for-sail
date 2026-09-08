@@ -158,6 +158,9 @@ jobs:
               find python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} +
               echo 'Pinned JIT source mtimes'
             fi
+            # The JIT build directory moves off the shared NAS cache before
+            # anything can compile; the script it comes from records why.
+            . scripts/ci/ppu/use_local_jit_cache.sh
             # No page-cache warm here, as on the four-node entry: the checkpoint
             # does fit in one node's memory, but under pp 2 each node loads
             # roughly its own half, so a warm of the whole tree would read twice

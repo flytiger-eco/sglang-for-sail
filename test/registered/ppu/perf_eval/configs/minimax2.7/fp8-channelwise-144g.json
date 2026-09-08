@@ -30,7 +30,8 @@
       "reasoning_parser": "minimax-append-think",
       "tool_call_parser": "minimax-m2",
       "dist_timeout": 3600,
-      "watchdog_timeout": 3600
+      "watchdog_timeout": 3600,
+      "disable_radix_cache": true
     },
     "env": {
       "SGLANG_WARMUP_TIMEOUT": 3600
