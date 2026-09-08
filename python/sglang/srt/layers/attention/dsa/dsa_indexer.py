@@ -649,6 +649,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         cu_seq_len_k_start: torch.Tensor,
         cu_seq_len_k_end: torch.Tensor,
         clean_logits: bool = True,
+        force_unfused_topk: bool = False,
     ):
         if self.use_fp4:
             # FP4 path: q = (q_packed_uint8, q_sf_int32), kv = (k_packed_uint8, k_sf_int32_byte).
@@ -667,10 +668,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # [DSV4-BF16-TOPK] FP4 path must emit bf16 logits so the dsv4
-                # bf16 per-row topk kernel can consume them directly (default
-                # would be fp32, which falls back to fast_topk_transform_fused).
-                logits_dtype=torch.bfloat16,
+                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
+                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
             )
 
         assert isinstance(q, torch.Tensor)
@@ -683,6 +682,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.bf16_indexer:
             kv_cache = kv[0].view(torch.bfloat16)
+            # bf16 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
             return deep_gemm.bf16_mqa_logits(
                 q,
                 kv_cache,
@@ -693,6 +693,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif self.use_fp8:
             kv_cache = (kv[0].view(torch.float8_e4m3fn), kv[1])
+            # fp8 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
             return deep_gemm.fp8_mqa_logits(
                 q,
                 kv_cache,
@@ -710,10 +711,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # [DSV4-BF16-TOPK] INT8 path must emit bf16 logits so the dsv4
-                # bf16 per-row topk kernel can consume them directly (default
-                # would be fp32, which falls back to fast_topk_transform_fused).
-                logits_dtype=torch.bfloat16,
+                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
+                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
             )
         raise NotImplementedError
 
@@ -1625,6 +1624,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks,
                         ke,
                         clean_logits=False,
+                        force_unfused_topk=getattr(
+                            metadata, "force_unfused_topk", False
+                        ),
                     )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
@@ -1686,6 +1688,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
+                        force_unfused_topk=getattr(
+                            metadata, "force_unfused_topk", False
+                        ),
                     )
 
             lengths_chunk = seq_lens_expanded[start:end]
@@ -1916,6 +1921,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
+                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
                 )
             topk_result = metadata.topk_transform(
                 logits,
@@ -1972,6 +1978,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     ks,
                     ke,
                     clean_logits=False,
+                    force_unfused_topk=getattr(metadata, "force_unfused_topk", False),
                 )
             actual_seq_q = torch.tensor([actual_seq_q], dtype=torch.int32).to(
                 device="cuda", non_blocking=True
