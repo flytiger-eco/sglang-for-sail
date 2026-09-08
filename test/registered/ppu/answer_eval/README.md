@@ -1133,10 +1133,76 @@ Two entries error rather than grade, and both are known:
   `build_label_candidates` then builds a label record whose `candidate_answer` is
   that empty string, which violates the annotation invariant that exactly one
   candidate-answer field be non-empty, and the whole report build raises instead.
-  The fix is to skip an empty final answer when selecting label candidates, the
-  same way infrastructure failures are already skipped there; it is a kit
-  robustness gap unrelated to the three fixes above, none of which touch response
-  parsing or candidate selection.
+  `3c46b11d9c` skips an empty final answer when selecting label candidates, the
+  same way infrastructure failures are already skipped there, so this entry reports
+  9/10 rather than raising. It was a kit robustness gap unrelated to the three fixes
+  above, none of which touch response parsing or candidate selection, and it is not
+  yet confirmed on a run of this entry.
+
+## The two-node line — measured
+
+The first two-node run to reach a verdict is
+[run 34132812028](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34132812028),
+2026-09-07, with the pods at `61dd1838`. One of the two entries graded:
+
+| Entry | Passed | Failing / error | Note |
+| --- | --- | --- | --- |
+| `qwen3.8-2.4t-a95b-mxfp4-fp8` | 10/10 | — | one suspect: `henan-bordering-provinces`, 4-gram coverage 0.55 |
+| `kimi2.6-w8a8-int8` | error | — | all ten `server_start_failed`; PP defect below |
+
+That 10/10 is what the gloo derivation was for: on the run before it every case of
+this entry was `server_start_failed` six minutes in, and here both nodes reached
+ready and graded. The suite itself took 1903.5 s and the job 47m53s, against an
+`est_time` of 7200 for this suite — the first measured figure that could replace it.
+
+`kimi2.6-w8a8-int8` failed before serving, and its cause is not in the traceback it
+printed. All sixteen schedulers — `PP0 TP0` through `PP0 TP7` on rank 0 and
+`PP1 TP0` through `PP1 TP7` on rank 1 — raised `RecursionError: maximum recursion
+depth exceeded` out of torch's `named_parameters`, both node status files recorded
+255, and all ten cases came back `server_start_failed`. What actually happened is a
+PP defect hidden by a `LazyValue` one, fixed together in `7559dea240`:
+
+- `DeepseekV2ForCausalLM`, which is this checkpoint's language model, built its
+  `routed_experts_weights_of_layer` by walking `enumerate(self.model.layers)` and
+  reading `layer.mlp`. Under `pp_size > 1` `make_layers` pads that list with
+  `PPMissingLayer` for every layer another stage holds, and the placeholder has no
+  `mlp`, so the walk raises `AttributeError`. Every single-board entry runs at
+  `pp_size` 1 and never sees a placeholder, which is why this had not shown before
+  a two-node entry graded. It now walks
+  `range(self.model.start_layer, self.model.end_layer)`, the bounds `qwen3_5` and
+  `gpt_oss` already use. `GlmMoeDsaForCausalLM` subclasses this class and is
+  carried by the same fix.
+- `LazyValue` is what turned that `AttributeError` into the `RecursionError`.
+  `__getattr__` forwarded to `self.value`, and Python falls back to `__getattr__`
+  not only for a name an object lacks but also whenever a property getter raises
+  `AttributeError` — so the creator's error arrived back at `__getattr__` under the
+  name `value`, which read `self.value` again, which ran the creator again, since
+  it is only retired on success. 981 rounds of that exhausted the stack, and what
+  got reported was wherever the last round happened to stand. Names the class owns
+  now stop at `__getattr__`, and a creator's `AttributeError` is re-raised as
+  `RuntimeError` with the original attached: a bare `AttributeError` leaving the
+  getter is indistinguishable from `value` being absent, and the caller reads the
+  property as `getattr(model, name, None)`, where it would be swallowed into a
+  silent `None` — a model that failed to build its expert list would present as a
+  model with no experts. `TestLazyValue` in
+  `test/registered/unit/utils/test_common.py` locks both halves.
+
+Three other creators in this tree have the same `enumerate` shape and would fail
+the same way under `pp_size > 1`: `mimo_v2.py`, `glm4_moe_lite.py`, and
+`qwen3_next.py`. None of the three is an entry of any suite here, so none can be
+verified on this fleet, and they are recorded rather than changed.
+
+**A lost evidence upload no longer reports a passing suite as failed.** Both jobs
+of that run ended `failure`, and for the 10/10 entry the only non-green step was
+the artifact upload: `CreateArtifact` was reset (`ECONNRESET`) four seconds after
+the step announced thirteen files, with no retry of its own. The verdict was never
+at risk — it leaves the collect step over annotations, and rank 0's log carries the
+per-case table — but the run page said failed. `7559dea240` marks the upload
+`continue-on-error`, waits 30 seconds, and tries once more with `overwrite: true`,
+which v4 needs because the first attempt can be reset after it has already created
+the artifact. Fourteen jobs across the three Answer workflows carry it. What a lost
+upload still costs is the machine-readable copy — `result.json`, `junit.xml`, and
+the logs of every rank but rank 0 — which exists nowhere else.
 
 ## Results and annotations
 
