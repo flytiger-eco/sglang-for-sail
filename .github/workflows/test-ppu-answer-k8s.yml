@@ -145,13 +145,40 @@ jobs:
           ENTRY: qwen3.8-27b-bf16
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/qwen3.8-27b-bf16
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
+      # Best effort, and deliberately so: the verdict has already left this job
+      # over the annotations the step above prints, so a reset on the github
+      # egress here must not turn a passing suite red. Measured on run
+      # 34132812028, whose two-node entry passed all ten cases and was still
+      # reported failed because CreateArtifact was reset four seconds in, with
+      # no retry of its own. What a lost upload costs is the machine-readable
+      # copy -- result.json, junit.xml, and the logs of every rank but rank 0 --
+      # which exists nowhere else; the counts and each failing case stay in the
+      # job log either way.
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-qwen3.8-27b-bf16-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-qwen3.8-27b-bf16-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # 116 GiB of weights, and the smallest of the new entries; it also cannot be
@@ -207,12 +234,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/minimax2.7-mxfp4-fp8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lane B: the one entry already verified on this board, and the longest single
@@ -265,12 +310,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/qwen3.5-397b-w8a8-int8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-qwen3.5-397b-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-qwen3.5-397b-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lanes C and D: 704 GiB each, the largest single-board checkpoints here. The
@@ -324,12 +387,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/glm5.2-w8a8-int8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-glm5.2-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-glm5.2-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   glm52-fp8-chan:
@@ -380,12 +461,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/glm5.2-fp8-channelwise
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-glm5.2-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-glm5.2-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lane E: the two remaining Qwen3.5 formats, same checkpoint family and the
@@ -438,12 +537,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/qwen3.5-397b-mxfp4-fp8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   qwen35-397b-fp8-chan:
@@ -496,12 +613,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/qwen3.5-397b-fp8-channelwise
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lane F: the smaller GLM format, then the remaining MiniMax one.
@@ -553,12 +688,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/glm5.2-mxfp4-fp8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-glm5.2-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-glm5.2-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   minimax27-fp8-chan:
@@ -611,12 +764,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/minimax2.7-fp8-channelwise
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lane G: both single-board Kimi formats, one after the other.
@@ -668,12 +839,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-w4a8-int8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   kimi26-mxfp4:
@@ -726,12 +915,30 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/kimi2.6-mxfp4-fp8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30
 
   # Lane H: the last MiniMax format, alone, so eight boards are asked for and
@@ -784,10 +991,28 @@ jobs:
           ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/minimax2.7-w8a8-int8
         run: bash scripts/ci/ppu/collect_answer_evidence.sh
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-minimax2.7-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-minimax2.7-w8a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30

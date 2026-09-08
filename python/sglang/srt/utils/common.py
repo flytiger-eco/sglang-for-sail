@@ -3293,6 +3293,19 @@ class LazyValue:
         self._value = None
 
     def __getattr__(self, name):
+        # Names this class owns stop here instead of being forwarded. Python
+        # falls back to __getattr__ not only for names an object lacks but also
+        # whenever a property getter raises AttributeError, so a creator that
+        # raises one arrives here under the name "value"; forwarding that to
+        # self.value runs the creator again -- it is only retired on success --
+        # and the two call each other until the stack is gone. What the caller
+        # then sees is a RecursionError from wherever the last round happened to
+        # stand, not the error that started it. Measured on run 34132812028: a
+        # two-node Kimi K2.6 reported RecursionError out of torch's
+        # named_parameters after 981 rounds, and the missing attribute driving
+        # it was nowhere in the traceback.
+        if name == "value" or name.startswith("_"):
+            raise AttributeError(name)
         return getattr(self.value, name)
 
     def __getitem__(self, key):
@@ -3304,7 +3317,17 @@ class LazyValue:
     @property
     def value(self):
         if self._creator is not None:
-            self._value = self._creator()
+            try:
+                self._value = self._creator()
+            except AttributeError as e:
+                # Deliberately a different class. To the interpreter an
+                # AttributeError leaving this getter is indistinguishable from
+                # "value" being absent, so it would be spent on the fallback
+                # above -- or, where the caller reads the property through
+                # getattr(model, name, None), swallowed into a silent None.
+                raise RuntimeError(
+                    f"LazyValue creator {self._creator!r} raised AttributeError: {e}"
+                ) from e
             self._creator = None
         return self._value
 

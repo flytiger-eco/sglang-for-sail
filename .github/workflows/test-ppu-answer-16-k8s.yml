@@ -268,11 +268,31 @@ jobs:
             cat "${destination}/summary.md" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
+      # Best effort with one retry; see the note on the artifact egress in
+      # test-ppu-answer-k8s.yml.
       - name: Upload Answer evidence
+        id: upload_evidence
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: ppu-answer-k8s-16-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Answer evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-answer-k8s-16-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-answer-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the
+          # artifact, and v4 refuses a name it already holds.
+          overwrite: true
           retention-days: 30

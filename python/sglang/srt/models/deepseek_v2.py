@@ -2621,11 +2621,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
+        # Only the layers this pipeline stage owns. make_layers pads the list
+        # with PPMissingLayer for every layer another stage holds, and that
+        # placeholder has no mlp, so walking the whole list raises
+        # AttributeError as soon as pp_size > 1 -- measured on run 34132812028,
+        # where the two-node Kimi K2.6 entry, whose language model is this
+        # class, lost all eight ranks right after the weights were read. These
+        # are the same bounds qwen3_5 and gpt_oss enumerate.
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
         )
         self.capture_aux_hidden_states = False
