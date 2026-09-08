@@ -195,6 +195,15 @@ NIGHTLY_SUITES = {
         # Whole boards, one suite each.
         "nightly-perf-16-ppu",
         "nightly-perf-32-ppu",
+        # Prefill/decode-disaggregated serving, which is two servers of one
+        # checkpoint plus a router and so always holds more than one board: the
+        # number is again the devices the config declares, sixteen for a 1p1d of
+        # two eight-device boards. Its own suite rather than an entry in
+        # nightly-perf-16-ppu because the two lines run different code -- a PD
+        # node's role, and whether it measures at all, depends on the rank the
+        # launcher handed it -- and its own workflow for the reason every perf
+        # suite has one.
+        "nightly-pd-perf-16-glm52-ppu",
     ],
 }
 

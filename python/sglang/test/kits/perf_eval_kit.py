@@ -1203,6 +1203,18 @@ def perf_provenance(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     return provenance
 
 
+# The three sections a disaggregated config shares with a colocated one, exported
+# under public names so `pd_perf_eval_kit` can validate them with these functions
+# instead of a second copy: what a board is, what a checkpoint is and what a
+# measurement asks for are the same reviewed contract on both lines, and a copy
+# would let them drift.  Aliases rather than renames, because the callers inside
+# this module read better against the private names next to the ones that stay
+# private (`_validate_server` has no disaggregated meaning).
+validate_hardware = _validate_hardware
+validate_model = _validate_model
+validate_workload = _validate_workload
+
+
 __all__ = [
     "ALLOWED_SERVER_ENVIRONMENT",
     "EXTERNAL_SERVER_ENVIRONMENT",
@@ -1240,6 +1252,9 @@ __all__ = [
     "render_summary",
     "resolve_distributed_runtime",
     "resolve_measurement_plan",
+    "validate_hardware",
+    "validate_model",
     "validate_test_config",
+    "validate_workload",
     "write_report_files",
 ]

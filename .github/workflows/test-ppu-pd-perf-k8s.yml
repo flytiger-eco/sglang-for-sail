@@ -1,0 +1,157 @@
+name: PD Perf Test 16-PPU (PPU K8s)
+
+on:
+  # Dispatch only, and deliberately not wired into any nightly caller: this entry
+  # claims two whole ZW-M890P boards and has never had a measured run. It becomes
+  # a scheduled line once one has passed, not before.
+  #
+  # A workflow of its own rather than a lane in test-ppu-perf-k8s.yml, for the
+  # reason the colocated 16-board entry has one: that file is the routinely
+  # dispatched single-board path and every lane in it claims one board, so folding
+  # a two-board entry into it would make each dispatch ask the cluster for two
+  # more. What is genuinely new here is not the pod count but the shape of the run
+  # -- two servers of one checkpoint with a router in front and a KV path between
+  # them -- and the first thing this line has to establish is whether that shape
+  # comes up at all on these boards; see the README next to the config for the two
+  # unknowns it is dispatched to answer.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-pd-perf-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  PERF_SUITE: nightly-pd-perf-16-glm52-ppu
+  PD_CONFIG: test/registered/ppu/pd_perf_eval/configs/glm5.2/fp8-channelwise-144g-pd-1p1d-4k-1500.json
+
+jobs:
+  pd-perf-16-k8s:
+    name: nightly-pd-perf-16-glm52-ppu (btv1.5)
+    # The orchestration shell is CPU-only and holds no device; the action
+    # gang-schedules two worker pods, each onto a board carrying the label.
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # Bounded by the config's own 5400s startup budget per role -- the two loads
+    # proceed in parallel, so it is one budget, not two -- plus the endpoint
+    # exchange, one measurement of 80 requests at 4096 in / 1500 out, and the
+    # dependency install. The first measured run is what should replace this.
+    timeout-minutes: 270
+    env:
+      # Same NAS-as-transport arrangement as the colocated multi-board workflow:
+      # the pods write under /mnt/wl_nas and this shell reads the same bytes under
+      # /wl_nas. Here that directory carries a second load -- it is how the two
+      # nodes exchange their HTTP endpoints, their device inventories and rank 0's
+      # completion -- so it has to be the same path in every pod, which is why the
+      # suite refuses a relative one.
+      PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-glm52-ppu
+      PERF_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-glm52-ppu
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
+          # changes via `git diff HEAD~1`.
+          fetch-depth: 2
+      # Second attempt only if the first failed; see the note on the github.com
+      # egress in test-ppu-answer-k8s.yml.
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+
+      - name: Run nightly-pd-perf-16-glm52-ppu via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into a
+          # PodGroup with minMember 2, so the group either gets both boards or
+          # waits. That guarantee matters more here than on the colocated line: a
+          # prefill server whose decode peer never arrives holds a board for the
+          # whole peer-wait budget and then reports nothing. Eight per node is the
+          # whole board, which is what each role's tp 8 needs.
+          nnodes: 2
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          # The board body is a script rather than an inline command, as on the
+          # single-board entries: it is the same body on both nodes, and which role
+          # a node serves is decided from the rank the action injects, not here.
+          command: bash /workspace/source/scripts/ci/ppu/run_pd_perf_suite_node.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=${{ env.PERF_SUITE }},PERF_TIMEOUT_PER_FILE=13800,SGLANG_PPU_PD_PERF_TEST_CONFIG=/workspace/source/${{ env.PD_CONFIG }},SGLANG_PPU_PD_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 240
+
+      # Read, not moved: the pods write as root and this shell is a different,
+      # non-root uid, so an rm here fails with EPERM on every file and turns the
+      # step red even when the suite passed. What the copy brings back is rank 0's
+      # report plus, under ranks/, the endpoint each node published, one device
+      # inventory per node, each node's own log and each node's exit code. The
+      # report is the same schema the colocated line produces, which is why the
+      # collector needs no PD-specific variant.
+      - name: Collect PD Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: nightly-pd-perf-16-glm52-ppu
+          PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+
+      # Best effort with one retry; see the note on the artifact egress in
+      # test-ppu-answer-k8s.yml.
+      - name: Upload PD Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pd-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload PD Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pd-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          # The first attempt can be reset after it has created the artifact, and
+          # v4 refuses a name it already holds.
+          overwrite: true
+          retention-days: 30
