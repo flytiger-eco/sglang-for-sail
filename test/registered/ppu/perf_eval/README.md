@@ -63,13 +63,13 @@ one that was a duplicate, leaving 20 measurements in 12 configs and 7 suites.
 
 | Suite | Test file | Model | Configs | Measurements | Devices |
 | --- | --- | --- | --- | --- | --- |
-| `nightly-perf-2-minimax27-ppu` | `test_ppu_minimax_m27_perf.py` | MiniMax-M2.7 | 2 | 4 | 2 |
-| `nightly-perf-4-glm52-ppu` | `test_ppu_glm52_mxfp4_perf.py` | GLM-5.2 MXFP4-FP8 | 2 | 2 | 4 |
-| `nightly-perf-4-qwen35-ppu` | `test_ppu_qwen35_perf.py` | Qwen3.5-397B-A17B | 2 | 4 | 4 |
-| `nightly-perf-8-glm52-ppu` | `test_ppu_glm52_perf.py` | GLM-5.2 FP8-channelwise | 2 | 2 | 8 |
-| `nightly-perf-8-kimi26-ppu` | `test_ppu_kimi_k26_perf.py` | Kimi-K2.6 | 2 | 4 | 8 |
-| `nightly-perf-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_perf.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 2 | 16, over 2 nodes |
-| `nightly-perf-32-ppu` | `test_ppu_qwen38_a95b_perf.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 2 | 32, over 4 nodes |
+| `nightly-perf-2-minimax27-ppu` | `test_ppu_minimax_m27_prefill_perf.py` | MiniMax-M2.7 | 2 | 4 | 2 |
+| `nightly-perf-4-glm52-ppu` | `test_ppu_glm52_mxfp4_prefill_perf.py` | GLM-5.2 MXFP4-FP8 | 2 | 2 | 4 |
+| `nightly-perf-4-qwen35-ppu` | `test_ppu_qwen35_prefill_perf.py` | Qwen3.5-397B-A17B | 2 | 4 | 4 |
+| `nightly-perf-8-glm52-ppu` | `test_ppu_glm52_prefill_perf.py` | GLM-5.2 FP8-channelwise | 2 | 2 | 8 |
+| `nightly-perf-8-kimi26-ppu` | `test_ppu_kimi_k26_prefill_perf.py` | Kimi-K2.6 | 2 | 4 | 8 |
+| `nightly-perf-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_prefill_perf.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 2 | 16, over 2 nodes |
+| `nightly-perf-32-ppu` | `test_ppu_qwen38_a95b_prefill_perf.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 2 | 32, over 4 nodes |
 
 The device count leads the suite name because it is the scheduling fact a reader
 needs first: it is how many whole boards a dispatch of that suite asks the
@@ -106,18 +106,18 @@ with the two prefill lengths as the measurements inside it:
 
 | Config | Source cases (btv1.5 `144G/Daily/Prefill`) |
 | --- | --- |
-| `minimax2.7/mxfp4-fp8-144g.json` | `minimax-m2_7_mxfp4-fp8_{4000,64000}_1_0001.json` |
-| `minimax2.7/fp8-channelwise-144g.json` | `minimax-m2_7_fp8-channel_{4000,64000}_1_0001.json` |
+| `minimax2.7/mxfp4-fp8-144g-prefill.json` | `minimax-m2_7_mxfp4-fp8_{4000,64000}_1_0001.json` |
+| `minimax2.7/fp8-channelwise-144g-prefill.json` | `minimax-m2_7_fp8-channel_{4000,64000}_1_0001.json` |
 | `glm5.2/mxfp4-fp8-144g-prefill-4k.json` | `glm_5_2_mxfp4-fp8_4000_1_0001.json` |
 | `glm5.2/mxfp4-fp8-144g-prefill-64k.json` | `glm_5_2_mxfp4-fp8_64000_1_0001.json` |
 | `glm5.2/fp8-channelwise-144g-prefill-4k.json` | `glm_5_2_fp8-channel_4000_1_0001.json` |
 | `glm5.2/fp8-channelwise-144g-prefill-64k.json` | `glm_5_2_fp8-channel_64000_1_0001.json` |
-| `qwen3.5/397b-a17b-mxfp4-fp8-144g.json` | `qwen3_5-397b-a17b_mxfp4-fp8_{4000,64000}_1_0001.json` |
-| `qwen3.5/397b-a17b-fp8-channelwise-144g.json` | `qwen3_5-397b-a17b_fp8-channel_{4000,64000}_1_0001.json` |
-| `kimi2.6/mxfp4-fp8-144g.json` | `kimi-k2_6_mxfp4-fp8_{4000,64000}_1_0001.json` |
-| `kimi2.6/w4a8-int8-144g.json` | `kimi-k2_6_int4_{4000,64000}_1_0001.json` |
-| `qwen3.8/2.4t-a95b-mxfp4-fp8-144g-2n.json` | `qwen3_8_mxfp4-fp8_2node_{4000,64000}_1_0001.json` |
-| `qwen3.8/2.4t-a95b-fp8-144g-4n.json` | `qwen3_8_2_4t-a95b_fp8_4node_{4000,64000}_1_0001.json` |
+| `qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json` | `qwen3_5-397b-a17b_mxfp4-fp8_{4000,64000}_1_0001.json` |
+| `qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json` | `qwen3_5-397b-a17b_fp8-channel_{4000,64000}_1_0001.json` |
+| `kimi2.6/mxfp4-fp8-144g-prefill.json` | `kimi-k2_6_mxfp4-fp8_{4000,64000}_1_0001.json` |
+| `kimi2.6/w4a8-int8-144g-prefill.json` | `kimi-k2_6_int4_{4000,64000}_1_0001.json` |
+| `qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json` | `qwen3_8_mxfp4-fp8_2node_{4000,64000}_1_0001.json` |
+| `qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json` | `qwen3_8_2_4t-a95b_fp8_4node_{4000,64000}_1_0001.json` |
 
 The one dropped case is `glm_5_2_mxfp4-fp8_tp4_64000_1_0001.json`. It is
 byte-identical in every reviewed parameter to `glm_5_2_mxfp4-fp8_64000_1_0001.json`

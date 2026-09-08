@@ -3,7 +3,7 @@
 The btv1.5 prefill plan measures this checkpoint across two ZW-M890P boards at
 tp 8 with pp 2, and this file is the two-node topology of that plan:
 
-  configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-2n.json
+  configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json
 
 Both measurements the config names -- a 4k-token and a 64k-token prefill, ten
 prompts each at concurrency one -- share one launch of the server, with the KV
@@ -36,7 +36,7 @@ register_ppu_ci(est_time=7200, suite="nightly-perf-16-ppu", nightly=True)
 
 class TestPPUQwen38A95BMxfp4Perf(PerfSuiteMixin, unittest.TestCase):
     default_test_config_path = (
-        DATA_ROOT / "configs" / "qwen3.8" / "2.4t-a95b-mxfp4-fp8-144g-2n.json"
+        DATA_ROOT / "configs" / "qwen3.8" / "2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json"
     )
 
 

@@ -3,8 +3,8 @@
 Two reviewed configs share this file, one per checkpoint the btv1.5 prefill plan
 measures on a single board at tp 8:
 
-  configs/kimi2.6/mxfp4-fp8-144g.json   the default below
-  configs/kimi2.6/w4a8-int8-144g.json
+  configs/kimi2.6/mxfp4-fp8-144g-prefill.json   the default below
+  configs/kimi2.6/w4a8-int8-144g-prefill.json
 
 Their server arguments are identical -- the plan's INT4 and MXFP4 cases differ in
 nothing but the weights they read -- and each config carries two measurements, a
@@ -37,7 +37,7 @@ register_ppu_ci(est_time=5400, suite="nightly-perf-8-kimi26-ppu", nightly=True)
 
 
 class TestPPUKimiK26Perf(PerfSuiteMixin, unittest.TestCase):
-    default_test_config_path = DATA_ROOT / "configs" / "kimi2.6" / "mxfp4-fp8-144g.json"
+    default_test_config_path = DATA_ROOT / "configs" / "kimi2.6" / "mxfp4-fp8-144g-prefill.json"
 
 
 if __name__ == "__main__":

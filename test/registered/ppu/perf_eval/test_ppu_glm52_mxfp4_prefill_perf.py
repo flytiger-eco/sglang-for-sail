@@ -12,7 +12,7 @@ runs `dsa` with expert parallelism, prefill context parallelism at `attn_cp_size
 4, a 32768-token chunked prefill and the overlap schedule off.  A single server
 cannot be both, so each config carries exactly one measurement.
 
-A file of its own rather than two more configs of `test_ppu_glm52_perf.py`
+A file of its own rather than two more configs of `test_ppu_glm52_prefill_perf.py`
 because these claim four devices and those claim eight, and the suite name is
 what tells the workflow which to ask the cluster for.
 

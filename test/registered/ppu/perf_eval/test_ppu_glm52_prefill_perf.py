@@ -19,7 +19,7 @@ Only one of the two runs per job: the workflow names the config in
 `SGLANG_PPU_PERF_TEST_CONFIG` and the class falls back to the default when it is
 unset.  The MXFP4 checkpoint of the same model is a separate file, not a config
 here, because it is served at tp 4 and a suite has to state how many devices it
-claims; see `test_ppu_glm52_mxfp4_perf.py`.
+claims; see `test_ppu_glm52_mxfp4_prefill_perf.py`.
 
 Nothing here judges a number.  The suite is red only when a measurement produced
 no numbers at all, never for being slow.

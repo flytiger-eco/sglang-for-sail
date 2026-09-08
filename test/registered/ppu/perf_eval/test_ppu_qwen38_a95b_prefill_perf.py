@@ -3,7 +3,7 @@
 The FP8 weights of this checkpoint do not fit on two boards, so the btv1.5
 prefill plan serves them across four ZW-M890P boards at tp 8 with pp 4:
 
-  configs/qwen3.8/2.4t-a95b-fp8-144g-4n.json
+  configs/qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json
 
 Every node runs this same registered file; the launcher tells each which rank it
 is, rank 0 owns the HTTP API and the numbers, and the other three hold their
@@ -31,7 +31,7 @@ register_ppu_ci(est_time=7200, suite="nightly-perf-32-ppu", nightly=True)
 
 class TestPPUQwen38A95BPerf(PerfSuiteMixin, unittest.TestCase):
     default_test_config_path = (
-        DATA_ROOT / "configs" / "qwen3.8" / "2.4t-a95b-fp8-144g-4n.json"
+        DATA_ROOT / "configs" / "qwen3.8" / "2.4t-a95b-fp8-144g-prefill-4n.json"
     )
 
 

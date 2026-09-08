@@ -3,8 +3,8 @@
 Two reviewed configs share this file, one per checkpoint the btv1.5 prefill plan
 measures at tp 4:
 
-  configs/qwen3.5/397b-a17b-mxfp4-fp8-144g.json        the default below
-  configs/qwen3.5/397b-a17b-fp8-channelwise-144g.json
+  configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json        the default below
+  configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json
 
 Their server arguments are identical -- the plan's two cases differ in nothing but
 the weights they read -- and each carries a 4k-token and a 64k-token prefill of
@@ -38,7 +38,7 @@ register_ppu_ci(est_time=4800, suite="nightly-perf-4-qwen35-ppu", nightly=True)
 
 class TestPPUQwen35Perf(PerfSuiteMixin, unittest.TestCase):
     default_test_config_path = (
-        DATA_ROOT / "configs" / "qwen3.5" / "397b-a17b-mxfp4-fp8-144g.json"
+        DATA_ROOT / "configs" / "qwen3.5" / "397b-a17b-mxfp4-fp8-144g-prefill.json"
     )
 
 

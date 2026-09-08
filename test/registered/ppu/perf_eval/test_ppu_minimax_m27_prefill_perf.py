@@ -3,8 +3,8 @@
 Two reviewed configs share this file, one per checkpoint the btv1.5 prefill plan
 measures at tp 2:
 
-  configs/minimax2.7/mxfp4-fp8-144g.json        the default below
-  configs/minimax2.7/fp8-channelwise-144g.json
+  configs/minimax2.7/mxfp4-fp8-144g-prefill.json        the default below
+  configs/minimax2.7/fp8-channelwise-144g-prefill.json
 
 Each carries a 4k-token and a 64k-token prefill of ten prompts at concurrency
 one, sharing one launch with the KV cache flushed between them.  The two differ
@@ -41,7 +41,7 @@ register_ppu_ci(est_time=4800, suite="nightly-perf-2-minimax27-ppu", nightly=Tru
 
 class TestPPUMinimaxM27Perf(PerfSuiteMixin, unittest.TestCase):
     default_test_config_path = (
-        DATA_ROOT / "configs" / "minimax2.7" / "mxfp4-fp8-144g.json"
+        DATA_ROOT / "configs" / "minimax2.7" / "mxfp4-fp8-144g-prefill.json"
     )
 
 

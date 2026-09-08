@@ -38,7 +38,7 @@ permissions:
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
   PERF_SUITE: nightly-perf-16-ppu
-  PERF_CONFIG: test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-2n.json
+  PERF_CONFIG: test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json
 
 jobs:
   perf-16-k8s:
