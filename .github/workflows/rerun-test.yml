@@ -190,6 +190,7 @@ jobs:
             bash -c "
               cd /workspace && \
               bash scripts/ci/ppu/ppu_install_dependency.sh && \
+              . scripts/ci/ppu/use_local_jit_cache.sh && \
               git config --global --add safe.directory /workspace && \
               cd test && \
               python3 ${{ inputs.test_command }}
