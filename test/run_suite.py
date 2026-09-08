@@ -176,6 +176,25 @@ NIGHTLY_SUITES = {
         "nightly-answer-16-ppu",
         "nightly-answer-16-kimi26-ppu",
         "nightly-answer-32-ppu",
+        # Serving performance suites, driven by their own workflows for the same
+        # reason the answer ones are: a measurement holds a whole board for as
+        # long as the checkpoint takes to load, and the nightly-1..8 chain must
+        # not wait behind that. A suite records TTFT and throughput and judges
+        # neither -- it is red only when a measurement produced no numbers -- so
+        # the names below carry evidence, not a threshold.
+        #
+        # The number is the devices the configs of that suite declare, not the
+        # board they hold: the plan serves MiniMax-M2.7 at tp 2 and Qwen3.5 and
+        # GLM-5.2-MXFP4 at tp 4, and one suite cannot state two device counts,
+        # which is why GLM-5.2 has two suites while its answer line has one.
+        "nightly-perf-2-minimax27-ppu",
+        "nightly-perf-4-glm52-ppu",
+        "nightly-perf-4-qwen35-ppu",
+        "nightly-perf-8-glm52-ppu",
+        "nightly-perf-8-kimi26-ppu",
+        # Whole boards, one suite each.
+        "nightly-perf-16-ppu",
+        "nightly-perf-32-ppu",
     ],
 }
 
