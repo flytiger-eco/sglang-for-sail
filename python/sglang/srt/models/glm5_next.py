@@ -112,6 +112,7 @@ from sglang.srt.models.glm_ocr import (
     GlmOcrVisionPatchEmbed,
     GlmOcrVisionPatchMerger,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
@@ -1246,14 +1247,29 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.lm_head = None
         self.logits_processor = None
 
-        # [PPU-fix] ignore list prefix remap: checkpoint uses model.language_model. prefix,
-        # but sglang module prefix is model. — without remap 501 ignore entries are ineffective,
-        # causing BF16 layers to be incorrectly quantized as INT8 (see cohere2_vision.py precedent)
-        if quant_config is not None and hasattr(quant_config, "ignore") and quant_config.ignore:
-            quant_config.ignore = [
-                e.replace("model.language_model.", "model.") if e.startswith("model.language_model.") else e
-                for e in quant_config.ignore
-            ]
+        # [PPU-fix] The checkpoint quantization lists use model.language_model.*, while
+        # SGLang constructs the text modules under model.*.
+        if quant_config is not None:
+            layers = getattr(quant_config, "ignore", None)
+            if layers:
+                quant_config.ignore = [
+                    (
+                        layer.replace("model.language_model.", "model.", 1)
+                        if layer.startswith("model.language_model.")
+                        else layer
+                    )
+                    for layer in layers
+                ]
+            if quant_config.get_name() == "mxfp4":
+                quant_config.apply_weight_name_mapper(
+                    WeightsMapper(
+                        orig_to_new_substr={"attn.qkv": "attn.qkv_proj"},
+                        orig_to_new_prefix={
+                            "model.language_model.": "model.",
+                            "model.visual.": "visual.",
+                        },
+                    )
+                )
 
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
