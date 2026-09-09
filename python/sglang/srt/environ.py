@@ -1929,6 +1929,8 @@ class Envs:
     # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
     # sampling accept and commits as a CUDA graph right after the verify graph.
     SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
+    # Use CUDA for separate MLA K-cache quantization instead of Triton.
+    SGLANG_OPT_USE_CUDA_MLA_K_CACHE_QUANT = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
