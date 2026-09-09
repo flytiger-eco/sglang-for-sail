@@ -1,0 +1,253 @@
+name: PPU Accuracy Nightly (K8s)
+
+on:
+  # No schedule, for the reason test-ppu-answer-k8s.yml records: cron is honoured
+  # only from the default branch, and this file lives on a version branch, so a
+  # cron here would never fire. The btv1.5 accuracy line is dispatched by hand or
+  # by a caller through workflow_call.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      mode:
+        description: 'smoke evaluates 20 samples to prove the path; full evaluates the whole split.'
+        required: false
+        type: choice
+        options:
+          - full
+          - smoke
+          - both
+        default: full
+      dataset_dir:
+        description: 'Override the staged dataset directory the configs name. Recorded in the report when set.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      mode:
+        description: 'smoke evaluates 20 samples to prove the path; full evaluates the whole split.'
+        required: false
+        type: string
+        default: full
+      dataset_dir:
+        description: 'Override the staged dataset directory the configs name. Recorded in the report when set.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-accuracy-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+# The accuracy sibling of test-ppu-answer-k8s.yml and test-ppu-perf-k8s.yml, and
+# the same shape for the same reasons -- read the Answer file's header for the
+# full account. In brief: one job per entry and never a matrix, because
+# flytiger-eco/ppu-distributed-action builds both its NAS staging path and its
+# K8s job name out of $GITHUB_JOB which every leg of a matrix shares; the job
+# body lives in scripts/ci/ppu/ rather than in a local composite action, because
+# this runner group drives the job through a container hook so `uses: ./`
+# resolves against the runner's own filesystem where the checkout wrote nothing
+# (run 34085102675); and every job checks out twice, the second time only if the
+# first failed, because a self-clearing egress fault must not judge a model.
+#
+# Three things differ from the other two lines, all of them consequences of what
+# an accuracy run is:
+#
+#   * the score comes from EvalScope, not from a harness of ours, and EvalScope
+#     runs in a virtual environment of its own that setup_evalscope.sh builds --
+#     its dependency closure moves `datasets` and `dill` under the serving stack
+#     otherwise. The board script exports SGLANG_PPU_EVALSCOPE_BIN so the suite
+#     scores with that EvalScope and not with whatever else is on PATH.
+#
+#   * the dataset is a staged directory on the NAS rather than a repository
+#     asset. These are public splits far too large to check in, and this cluster
+#     has no route to a dataset hub, so an unstaged dataset is a failure the
+#     board script reports before it loads a checkpoint.
+#
+#   * the budget is hours, not minutes. A full GSM8K split is 1319 prompts
+#     against a reasoning model, run at the server's own concurrency, so the
+#     timeouts below are an order of magnitude larger than the perf line's and a
+#     job holds its board for most of a night. That is why `mode: smoke` exists:
+#     20 samples prove the whole path -- install, stage, serve, score, report --
+#     for the price of the weight load alone.
+#
+# `entry` names the config in the job name, the report path and the artifact,
+# because `suite` does not: both entries below run the one registered file and
+# differ only in the config SGLANG_PPU_ACCURACY_TEST_CONFIG selects.
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+jobs:
+  # Twenty samples, which is not an accuracy measurement and is not meant to be:
+  # it is the proof that the environment, the staged dataset, the server, the
+  # tool and the report reader all agree, and it costs one weight load. Skipped
+  # by default -- `mode: full` -- because a smoke score that reached the run page
+  # unlabelled would be mistaken for a verdict.
+  glm52-fp8chan-gsm8k-smoke:
+    name: glm5.2-fp8-channelwise gsm8k smoke (btv1.5)
+    if: ${{ inputs.mode == 'smoke' || inputs.mode == 'both' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=12600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 215
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      # Best effort, for the reason the other two lines record: the score has
+      # already left this job over the annotations the step above prints, so a
+      # reset on the github egress here must not turn a passing suite red. What a
+      # lost upload costs is the machine-readable copy -- result.json, junit.xml,
+      # the EvalScope report and its log -- which the annotations and the on-NAS
+      # record both outlive.
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # The whole split. `needs` plus `!cancelled()` rather than a bare `needs`, so
+  # that when both run the smoke's verdict orders them without gating them: a
+  # smoke that failed on a flaky server should not withhold the measurement, and
+  # the two must not hold two boards at once.
+  glm52-fp8chan-gsm8k:
+    name: glm5.2-fp8-channelwise gsm8k (btv1.5)
+    needs: glm52-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
