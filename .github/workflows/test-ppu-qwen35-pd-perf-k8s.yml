@@ -1,24 +1,15 @@
-name: PD Perf Test 16-PPU (PPU K8s)
+name: Qwen3.5 PD Perf Test 16-PPU (PPU K8s)
 
 on:
   # Dispatch only, and deliberately not wired into any nightly caller: this entry
   # claims two whole ZW-M890P boards and has never had a measured run. It becomes
-  # a scheduled line once one has passed, not before.
+  # a scheduled line once one has passed, not before -- the same rule the GLM-5.2
+  # 16-board PD entry follows.
   #
-  # A workflow of its own rather than a lane in test-ppu-perf-k8s.yml, for the
-  # reason the colocated 16-board entry has one: that file is the routinely
-  # dispatched single-board path and every lane in it claims one board, so folding
-  # a two-board entry into it would make each dispatch ask the cluster for two
-  # more. What is genuinely new here is not the pod count but the shape of the run
-  # -- two servers of one checkpoint with a router in front and a KV path between
-  # them -- and the first thing this line has to establish is whether that shape
-  # comes up at all on these boards; see the README next to the config for the two
-  # unknowns it is dispatched to answer.
-  # One suite, two checkpoints: the fp8-channelwise and mxfp4-fp8 GLM-5.2 cases the
-  # btv1.5 plan measures at 1p1d share one test file, and one job runs whichever the
-  # dispatch names. The default is the fp8-channelwise case, which is the class
-  # default too and the one checkpoint the colocated GLM-5.2 suite already serves;
-  # the mxfp4-fp8 case additionally decodes with EAGLE MTP over the base checkpoint.
+  # One suite, two checkpoints: the fp8-channelwise and mxfp4-fp8 Qwen3.5 cases the
+  # btv1.5 PD plan measures at 1p1d differ in nothing the run's shape cares about,
+  # so they share a workflow and a suite and are told apart by the config this
+  # dispatch names. The default is the mxfp4 case, which is the class default too.
   workflow_dispatch:
     inputs:
       ref:
@@ -27,13 +18,13 @@ on:
         type: string
         default: ''
       pd_config:
-        description: 'Which reviewed GLM-5.2 checkpoint to serve.'
+        description: 'Which reviewed config to serve.'
         required: false
         type: choice
-        default: 'fp8-channelwise'
+        default: 'mxfp4-fp8'
         options:
-          - 'fp8-channelwise'
           - 'mxfp4-fp8'
+          - 'fp8-channelwise'
   workflow_call:
     inputs:
       ref:
@@ -42,13 +33,13 @@ on:
         type: string
         default: ''
       pd_config:
-        description: 'Which reviewed GLM-5.2 checkpoint to serve.'
+        description: 'Which reviewed config to serve.'
         required: false
         type: string
-        default: 'fp8-channelwise'
+        default: 'mxfp4-fp8'
 
 concurrency:
-  group: test-ppu-pd-perf-k8s-${{ inputs.ref || github.ref }}-${{ inputs.pd_config }}
+  group: test-ppu-qwen35-pd-perf-k8s-${{ inputs.ref || github.ref }}-${{ inputs.pd_config }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
@@ -56,12 +47,12 @@ permissions:
 
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
-  PERF_SUITE: nightly-pd-perf-16-glm52-ppu
-  PD_CONFIG: test/registered/ppu/pd_perf_eval/configs/glm5.2/${{ inputs.pd_config || 'fp8-channelwise' }}-144g-pd-1p1d-4k-1500.json
+  PERF_SUITE: nightly-pd-perf-16-qwen35-ppu
+  PD_CONFIG: test/registered/ppu/pd_perf_eval/configs/qwen3.5/397b-a17b-${{ inputs.pd_config || 'mxfp4-fp8' }}-144g-pd-1p1d-4k-1500.json
 
 jobs:
   pd-perf-16-k8s:
-    name: nightly-pd-perf-16-glm52-ppu (btv1.5)
+    name: nightly-pd-perf-16-qwen35-ppu (btv1.5)
     # The orchestration shell is CPU-only and holds no device; the action
     # gang-schedules two worker pods, each onto a board carrying the label.
     runs-on: k8s-runner-group-cpu-flytiger
@@ -79,8 +70,8 @@ jobs:
       # nodes exchange their HTTP endpoints, their device inventories and rank 0's
       # completion -- so it has to be the same path in every pod, which is why the
       # suite refuses a relative one.
-      PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-glm52-ppu
-      PERF_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-glm52-ppu
+      PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-qwen35-ppu
+      PERF_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-pd-perf-16-qwen35-ppu
     steps:
       - name: Checkout code
         id: checkout
@@ -104,7 +95,7 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
 
-      - name: Run nightly-pd-perf-16-glm52-ppu via K8s
+      - name: Run nightly-pd-perf-16-qwen35-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -141,7 +132,7 @@ jobs:
         if: always()
         shell: bash
         env:
-          ENTRY: nightly-pd-perf-16-glm52-ppu
+          ENTRY: nightly-pd-perf-16-qwen35-ppu
           PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
         run: bash scripts/ci/ppu/collect_perf_evidence.sh
 
@@ -153,7 +144,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-pd-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-pd-perf-k8s-16-qwen35-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-perf-artifacts/
           if-no-files-found: warn
           retention-days: 30
@@ -166,7 +157,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-pd-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-pd-perf-k8s-16-qwen35-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-perf-artifacts/
           if-no-files-found: warn
           # The first attempt can be reset after it has created the artifact, and
