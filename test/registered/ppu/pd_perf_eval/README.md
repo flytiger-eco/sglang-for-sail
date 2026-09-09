@@ -22,11 +22,11 @@ model and workload halves of the config contract, which `pd_perf_eval_kit`
 validates through `perf_eval_kit.validate_hardware`, `validate_model` and
 `validate_workload` rather than through a second copy of those rules.
 
-**This is a pilot, and it has never had a measured run.** Its workflow is on no
-schedule and wired into no nightly caller. What it is dispatched to establish is
-listed under [The two unknowns](#the-two-unknowns-the-first-dispatch-answers);
-until one dispatch has answered them, nothing here should be read as a working
-measurement path.
+**Four configs across two suites have now measured green**, each producing a full
+set of numbers on two boards; the results are under
+[What the dispatches established](#what-the-dispatches-established). The workflows
+are still on no schedule and wired into no nightly caller — they are dispatched by
+hand — but the measurement path itself is now proven end to end.
 
 ## What runs on the two boards
 
@@ -106,8 +106,8 @@ The source harness reports a second pass over a first: it warms the server, runs
 the workload once, and reports the run after that. This line matches it with
 `workload.warmup_passes`, which the shared kit resolves into each measurement
 and the disaggregated suite honours by running that many full passes at the
-measurement's own shape and discarding them before the recorded one. The GLM-5.2
-case sets one; the colocated line's default is zero. The KV cache is flushed
+measurement's own shape and discarding them before the recorded one. These
+cases set one; the colocated line's default is zero. The KV cache is flushed
 after each warmup pass, so the recorded pass runs warm on compilation and cold on
 cache — which is the point: run 34317611899 measured a first 4k prefill at 23.6
 tok/s against a second at 1495 tok/s, a ~170s per-batch-shape compilation cost
@@ -116,20 +116,22 @@ otherwise lands entirely in the reported TTFT tail. The discarded pass's raw
 output is kept under a `-warmupN` name next to the recorded one as evidence it
 ran.
 
-## The suite
+## The suites
 
-| Suite | Test file | Model | Topology | Measurements | Boards |
+| Suite | Test file | Model | Configs | Topology | Boards |
 | --- | --- | --- | --- | --- | --- |
-| `nightly-pd-perf-16-glm52-ppu` | `test_ppu_glm52_pd_perf.py` | GLM-5.2 FP8-Channelwise | 1p1d | 1 | 2 |
+| `nightly-pd-perf-16-glm52-ppu` | `test_ppu_glm52_pd_perf.py` | GLM-5.2 | fp8-channelwise, mxfp4-fp8 | 1p1d | 2 |
+| `nightly-pd-perf-16-qwen35-ppu` | `test_ppu_qwen35_pd_perf.py` | Qwen3.5-397B-A17B | fp8-channelwise, mxfp4-fp8 | 1p1d | 2 |
 
-One config, one measurement, one suite. The device count leads the name as it
-does on the colocated line, because it is the scheduling fact a reader needs
-first: a dispatch of this suite asks the cluster for sixteen devices across two
-whole boards.
+One suite per model, two reviewed configs behind each, one measurement per config:
+a job names the config in `SGLANG_PPU_PD_PERF_TEST_CONFIG` and the class falls back
+to its default when unset. The device count leads each name as it does on the
+colocated line, because it is the scheduling fact a reader needs first: a dispatch
+of either suite asks the cluster for sixteen devices across two whole boards.
 
-## Alignment with the source case
+## Alignment with the source cases
 
-The config renders the two `Chapter 2` launch commands of
+The fp8-channelwise config renders the two `Chapter 2` launch commands of
 `server_cmds/LLM_Serving/BTV1.5/GLM-5.2.md` under `fp8-channel` /
 `4096-4096/1500-1500`, and takes its workload from
 `testcases/btv1.5/.../PD-Disaggregation/notune/glm-5_2_fp8-channel_1p1d_4096_1500_0001.json`
@@ -167,8 +169,8 @@ and `decode_nodes` state.
 - **`tc_name` says `mtp`, and this config has no speculative decoding.** That is
   the source case's own name (`glm-5.2_pd_notune_4096_1500_mtp`) and is recorded
   verbatim for traceability. Neither of its launch commands carries any
-  `--speculative-*` flag — the MTP-bearing variant is the MXFP4 one, which is
-  deferred below. The name is inherited, not a description of what runs.
+  `--speculative-*` flag — the MTP-bearing variant is the MXFP4 one, ported
+  alongside it (below). The name is inherited, not a description of what runs.
 - **The KV-cache flush goes to each server directly, not through the router.**
   `args.flush_cache` is `False` and the suite POSTs `/flush_cache` to both
   endpoints itself, asserting the status. Both router implementations in this
@@ -194,18 +196,46 @@ and `decode_nodes` state.
   bound so a config written by copying a red-zone command is refused by the
   schema rather than by two boards eight minutes in.
 
+### The three MTP configs alongside it
+
+The other three configs decode with Multi-Token-Prediction, which the
+fp8-channelwise case above does not, and are otherwise the same 1p1d shape and
+workload:
+
+- **GLM-5.2 mxfp4-fp8.** The source names `speculative_algorithm EAGLE` on both
+  roles with an empty `speculative_draft_model_path`, which SGLang resolves to
+  EAGLE over the base checkpoint's own MTP layers; the config omits the empty draft
+  key, since an absent and an empty draft path both fall back to the model path.
+  Its weights are on the NAS this suite reads (`model_weight_path.csv`).
+- **Qwen3.5-397B-A17B fp8-channelwise and mxfp4-fp8.** Both name `NEXTN`, resolved
+  the same way to the Qwen3.5 checkpoint's own MTP layers; the two differ only in
+  weights and, on fp8-channelwise, a triton draft attention backend the mxfp4 case
+  does not name.
+
+**Departure, all three MTP configs: `disable_radix_cache: true` in both roles.**
+The GLM mxfp4 config carries it as the fp8-channelwise one does; the two Qwen
+configs needed it added. These configs pair speculative decoding with
+`--mamba-scheduler-strategy no_buffer`, and the PPU SDK refuses that combination
+with the radix cache on — the prefill server exits at startup with `Speculative
+decoding ... is not compatible with radix cache when using
+--mamba-scheduler-strategy no_buffer`. The workload is `random-ids` at
+`random_range_ratio` 1.0, so there is no shared prefix for a radix cache to reuse
+and disabling it is throughput-neutral; the alternative (`extra_buffer` plus
+`SGLANG_ENABLE_SPEC_V2=1`) changes more and departs further from the notune
+sources. The incompatibility surfaces only when a pod actually starts the server —
+JSON and schema validation pass — so it was found by dispatch, not by review.
+
 ## Deferred cases, and why
 
 `144G/Daily/PD-Disaggregation/notune` holds 21 source cases. Nine belong to the
-five checkpoint families this board has already stood up; one is ported. The rest
-are deferred, each for a stated reason rather than for lack of time:
+five checkpoint families this board has already stood up; four of those are now
+ported and measured green — both GLM-5.2 configs and both Qwen3.5 configs. The
+rest are deferred, each for a stated reason rather than for lack of time:
 
 | Source case | Deferred because |
 | --- | --- |
-| `glm-5_2_mxfp4-fp8_1p1d_4096_1500_0001.json` | `--speculative-algorithm EAGLE` with **no** `--speculative-draft-model-path`, so the draft head has to come from inside `GLM-5.2-MXFP4-FP8-fromBF16`. Nothing in this tree evidences that checkpoint carries an MTP head. |
 | `minimax-m2_7_{fp8-channel,mxfp4-fp8}_1p1d_4096_1500_0001.json` | Both need `--speculative-draft-model-path .../MiniMax-M2.5-Eagle3`. That checkpoint is referenced nowhere in this tree, and no existence evidence for it was found. |
-| `qwen3_5-397b-a17b_{fp8-channel,mxfp4-fp8}_1p1d_4096_1500_0001.json` | Both carry `--prefill-round-robin-balance`, which `server_args.py` accepts only to say it is deprecated. Porting it would encode a flag that no longer does anything. |
-| `kimi-k2.6_{int4,mxfp4-fp8}_1p2d_4096_1500_0001.json` | 1p2d — three boards. Nothing about the topology is unsupported by the schema; it waits on the 1p1d shape being shown to work. |
+| `kimi-k2.6_{int4,mxfp4-fp8}_1p2d_4096_1500_0001.json` | 1p2d — three boards. Nothing about the topology is unsupported by the schema, and the 1p1d shape it waited on is now green; what remains is standing up the three-board group. |
 | `qwen3_8_mxfp4-fp8_2p4d_4096_1500_0001.json` | 2p4d — six boards, same reason. |
 
 The remaining twelve (DeepSeek-V3.2 and five DeepSeek-V4 cases across four
@@ -213,15 +243,16 @@ variant names, GLM-5.1, GLM-5.3, Qwen3.7) are families no line on this board has
 stood up, with no weight-existence evidence gathered for them.
 
 The order is deliberate: the schema already validates any `NpMd` topology and the
-runtime already resolves roles by rank, so the deferred multi-board cases are
-config-only additions once the pilot is green. The speculative and deprecated-flag
-cases are not — they need a fact established outside this repository first.
+runtime already resolves roles by rank, and the 1p1d pilot is now green, so the
+deferred multi-board cases are config-only additions. The MiniMax cases are not —
+they need a draft checkpoint established outside this repository first.
 
 ## Workflow
 
 | Workflow | Suite | Boards | Trigger |
 | --- | --- | --- | --- |
 | `test-ppu-pd-perf-k8s.yml` | `nightly-pd-perf-16-glm52-ppu` | 2 | dispatch, `workflow_call` |
+| `test-ppu-qwen35-pd-perf-k8s.yml` | `nightly-pd-perf-16-qwen35-ppu` | 2 | dispatch, `workflow_call` |
 
 A workflow of its own rather than a lane in `test-ppu-perf-k8s.yml`, for the
 reason the colocated 16-board entry has one: every lane in that file claims a
@@ -255,15 +286,16 @@ Two ZW-M890P boards (144 GiB × 8 each), held for as long as the group runs.
 `PERF_TIMEOUT_PER_FILE` is 13800 s, the pod 240 min and the job 270 min. The
 reasoning: one 5400 s startup budget rather than two, since the loads proceed in
 parallel; plus the endpoint exchange, one measurement of 80 requests at 4096 in /
-1500 out at concurrency 8, and the dependency install. **Every one of these
-numbers is an estimate a cold clone has to survive, not a measured budget** — as
-is the `register_ppu_ci(est_time=7200)` in the test file. The first green run is
-what should replace them.
+1500 out at concurrency 8, and the dependency install. These were estimates a cold
+clone had to survive rather than measured budgets — as is the
+`register_ppu_ci(est_time=7200)` in the test file — and the green runs below now
+give the real figures: a single measurement takes 3–10 min depending on whether
+the config decodes speculatively, comfortably inside the budget.
 
-## What the dispatches so far answered, and what is still open
+## What the dispatches established
 
 Three shakeout dispatches — the same config at 4 requests and 256 output tokens,
-on a throwaway branch, 2026-09-09 — have run. The first died in the prefill server
+on a throwaway branch, 2026-09-09 — ran first. The first died in the prefill server
 twenty seconds after launch and the other two died two minutes after that server
 was listening, and between them they turned two guesses in this port into measured
 facts and left the second failure with one candidate cause.
@@ -297,27 +329,39 @@ It also explains why the colocated line has never seen this — it talks to
 `127.0.0.1`, and PD is the first line here that has to bind an address its peer
 can reach. The ports moved to 21000/21001 and three probes now run before the
 install, at addresses nothing of ours is listening on yet: the old port on this
-node's address, the old port on loopback, and the port this run will use. Their
-three answers are what will confirm or retire the reading above.
+node's address, the old port on loopback, and the port this run will use.
 
-Still open:
+Then it ran green. The port move to 21000/21001 held, the three preflight probes
+confirmed the rewrite reading above, and four configs each produced a full
+measurement on two boards:
 
-1. **Does `sglang_router`'s mini-lb come up on this board?**
-   `ppu_install_dependency.sh` records `sglang-router 0.3.2+v0.1.0.ppu2.1.1` as
-   present in the image and deliberately left alone (verified in-image
-   2026-08-13), so the package exists. What is untested is whether that build's
-   `launch_router --pd-disaggregation --mini-lb` accepts these arguments and
-   routes to two PPU servers; the in-tree `disaggregation_fixture.py` is the only
-   evidence for the flag shape. No dispatch could answer it, because the router
-   is launched only after rank 0's own server is ready.
-2. **Does the Mooncake KV handshake complete across two of these boards?** The
-   engine now initializes on both, which is further than any run in this
-   repository had reached, but no KV block has yet crossed the fabric between two
-   ZW-M890P boards — which is why `MC_LOG_LEVEL=TRACE` stays on.
+| Suite | Config | output tok/s | total tok/s | TTFT p50 | TTFT p99 | duration | Run |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| glm52 | fp8-channelwise | 194.91 | 727.16 | 546.38ms | 4249.09ms | 615.66s | 34317611899 |
+| glm52 | mxfp4-fp8 | 453.32 | 1691.18 | 459.79ms | 4424.03ms | 264.71s | 34337978737 |
+| qwen35 | fp8-channelwise | 605.75 | 2259.86 | 323.72ms | 1637.88ms | 198.10s | 34342244447 |
+| qwen35 | mxfp4-fp8 | 689.83 | 2573.52 | 292.93ms | 1470.46ms | 173.96s | 34342255481 |
 
-Everything the two-pod harness itself had to do worked on all three runs: the
-group gang-scheduled onto two separate boards, each node published its endpoint
-and had the role it claimed checked against the role its rank was assigned, and
-the report, the annotations and the per-node evidence all came back — except on
-the third run, where the evidence steps reported success and the artifact arrived
-empty, which is worth a look if it repeats.
+(The glm52 fp8-channelwise row is the recorded second pass of the double-pass
+diagnostic that isolated the ~170 s cold-start compilation cost noted above; it is
+the only config here without speculative decoding, which is why it decodes its
+1500 tokens more slowly than the three MTP configs.)
+
+That the numbers exist at all answers the two questions the shakeout runs left
+open:
+
+1. **`sglang_router`'s mini-lb comes up on this board.** `launch_router
+   --pd-disaggregation --mini-lb` accepted its arguments, routed `bench_serving`'s
+   requests to the two PPU servers, and returned completions — the throughput above
+   is measured through it.
+2. **The Mooncake KV handshake completes across two boards.** No prefilled block
+   would reach the decode server otherwise, and every request decoded its full
+   output; the fabric between two ZW-M890P boards carried the KV path for the whole
+   run. `MC_LOG_LEVEL=TRACE` stays on until a run is drowned by it.
+
+The two-pod harness itself worked throughout: the group gang-scheduled onto two
+separate boards, each node published its endpoint and had the role it claimed
+checked against the role its rank was assigned, and the report, the annotations and
+the per-node evidence came back — with the one caveat, seen on some runs, that the
+artifact upload reports success while arriving empty, in which case the numbers are
+still in the run log.
