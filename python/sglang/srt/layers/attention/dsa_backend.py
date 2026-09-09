@@ -91,7 +91,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -888,7 +888,9 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")  # [PPU-int8] allow flashmla_sparse for kpool on SM80
+            # [PPU-int8] allow flashmla_sparse for kpool on SM80
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
+            or (_is_ppu and dsa_impl == "flashmla_kv")
         ):
             return
         raise NotImplementedError(
@@ -4146,10 +4148,26 @@ class DeepseekSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
+        topk_length = None
+        if _is_ppu and self.dsa_index_kpool > 1:
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
+            )
+            padding = (-page_table_1.shape[-1]) % 64
+            if padding:
+                page_table_1 = torch.cat(
+                    (
+                        page_table_1,
+                        page_table_1.new_full((page_table_1.shape[0], padding), -1),
+                    ),
+                    dim=1,
+                )
+            topk_length = cache_seqlens[: page_table_1.shape[0]]
+        else:
+            assert (
+                page_table_1.shape[-1] == self.dsa_index_topk
+            )  # requirement of FlashMLA decode kernel
         indices = page_table_1.unsqueeze(1)
-        assert (
-            indices.shape[-1] == self.dsa_index_topk
-        )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
             q=q_input,
@@ -4165,6 +4183,7 @@ class DeepseekSparseAttnBackend(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            topk_length=topk_length,
         )
 
         if target_q_heads != num_q_heads:
