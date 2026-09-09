@@ -107,6 +107,19 @@ if [ ! -d "$ACCURACY_DATASET_DIR" ]; then
   echo "       datasets.load_dataset(path=<dir>, name=<subset>, split=<split>)."
   echo "       If it is already staged elsewhere, set SGLANG_PPU_ACCURACY_DATASET_DIR"
   echo "       to that directory instead; the report records that it was overridden."
+  # Which is the likely case the first time this line runs anywhere, so this
+  # dispatch answers "where is it then?" rather than only "not there". Bounded on
+  # both depth and wall clock: this is a shared filesystem and a broad walk of it
+  # would cost more than the answer is worth.
+  parent=$(dirname "$ACCURACY_DATASET_DIR")
+  while [ "$parent" != "/" ] && [ ! -d "$parent" ]; do
+    parent=$(dirname "$parent")
+  done
+  echo "       The deepest existing ancestor is ${parent}, which holds:"
+  ls -1 "$parent" 2>/dev/null | head -40 | sed 's/^/         /'
+  echo "       Anything named after the dataset under /nas_aisw/datasets:"
+  timeout 120 find /nas_aisw/datasets -maxdepth 4 -iname "*${ACCURACY_DATASET}*" 2>/dev/null |
+    head -20 | sed 's/^/         /' || echo "         (search timed out)"
   exit 1
 fi
 
