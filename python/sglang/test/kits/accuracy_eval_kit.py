@@ -102,12 +102,13 @@ REPORT_SCHEMA_VERSION = 2
 # The datasets a config may name, and what this repository knows about each.
 #
 # `dataset_id` is the ModelScope id EvalScope resolves by default, kept here
-# because the PPU pods are offline: the config states a local directory instead
-# and this is what that directory has to be a copy of.  `primary_metric` is the
-# metric EvalScope marks as the benchmark's conclusion, and a config that names
-# a different one is refused rather than silently scored on something else.
-# `samples` is the published size of the evaluation split, which is what makes
-# a truncated dataset visible as a number instead of as a lower score.
+# because the config states a staged local directory instead: this is what that
+# directory has to be a copy of, and it is what the message on a missing dataset
+# names.  `primary_metric` is the metric EvalScope marks as the benchmark's
+# conclusion, and a config that names a different one is refused rather than
+# silently scored on something else.  `samples` is the published size of the
+# evaluation split, which is what makes a truncated dataset visible as a number
+# instead of as a lower score.
 DATASET_CONTRACTS = {
     "gsm8k": {
         "dataset_id": "AI-ModelScope/gsm8k",
@@ -240,8 +241,9 @@ SERVER_PARAMETER_CLI_ORDER = (
 # The environment a config may set around the server.  `SGLANG_USE_MODELSCOPE`
 # is deliberately absent although every P0_daily case sets it: it asks SGLang to
 # resolve the model through ModelScope, and these configs name an absolute NAS
-# path on a pod with no route to it, so honouring the name would replace a
-# working local load with a network timeout.
+# path.  These pods can in fact reach ModelScope, which makes the variable worse
+# than useless rather than merely useless: what it can buy is a hub fetch of
+# weights that are already on the filesystem the config names.
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
@@ -511,8 +513,8 @@ def _validate_evaluation(evaluation: Any) -> None:
         )
     if not str(evaluation["dataset_dir"]).startswith("/"):
         raise AccuracyEvalError(
-            "evaluation.dataset_dir must be an absolute path: the pods are "
-            "offline, so the dataset is a staged directory rather than a hub id"
+            "evaluation.dataset_dir must be an absolute path: the dataset is a "
+            "directory staged on shared storage rather than a hub id"
         )
     batch_size = evaluation["eval_batch_size"]
     if (
@@ -707,9 +709,10 @@ def build_evalscope_command(
     client here and needs neither the checkpoint nor a device.
 
     The dataset is passed as `dataset_id` pointing at a staged directory rather
-    than as the hub id in `DATASET_CONTRACTS`, because the pods have no route to
-    ModelScope.  `local_path` would also work and is what the offline guide
-    still shows, but it is documented as deprecated in favour of `dataset_id`.
+    than as the hub id in `DATASET_CONTRACTS`, so that the measurement reads the
+    same bytes every night instead of whatever a hub serves at the time.
+    `local_path` would also work and is what the offline guide still shows, but
+    it is documented as deprecated in favour of `dataset_id`.
     """
 
     generation = dict(plan["generation"])

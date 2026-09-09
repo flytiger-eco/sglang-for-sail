@@ -47,10 +47,11 @@ PIPEOF
 : "${ACCURACY_TIMEOUT_PER_FILE:?the per-file timeout is required}"
 
 # Constant for every entry, so they are set here rather than repeated in each
-# job. HF_HUB_OFFLINE keeps the tokenizer load off the network on a cluster that
-# has none; HF_HUB_CACHE is the shared read-only cache the checkpoints' companion
-# repositories were fetched into. PPU_SUPPORTS_FP8=0 reflects the board, not a
-# preference.
+# job. HF_HUB_OFFLINE keeps the tokenizer load off a route that is dead --
+# huggingface.co answers nothing from these pods, measured in run 34374868204 --
+# so a companion-repository lookup fails fast instead of hanging; HF_HUB_CACHE is
+# the shared read-only cache those repositories were fetched into.
+# PPU_SUPPORTS_FP8=0 reflects the board, not a preference.
 export SGLANG_IS_IN_CI=true
 export CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include
 export HF_HUB_OFFLINE=1
@@ -92,13 +93,18 @@ echo "checkpoint:      $ACCURACY_MODEL_PATH"
 echo "dataset:         $ACCURACY_DATASET at $ACCURACY_DATASET_DIR"
 
 # The cheapest preflight, and the one whose failure a reader is least likely to
-# diagnose from a traceback: the pod has no network to a hub, so a dataset that
-# was never staged onto the NAS cannot be fetched at evaluation time and the
-# message has to say what to stage and where.
+# diagnose from a traceback: an unstaged dataset would otherwise surface as a
+# `datasets` error after the checkpoint had been loaded, so it is checked before
+# anything expensive happens and the message says what to stage and where.
+#
+# A pod on this cluster can reach ModelScope -- measured, run 34374868204: the
+# probe downloaded this very dataset -- so the fix is a command any pod can run,
+# and it is deliberately not run here. A nightly whose input arrives over egress
+# is a nightly that can be red for a reason that has nothing to do with the
+# model, and comparability wants every run to read the same bytes.
 if [ ! -d "$ACCURACY_DATASET_DIR" ]; then
   echo "ERROR: the ${ACCURACY_DATASET} dataset is not staged at ${ACCURACY_DATASET_DIR}."
-  echo "       This pod has no route to a dataset hub. Stage it once from a host"
-  echo "       that does, then re-dispatch:"
+  echo "       Stage it once, from this pod or any other, then re-dispatch:"
   echo "         modelscope download --dataset <dataset_id> --local_dir ${ACCURACY_DATASET_DIR}"
   echo "       The dataset_id for each supported dataset is in DATASET_CONTRACTS,"
   echo "       python/sglang/test/kits/accuracy_eval_kit.py."
@@ -107,19 +113,14 @@ if [ ! -d "$ACCURACY_DATASET_DIR" ]; then
   echo "       datasets.load_dataset(path=<dir>, name=<subset>, split=<split>)."
   echo "       If it is already staged elsewhere, set SGLANG_PPU_ACCURACY_DATASET_DIR"
   echo "       to that directory instead; the report records that it was overridden."
-  # Which is the likely case the first time this line runs anywhere, so this
-  # dispatch answers "where is it then?" rather than only "not there". Bounded on
-  # both depth and wall clock: this is a shared filesystem and a broad walk of it
-  # would cost more than the answer is worth.
+  # Cheap, and it distinguishes "nothing is staged" from "the parent holds a
+  # differently spelled copy", which are different mistakes with different fixes.
   parent=$(dirname "$ACCURACY_DATASET_DIR")
   while [ "$parent" != "/" ] && [ ! -d "$parent" ]; do
     parent=$(dirname "$parent")
   done
   echo "       The deepest existing ancestor is ${parent}, which holds:"
   ls -1 "$parent" 2>/dev/null | head -40 | sed 's/^/         /'
-  echo "       Anything named after the dataset under /nas_aisw/datasets:"
-  timeout 120 find /nas_aisw/datasets -maxdepth 4 -iname "*${ACCURACY_DATASET}*" 2>/dev/null |
-    head -20 | sed 's/^/         /' || echo "         (search timed out)"
   exit 1
 fi
 

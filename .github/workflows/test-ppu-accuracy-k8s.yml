@@ -72,9 +72,10 @@ permissions:
 #     scores with that EvalScope and not with whatever else is on PATH.
 #
 #   * the dataset is a staged directory on the NAS rather than a repository
-#     asset. These are public splits far too large to check in, and this cluster
-#     has no route to a dataset hub, so an unstaged dataset is a failure the
-#     board script reports before it loads a checkpoint.
+#     asset. These are public splits far too large to check in, and although a
+#     pod here can reach ModelScope, a nightly is not given an input that
+#     arrives over egress: an unstaged dataset is a failure the board script
+#     reports before it loads a checkpoint.
 #
 #   * the budget is hours, not minutes. A full GSM8K split is 1319 prompts
 #     against a reasoning model, run at the server's own concurrency, so the

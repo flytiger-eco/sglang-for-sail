@@ -208,8 +208,8 @@ class TestConfigValidation(unittest.TestCase):
         )
 
     def test_use_modelscope_is_not_a_supported_variable(self):
-        # The internal cases all set it; honouring it on an offline pod would
-        # turn a local checkpoint load into a network timeout.
+        # The internal cases all set it; these pods can reach ModelScope, so
+        # honouring it can only buy a hub fetch of weights already on the NAS.
         self.assertNotIn("SGLANG_USE_MODELSCOPE", SUPPORTED_SERVER_ENVIRONMENT)
 
     def test_unified_and_split_attention_backends_are_alternatives(self):

@@ -91,11 +91,21 @@ Two configs sit behind that one suite and differ only in `limit`:
 by naming it in `SGLANG_PPU_ACCURACY_TEST_CONFIG`; a suite is a file, because
 `register_ppu_ci` registers per file.
 
-One entry rather than twenty-one because two facts about this line can only be
-established by running it, and each of them would be wrong twenty-one times over:
-whether the internal pip index carries EvalScope, and where these datasets are
-staged on the NAS. Neither is a fact about a model, so paying for it once is
-enough. The remaining twenty cases follow once one has run green.
+One entry rather than twenty-one because two facts about this line could only be
+established by running it, and each of them would have been wrong twenty-one
+times over: whether the pip index carries EvalScope, and where these datasets
+live on the NAS. Both are now measured rather than assumed, in a 1-PPU probe
+(runs `34374868204` and `34376132868`) that cost minutes instead of a night:
+
+* the index carries `evalscope` up to and including the pinned `1.11.1`, so
+  `setup_evalscope.sh` needs no wheelhouse on this cluster;
+* `/nas_aisw/datasets` held only `checkpoints`, `dsmManager`, `hf_cache` and
+  `packages` — no dataset area existed at all — and it is writable from a pod,
+  so `evalscope/<dataset_id>` was created there and GSM8K staged into it. That
+  is the path the two configs name.
+
+Neither is a fact about a model, so paying for it once was enough. The remaining
+twenty cases follow once one has run green.
 
 ## The datasets
 
@@ -119,9 +129,16 @@ is not an alias, so it arrives unchanged.
 They are not repository assets, unlike the Answer corpus: they are public splits
 far too large to check in. The config names an absolute directory on shared
 storage, and EvalScope is pointed at it through `--dataset-args` so it reads that
-directory instead of resolving a hub id. The pods have no route to a hub, so a
-missing dataset is a failure the board script reports before it loads a
-checkpoint, with the `modelscope download` command that would fix it.
+directory instead of resolving a hub id.
+
+Staged rather than fetched per run, although these pods *can* reach ModelScope —
+the probe above downloaded GSM8K from one, while `huggingface.co` answered
+nothing at all. Two reasons: a nightly whose input arrives over egress can be red
+for a reason that has nothing to do with the model, and a score is comparable
+across nights only if the data behind it did not change between them. A missing
+dataset is therefore a failure the board script reports before it loads a
+checkpoint, with the `modelscope download` command that fixes it, and never a
+download it starts on its own.
 
 What that directory has to be is not a free choice. EvalScope treats a
 `dataset_id` that exists on disk as local and then hands it to
@@ -130,7 +147,9 @@ directory must be the **snapshot root** of the dataset repository — the level 
 contains the per-subset directories, such as `main/` for GSM8K — and not one of
 those subdirectories and not a single parquet file. That is exactly what
 `modelscope download --local_dir` produces, which is why the message names that
-command and not a file copy.
+command and not a file copy. What GSM8K staged as, for reference:
+`main/{train,test}-00000-of-00001.parquet`, `socratic/` beside it, and
+`eval.yaml` at the root.
 
 The staged location is the one path in a reviewed config that this repository
 cannot check, so `SGLANG_PPU_ACCURACY_DATASET_DIR` overrides it and the workflow
@@ -139,8 +158,9 @@ actually read and whether it was overridden, so a score cannot be traced back to
 data other than the data it was measured on.
 
 `SGLANG_USE_MODELSCOPE`, which every source case sets, is deliberately **not** a
-supported variable: on an offline pod it turns a local checkpoint load into a
-network timeout.
+supported variable: the configs name absolute local checkpoint paths, and since
+these pods do reach ModelScope, what honouring it can buy is a hub fetch of
+weights that are already on the NAS.
 
 ## EvalScope lives in an environment of its own
 

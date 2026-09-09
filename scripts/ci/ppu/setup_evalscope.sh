@@ -50,7 +50,8 @@ else
   # independent of egress on a cluster whose network is the least reliable thing
   # about it. Not --no-index by itself, because a wheelhouse assembled for one
   # release is not guaranteed to close over a later pin -- the index stays as the
-  # fallback rather than as the plan.
+  # fallback rather than as the plan. Today there is no wheelhouse and the index
+  # is what runs: it carries evalscope 1.11.1 (measured, run 34374868204).
   installed=0
   if [ -d "${EVALSCOPE_WHEELHOUSE}" ]; then
     echo "Trying the local wheel directory ${EVALSCOPE_WHEELHOUSE}"
