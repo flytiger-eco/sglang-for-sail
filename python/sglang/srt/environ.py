@@ -1187,6 +1187,9 @@ class Envs:
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    # Fused SiLU+Mul + per-token fp8 quant JIT kernel in the channel-wise
+    # masked DeepGEMM path. Set =0 to fall back to the Triton implementation.
+    SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)

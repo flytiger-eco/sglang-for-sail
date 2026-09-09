@@ -1220,9 +1220,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.kernels.ops.moe.ep_moe_kernels import (
             silu_and_mul_masked_post_quant_fwd,
         )
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_8bit,
-        )
         from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
@@ -1283,17 +1280,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         # Act
         scale_block_size = gateup_output.shape[2] // 2
-        if _MASKED_GEMM_FAST_ACT:
-            down_input, down_input_scale = sglang_per_token_group_quant_8bit(
-                x=gateup_output,
-                dst_dtype=torch.float8_e4m3fn,
-                group_size=scale_block_size,
-                masked_m=masked_m,
-                column_major_scales=True,
-                scale_tma_aligned=False,
+        if envs.SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA.get():
+            # PPU: fused SiLU+Mul + per-token fp8 quant via the JIT kernel.
+            from sglang.jit_kernel.silu_mul_quant import (
+                silu_and_mul_masked_post_per_token_quant_fp8,
+            )
+
+            down_input, down_input_scale = silu_and_mul_masked_post_per_token_quant_fp8(
+                gateup_output,
+                masked_m,
+                swiglu_limit=swiglu_limit_arg,
+                expected_m=expected_m,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                fuse_silu_and_mul=True,
-                enable_v2=True,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
             )
         else:
             down_input = torch.empty(
