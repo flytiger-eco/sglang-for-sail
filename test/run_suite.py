@@ -204,6 +204,9 @@ NIGHTLY_SUITES = {
         # launcher handed it -- and its own workflow for the reason every perf
         # suite has one.
         "nightly-pd-perf-16-glm52-ppu",
+        # The same PD story for the second checkpoint under review; its own suite
+        # because it is a different model and config, not another line of glm52's.
+        "nightly-pd-perf-16-qwen35-ppu",
     ],
 }
 
