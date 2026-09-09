@@ -31,6 +31,7 @@ from sglang.test.kits.perf_eval_kit import (
     INPUT_LENGTH_TOLERANCE,
     MEASUREMENT_REQUIRED_KEYS,
     METRIC_FIELDS,
+    DECODE_METRIC_FIELDS,
     REASON_CODES,
     SERVER_PARAMETER_STORE_TRUE,
     MeasurementError,
@@ -89,10 +90,12 @@ def benchmark_result(**overrides):
         "p99_ttft_ms": 1300.0,
         "mean_e2e_latency_ms": 1240.0,
         "median_e2e_latency_ms": 1205.0,
+        "p90_e2e_latency_ms": 1290.0,
         "p99_e2e_latency_ms": 1310.0,
         "request_throughput": 0.81,
         "input_throughput": 3240.0,
         "output_throughput": 0.81,
+        "max_output_tokens_per_s": 5.0,
         "total_throughput": 3240.81,
         "duration": 12.34,
         "completed": 10,
@@ -100,6 +103,18 @@ def benchmark_result(**overrides):
         "total_output_tokens": 10,
         "concurrency": 1,
         "max_concurrent_requests": 1,
+        # The decode-side numbers bench_serving always emits: zero for a
+        # single-token case, real once a measurement decodes past the first
+        # token.  extract_metrics records them only when asked (include_decode).
+        "mean_tpot_ms": 40.0,
+        "median_tpot_ms": 39.5,
+        "std_tpot_ms": 1.2,
+        "p99_tpot_ms": 41.0,
+        "mean_itl_ms": 40.1,
+        "median_itl_ms": 39.6,
+        "std_itl_ms": 1.3,
+        "p95_itl_ms": 41.2,
+        "p99_itl_ms": 41.5,
         "input_lens": [4000] * 10,
         "output_lens": [1] * 10,
         "errors": [""] * 10,
@@ -205,11 +220,14 @@ class TestPPUPerfEval(unittest.TestCase):
         # a measurement actually ran with rather than leave a caller to rediscover
         # a default the config left out.
         config = copy.deepcopy(self.test_config)
-        for key in ("random_range_ratio", "warmup_requests", "seed"):
+        for key in ("random_range_ratio", "warmup_requests", "warmup_passes", "seed"):
             config["workload"].pop(key, None)
         entry = resolve_measurement_plan(config)[0]
         self.assertEqual(entry["random_range_ratio"], 1.0)
         self.assertEqual(entry["warmup_requests"], 1)
+        # Zero by default: the colocated line discards no pass, so a config that
+        # states nothing runs exactly the one recorded pass.
+        self.assertEqual(entry["warmup_passes"], 0)
         self.assertEqual(entry["seed"], 0)
         self.assertEqual(entry["flush_cache_timeout_seconds"], 900)
         self.assertEqual(entry["dataset"], config["workload"]["dataset"])
@@ -292,6 +310,10 @@ class TestPPUPerfEval(unittest.TestCase):
             (
                 lambda c: c["workload"].__setitem__("random_range_ratio", 0.0),
                 "a ratio that measures a distribution",
+            ),
+            (
+                lambda c: c["workload"].__setitem__("warmup_passes", -1),
+                "a negative count of passes to discard",
             ),
             (
                 lambda c: c["workload"]["measurements"][0].__setitem__("input_len", 0),
@@ -624,12 +646,39 @@ class TestPPUPerfEval(unittest.TestCase):
         self.assertEqual(
             metrics["total_token_throughput_tok_s"], raw["total_throughput"]
         )
+        # End-to-end p90 and the output-throughput peak are defined from the
+        # first token, so they are recorded for every measurement, prefill or
+        # not.
+        self.assertEqual(metrics["e2e_latency_p90_ms"], raw["p90_e2e_latency_ms"])
+        self.assertEqual(
+            metrics["output_token_throughput_peak_tok_s"],
+            raw["max_output_tokens_per_s"],
+        )
         self.assertEqual(metrics["duration_s"], raw["duration"])
-        # Both are undefined for a single output token, so recording the zero
-        # bench_serving computes over an empty list would read as a measurement.
+        # Time per output token and inter-token latency are undefined for a
+        # single output token, so recording the zero bench_serving computes over
+        # an empty list would read as a measurement.  Without include_decode they
+        # are left out, and TTFT p90 is absent for the separate reason that
+        # bench_serving does not emit it.
         self.assertNotIn("tpot_mean_ms", metrics)
         self.assertNotIn("itl_mean_ms", metrics)
         self.assertNotIn("ttft_p90_ms", metrics)
+
+        # A decoding measurement records them, keyed under the unambiguous names.
+        decode = extract_metrics(raw, include_decode=True)
+        self.assertEqual(len(decode), len(METRIC_FIELDS) + len(DECODE_METRIC_FIELDS))
+        self.assertEqual(decode["tpot_mean_ms"], raw["mean_tpot_ms"])
+        self.assertEqual(decode["itl_p99_ms"], raw["p99_itl_ms"])
+        # A decode source key that went missing is the same inability to measure
+        # as any other, but only when the decode set was asked for.
+        without_tpot = benchmark_result()
+        without_tpot.pop("mean_tpot_ms")
+        self.assertEqual(
+            len(extract_metrics(without_tpot)), len(METRIC_FIELDS)
+        )
+        with self.assertRaises(MeasurementError) as raised_decode:
+            extract_metrics(without_tpot, include_decode=True)
+        self.assertEqual(raised_decode.exception.reason_code, "metrics_missing")
 
         raw.pop("median_ttft_ms")
         with self.assertRaises(MeasurementError) as raised:
@@ -776,6 +825,30 @@ class TestPPUPerfEval(unittest.TestCase):
             "time per output token and inter-token latency are undefined", summary
         )
         self.assertIn(self.test_config["model"]["served_model_name"], lines[0])
+
+    def test_a_decoding_measurement_records_and_shows_the_decode_timings(self):
+        # A measurement that decodes past the first token has time per output
+        # token and inter-token latency defined, so measurement_record keeps them
+        # -- keyed off the measurement's own output_len -- and the summary shows
+        # them rather than the note the single-token line carries.
+        config = copy.deepcopy(self.test_config)
+        config["workload"]["measurements"][0]["output_len"] = 1500
+        plan = resolve_measurement_plan(config)
+        record = measurement_record(plan[0], benchmark_result())
+        self.assertEqual(record["status"], "measured")
+        self.assertEqual(record["metrics"]["tpot_mean_ms"], 40.0)
+        self.assertEqual(record["metrics"]["itl_p99_ms"], 41.5)
+        report = build_report(config, [record], provenance=perf_provenance(config))
+        summary = render_summary(report)
+        measured = [
+            line for line in summary.splitlines() if line.startswith("- MEASURED ")
+        ]
+        self.assertEqual(len(measured), 1)
+        self.assertIn("tpot_mean=40.00ms", measured[0])
+        self.assertIn("itl_p99=41.50ms", measured[0])
+        self.assertNotIn(
+            "time per output token and inter-token latency are undefined", summary
+        )
 
     def test_report_files_carry_the_numbers_and_need_no_redaction(self):
         plan = resolve_measurement_plan(self.test_config)

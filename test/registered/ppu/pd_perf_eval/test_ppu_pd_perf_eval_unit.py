@@ -37,10 +37,13 @@ from sglang.test.kits.pd_perf_eval_kit import (
     validate_pd_test_config,
 )
 from sglang.test.kits.perf_eval_kit import (
+    DECODE_METRIC_FIELDS,
+    METRIC_FIELDS,
     PerfEvalError,
     build_report,
     failed_measurement_record,
     load_json,
+    measurement_record,
     render_summary,
     resolve_measurement_plan,
 )
@@ -114,6 +117,26 @@ class TestPPUPdPerfEval(unittest.TestCase):
             ),
             (4096, 1500, 80, 8),
         )
+        # The internal harness reports a second pass over a first, so this line
+        # discards one warmup pass at the measurement's own shape before the
+        # recorded one; the colocated line's default is zero.
+        self.assertEqual(plan[0]["warmup_passes"], 1)
+
+    def test_the_decoding_case_records_the_decode_side_timings(self):
+        # Unlike the prefill line, this case decodes 1500 tokens, so time per
+        # output token and inter-token latency are defined and recorded; the
+        # source case's metric block asks for TPOT and its percentiles.  The set
+        # is picked from the measurement's output_len by the shared kit.
+        plan = resolve_measurement_plan(self.config)
+        raw = {source: 1.0 for _, source in METRIC_FIELDS + DECODE_METRIC_FIELDS}
+        raw["completed"] = plan[0]["num_prompts"]
+        raw["input_lens"] = [plan[0]["input_len"]] * plan[0]["num_prompts"]
+        raw["output_lens"] = [plan[0]["output_len"]] * plan[0]["num_prompts"]
+        raw["errors"] = [""] * plan[0]["num_prompts"]
+        record = measurement_record(plan[0], raw)
+        self.assertEqual(record["status"], "measured")
+        for name, _ in DECODE_METRIC_FIELDS:
+            self.assertIn(name, record["metrics"])
 
     def test_an_unknown_schema_or_top_level_key_is_refused(self):
         self.config["schema_version"] = "ppu-perf-test-config/v1"

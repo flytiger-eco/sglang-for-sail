@@ -706,6 +706,36 @@ class PDPerfSuiteMixin:
                     f"{response.status_code}",
                 )
 
+    def _run_warmup_passes(self, plan_entry):
+        """Run and discard the measurement's warmup passes.
+
+        Each is a full pass at the measurement's own shape, so the recorded pass
+        that follows begins with this image's compilation and allocator state
+        already warm; the KV cache is flushed after each, so the recorded pass
+        does not also begin with the warmup's prompts cached and report a prefill
+        it did not perform.  This is the "run twice, keep the second" shape the
+        internal disaggregated cases were measured under, and it is what absorbs
+        the per-batch-shape compilation cost the first request of each shape pays
+        on these boards -- a cost `warmup_requests`, capped at 32 output tokens,
+        cannot reach.  ``warmup_passes`` is zero on the colocated line, where a
+        prefill measurement pays that cost once and there is nothing to discard.
+
+        The discarded output lands in ``raw`` under a ``-warmupN`` name rather
+        than the measurement's own, so it is kept as evidence the pass ran
+        without overwriting the number the recorded pass reports.
+        """
+
+        for warmup_index in range(plan_entry["warmup_passes"]):
+            label = f"{plan_entry['id']}-warmup{warmup_index + 1}"
+            print(f"::group::warmup {label}", flush=True)
+            try:
+                args = self.build_benchmark_args(plan_entry)
+                args.output_file = str(self.raw_dir / f"{label}.jsonl")
+                run_benchmark(args)
+            finally:
+                print("::endgroup::", flush=True)
+            self._flush_cache(plan_entry)
+
     def _measure(self, plan_entry):
         """Run one measurement and grade it, never raising.
 
@@ -715,6 +745,25 @@ class PDPerfSuiteMixin:
         expensive thing.  The run still ends red, because ``build_report`` counts
         them.
         """
+
+        try:
+            self._run_warmup_passes(plan_entry)
+        except SystemExit as exc:
+            # A warmup pass that exits the process is the recorded pass's fate
+            # too; recording it here keeps the rest of the plan and the report.
+            return failed_measurement_record(
+                plan_entry,
+                "benchmark_crashed",
+                f"a warmup pass exited with status {exc.code}",
+            )
+        except MeasurementError as exc:
+            # A warmup flush that failed endangers the recorded pass the same way
+            # a between-measurement flush does; its reason code is carried as is.
+            return failed_measurement_record(plan_entry, exc.reason_code, str(exc))
+        except Exception as exc:
+            return failed_measurement_record(
+                plan_entry, "benchmark_crashed", f"{type(exc).__name__}: {exc}"
+            )
 
         print(f"::group::measure {plan_entry['id']}", flush=True)
         try:

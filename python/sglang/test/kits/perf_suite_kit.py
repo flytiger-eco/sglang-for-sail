@@ -261,7 +261,8 @@ class PerfSuiteMixin:
         ]
         provenance = cls._provenance(accelerator)
         provenance["setup_stage"] = stage
-        report = build_report(cls.test_config, measurements, provenance=provenance)
+        report = build_report(
+            cls.test_config, measurements, provenance=provenance)
         write_report_files(report, cls.report_dir)
         print(render_summary(report), flush=True)
 
@@ -272,7 +273,8 @@ class PerfSuiteMixin:
         cls.model_config = cls.test_config["model"]
         cls.server_config = cls.test_config["server"]["parameters"]
         cls.plan = resolve_measurement_plan(cls.test_config)
-        cls.output_dir = Path(os.environ.get(RESULTS_DIR_ENV, "ppu-perf-artifacts"))
+        cls.output_dir = Path(os.environ.get(
+            RESULTS_DIR_ENV, "ppu-perf-artifacts"))
         # Before the try: a config that asks for several nodes without giving
         # them a way to reach each other is a misconfiguration of the caller,
         # and the structured evidence below is written to a directory this very
@@ -303,7 +305,8 @@ class PerfSuiteMixin:
                 )
             config_path = model_dir / "config.json"
             if not config_path.is_file():
-                raise RuntimeError(f"{cls.model_path} does not contain config.json")
+                raise RuntimeError(
+                    f"{cls.model_path} does not contain config.json")
             checkpoint_config = load_json(config_path)
             accepted_model_types = cls.model_config["accepted_model_types"]
             if checkpoint_config.get("model_type") not in accepted_model_types:
@@ -312,7 +315,8 @@ class PerfSuiteMixin:
                     f"{checkpoint_config.get('model_type')!r} is not one of the "
                     f"accepted types {accepted_model_types}"
                 )
-            expected_device_count = len(cls.test_config["hardware"]["visible_devices"])
+            expected_device_count = len(
+                cls.test_config["hardware"]["visible_devices"])
             if torch.cuda.device_count() != expected_device_count:
                 raise RuntimeError(
                     f"{cls.test_config['test_id']} requires {expected_device_count} "
@@ -379,7 +383,8 @@ class PerfSuiteMixin:
 
         environment = perf_server_environment(cls.test_config)
         if cls.distributed is not None:
-            master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(":")
+            master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(
+                ":")
             environment.update(
                 {
                     "MASTER_ADDR": master_addr,
@@ -510,6 +515,35 @@ class PerfSuiteMixin:
                 f"{response.status_code}",
             )
 
+    def _run_warmup_passes(self, plan_entry):
+        """Run and discard the measurement's warmup passes.
+
+        Each is a full pass at the measurement's own shape, so the recorded pass
+        that follows begins with this image's compilation and allocator state
+        already warm; the KV cache is flushed after each, so the recorded pass
+        does not also begin with the warmup's prompts cached and report a prefill
+        it did not perform.  ``warmup_passes`` is zero on every colocated config
+        -- a prefill measurement pays its compilation cost once and there is
+        nothing to discard -- so this is a no-op here today, and exists so the
+        two lines drive a measurement the same way should a colocated case ever
+        want the disaggregated line's "run twice, keep the second" shape.
+
+        The discarded output lands in ``raw`` under a ``-warmupN`` name rather
+        than the measurement's own, so it is kept as evidence the pass ran
+        without overwriting the number the recorded pass reports.
+        """
+
+        for warmup_index in range(plan_entry["warmup_passes"]):
+            label = f"{plan_entry['id']}-warmup{warmup_index + 1}"
+            print(f"::group::warmup {label}", flush=True)
+            try:
+                args = self.build_benchmark_args(plan_entry)
+                args.output_file = str(self.raw_dir / f"{label}.jsonl")
+                run_benchmark(args)
+            finally:
+                print("::endgroup::", flush=True)
+            self._flush_cache(plan_entry)
+
     def _measure(self, plan_entry):
         """Run one measurement and grade it, never raising.
 
@@ -519,6 +553,25 @@ class PerfSuiteMixin:
         already up and the remaining measurements are the expensive thing to
         redo.  The run still ends red, because ``build_report`` counts them.
         """
+
+        try:
+            self._run_warmup_passes(plan_entry)
+        except SystemExit as exc:
+            # A warmup pass that exits the process is the recorded pass's fate
+            # too; recording it here keeps the rest of the plan and the report.
+            return failed_measurement_record(
+                plan_entry,
+                "benchmark_crashed",
+                f"a warmup pass exited with status {exc.code}",
+            )
+        except MeasurementError as exc:
+            # A warmup flush that failed endangers the recorded pass the same way
+            # a between-measurement flush does; its reason code is carried as is.
+            return failed_measurement_record(plan_entry, exc.reason_code, str(exc))
+        except Exception as exc:
+            return failed_measurement_record(
+                plan_entry, "benchmark_crashed", f"{type(exc).__name__}: {exc}"
+            )
 
         print(f"::group::measure {plan_entry['id']}", flush=True)
         try:
@@ -587,7 +640,8 @@ class PerfSuiteMixin:
             except OSError:
                 released = sentinel.exists()
             if released:
-                print(f"node {self.node_rank} was released by rank 0", flush=True)
+                print(
+                    f"node {self.node_rank} was released by rank 0", flush=True)
                 return
             exit_code = self.process.poll()
             if exit_code is not None:

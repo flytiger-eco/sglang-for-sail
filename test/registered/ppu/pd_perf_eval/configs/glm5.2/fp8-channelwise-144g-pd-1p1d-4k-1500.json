@@ -131,6 +131,7 @@
     "dataset": "random-ids",
     "random_range_ratio": 1.0,
     "warmup_requests": 1,
+    "warmup_passes": 1,
     "seed": 0,
     "measurements": [
       {

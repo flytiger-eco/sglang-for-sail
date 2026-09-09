@@ -27,12 +27,22 @@ inside the file, not by its directory.
 ## What this line measures, and what it does not
 
 Every measurement records TTFT (mean, median, std, p99), end-to-end latency
-(mean, median, p99), the four throughputs `bench_serving` reports (request,
-input-token, output-token, total-token), the run duration, the completed count,
-the input and output token totals, and the achieved concurrency — the seventeen
-fields of `perf_eval_kit.METRIC_FIELDS`. They reach the run page as annotations,
-one notice per measurement, and the machine-readable copy (`result.json`,
-`junit.xml`, the raw `bench_serving` JSONL) travels in the artifact.
+(mean, median, p90, p99), the four throughputs `bench_serving` reports (request,
+input-token, output-token, total-token) and the peak output-token throughput,
+the run duration, the completed count, the input and output token totals, and
+both the achieved and the ceiling concurrency — the nineteen fields of
+`perf_eval_kit.METRIC_FIELDS`, each defined from the first token and so recorded
+truthfully whether a case decodes or not. They reach the run page as
+annotations, one notice per measurement, and the machine-readable copy
+(`result.json`, `junit.xml`, the raw `bench_serving` JSONL) travels in the
+artifact.
+
+A measurement that decodes more than one output token records nine further
+fields — time per output token (mean, median, std, p99) and inter-token latency
+(mean, median, std, p95, p99), the `perf_eval_kit.DECODE_METRIC_FIELDS` — chosen
+by its own `output_len`. Every colocated case here asks for a single output
+token, so these stay out of its `result.json`; the disaggregated line, which
+decodes fifteen hundred, carries them.
 
 **Nothing here judges a number.** A measurement is red only when it produced no
 usable numbers at all, which `perf_eval_kit.REASON_CODES` enumerates exactly:
@@ -47,11 +57,15 @@ failure — the number is still recorded. A slow server is never red.
 ### Omissions, and why
 
 - **TTFT_P90.** The btv1.5 metric block reads a `tp_90` percentile that
-  `bench_serving` does not emit; adding it would mean changing `bench_serving.py`,
-  which this line does not do. The p99 tail is recorded in its place.
-- **TPOT and ITL.** Every ported case is a prefill: `output_len` is 1, so there
-  is no second token to time between. Decode-side metrics would all be degenerate
-  and are not recorded.
+  `bench_serving` does not emit for time to first token; adding it would mean
+  changing `bench_serving.py`, which this line does not do. The p99 tail is
+  recorded in its place. End-to-end latency and time per output token do carry
+  a p90, so those are recorded.
+- **TPOT and ITL on a prefill.** A colocated case asks for a single output
+  token, so there is no second token to time between; `bench_serving` would
+  return zero over an empty list. Rather than record that zero, the decode-side
+  fields are omitted for `output_len` of one and recorded for the disaggregated
+  line that decodes — see `DECODE_METRIC_FIELDS` above.
 
 ## The suites
 

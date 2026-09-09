@@ -76,31 +76,45 @@ bytes.
 
 Same contract as the colocated line, and the same refusal to judge: a
 measurement is red only when it produced no usable numbers at all, per
-`perf_eval_kit.REASON_CODES`. A slow server is never red. The seventeen fields of
-`perf_eval_kit.METRIC_FIELDS` are recorded, reaching the run page as one
-annotation per measurement with the machine-readable copy in the artifact.
+`perf_eval_kit.REASON_CODES`. A slow server is never red. The nineteen fields of
+`perf_eval_kit.METRIC_FIELDS` are recorded for every measurement, reaching the
+run page as one annotation per measurement with the machine-readable copy in the
+artifact.
 
-### TPOT and ITL are not recorded, and here that is a real gap
+### TPOT and ITL are recorded here, because this case decodes
 
 Unlike the prefill line — where `output_len` is 1 and decode-side metrics would
 be degenerate — this case decodes 1500 tokens per request, and the source case's
-metric block asks for `TPOT_AVG` and its percentiles. `bench_serving` does emit
+metric block asks for `TPOT_AVG` and its percentiles. `bench_serving` emits
 `mean_tpot_ms`, `median_tpot_ms`, `std_tpot_ms`, `p99_tpot_ms` and the ITL
-family, so nothing prevents recording them except that `METRIC_FIELDS` is shared
-with the colocated line: extending it would change every colocated report's
-schema from inside a PD-scoped change, and populate six fields there with the
-zeros an empty `tpots` list produces.
-
-They are left out deliberately, and the omission costs less than it looks:
-`TPOT_AVG` is `primary: false` in the source case, both of its primary metrics
-(`total_token_throughput`, `output_token_throughput`) are recorded, and at a
-pinned concurrency the output throughput carries the same decode-side signal.
-Adding a decode-metric block is the first follow-up once a measured run exists,
-and it belongs in a change of its own that touches both lines.
+family, and the shared `perf_eval_kit.DECODE_METRIC_FIELDS` records all nine —
+but only when a measurement's `output_len` is above one. A single-token prefill
+measurement still omits them rather than record the zero an empty `tpots` list
+produces, so extending the schema for this line changed no colocated report: the
+colocated configs decode one token and take the prefill set unchanged, while
+this one decodes 1500 and takes the decode set as well. End-to-end p90 and the
+output-throughput peak, defined from the first token, were folded into the
+always-recorded set at the same time.
 
 `TTFT_P90` is omitted for the reason the colocated line records: the source
 metric block reads a `tp_90` percentile `bench_serving` does not emit, and this
 line does not change `bench_serving`. The p99 tail stands in its place.
+
+### The recorded pass is the second, by construction
+
+The source harness reports a second pass over a first: it warms the server, runs
+the workload once, and reports the run after that. This line matches it with
+`workload.warmup_passes`, which the shared kit resolves into each measurement
+and the disaggregated suite honours by running that many full passes at the
+measurement's own shape and discarding them before the recorded one. The GLM-5.2
+case sets one; the colocated line's default is zero. The KV cache is flushed
+after each warmup pass, so the recorded pass runs warm on compilation and cold on
+cache — which is the point: run 34317611899 measured a first 4k prefill at 23.6
+tok/s against a second at 1495 tok/s, a ~170s per-batch-shape compilation cost
+that `warmup_requests` (capped at 32 output tokens) cannot reach and that
+otherwise lands entirely in the reported TTFT tail. The discarded pass's raw
+output is kept under a `-warmupN` name next to the recorded one as evidence it
+ran.
 
 ## The suite
 

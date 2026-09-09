@@ -498,6 +498,7 @@ def _validate_workload(workload: dict[str, Any]) -> None:
         "measurements",
         "random_range_ratio",
         "warmup_requests",
+        "warmup_passes",
         "seed",
         "flush_cache_timeout_seconds",
     }:
@@ -527,6 +528,24 @@ def _validate_workload(workload: dict[str, Any]) -> None:
         or warmup_requests < 0
     ):
         raise PerfEvalError("workload.warmup_requests must be a non-negative integer")
+    # How many full passes at a measurement's own shape to run and discard
+    # before the recorded one.  Zero is the colocated line's setting and the
+    # default: its prefill measurements pay their compilation cost once and the
+    # number is the number.  The disaggregated GLM-5.2 case sets one, because the
+    # internal harness it is ported from reports a second pass over a first: the
+    # boards this line runs on pay a per-batch-shape compilation cost on the
+    # first request of each shape -- measured at ~170s for a 4k prefill in run
+    # 34317611899 -- and `warmup_requests`, capped at 32 output tokens, cannot
+    # reach the decode shapes to absorb it.  A discarded pass does, and the KV
+    # cache is flushed after it, so the recorded pass runs warm on compilation
+    # and cold on cache.
+    warmup_passes = workload.get("warmup_passes", 0)
+    if (
+        not isinstance(warmup_passes, int)
+        or isinstance(warmup_passes, bool)
+        or warmup_passes < 0
+    ):
+        raise PerfEvalError("workload.warmup_passes must be a non-negative integer")
     seed = workload.get("seed", 0)
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise PerfEvalError("workload.seed must be a non-negative integer")
@@ -598,6 +617,7 @@ def resolve_measurement_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
             "concurrency": measurement["concurrency"],
             "random_range_ratio": workload.get("random_range_ratio", 1.0),
             "warmup_requests": workload.get("warmup_requests", 1),
+            "warmup_passes": workload.get("warmup_passes", 0),
             "seed": workload.get("seed", 0),
             "flush_cache_timeout_seconds": workload.get(
                 "flush_cache_timeout_seconds", 900
@@ -828,11 +848,12 @@ def perf_expected_hardware(config: dict[str, Any]) -> str:
 # requests per second, and a reader comparing two reports should not have to know
 # which is which.
 #
-# Time per output token and inter-token latency are absent on purpose.  Every
-# ported case asks for a single output token, and both quantities are defined
-# only from the second token onwards, so ``bench_serving`` computes them over an
-# empty list; recording the zero it produces would read as a measurement rather
-# than as an undefined quantity.  render_summary states the omission.
+# These are recorded for every measurement, single-token or not.  End-to-end
+# latency and both throughput peaks are defined from the first token, so a
+# prefill-only case carries them as truthfully as a decode one; only time per
+# output token and inter-token latency are undefined for one output token, and
+# those are split out into ``DECODE_METRIC_FIELDS`` below rather than recorded
+# as the zero ``bench_serving`` computes over an empty list.
 #
 # P90 time to first token is absent for a different reason: ``BenchmarkMetrics``
 # carries p90 for end-to-end latency and for time per output token but not for
@@ -847,10 +868,12 @@ METRIC_FIELDS = (
     ("ttft_p99_ms", "p99_ttft_ms"),
     ("e2e_latency_mean_ms", "mean_e2e_latency_ms"),
     ("e2e_latency_median_ms", "median_e2e_latency_ms"),
+    ("e2e_latency_p90_ms", "p90_e2e_latency_ms"),
     ("e2e_latency_p99_ms", "p99_e2e_latency_ms"),
     ("request_throughput_req_s", "request_throughput"),
     ("input_token_throughput_tok_s", "input_throughput"),
     ("output_token_throughput_tok_s", "output_throughput"),
+    ("output_token_throughput_peak_tok_s", "max_output_tokens_per_s"),
     ("total_token_throughput_tok_s", "total_throughput"),
     ("duration_s", "duration"),
     ("completed", "completed"),
@@ -858,6 +881,26 @@ METRIC_FIELDS = (
     ("total_output_tokens", "total_output_tokens"),
     ("concurrency", "concurrency"),
     ("max_concurrent_requests", "max_concurrent_requests"),
+)
+
+# The decode-side numbers, recorded only when a measurement asks for more than
+# one output token.  Time per output token and inter-token latency are defined
+# from the second token onwards, so for a single-token prefill case
+# ``bench_serving`` computes them over an empty list and returns zero; recording
+# that zero would read as a measurement rather than as an undefined quantity, so
+# the colocated prefill line omits these fields entirely while the disaggregated
+# line, which decodes 1500 tokens, records them.  ``measurement_record`` picks
+# the set from the measurement's own ``output_len``.
+DECODE_METRIC_FIELDS = (
+    ("tpot_mean_ms", "mean_tpot_ms"),
+    ("tpot_median_ms", "median_tpot_ms"),
+    ("tpot_std_ms", "std_tpot_ms"),
+    ("tpot_p99_ms", "p99_tpot_ms"),
+    ("itl_mean_ms", "mean_itl_ms"),
+    ("itl_median_ms", "median_itl_ms"),
+    ("itl_std_ms", "std_itl_ms"),
+    ("itl_p95_ms", "p95_itl_ms"),
+    ("itl_p99_ms", "p99_itl_ms"),
 )
 
 # How far the prompts the tokenizer actually produced may drift from the length
@@ -890,22 +933,28 @@ def _summarize_lengths(lengths: list[int] | None) -> dict[str, Any] | None:
     }
 
 
-def extract_metrics(raw: dict[str, Any]) -> dict[str, Any]:
+def extract_metrics(raw: dict[str, Any], *, include_decode: bool = False) -> dict[str, Any]:
     """Pull the recorded numbers out of what ``run_benchmark`` returned.
 
     A missing key is an error rather than a null, because ``run_benchmark``
     populates all of them together: an absent one means this tree's benchmark
     result shape moved, and silently recording nulls would turn that into a run
     of blank reports nobody reads twice.
+
+    ``include_decode`` adds the time-per-output-token and inter-token-latency
+    fields, and is set from the measurement's ``output_len``: they are defined
+    only past the first output token, so a single-token prefill measurement
+    leaves them out rather than record the zero ``bench_serving`` computes.
     """
 
-    missing = [source for _, source in METRIC_FIELDS if source not in raw]
+    fields = METRIC_FIELDS + DECODE_METRIC_FIELDS if include_decode else METRIC_FIELDS
+    missing = [source for _, source in fields if source not in raw]
     if missing:
         raise MeasurementError(
             "metrics_missing",
             "the benchmark result is missing " + ", ".join(sorted(missing)),
         )
-    return {name: raw[source] for name, source in METRIC_FIELDS}
+    return {name: raw[source] for name, source in fields}
 
 
 def observed_workload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -936,7 +985,9 @@ def measurement_record(
     record = _base_record(plan_entry)
     observed = observed_workload(raw)
     record["observed"] = observed
-    record["metrics"] = extract_metrics(raw)
+    record["metrics"] = extract_metrics(
+        raw, include_decode=plan_entry["output_len"] > 1
+    )
 
     if observed["request_errors"]:
         record["status"] = "failed"
@@ -1087,7 +1138,7 @@ def render_summary(report: dict[str, Any]) -> str:
         lines.append("")
         for record in measured:
             metrics = record["metrics"]
-            lines.append(
+            line = (
                 f"- MEASURED {record['id']} | "
                 f"in={record['input_len']} out={record['output_len']} "
                 f"prompts={record['num_prompts']} "
@@ -1099,6 +1150,15 @@ def render_summary(report: dict[str, Any]) -> str:
                 f"total={_fmt(metrics['total_token_throughput_tok_s'])}tok/s | "
                 f"duration={_fmt(metrics['duration_s'])}s"
             )
+            # Decode timings only when the measurement asked for more than one
+            # output token; a prefill case never carries them (see
+            # DECODE_METRIC_FIELDS), so the annotation does not invent a zero.
+            if "tpot_mean_ms" in metrics:
+                line += (
+                    f" | tpot_mean={_fmt(metrics['tpot_mean_ms'])}ms "
+                    f"itl_p99={_fmt(metrics['itl_p99_ms'])}ms"
+                )
+            lines.append(line)
         lines.append("")
 
     failed = [
@@ -1221,6 +1281,7 @@ __all__ = [
     "INPUT_LENGTH_TOLERANCE",
     "MEASUREMENT_REQUIRED_KEYS",
     "METRIC_FIELDS",
+    "DECODE_METRIC_FIELDS",
     "MeasurementError",
     "PERF_CONFIG_SCHEMA_VERSION",
     "PERF_REPORT_SCHEMA_VERSION",
