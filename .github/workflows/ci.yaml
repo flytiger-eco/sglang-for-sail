@@ -1,0 +1,54 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Stage 1: 密钥扫描预检（组织级 reusable workflow）
+  precheck:
+    name: Pre-check
+    uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
+
+  # Stage 2: 冒烟测试 与 AI 评审 并行
+  smoke-test:
+    name: Smoke Test
+    needs: precheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke tests
+        run: |
+          echo "在此替换为你的冒烟测试命令"
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  # Stage 3: 人工审批门禁
+  human-review:
+    name: Human Review Gate
+    needs: [smoke-test, ai-code-review]
+    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  # Stage 4: 完整业务 CI
+  ci:
+    name: Full CI
+    needs: human-review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run full CI
+        run: |
+          echo "在此替换为你的完整 CI 命令（构建 / 单测 / 打包等）"
