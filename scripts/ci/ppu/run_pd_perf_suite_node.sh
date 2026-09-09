@@ -131,18 +131,29 @@ export MC_GID_INDEX
 # /24 -- the peer's out-of-band address is on it, so a peer discovered at runtime
 # needs nothing added -- plus loopback, for the router the benchmark posts to.
 #
-# Which address that is takes three methods, and the order is the fifth dispatch's
-# doing.  The default route's source address was the only method until that run
+# Which address that is takes four methods, and the order is what three dispatches
+# taught.  The default route's source address was the only method until one run
 # landed on two boards that have no default route: both pods exited thirty seconds
 # in, having derived nothing, and the K8s events showed both containers started
 # clean, so the whole failure was this derivation.  The boards that carry a
 # default route are not a subset anyone controls -- the scheduler picks whichever
-# two are free -- so the second method has to be one that does not need routing at
-# all.  Resolving the node's own name is that method, and it is not a guess: the
-# name the action injects is the K8s node name, which is the FQDN, and DNS maps
-# swu07 and swu08 to exactly the two addresses the earlier dispatches derived
-# through the route on those same boards.  `hostname -i` stays last, since it was
-# already here and costs nothing, though it was empty on the boards that failed.
+# two are free -- so no method that needs routing to the internet can be the last
+# word.  Resolving the node's own name was the answer for two boards and not for a
+# third: the next run put rank 0 on swu03, whose record exists in the DNS this
+# fabric answers with, and the lookup a second into the container's life returned
+# nothing anyway, which is what a resolver that is not up yet looks like.
+#
+# So the method that does not depend on either is asked first of the two: which
+# address does this node use to reach the NAS it is already writing to.  The
+# server is read out of the mount table rather than named here, the route to it is
+# specific rather than default, and the question is answered by a file this script
+# has already written -- the log holding this very line lives on that NAS, so a
+# node that got this far has a working path to it.  On the bypass host of this
+# fabric the three methods agree to the letter: the route to the NAS, the route to
+# the internet, and DNS for its own name all return 11.161.48.214, which is the
+# same agreement DNS and the route showed on swu07 and swu08.  `hostname -i` stays
+# last, since it was already here and costs nothing, though it was empty on every
+# board that needed it.
 #
 # SGLANG_HOST_IP carries the answer into the suite, which otherwise repeats the
 # derivation itself: `get_local_ip_auto` probes by connecting a UDP socket
@@ -152,13 +163,47 @@ export MC_GID_INDEX
 # protecting it.  Read first by that function, it also makes one address serve
 # the bypass below, the endpoint each node publishes, and the address each
 # server binds, rather than three derivations that agree only by luck.
-NODE_ADDRESS=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (field = 1; field < NF; field++) if ($field == "src") print $(field + 1)}' | head -1)
+address_towards() {
+  ip route get "$1" 2>/dev/null |
+    awk '{for (field = 1; field < NF; field++) if ($field == "src") print $(field + 1)}' |
+    head -1
+}
+NODE_ADDRESS=$(address_towards 1.1.1.1)
 NODE_ADDRESS_SOURCE="the source address of the default route"
-if [ -z "$NODE_ADDRESS" ] && [ -n "${NODE_NAME:-}" ]; then
-  NODE_ADDRESS=$(getent ahostsv4 "$NODE_NAME" 2>/dev/null | awk '{print $1}' | head -1)
-  if [ -z "$NODE_ADDRESS" ]; then
-    NODE_ADDRESS=$(getent hosts "$NODE_NAME" 2>/dev/null | awk '$1 ~ /^[0-9]+[.]/ {print $1}' | head -1)
+if [ -z "$NODE_ADDRESS" ]; then
+  # The NFS server behind the results directory, which is the deepest mount point
+  # this directory sits under -- a node mounting more than one NAS has one that
+  # holds the group's rank files and that is the one worth reaching.
+  NAS_ADDRESS=$(awk -v dir="$SGLANG_PPU_PD_PERF_RESULTS_DIR/" '
+    $3 ~ /^nfs/ {
+      point = $2
+      if (substr(point, length(point)) != "/") point = point "/"
+      if (index(dir, point) == 1 && length(point) > length(deepest)) {
+        deepest = point
+        if (match($4, /addr=[0-9.]+/)) server = substr($4, RSTART + 5, RLENGTH - 5)
+      }
+    }
+    END {print server}
+  ' /proc/mounts)
+  if [ -n "$NAS_ADDRESS" ]; then
+    NODE_ADDRESS=$(address_towards "$NAS_ADDRESS")
+    NODE_ADDRESS_SOURCE="the route to the NAS at $NAS_ADDRESS"
   fi
+fi
+if [ -z "$NODE_ADDRESS" ] && [ -n "${NODE_NAME:-}" ]; then
+  # Asked more than once, and not because DNS is flaky: the one board where this
+  # returned nothing had a record, and the query went out seconds after the
+  # container started.  A resolver reached a moment later answers.
+  for attempt in 1 2 3 4 5; do
+    NODE_ADDRESS=$(getent ahostsv4 "$NODE_NAME" 2>/dev/null | awk '{print $1}' | head -1)
+    if [ -z "$NODE_ADDRESS" ]; then
+      NODE_ADDRESS=$(getent hosts "$NODE_NAME" 2>/dev/null | awk '$1 ~ /^[0-9]+[.]/ {print $1}' | head -1)
+    fi
+    if [ -n "$NODE_ADDRESS" ]; then
+      break
+    fi
+    sleep 3
+  done
   NODE_ADDRESS_SOURCE="DNS for $NODE_NAME"
 fi
 if [ -z "$NODE_ADDRESS" ]; then
@@ -168,8 +213,9 @@ fi
 if [ -z "$NODE_ADDRESS" ]; then
   echo "could not derive this node's own address, which the proxy bypass, the" \
     "endpoint this node publishes and the address its server binds all need;" \
-    "tried the default route, DNS for ${NODE_NAME:-an unnamed node}," \
-    "and hostname -i" >&2
+    "tried the default route, the route to the NAS at" \
+    "${NAS_ADDRESS:-an address the mount table did not give}," \
+    "DNS for ${NODE_NAME:-an unnamed node}, and hostname -i" >&2
   exit 1
 fi
 export SGLANG_HOST_IP="$NODE_ADDRESS"
