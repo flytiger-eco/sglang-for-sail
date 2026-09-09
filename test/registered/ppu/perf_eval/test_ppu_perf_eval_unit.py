@@ -27,11 +27,11 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.kits.answer_eval_kit import canonical_digest
 from sglang.test.kits.perf_eval_kit import (
     ALLOWED_SERVER_ENVIRONMENT,
+    DECODE_METRIC_FIELDS,
     EXTERNAL_SERVER_ENVIRONMENT,
     INPUT_LENGTH_TOLERANCE,
     MEASUREMENT_REQUIRED_KEYS,
     METRIC_FIELDS,
-    DECODE_METRIC_FIELDS,
     REASON_CODES,
     SERVER_PARAMETER_STORE_TRUE,
     MeasurementError,
@@ -473,6 +473,7 @@ class TestPPUPerfEval(unittest.TestCase):
                 "--disable-custom-all-reduce",
                 "--enforce-disable-flashinfer-allreduce-fusion",
                 "--enable-dsa-prefill-context-parallel",
+                "--disable-radix-cache",
                 "--disable-overlap-schedule",
                 "--enable-metrics",
                 "--served-model-name",
