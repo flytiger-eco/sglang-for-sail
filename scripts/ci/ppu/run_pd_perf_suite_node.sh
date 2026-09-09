@@ -130,16 +130,49 @@ export MC_GID_INDEX
 # aiohttp reads neither, so it was never at risk.  The block is this node's own
 # /24 -- the peer's out-of-band address is on it, so a peer discovered at runtime
 # needs nothing added -- plus loopback, for the router the benchmark posts to.
-# The address is the source of the default route, which is the one SGLang itself
-# resolves to and publishes as this node's endpoint.
+#
+# Which address that is takes three methods, and the order is the fifth dispatch's
+# doing.  The default route's source address was the only method until that run
+# landed on two boards that have no default route: both pods exited thirty seconds
+# in, having derived nothing, and the K8s events showed both containers started
+# clean, so the whole failure was this derivation.  The boards that carry a
+# default route are not a subset anyone controls -- the scheduler picks whichever
+# two are free -- so the second method has to be one that does not need routing at
+# all.  Resolving the node's own name is that method, and it is not a guess: the
+# name the action injects is the K8s node name, which is the FQDN, and DNS maps
+# swu07 and swu08 to exactly the two addresses the earlier dispatches derived
+# through the route on those same boards.  `hostname -i` stays last, since it was
+# already here and costs nothing, though it was empty on the boards that failed.
+#
+# SGLANG_HOST_IP carries the answer into the suite, which otherwise repeats the
+# derivation itself: `get_local_ip_auto` probes by connecting a UDP socket
+# towards 8.8.8.8, which needs the same default route, and its own fallback is
+# the hostname lookup that was empty here -- so on those two boards the suite
+# would raise `Can not get local ip` a minute after this script stopped
+# protecting it.  Read first by that function, it also makes one address serve
+# the bypass below, the endpoint each node publishes, and the address each
+# server binds, rather than three derivations that agree only by luck.
 NODE_ADDRESS=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (field = 1; field < NF; field++) if ($field == "src") print $(field + 1)}' | head -1)
+NODE_ADDRESS_SOURCE="the source address of the default route"
+if [ -z "$NODE_ADDRESS" ] && [ -n "${NODE_NAME:-}" ]; then
+  NODE_ADDRESS=$(getent ahostsv4 "$NODE_NAME" 2>/dev/null | awk '{print $1}' | head -1)
+  if [ -z "$NODE_ADDRESS" ]; then
+    NODE_ADDRESS=$(getent hosts "$NODE_NAME" 2>/dev/null | awk '$1 ~ /^[0-9]+[.]/ {print $1}' | head -1)
+  fi
+  NODE_ADDRESS_SOURCE="DNS for $NODE_NAME"
+fi
 if [ -z "$NODE_ADDRESS" ]; then
   NODE_ADDRESS=$(hostname -i 2>/dev/null | awk '{print $1}')
+  NODE_ADDRESS_SOURCE="hostname -i"
 fi
 if [ -z "$NODE_ADDRESS" ]; then
-  echo "could not derive this node's own address, which the proxy bypass needs" >&2
+  echo "could not derive this node's own address, which the proxy bypass, the" \
+    "endpoint this node publishes and the address its server binds all need;" \
+    "tried the default route, DNS for ${NODE_NAME:-an unnamed node}," \
+    "and hostname -i" >&2
   exit 1
 fi
+export SGLANG_HOST_IP="$NODE_ADDRESS"
 no_proxy="${no_proxy:+$no_proxy,}localhost,127.0.0.1,$NODE_ADDRESS,$(echo "$NODE_ADDRESS" | cut -d. -f1-3).0/24"
 export no_proxy
 NO_PROXY="$no_proxy"
@@ -171,7 +204,7 @@ echo "role port:       $PD_ROLE_PORT"
 echo "results dir:     $SGLANG_PPU_PD_PERF_RESULTS_DIR"
 echo "gloo interface:  $GLOO_SOCKET_IFNAME"
 echo "gid index:       $MC_GID_INDEX"
-echo "node address:    $NODE_ADDRESS"
+echo "node address:    $NODE_ADDRESS (from $NODE_ADDRESS_SOURCE)"
 echo "proxy bypass:    $no_proxy"
 echo "inherited proxy: http_proxy=${http_proxy:-unset} https_proxy=${https_proxy:-unset} HTTP_PROXY=${HTTP_PROXY:-unset} HTTPS_PROXY=${HTTPS_PROXY:-unset}"
 echo "visible devices: $CUDA_VISIBLE_DEVICES"
