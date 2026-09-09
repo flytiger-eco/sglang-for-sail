@@ -87,6 +87,39 @@ export SGLANG_PPU_SOURCE_REVISION
 MC_GID_INDEX=$(bash scripts/ci/ppu/answer_gid_index.sh)
 export MC_GID_INDEX
 
+# And the HTTP hops that must not go through a proxy.  Every one this line makes
+# is inside the cluster: a server warming itself up over its own routable
+# address, rank 0 waiting for its peer's `/health`, the benchmark posting to the
+# router, and the router reaching both servers.  On the second dispatch of this
+# line the first of those never arrived -- the prefill server's own
+# `/model_info` came back as an nginx 404 for the full two minutes of the warmup
+# loop while the uvicorn bound to that exact address logged no request at all,
+# and the server was killed as a failed initialization.  Nothing here names a
+# proxy: not this script, not the workflow, not the distributed action, and not
+# the source commands this case was ported from.  So the bypass is what this line
+# can set, and the variables it inherited are printed below, which is what tells
+# a repeat of that 404 apart from a transparent redirect.
+#
+# `requests`, which the warmup and every readiness poll use, and the router's
+# Rust client both read `no_proxy` and both accept a CIDR block; the benchmark's
+# aiohttp reads neither, so it was never at risk.  The block is this node's own
+# /24 -- the peer's out-of-band address is on it, so a peer discovered at runtime
+# needs nothing added -- plus loopback, for the router the benchmark posts to.
+# The address is the source of the default route, which is the one SGLang itself
+# resolves to and publishes as this node's endpoint.
+NODE_ADDRESS=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (field = 1; field < NF; field++) if ($field == "src") print $(field + 1)}' | head -1)
+if [ -z "$NODE_ADDRESS" ]; then
+  NODE_ADDRESS=$(hostname -i 2>/dev/null | awk '{print $1}')
+fi
+if [ -z "$NODE_ADDRESS" ]; then
+  echo "could not derive this node's own address, which the proxy bypass needs" >&2
+  exit 1
+fi
+no_proxy="${no_proxy:+$no_proxy,}localhost,127.0.0.1,$NODE_ADDRESS,$(echo "$NODE_ADDRESS" | cut -d. -f1-3).0/24"
+export no_proxy
+NO_PROXY="$no_proxy"
+export NO_PROXY
+
 # The device list and the checkpoint come out of the config the test will read: a
 # second copy in the workflow could drift from what the suite validates against.
 # nproc_per_node is a resource request and not device isolation, so narrowing the
@@ -108,6 +141,9 @@ echo "role:            $PD_ROLE"
 echo "results dir:     $SGLANG_PPU_PD_PERF_RESULTS_DIR"
 echo "gloo interface:  $GLOO_SOCKET_IFNAME"
 echo "gid index:       $MC_GID_INDEX"
+echo "node address:    $NODE_ADDRESS"
+echo "proxy bypass:    $no_proxy"
+echo "inherited proxy: http_proxy=${http_proxy:-unset} https_proxy=${https_proxy:-unset} HTTP_PROXY=${HTTP_PROXY:-unset} HTTPS_PROXY=${HTTPS_PROXY:-unset}"
 echo "visible devices: $CUDA_VISIBLE_DEVICES"
 echo "checkpoint:      $PD_MODEL_PATH"
 

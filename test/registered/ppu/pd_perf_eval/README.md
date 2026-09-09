@@ -210,8 +210,9 @@ holds a board for the entire 5400 s peer-wait budget and then reports nothing.
 One thing `run_pd_perf_suite_node.sh` deliberately does not do, recorded in its
 header: it derives **no rendezvous address** (see above). It does set the **RoCE
 GID index**, through the collective line's `answer_gid_index.sh` and under
-Mooncake's own `MC_GID_INDEX`, because the KV path needs it told even though no
-collective here crosses the node boundary — see the answered unknown below.
+Mooncake's own `MC_GID_INDEX`, and it sets a **proxy bypass** for the cluster
+addresses its own HTTP hops use — both because the dispatches below proved they
+were needed.
 `GLOO_SOCKET_IFNAME=lo` is correct here for the single-board reason: each
 server's ranks are processes in one network namespace, and its peer is reached
 over HTTP and RDMA, never over gloo.
@@ -234,35 +235,48 @@ numbers is an estimate a cold clone has to survive, not a measured budget** — 
 is the `register_ppu_ci(est_time=7200)` in the test file. The first green run is
 what should replace them.
 
-## What the first dispatch answered, and what is still open
+## What the dispatches so far answered, and what is still open
 
-The first dispatch of this line — a shakeout of the same config at 4 requests and
-256 output tokens, on a throwaway branch, 2026-09-09 — failed in the prefill
-server twenty seconds after launch, and in failing answered one of the two
-questions the line was written to ask.
+Two shakeout dispatches — the same config at 4 requests and 256 output tokens, on
+a throwaway branch, 2026-09-09 — have run. The first died in the prefill server
+twenty seconds after launch, the second two minutes after its server was
+listening, and between them they turned two guesses in this port into measured
+facts.
 
-1. **Does `sglang_router`'s mini-lb come up on this board?** Still open.
+The first found that the Mooncake transfer engine opened none of the four bonds:
+`No suitable GID found on mlx5_bond_1/`, then `Failed to open device mlx5_bond_1
+on port  with GID -1`, on every bond, then `Mooncake Transfer Engine
+initialization failed` and a server killed at `-9`. Its automatic GID discovery
+requires an IPv4-mapped-IPv6 GID and these bonds carry no IPv4, which is upstream
+Mooncake #1593. `run_pd_perf_suite_node.sh` now derives the index with the
+collective line's `answer_gid_index.sh` and exports it as `MC_GID_INDEX`, and the
+second dispatch confirmed the effect: `Using user-specified GID index: 3` on
+every bond, the engine up, the checkpoint loaded and the server listening.
+
+The second then died in the server's own warmup. Its `/model_info` request to its
+own routable address came back as an nginx 404 for the full two minutes of the
+warmup loop, while the uvicorn bound to that exact address logged no request at
+all — so the request never arrived. Nothing in this repository names a proxy, so
+the script now exports a `no_proxy` covering loopback and this node's own /24,
+and prints the proxy variables it inherited, which is what will tell a repeat of
+that 404 apart from a transparent redirect.
+
+Still open:
+
+1. **Does `sglang_router`'s mini-lb come up on this board?**
    `ppu_install_dependency.sh` records `sglang-router 0.3.2+v0.1.0.ppu2.1.1` as
    present in the image and deliberately left alone (verified in-image
    2026-08-13), so the package exists. What is untested is whether that build's
    `launch_router --pd-disaggregation --mini-lb` accepts these arguments and
    routes to two PPU servers; the in-tree `disaggregation_fixture.py` is the only
-   evidence for the flag shape. The shakeout could not answer it, because the
-   router is launched after rank 0's own server is ready and that server died
-   first.
-2. **Does the Mooncake KV handshake complete across two of these boards?** Not
-   until the transfer engine is told a GID index, which it now is. Left to
-   itself Mooncake opened none of the four bonds — `No suitable GID found on
-   mlx5_bond_1/`, then `Failed to open device mlx5_bond_1 on port  with GID -1`,
-   on every bond, then `Mooncake Transfer Engine initialization failed` and a
-   server killed at `-9`. Its automatic discovery requires an IPv4-mapped-IPv6
-   GID and these bonds carry no IPv4, which is upstream Mooncake #1593;
-   `run_pd_perf_suite_node.sh` now derives the index and exports it as
-   `MC_GID_INDEX`. What that leaves unproven is the handshake itself: no run has
-   yet moved a KV block between two ZW-M890P boards, which is why
-   `MC_LOG_LEVEL=TRACE` stays on.
+   evidence for the flag shape. Neither dispatch could answer it, because the
+   router is launched only after rank 0's own server is ready.
+2. **Does the Mooncake KV handshake complete across two of these boards?** The
+   engine now initializes on both, which is further than any run in this
+   repository had reached, but no KV block has yet crossed the fabric between two
+   ZW-M890P boards — which is why `MC_LOG_LEVEL=TRACE` stays on.
 
-Everything else the two-pod harness had to do worked on that run: the group
+Everything the two-pod harness itself had to do worked on both runs: the group
 gang-scheduled onto two separate boards, each node published its endpoint and had
 the role it claimed checked against the role its rank was assigned, and the
 report, the annotations and the per-node evidence all came back.
