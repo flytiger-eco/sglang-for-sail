@@ -44,6 +44,31 @@ PIPEOF
 : "${PERF_SUITE:?the registered suite name is required}"
 : "${PERF_TIMEOUT_PER_FILE:?the per-file timeout is required}"
 
+# Everything below, into the shared directory, from this line rather than from
+# the suite. The action streams worker-0 and no other pod, and `rank-N.log` is
+# opened by `run_perf_suite_node.sh`, which is the last thing this script does --
+# so a node that dies in the install, the JIT cache or the page-cache warm dies
+# with its output nowhere. The fourth dispatch of this line is what that costs:
+# the decode pod exited non-zero three minutes in, the run reported
+# "failed=1" without naming a pod or a reason, the pods were gone by the time
+# anyone looked, and the shared directory held not one byte of that node. Which
+# left the whole pre-suite phase -- the only phase it could have died in -- with
+# no evidence at all, on a line where every dispatch costs two boards.
+#
+# Appended rather than truncated so a retried node does not erase its first
+# attempt, and guarded on both things the redirect needs -- a writable path under
+# the shared directory, and the /dev/fd the process substitution opens -- because
+# a failed redirection on `exec` ends the script under `set -e`, and a diagnostic
+# that fails the run it exists to explain would be worse than no diagnostic.
+PD_NODE_LOG="$SGLANG_PPU_PD_PERF_RESULTS_DIR/ranks/rank-${NODE_RANK:-0}-node.log"
+if mkdir -p "$(dirname "$PD_NODE_LOG")" 2>/dev/null &&
+  touch "$PD_NODE_LOG" 2>/dev/null &&
+  [ -d /dev/fd ]; then
+  exec > >(tee -a "$PD_NODE_LOG") 2>&1
+else
+  echo "could not open $PD_NODE_LOG; this node's log stays in its pod" >&2
+fi
+
 # Constant for every entry of this line, as on the single-board one:
 # HF_HUB_OFFLINE keeps the tokenizer load off a cluster that has no network, and
 # a PD run loads a tokenizer three times over -- once in each server and once in
@@ -160,13 +185,21 @@ echo "checkpoint:      $PD_MODEL_PATH"
 # nginx 404 back every time.  A bound socket that never sees the packets sent to
 # it means something on the node rewrites them, and Kubernetes hands out node
 # ports from exactly 30000, which is why the ports moved below it.  The probes
-# are what turns that reading into a measurement: the old port on this node's
-# address should answer, since answering with nothing behind it is the whole
-# finding, the same port on loopback should refuse, which is why the colocated
-# line -- it talks to 127.0.0.1 -- has never hit this, and the port this run
-# will actually use should refuse too.  All three are one connect each, and none
-# of them fails the run: a probe that comes back other than expected is read in
-# the log next to the failure it explains.
+# are what turned that reading into a measurement, and the fourth dispatch
+# printed all three: this node's address on 30000 answered `HTTP 404`, which is
+# the finding, since nothing of ours was behind it; 30000 on loopback answered
+# `HTTP 404` as well; and the port this run uses refused, which is what a port
+# with nothing behind it is supposed to do.
+#
+# The loopback answer is the part worth keeping in mind.  The rewrite matches on
+# the port and not on the address, so 127.0.0.1 is inside it too, and the
+# colocated line's habit of talking to 127.0.0.1 protects it from nothing: that
+# line's 31000 is inside the same node-port range, and it has stayed up only
+# because no service in this cluster has been handed 31000 yet.
+#
+# All three are one connect each, and none of them fails the run: a probe that
+# comes back other than expected is read in the log next to the failure it
+# explains.
 for probe_target in "$NODE_ADDRESS 30000" "127.0.0.1 30000" "$NODE_ADDRESS $PD_ROLE_PORT"; do
   probe_address=${probe_target% *}
   probe_port=${probe_target#* }
