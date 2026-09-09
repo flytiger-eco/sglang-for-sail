@@ -673,9 +673,7 @@ class TestPPUPerfEval(unittest.TestCase):
         # as any other, but only when the decode set was asked for.
         without_tpot = benchmark_result()
         without_tpot.pop("mean_tpot_ms")
-        self.assertEqual(
-            len(extract_metrics(without_tpot)), len(METRIC_FIELDS)
-        )
+        self.assertEqual(len(extract_metrics(without_tpot)), len(METRIC_FIELDS))
         with self.assertRaises(MeasurementError) as raised_decode:
             extract_metrics(without_tpot, include_decode=True)
         self.assertEqual(raised_decode.exception.reason_code, "metrics_missing")

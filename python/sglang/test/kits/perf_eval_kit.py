@@ -933,7 +933,9 @@ def _summarize_lengths(lengths: list[int] | None) -> dict[str, Any] | None:
     }
 
 
-def extract_metrics(raw: dict[str, Any], *, include_decode: bool = False) -> dict[str, Any]:
+def extract_metrics(
+    raw: dict[str, Any], *, include_decode: bool = False
+) -> dict[str, Any]:
     """Pull the recorded numbers out of what ``run_benchmark`` returned.
 
     A missing key is an error rather than a null, because ``run_benchmark``

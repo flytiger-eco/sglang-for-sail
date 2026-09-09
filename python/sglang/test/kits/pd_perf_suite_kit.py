@@ -390,9 +390,7 @@ class PDPerfSuiteMixin:
             # reason the endpoints are: it is the other file one node writes and
             # another reads, and a release meant for an earlier run would send a
             # peer home while this one still needs its board.
-            cls._sentinel_path().write_text(
-                f"{cls._run_stamp()}\n", encoding="utf-8"
-            )
+            cls._sentinel_path().write_text(f"{cls._run_stamp()}\n", encoding="utf-8")
         except OSError as error:
             print(
                 f"failed to release the worker nodes: {type(error).__name__}: {error}",

@@ -261,8 +261,7 @@ class PerfSuiteMixin:
         ]
         provenance = cls._provenance(accelerator)
         provenance["setup_stage"] = stage
-        report = build_report(
-            cls.test_config, measurements, provenance=provenance)
+        report = build_report(cls.test_config, measurements, provenance=provenance)
         write_report_files(report, cls.report_dir)
         print(render_summary(report), flush=True)
 
@@ -273,8 +272,7 @@ class PerfSuiteMixin:
         cls.model_config = cls.test_config["model"]
         cls.server_config = cls.test_config["server"]["parameters"]
         cls.plan = resolve_measurement_plan(cls.test_config)
-        cls.output_dir = Path(os.environ.get(
-            RESULTS_DIR_ENV, "ppu-perf-artifacts"))
+        cls.output_dir = Path(os.environ.get(RESULTS_DIR_ENV, "ppu-perf-artifacts"))
         # Before the try: a config that asks for several nodes without giving
         # them a way to reach each other is a misconfiguration of the caller,
         # and the structured evidence below is written to a directory this very
@@ -305,8 +303,7 @@ class PerfSuiteMixin:
                 )
             config_path = model_dir / "config.json"
             if not config_path.is_file():
-                raise RuntimeError(
-                    f"{cls.model_path} does not contain config.json")
+                raise RuntimeError(f"{cls.model_path} does not contain config.json")
             checkpoint_config = load_json(config_path)
             accepted_model_types = cls.model_config["accepted_model_types"]
             if checkpoint_config.get("model_type") not in accepted_model_types:
@@ -315,8 +312,7 @@ class PerfSuiteMixin:
                     f"{checkpoint_config.get('model_type')!r} is not one of the "
                     f"accepted types {accepted_model_types}"
                 )
-            expected_device_count = len(
-                cls.test_config["hardware"]["visible_devices"])
+            expected_device_count = len(cls.test_config["hardware"]["visible_devices"])
             if torch.cuda.device_count() != expected_device_count:
                 raise RuntimeError(
                     f"{cls.test_config['test_id']} requires {expected_device_count} "
@@ -383,8 +379,7 @@ class PerfSuiteMixin:
 
         environment = perf_server_environment(cls.test_config)
         if cls.distributed is not None:
-            master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(
-                ":")
+            master_addr, _, _ = cls.distributed["dist_init_addr"].rpartition(":")
             environment.update(
                 {
                     "MASTER_ADDR": master_addr,
@@ -640,8 +635,7 @@ class PerfSuiteMixin:
             except OSError:
                 released = sentinel.exists()
             if released:
-                print(
-                    f"node {self.node_rank} was released by rank 0", flush=True)
+                print(f"node {self.node_rank} was released by rank 0", flush=True)
                 return
             exit_code = self.process.poll()
             if exit_code is not None:
