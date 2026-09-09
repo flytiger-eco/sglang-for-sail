@@ -133,11 +133,16 @@ PD_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SG
 # that names it is what makes a two-pod run readable. Read out of the JSON rather
 # than through `pd_perf_eval_kit`, because this runs before the install.
 PD_ROLE=$(python3 -c "import json, os; c = json.load(open(os.environ['SGLANG_PPU_PD_PERF_TEST_CONFIG'])); print('prefill' if int(os.environ.get('NODE_RANK', '0')) < c['disaggregation']['prefill_nodes'] else 'decode')")
+# And the port that role's server will listen on, read the same way and for the
+# same reason: only the probes below use it, and only to reach an address before
+# anything of ours is behind it.
+PD_ROLE_PORT=$(python3 -c "import json, os; c = json.load(open(os.environ['SGLANG_PPU_PD_PERF_TEST_CONFIG'])); print(c['disaggregation'][('prefill' if int(os.environ.get('NODE_RANK', '0')) < c['disaggregation']['prefill_nodes'] else 'decode') + '_port'])")
 echo "source revision: $SGLANG_PPU_SOURCE_REVISION"
 echo "test config:     $SGLANG_PPU_PD_PERF_TEST_CONFIG"
 echo "suite:           $PERF_SUITE"
 echo "node rank:       ${NODE_RANK:-0} of ${NNODES:-1} on ${NODE_NAME:-an unnamed node}"
 echo "role:            $PD_ROLE"
+echo "role port:       $PD_ROLE_PORT"
 echo "results dir:     $SGLANG_PPU_PD_PERF_RESULTS_DIR"
 echo "gloo interface:  $GLOO_SOCKET_IFNAME"
 echo "gid index:       $MC_GID_INDEX"
@@ -146,6 +151,40 @@ echo "proxy bypass:    $no_proxy"
 echo "inherited proxy: http_proxy=${http_proxy:-unset} https_proxy=${https_proxy:-unset} HTTP_PROXY=${HTTP_PROXY:-unset} HTTPS_PROXY=${HTTPS_PROXY:-unset}"
 echo "visible devices: $CUDA_VISIBLE_DEVICES"
 echo "checkpoint:      $PD_MODEL_PATH"
+
+# Three probes, before the install and before a checkpoint is touched, at
+# addresses nothing of ours is listening on yet.  They are here because the
+# second and third dispatches of this line both died the same way: a prefill
+# server bound to its own routable address on port 30000, logged no request for
+# the two minutes its warmup spent asking itself for `/model_info`, and read an
+# nginx 404 back every time.  A bound socket that never sees the packets sent to
+# it means something on the node rewrites them, and Kubernetes hands out node
+# ports from exactly 30000, which is why the ports moved below it.  The probes
+# are what turns that reading into a measurement: the old port on this node's
+# address should answer, since answering with nothing behind it is the whole
+# finding, the same port on loopback should refuse, which is why the colocated
+# line -- it talks to 127.0.0.1 -- has never hit this, and the port this run
+# will actually use should refuse too.  All three are one connect each, and none
+# of them fails the run: a probe that comes back other than expected is read in
+# the log next to the failure it explains.
+for probe_target in "$NODE_ADDRESS 30000" "127.0.0.1 30000" "$NODE_ADDRESS $PD_ROLE_PORT"; do
+  probe_address=${probe_target% *}
+  probe_port=${probe_target#* }
+  probe_answer=$(python3 -c "
+import sys, urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(f'http://{sys.argv[1]}:{sys.argv[2]}/model_info', timeout=5) as response:
+        print(f'HTTP {response.status}')
+except urllib.error.HTTPError as error:
+    print(f'HTTP {error.code}')
+except urllib.error.URLError as error:
+    reason = error.reason
+    print(type(reason).__name__ if isinstance(reason, BaseException) else reason)
+except Exception as error:
+    print(type(error).__name__)
+" "$probe_address" "$probe_port")
+  echo "port probe:      $probe_address:$probe_port answers $probe_answer with nothing of ours listening"
+done
 
 bash scripts/ci/ppu/ppu_install_dependency.sh
 

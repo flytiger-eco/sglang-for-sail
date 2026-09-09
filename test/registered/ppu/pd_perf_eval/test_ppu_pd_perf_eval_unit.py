@@ -19,6 +19,7 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.kits.pd_perf_eval_kit import (
+    PD_HIGHEST_BINDABLE_PORT,
     PD_PERF_CONFIG_SCHEMA_VERSION,
     PD_RESERVED_SERVER_PARAMETERS,
     PD_ROLES,
@@ -200,6 +201,22 @@ class TestPPUPdPerfEval(unittest.TestCase):
         ]
         with self.assertRaises(PerfEvalError):
             validate_pd_test_config(self.config)
+
+    def test_a_port_the_cluster_hands_out_or_reuses_is_refused(self):
+        # 30000 is where the node port range starts and 40000 sits inside the
+        # ephemeral one, which is exactly the pair the red-zone commands use: a
+        # config written by copying them is the case this check exists for, and
+        # it costs two boards and a checkpoint load to learn any other way.
+        for port in (30000, 32767, 40000):
+            with self.subTest(port=port):
+                config = copy.deepcopy(self.reference)
+                config["disaggregation"]["prefill_port"] = port
+                with self.assertRaisesRegex(PerfEvalError, "at most"):
+                    validate_pd_test_config(config)
+        for field in ("prefill_port", "decode_port", "router_port"):
+            self.assertLessEqual(
+                self.reference["disaggregation"][field], PD_HIGHEST_BINDABLE_PORT
+            )
 
     def test_the_kv_path_names_a_backend_sglang_accepts(self):
         self.config["disaggregation"]["transfer_backend"] = "rdma"

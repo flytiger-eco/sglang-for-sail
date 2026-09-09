@@ -36,8 +36,8 @@ server-side processes exist across them:
 
 | Process | Node | Port | Role |
 | --- | --- | --- | --- |
-| prefill server | rank 0 | 30000 | `--disaggregation-mode prefill`, tp 8 |
-| decode server | rank 1 | 40000 | `--disaggregation-mode decode`, tp 8, dp 8 |
+| prefill server | rank 0 | 21000 | `--disaggregation-mode prefill`, tp 8 |
+| decode server | rank 1 | 21001 | `--disaggregation-mode decode`, tp 8, dp 8 |
 | mini-lb router | rank 0 | 12345 | what `bench_serving` posts to |
 
 Which role a rank serves is the config's answer to the rank the action injects
@@ -168,6 +168,17 @@ and `decode_nodes` state.
   It is kept because the first dispatch is diagnostic and this is the KV path's
   only voice; if a later run is drowned by it, the level belongs in the config,
   which is why it is a reviewed key rather than a hard-coded export.
+- **The servers listen on 21000 and 21001, not the source's 30000 and 40000.**
+  The only departure here a run actually forced: 30000 is where Kubernetes starts
+  handing out node ports, and on these nodes traffic to `<node ip>:30000` is
+  rewritten before it reaches a socket bound to exactly that address — measured
+  twice, in the dispatches below. 40000 sits in the ephemeral range, where an
+  outbound connection can take the port first; nothing has been seen to, but it
+  is the same class of problem and moving one port without the other would leave
+  it standing. The red-zone commands are not wrong to use either, since they do
+  not run under Kubernetes. `pd_perf_eval_kit.PD_HIGHEST_BINDABLE_PORT` holds the
+  bound so a config written by copying a red-zone command is refused by the
+  schema rather than by two boards eight minutes in.
 
 ## Deferred cases, and why
 
@@ -237,11 +248,11 @@ what should replace them.
 
 ## What the dispatches so far answered, and what is still open
 
-Two shakeout dispatches — the same config at 4 requests and 256 output tokens, on
-a throwaway branch, 2026-09-09 — have run. The first died in the prefill server
-twenty seconds after launch, the second two minutes after its server was
-listening, and between them they turned two guesses in this port into measured
-facts.
+Three shakeout dispatches — the same config at 4 requests and 256 output tokens,
+on a throwaway branch, 2026-09-09 — have run. The first died in the prefill server
+twenty seconds after launch and the other two died two minutes after that server
+was listening, and between them they turned two guesses in this port into measured
+facts and left the second failure with one candidate cause.
 
 The first found that the Mooncake transfer engine opened none of the four bonds:
 `No suitable GID found on mlx5_bond_1/`, then `Failed to open device mlx5_bond_1
@@ -257,9 +268,23 @@ The second then died in the server's own warmup. Its `/model_info` request to it
 own routable address came back as an nginx 404 for the full two minutes of the
 warmup loop, while the uvicorn bound to that exact address logged no request at
 all — so the request never arrived. Nothing in this repository names a proxy, so
-the script now exports a `no_proxy` covering loopback and this node's own /24,
-and prints the proxy variables it inherited, which is what will tell a repeat of
-that 404 apart from a transparent redirect.
+the script exported a `no_proxy` covering loopback and this node's own /24 and
+printed the proxy variables it inherited.
+
+The third answered that: `inherited proxy: http_proxy=unset https_proxy=unset
+HTTP_PROXY=unset HTTPS_PROXY=unset`, and the identical 404. No proxy was ever
+configured, so no bypass could have helped — the bypass stays as the cheaper of
+the two defences, but the cause is elsewhere. What is left that fits a bound
+socket receiving nothing while nginx answers for it is a rewrite on the node, and
+the port the servers used, 30000, is where Kubernetes starts handing out node
+ports: kube-proxy's rules for a node port apply to traffic the node originates
+too, so a server that binds one is answered for by whatever backs that service.
+It also explains why the colocated line has never seen this — it talks to
+`127.0.0.1`, and PD is the first line here that has to bind an address its peer
+can reach. The ports moved to 21000/21001 and three probes now run before the
+install, at addresses nothing of ours is listening on yet: the old port on this
+node's address, the old port on loopback, and the port this run will use. Their
+three answers are what will confirm or retire the reading above.
 
 Still open:
 
@@ -269,14 +294,16 @@ Still open:
    2026-08-13), so the package exists. What is untested is whether that build's
    `launch_router --pd-disaggregation --mini-lb` accepts these arguments and
    routes to two PPU servers; the in-tree `disaggregation_fixture.py` is the only
-   evidence for the flag shape. Neither dispatch could answer it, because the
-   router is launched only after rank 0's own server is ready.
+   evidence for the flag shape. No dispatch could answer it, because the router
+   is launched only after rank 0's own server is ready.
 2. **Does the Mooncake KV handshake complete across two of these boards?** The
    engine now initializes on both, which is further than any run in this
    repository had reached, but no KV block has yet crossed the fabric between two
    ZW-M890P boards — which is why `MC_LOG_LEVEL=TRACE` stays on.
 
-Everything the two-pod harness itself had to do worked on both runs: the group
-gang-scheduled onto two separate boards, each node published its endpoint and had
-the role it claimed checked against the role its rank was assigned, and the
-report, the annotations and the per-node evidence all came back.
+Everything the two-pod harness itself had to do worked on all three runs: the
+group gang-scheduled onto two separate boards, each node published its endpoint
+and had the role it claimed checked against the role its rank was assigned, and
+the report, the annotations and the per-node evidence all came back — except on
+the third run, where the evidence steps reported success and the artifact arrived
+empty, which is worth a look if it repeats.

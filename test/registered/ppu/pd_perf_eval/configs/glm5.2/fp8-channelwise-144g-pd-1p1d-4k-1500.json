@@ -35,8 +35,8 @@
       "mlx5_bond_3"
     ],
     "bootstrap_port": 8998,
-    "prefill_port": 30000,
-    "decode_port": 40000,
+    "prefill_port": 21000,
+    "decode_port": 21001,
     "router_port": 12345,
     "peer_wait_timeout_seconds": 5400
   },

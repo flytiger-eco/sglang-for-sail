@@ -179,6 +179,17 @@ PD_TRANSFER_BACKENDS = ("mooncake", "mooncake_tcp", "nixl", "ascend", "mori", "f
 # the number is visible, and this is the check that keeps the two in step.
 PD_ROUTER_ASSUMED_BOOTSTRAP_PORT = 8998
 
+# The highest port this line's servers may listen on.  Above it lie two ranges
+# neither of which a server can hold on the CI nodes: Kubernetes hands out node
+# ports from 30000, and kube-proxy's rules rewrite traffic to <node ip>:<node
+# port> on the node itself, so a server that binds one loads a checkpoint, comes
+# up, and then answers nothing -- its own warmup reaches whatever backs the
+# service instead.  The ephemeral range starts just above that, where an
+# outbound connection can take the port before the server asks for it.  The
+# red-zone commands use 30000 and 40000 and are fine doing so, because they do
+# not run under Kubernetes; this line cannot copy them.
+PD_HIGHEST_BINDABLE_PORT = 29999
+
 PD_DISAGGREGATION_KEYS = {
     "prefill_nodes",
     "decode_nodes",
@@ -286,6 +297,14 @@ def _validate_disaggregation(disaggregation: dict[str, Any]) -> None:
             or not 1 <= value <= 65535
         ):
             raise PerfEvalError(f"disaggregation.{field} must be a TCP port")
+        if value > PD_HIGHEST_BINDABLE_PORT:
+            raise PerfEvalError(
+                f"disaggregation.{field} must be at most "
+                f"{PD_HIGHEST_BINDABLE_PORT}: above it are the Kubernetes node "
+                "port range, which the CI nodes rewrite out from under a "
+                "listening server, and the ephemeral range, which an outbound "
+                "connection can take first"
+            )
         ports[field] = value
     # The prefill and decode servers of a 1p1d run land on different nodes, but
     # nothing in this schema says they have to, and two roles sharing a port on
