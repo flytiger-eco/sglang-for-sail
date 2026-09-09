@@ -16,19 +16,11 @@
 # the other's config.  What it does share is the tail -- run_perf_suite_node.sh --
 # because keeping a node's log and its exact exit status is the same problem here.
 #
-# Two things the multi-node colocated entry does and this one deliberately does
-# not:
-#
-#   * No rendezvous address.  The two servers of a PD group do not join one
-#     process group -- each is a rank 0 of its own eight devices -- so there is
-#     nothing to meet at.  What the nodes exchange instead is an HTTP endpoint,
-#     published through the results directory by the suite itself.
-#
-#   * No RoCE GID index.  The cross-node path here is the Mooncake transfer
-#     engine's, over the devices the config names in `disaggregation.ib_devices`,
-#     not a collective's, so the index the collective line has to be told does not
-#     apply.  Should the KV handshake turn out to need its own hint, it belongs in
-#     the config next to those devices rather than here.
+# One thing the multi-node colocated entry does and this one deliberately does
+# not: it derives no rendezvous address.  The two servers of a PD group do not
+# join one process group -- each is a rank 0 of its own eight devices -- so there
+# is nothing to meet at.  What the nodes exchange instead is an HTTP endpoint,
+# published through the results directory by the suite itself.
 #
 # Reads:
 #   SGLANG_PPU_PD_PERF_TEST_CONFIG   absolute path of the reviewed PD config, and
@@ -74,6 +66,27 @@ git config --global --add safe.directory /workspace/source
 SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
 export SGLANG_PPU_SOURCE_REVISION
 
+# The RoCE GID index, which the Mooncake transfer engine needs told even though
+# no collective here crosses the node boundary -- each server is tp 8 inside one
+# board, so pccl never leaves it, and what does leave it is the KV path.
+# Mooncake picks the GID itself and cannot pick one here: its automatic discovery
+# requires an IPv4-mapped-IPv6 GID, and these bonds carry no IPv4 at all, so it
+# rejects every entry of a six-entry table and opens nothing --
+# "No suitable GID found on mlx5_bond_1/", then "Failed to open device
+# mlx5_bond_1 on port  with GID -1" on all four bonds, then a transfer engine
+# that fails to initialize and a server that dies twenty seconds in.  That is
+# upstream Mooncake #1593, and the first dispatch of this line hit it.  Told the
+# index explicitly, Mooncake uses it: it reads MC_GID_INDEX first and falls back
+# to NCCL_IB_GID_INDEX only in versions that carry that fallback, so the Mooncake
+# name is the one set here -- and only that one, since NCCL_IB_GID_INDEX would
+# also reach a pccl that currently works without it.  The script is the
+# collective line's, because it reads sysfs rather than a suite's config: among
+# the GIDs that are not link-local it takes the highest index, the RoCE v2 entry
+# of the routable fd03::/8 address, and refuses to print a number if the devices
+# of a host disagree.
+MC_GID_INDEX=$(bash scripts/ci/ppu/answer_gid_index.sh)
+export MC_GID_INDEX
+
 # The device list and the checkpoint come out of the config the test will read: a
 # second copy in the workflow could drift from what the suite validates against.
 # nproc_per_node is a resource request and not device isolation, so narrowing the
@@ -94,6 +107,7 @@ echo "node rank:       ${NODE_RANK:-0} of ${NNODES:-1} on ${NODE_NAME:-an unname
 echo "role:            $PD_ROLE"
 echo "results dir:     $SGLANG_PPU_PD_PERF_RESULTS_DIR"
 echo "gloo interface:  $GLOO_SOCKET_IFNAME"
+echo "gid index:       $MC_GID_INDEX"
 echo "visible devices: $CUDA_VISIBLE_DEVICES"
 echo "checkpoint:      $PD_MODEL_PATH"
 

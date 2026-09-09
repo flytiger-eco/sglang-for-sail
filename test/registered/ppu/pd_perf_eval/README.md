@@ -207,11 +207,11 @@ It gang-schedules both pods into a PodGroup with `minMember` 2, which matters mo
 here than on the colocated line: a prefill server whose decode peer never arrives
 holds a board for the entire 5400 s peer-wait budget and then reports nothing.
 
-Two things `run_pd_perf_suite_node.sh` deliberately does not do, both recorded in
-its header: it derives **no rendezvous address** (see above) and sets **no RoCE
-GID index** — the cross-node path is Mooncake's over the devices
-`disaggregation.ib_devices` names, not a collective's. Should the KV handshake
-turn out to need its own hint, it belongs in the config next to those devices.
+One thing `run_pd_perf_suite_node.sh` deliberately does not do, recorded in its
+header: it derives **no rendezvous address** (see above). It does set the **RoCE
+GID index**, through the collective line's `answer_gid_index.sh` and under
+Mooncake's own `MC_GID_INDEX`, because the KV path needs it told even though no
+collective here crosses the node boundary — see the answered unknown below.
 `GLOO_SOCKET_IFNAME=lo` is correct here for the single-board reason: each
 server's ranks are processes in one network namespace, and its peer is reached
 over HTTP and RDMA, never over gloo.
@@ -234,18 +234,35 @@ numbers is an estimate a cold clone has to survive, not a measured budget** — 
 is the `register_ppu_ci(est_time=7200)` in the test file. The first green run is
 what should replace them.
 
-## The two unknowns the first dispatch answers
+## What the first dispatch answered, and what is still open
 
-1. **Does `sglang_router`'s mini-lb come up on this board?**
+The first dispatch of this line — a shakeout of the same config at 4 requests and
+256 output tokens, on a throwaway branch, 2026-09-09 — failed in the prefill
+server twenty seconds after launch, and in failing answered one of the two
+questions the line was written to ask.
+
+1. **Does `sglang_router`'s mini-lb come up on this board?** Still open.
    `ppu_install_dependency.sh` records `sglang-router 0.3.2+v0.1.0.ppu2.1.1` as
    present in the image and deliberately left alone (verified in-image
    2026-08-13), so the package exists. What is untested is whether that build's
    `launch_router --pd-disaggregation --mini-lb` accepts these arguments and
-   routes to two PPU servers. The in-tree `disaggregation_fixture.py` is the only
-   evidence for the flag shape.
-2. **Does the Mooncake KV handshake complete across two of these boards?**
-   The `mlx5_bond_*` devices come from the source commands and the transfer
-   backend is SGLang's default, but no run in this repository has moved a KV
-   block between two ZW-M890P boards. If it needs an environment hint beyond what
-   the source cases set, this is the run that will say so — which is why
-   `MC_LOG_LEVEL=TRACE` is left on.
+   routes to two PPU servers; the in-tree `disaggregation_fixture.py` is the only
+   evidence for the flag shape. The shakeout could not answer it, because the
+   router is launched after rank 0's own server is ready and that server died
+   first.
+2. **Does the Mooncake KV handshake complete across two of these boards?** Not
+   until the transfer engine is told a GID index, which it now is. Left to
+   itself Mooncake opened none of the four bonds — `No suitable GID found on
+   mlx5_bond_1/`, then `Failed to open device mlx5_bond_1 on port  with GID -1`,
+   on every bond, then `Mooncake Transfer Engine initialization failed` and a
+   server killed at `-9`. Its automatic discovery requires an IPv4-mapped-IPv6
+   GID and these bonds carry no IPv4, which is upstream Mooncake #1593;
+   `run_pd_perf_suite_node.sh` now derives the index and exports it as
+   `MC_GID_INDEX`. What that leaves unproven is the handshake itself: no run has
+   yet moved a KV block between two ZW-M890P boards, which is why
+   `MC_LOG_LEVEL=TRACE` stays on.
+
+Everything else the two-pod harness had to do worked on that run: the group
+gang-scheduled onto two separate boards, each node published its endpoint and had
+the role it claimed checked against the role its rank was assigned, and the
+report, the annotations and the per-node evidence all came back.
