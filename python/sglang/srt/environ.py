@@ -1285,6 +1285,8 @@ class Envs:
 
     # Cache / overlap
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    # Use CUDA for separate MLA K-cache quantization instead of Triton.
+    SGLANG_OPT_USE_CUDA_MLA_K_CACHE_QUANT = EnvBool(False)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(True)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
