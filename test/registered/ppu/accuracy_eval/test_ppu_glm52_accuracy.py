@@ -35,10 +35,13 @@ from sglang.test.kits.accuracy_suite_kit import AccuracySuiteMixin
 
 DATA_ROOT = Path(__file__).parent
 
-# A cold load plus a 3600-second warmup, then 1319 samples the server answers a
-# few tens at a time.  The estimate is the full config's; the smoke config
-# finishes long inside it, and the first measured run replaces the number.
-register_ppu_ci(est_time=18000, suite="nightly-accuracy-8-glm52-ppu", nightly=True)
+# The estimate is the full config's, built out of the smoke run that measured its
+# parts (run 34376918707): 1160s to bring the server up, of which 1050s was CUDA
+# graph capture, then 278s for one batch of the split.  The full split is 33 such
+# batches, which lands a little over eleven thousand seconds; the number below
+# leaves room for batches of forty running longer than the batch of twenty that
+# was timed.  The smoke config finishes far inside it -- 1454s, measured.
+register_ppu_ci(est_time=12000, suite="nightly-accuracy-8-glm52-ppu", nightly=True)
 
 
 class TestPPUGlm52AccuracyGSM8K(AccuracySuiteMixin, unittest.TestCase):

@@ -104,8 +104,40 @@ live on the NAS. Both are now measured rather than assumed, in a 1-PPU probe
   so `evalscope/<dataset_id>` was created there and GSM8K staged into it. That
   is the path the two configs name.
 
-Neither is a fact about a model, so paying for it once was enough. The remaining
-twenty cases follow once one has run green.
+Neither is a fact about a model, so paying for it once was enough. That entry has
+since run green, so the remaining twenty follow.
+
+### What the first green run measured
+
+Run `34376918707`, the smoke config on `board-type=ZW-M890P`:
+
+```
+gsm8k | accuracy=0.9500 | samples=20/20 shots=4 | baseline=none
+Evaluations: 1/1 measured
+gsm8k | no_baseline | gsm8k has no measured baseline on this hardware yet,
+                     so this score is recorded and not judged
+```
+
+Reported as `no_baseline` by design: the score is recorded, and what fills
+`evaluation.baseline` in is a reviewed change made from a *full* run, not from
+twenty samples.
+
+Where the 35 minutes of board time went, because the timeouts and `est_time` are
+now drawn to it rather than guessed:
+
+| Phase | Measured |
+| --- | --- |
+| Building the EvalScope venv (`setup_evalscope.sh`, no wheelhouse) | 305s |
+| Installing this repository editable beside it | ~100s |
+| Server up to `ready to roll`, of which CUDA graph capture was 1050s | 1160s |
+| `evalscope eval`, twenty samples in one batch | 278s |
+| The registered file, end to end | 1454s |
+
+Two things are worth carrying forward from that table. The evaluation is the
+cheap part — bringing the server up costs four times what scoring the smoke split
+does — so a full split is where the hours go, not the setup. And the venv is
+rebuilt per run, which is 305s that a wheelhouse on the NAS would remove if a
+night ever needs it back.
 
 ## The datasets
 
