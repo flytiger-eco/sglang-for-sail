@@ -233,6 +233,29 @@ class PDPerfSuiteMixin:
         return cls.rank_dir / f"rank-{node_rank}-endpoint.json"
 
     @classmethod
+    def _run_stamp(cls):
+        """Which run an endpoint file belongs to.
+
+        Stamped rather than cleaned up, which is what the sixth dispatch of this
+        line cost.  Rank 0 used to delete every node's endpoint before starting,
+        so that no peer could read one left behind in a reused directory -- and
+        deleted the decode node's endpoint, published thirty-six seconds
+        earlier, on the way past.  Rank 0 then waited its whole peer budget for
+        a file it had removed itself.  A stamp keeps the protection without the
+        race: a reader can tell a stale endpoint from a live one, and no node
+        ever touches a file another node owns.
+
+        Empty outside CI, where nothing supplies the two variables and nothing
+        reuses the directory either; two empty stamps compare equal, so the
+        check is inert there rather than an obstacle.
+        """
+
+        return (
+            f"{os.environ.get('GITHUB_RUN_ID', '')}"
+            f"-{os.environ.get('GITHUB_RUN_ATTEMPT', '')}"
+        )
+
+    @classmethod
     def _publish_endpoint(cls):
         """Tell the group where this node's server listens.
 
@@ -250,6 +273,7 @@ class PDPerfSuiteMixin:
                 "role": cls.role,
                 "url": cls.server_url,
                 "bootstrap_port": cls.test_config["disaggregation"]["bootstrap_port"],
+                "run": cls._run_stamp(),
             },
         )
 
@@ -264,7 +288,10 @@ class PDPerfSuiteMixin:
 
         The role each peer claims is checked against the role its rank is
         assigned, so a group whose pods were handed the wrong ranks fails here
-        rather than as a router pointed at two decode servers.
+        rather than as a router pointed at two decode servers.  An endpoint
+        stamped with another run counts as not yet published, and is named on
+        the way out, because a directory holding one is a directory two runs
+        share and that is worth saying rather than timing out silently.
         """
 
         deadline = time.monotonic() + cls.test_config["disaggregation"].get(
@@ -273,12 +300,17 @@ class PDPerfSuiteMixin:
         expected = [rank for rank in range(cls.runtime["nnodes"]) if rank != 0]
         endpoints = {0: {"role": cls.role, "url": cls.server_url}}
         pending = list(expected)
+        stale = {}
         while pending:
             for node_rank in list(pending):
                 try:
                     endpoint = load_json(cls._endpoint_path(node_rank))
                 except (OSError, ValueError):
                     continue
+                if endpoint.get("run") != cls._run_stamp():
+                    stale[node_rank] = endpoint.get("run")
+                    continue
+                stale.pop(node_rank, None)
                 expected_role = pd_role_for_node_rank(cls.test_config, node_rank)
                 if endpoint.get("role") != expected_role:
                     raise RuntimeError(
@@ -299,9 +331,15 @@ class PDPerfSuiteMixin:
                     f"while waiting for nodes {pending}"
                 )
             if time.monotonic() >= deadline:
-                raise RuntimeError(
+                message = (
                     f"nodes {pending} never published an endpoint under {cls.rank_dir}"
                 )
+                if stale:
+                    message += (
+                        f"; what they left there is stamped {sorted(stale.values())} "
+                        f"and this run is {cls._run_stamp()}"
+                    )
+                raise RuntimeError(message)
             time.sleep(PEER_POLL_SECONDS)
         return endpoints
 
@@ -348,8 +386,12 @@ class PDPerfSuiteMixin:
             return
         try:
             cls.rank_dir.mkdir(parents=True, exist_ok=True)
+            # Stamped with this run, and checked against it by the peers, for the
+            # reason the endpoints are: it is the other file one node writes and
+            # another reads, and a release meant for an earlier run would send a
+            # peer home while this one still needs its board.
             cls._sentinel_path().write_text(
-                f"{os.environ.get('GITHUB_RUN_ID', 'local')}\n", encoding="utf-8"
+                f"{cls._run_stamp()}\n", encoding="utf-8"
             )
         except OSError as error:
             print(
@@ -422,12 +464,16 @@ class PDPerfSuiteMixin:
             cls._preflight()
             cls.rank_dir.mkdir(parents=True, exist_ok=True)
             if cls.node_rank == 0:
-                # Cleared before this node publishes anything, so a peer cannot
-                # read the sentinel or an endpoint left by the previous run of
-                # the same directory and exit before this one has started.
+                # Its own two files, and no peer's.  The sentinel is rank 0's to
+                # clear, and a peer that read a stale one would exit before this
+                # run had started.  The peers' endpoints were cleared here too
+                # until the sixth dispatch showed what that costs: the decode
+                # node published at 11:13:44 and rank 0, still opening its own
+                # server, deleted that file at 11:14:1x, then waited its full
+                # ninety-minute peer budget for it.  A stale endpoint is now
+                # told apart by its run stamp, which no peer can lose a race to.
                 cls._sentinel_path().unlink(missing_ok=True)
-                for node_rank in range(cls.runtime["nnodes"]):
-                    cls._endpoint_path(node_rank).unlink(missing_ok=True)
+                cls._endpoint_path(0).unlink(missing_ok=True)
 
             stage = "server_start"
             cls.process = popen_launch_pd_server(
@@ -736,6 +782,14 @@ class PDPerfSuiteMixin:
                 released = sentinel.name in os.listdir(self.rank_dir)
             except OSError:
                 released = sentinel.exists()
+            if released:
+                # A release this run did not write does not count, and a
+                # half-written one reads as no release and is read again.
+                try:
+                    stamp = sentinel.read_text(encoding="utf-8").strip()
+                except OSError:
+                    stamp = None
+                released = stamp == self._run_stamp()
             if released:
                 print(f"node {self.node_rank} was released by rank 0", flush=True)
                 return
