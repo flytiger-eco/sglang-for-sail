@@ -50,9 +50,14 @@ score over 40 of 1319 prompts is not a smaller version of the measurement — it
 a different measurement that can pass a band it has no right to.
 
 `above_baseline` exists because the source cases state a two-sided band —
-`threshold: ["0.98", "2.00"]`, read here as a ratio band around a recorded
-baseline. A score twice its baseline is not a triumph; it is evidence that
-something changed that nobody meant to change, usually in the harness.
+`threshold: ["0.98", "2.00"]`. Both constants are carried over, but **the
+denominator is not**: the source cases divide by a score recorded on an H20 GPU
+and so ask *does this board match the GPU?*, while this line divides by its own
+first green full run on this board and asks *has this board drifted from
+itself?*. Same two numbers, different question — a red here says this checkpoint
+scores worse than it used to, not that the board trails a GPU. A score twice its
+baseline is not a triumph; it is evidence that something changed that nobody
+meant to change, usually in the harness.
 
 ### Two entries are judged; the rest are measured
 
@@ -67,18 +72,64 @@ not from a smoke run's twenty samples.
 Two entries have earned one, from run `34429388425` (see below), and are the only
 entries on the line that a future night can be red against:
 
-| Entry | Metric | Baseline | Floor (0.98) | Ceiling (2.00) |
-| --- | --- | --- | --- | --- |
-| `glm52-fp8chan-ceval` | `accuracy` | 0.9420 | 0.9232 | refused above 1.0 anyway |
-| `glm52-fp8chan-ifeval` | `prompt_level_strict` | 0.9279 | 0.9093 | refused above 1.0 anyway |
+| Entry | Metric | Baseline | Floor | Ceiling (2.00) | H20 cross-check | Ratio to H20 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `glm52-fp8chan-ceval` | `accuracy` | 0.9420 | 0.9046 | refused above 1.0 anyway | 0.9435–0.9443 | 0.9976–0.9984 |
+| `glm52-fp8chan-ifeval` | `prompt_level_strict` | 0.9279 | 0.8577 | refused above 1.0 anyway | 0.9242–0.9335 | 0.9940–1.0040 |
 
 The ceiling is inert for scores this high — twice either baseline exceeds the 1.0
 the metric can reach — so in practice these two are floors. That is the expected
 shape for a benchmark a checkpoint already scores well on; the ceiling earns its
 keep on a dataset where a harness fault can inflate a low score, not here.
 
+The last two columns are not part of the judgement. A baseline taken from this
+board's own first run has one blind spot: if that first run was itself degraded
+by a porting fault, the fault is frozen into the baseline and no later night can
+see it. The cross-check closes that gap once, at the moment the baseline is
+filled, by comparing against the H20 scores the source cases record for the same
+model and dataset (`kpi_result.core_indic_list`, quoted as the range across the
+recorded history). Both entries sit within half a percent of the GPU, so what
+went into the baseline is a healthy number rather than a frozen defect. The
+check is advisory and manual: it is run when a baseline is written, not on every
+night. It also carries different weight per dataset — the recorded H20 history is
+tight on C-Eval and GSM8K (within 1% for these checkpoints) but wide on IFEval,
+where some models span 0.74–0.92, so there only the order of magnitude is worth
+reading.
+
 The other nineteen full entries still carry `baseline: null`. Filling those in is
-the same reviewed change, one green full run at a time.
+the same reviewed change, one green full run at a time, and each fill states its
+own floor and cross-check alongside the score.
+
+### The floor is computed, not inherited
+
+`0.98` arrived from the source cases as one constant for every dataset. Accuracy
+is a binomial proportion, so its sampling noise depends on how many samples the
+split holds and on how high the score already sits; one constant cannot be right
+for three splits that run from 541 to 1346 samples. The floors above are computed
+instead — a one-sided 99% Wilson bound, Bonferroni-corrected across the 21 full
+entries a night (per-test α = 0.01/21, z = 3.30), then widened by √2 because the
+baseline is itself a single measurement and not a known truth:
+
+| Entry | n | Baseline | Computed floor | `0.98` would give | Slack: computed vs `0.98` |
+| --- | --- | --- | --- | --- | --- |
+| `glm52-fp8chan-ceval` | 1346 | 0.9420 | 0.9046 (r = 0.9603) | 0.9232 | 50 vs 25 samples |
+| `glm52-fp8chan-ifeval` | 541 | 0.9279 | 0.8577 (r = 0.9244) | 0.9093 | 38 vs 10 samples |
+
+`0.98` is tighter than the statistics support on both, and markedly so on IFEval,
+whose 541 prompts leave only ten flipped answers between a pass and a red — less
+than sampled decoding (`temperature: 1.0`) produces on its own. These two entries
+therefore state `min_ratio` rather than inherit the default. The conclusion does
+not rest on the family size: correcting across two judged entries instead of
+twenty-one still puts the honest floors at r = 0.9705 and r = 0.9444, both below
+`0.98`.
+
+Two limits on that arithmetic, both in the direction of the floors being
+conservative rather than lax. The binomial model treats each prompt as a fixed
+coin and so understates the spread under sampled decoding, which makes these
+floors a lower bound on the tolerance actually needed. And correcting across all
+21 entries is right for the line once it is fully judged, not for today's two —
+held deliberately, so that a floor does not move every time another baseline
+lands.
 
 ## The suites
 
