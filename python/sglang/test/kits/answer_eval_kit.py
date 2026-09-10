@@ -2275,7 +2275,11 @@ def default_provenance(
         "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
         "github_run_url": run_url,
         "base_image": os.environ.get("PPU_BASE_IMAGE"),
-        "base_image_digest": os.environ.get("PPU_BASE_IMAGE_DIGEST"),
+        # ``or None`` because the K8s lines set this to an empty string when the
+        # registry could not be asked what the tag resolves to.  An empty string
+        # would read as a recorded value and compare unequal to every real digest;
+        # absent is what it actually is.
+        "base_image_digest": os.environ.get("PPU_BASE_IMAGE_DIGEST") or None,
         "served_model_name": served_model_name,
         "checkpoint_name": Path(model_path).name if model_path else None,
         "checkpoint_config_sha256": checkpoint_config_digest(model_path),

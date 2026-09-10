@@ -234,9 +234,15 @@ throughput are the intended subjects. TTFT p99 and ITL p99 are recorded but are
 not comparison candidates yet — they are the noisiest fields and still carry
 warm-up residue.
 
-`base_image_digest` is null on this line: `PPU_BASE_IMAGE_DIGEST` is exported by
-the Answer nightly workflow and by no performance one, so a row currently
-attributes an image by its mutable tag only.
+`base_image_digest` is resolved by asking the registry what the tag points at, in
+`scripts/ci/ppu/resolve_image_digest.sh`, because this orchestration shell has no
+Docker daemon to inspect the image with — nor python3, nor jq. The pods are then
+launched on that digest rather than on the tag. The pinning is the point: the
+action submits pods with `imagePullPolicy: IfNotPresent`, so a node still holding
+an older image under this tag would run that one, and a digest merely read from
+the registry would name an image the measurement never used. A lookup that fails
+leaves the tag in place and the field null, which is what every run recorded
+before this existed; a nightly does not go red over provenance it cannot reach.
 
 ## Environment
 

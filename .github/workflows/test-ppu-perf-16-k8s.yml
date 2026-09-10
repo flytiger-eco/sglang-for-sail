@@ -85,10 +85,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
 
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run nightly-perf-16-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into
           # a PodGroup with minMember 2, so the group either gets both boards or
           # waits, rather than one pod holding eight devices while the other
@@ -177,7 +183,7 @@ jobs:
             bash ../scripts/ci/ppu/run_perf_suite_node.sh \
               ${{ env.PERF_SUITE }} 12000 "$SGLANG_PPU_PERF_RESULTS_DIR/ranks"
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/${{ env.PERF_CONFIG }},SGLANG_PPU_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
+          extra_env: "SGLANG_IS_IN_CI=true,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/${{ env.PERF_CONFIG }},SGLANG_PPU_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
           container_options: |
             privileged: true
             host_ipc: true

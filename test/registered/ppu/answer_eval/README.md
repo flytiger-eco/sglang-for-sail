@@ -294,7 +294,11 @@ everything around the test differs, while the test itself does not:
 - **Provenance.** `base_image_digest` is null on this path. The orchestration
   shell has no Docker daemon to inspect the image with and the pod cannot see its
   own digest, so only the image tag is recorded; on the bare-metal line the digest
-  is resolved by `docker image inspect`.
+  is resolved by `docker image inspect`. The daemon is not the only way to ask,
+  though: the performance lines resolve the digest from the registry over HTTPS in
+  `scripts/ci/ppu/resolve_image_digest.sh` and pin the pods to it, and this line
+  could be wired the same way. It has not been, so the null here is a gap rather
+  than a limit of the path.
 - **Trigger.** No cron. GitHub honours `schedule` only on the default branch, so a
   cron on a version branch would never fire while claiming the workflow is
   scheduled. The line is dispatched by hand or through `workflow_call`.
