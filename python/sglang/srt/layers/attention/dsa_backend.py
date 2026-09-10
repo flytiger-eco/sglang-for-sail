@@ -2991,6 +2991,12 @@ class DeepseekSparseAttnBackend(
             and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
             and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
             and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
+            # The sibling copy below mirrors tensor buffers only; the scalar
+            # plan_bs is NOT copied (same as num_draft_tokens today). Siblings
+            # of a multi-step group are captured at the same bucket bs, so the
+            # two are equal by construction -- assert it, and route back to the
+            # full recompute path instead of trusting a divergent row count.
+            and dst_plan.plan_bs == src_plan.plan_bs
         ):
             return False
         return True

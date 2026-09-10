@@ -1664,6 +1664,7 @@ def kpool_write_tail_and_maybe_compress(
     write_loc: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
+    plan_bs: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
@@ -1682,11 +1683,57 @@ def kpool_write_tail_and_maybe_compress(
     bn = key.shape[0]
     if bn == 0:
         return
-    assert bn % num_draft_tokens == 0
-    bs = bn // num_draft_tokens
+
+    # The plan -- not the incoming token count -- is the authority on how many
+    # REAL requests this write covers.
+    #
+    # Why `bn // num_draft_tokens` must NOT be used here: on the eager (non
+    # cuda-graph) path the kpool write plan is built BEFORE the batch is
+    # padded, then frozen -- see eagle_worker_common.prepare_for_draft_extend,
+    # which calls attn_backend.init_forward_metadata() and then
+    # mark_forward_metadata_ready() with the comment "Planned pre-pad; do NOT
+    # opt into post-pad re-plan" (the DSA indexer cannot rebuild its deep_gemm
+    # schedule_meta on a padded batch, #27091). Only afterwards does
+    # ModelRunner._prepare_eager_forward_batch() run the DP/MLP-sync padding
+    # (forward_batch_info.prepare_mlp_sync_batch -> _pad_inputs_to_size), which
+    # rounds the token count UP to get_cp_padding_align_size() (= attn_cp_size
+    # when CP is on). So with attn_cp_size=16, ndt=6 and a real bs=39, the
+    # forward carries 240 token rows while the plan still describes 39
+    # requests, and `bn // ndt` yields a phantom 40.
+    #
+    # The cuda-graph path is immune by construction: build_replay_fb_view()
+    # hands the backend a view whose seq_lens are already sliced to the capture
+    # bucket, so plan_bs == bn // ndt there and this changes nothing.
+    bs = plan_bs
+    assert bs > 0, f"plan_bs must be positive, got {bs} (bn={bn})"
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)
     assert write_loc.shape == (bs, max_closed_pools), write_loc.shape
     assert write_loc.stride(1) == 1, write_loc.stride()
+
+    # Padding-tail contract: _pad_tensor_to_size() appends the dummy rows at
+    # the END (torch.cat([tensor, tensor.new_zeros(size - tensor.shape[0])])),
+    # and the kernel below indexes tokens as `row = b * N + i_n` with
+    # `b = tl.program_id(0)`. Launching the grid with `bs` (== plan_bs)
+    # therefore covers exactly rows [0, plan_bs * num_draft_tokens) -- the real
+    # tokens, laid out contiguously per request -- and the alignment padding at
+    # the tail is simply never read. No masking or row-skipping is needed
+    # inside the kernel.
+    #
+    # DO NOT "fix" a shape mismatch here by growing the plan to `bn // ndt`
+    # rows. The padding rows are FABRICATED: _pad_inputs_to_size() also pads
+    # req_pool_indices with zeros, so a plan row for a non-existent request
+    # would resolve to req_pool_indices == 0 and make the kernel write that
+    # phantom request's kpool tail into request slot 0's ring buffer --
+    # silently corrupting a live request's index cache instead of crashing.
+    # Today that is only avoided by luck: the kernel early-returns on
+    # `out_cache_loc[b * N] == 0`, and the out_cache_loc padding happens to be
+    # zero too. That is a coincidence, not a contract -- and plan.req[b] would
+    # already be an out-of-bounds read on a plan_bs-row tensor.
+    assert bn >= bs * num_draft_tokens, (
+        f"token buffer too small for the write plan: bn={bn} < "
+        f"plan_bs({bs}) * num_draft_tokens({num_draft_tokens}) = "
+        f"{bs * num_draft_tokens}"
+    )
 
     key = key.contiguous()
     score = score.contiguous()

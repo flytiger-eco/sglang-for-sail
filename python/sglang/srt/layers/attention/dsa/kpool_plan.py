@@ -108,6 +108,11 @@ class KPoolWritePlan:
     ``write_loc[b, p]`` is the compression destination for logical pool
     ``base_pool[b] + p``. The compression kernel determines how many of these
     candidate pools were actually closed by each batch.
+
+    ``plan_bs`` is the authoritative count of REAL requests this plan
+    describes. Consumers must size their launch grid from it and must NOT
+    re-derive a batch size from the forward's token count -- see
+    ``kpool_write_tail_and_maybe_compress`` for why.
     """
 
     req: torch.Tensor
@@ -115,6 +120,7 @@ class KPoolWritePlan:
     tail_logical_start: torch.Tensor
     write_loc: torch.Tensor  # int64 [B, max_closed_pools]
     num_draft_tokens: int
+    plan_bs: int
     pool_seqlens_per_q: Optional[torch.Tensor] = None
     seqlens_per_q: Optional[torch.Tensor] = None
     pool_schedule_metadata: Optional[torch.Tensor] = None
@@ -687,6 +693,7 @@ def _alloc_kpool_write_plan_buffers(
             max_bs, max_closed_pools, dtype=torch.int64, device=device
         ),
         num_draft_tokens=num_draft_tokens,
+        plan_bs=max_bs,
         **verify_extras,
     )
 
