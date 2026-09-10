@@ -253,7 +253,26 @@ SUPPORTED_SERVER_ENVIRONMENT = {
 # in their own `generation_config`.  `seed` is ours: these cases sample rather
 # than decode greedily, and a fixed seed is what keeps two runs of one config
 # comparable without changing the distribution the baseline was measured on.
-SUPPORTED_GENERATION_KEYS = {"max_tokens", "temperature", "top_p", "seed", "timeout"}
+#
+# The truncation and penalty keys are here because the cases differ in them and
+# a score is a score of a distribution: Qwen3.5 states `top_k` 20 with `min_p`,
+# `presence_penalty` and `repetition_penalty`, MiniMax-M2.7 states `top_k` 40,
+# and GLM-5.2 and Kimi-K2.6 state neither.  Dropping them would sample a wider
+# distribution than the source case and make the resulting number a measurement
+# of something else.  They travel to the server untouched -- the block is
+# rendered into `--generation-config` and EvalScope forwards it to the
+# OpenAI-compatible endpoint, which accepts all four.
+SUPPORTED_GENERATION_KEYS = {
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
+    "timeout",
+}
 
 _EVALUATION_REQUIRED_KEYS = {
     "dataset",
@@ -574,7 +593,7 @@ def _validate_generation(generation: Any) -> None:
             f"evaluation.generation states {unsupported}; this schema models "
             f"{sorted(SUPPORTED_GENERATION_KEYS)}"
         )
-    for name in ("max_tokens", "seed", "timeout"):
+    for name in ("max_tokens", "top_k", "seed", "timeout"):
         value = generation.get(name)
         if value is None:
             continue
@@ -582,7 +601,13 @@ def _validate_generation(generation: Any) -> None:
             raise AccuracyEvalError(
                 f"evaluation.generation.{name} must be a non-negative int"
             )
-    for name in ("temperature", "top_p"):
+    for name in (
+        "temperature",
+        "top_p",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+    ):
         value = generation.get(name)
         if value is None:
             continue

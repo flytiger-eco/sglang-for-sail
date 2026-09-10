@@ -79,33 +79,45 @@ models this repository has never stood up:
 | Qwen3.5-397B-A17B FP8-Channelwise, Qwen3.5-397B-A17B MXFP4-FP8 | GLM-5.1 FP8-Channelwise, GLM-5.1 MXFP4-FP8 |
 | | Qwen3.7 MXFP4-FP8 |
 
-Ported so far is one of the 21, deliberately:
+All 21 are ported, across four suites — one per model family, because the
+configs of a family share one registered file and one process-wide
+`SGLANG_PPU_ACCURACY_TEST_CONFIG`:
 
-| Suite | Test file | Model | Dataset | Devices |
-| --- | --- | --- | --- | --- |
-| `nightly-accuracy-8-glm52-ppu` | `test_ppu_glm52_accuracy.py` | GLM-5.2 FP8-Channelwise | GSM8K | 8 |
+| Suite | Test file | Model family | Datasets | Configs | Devices |
+| --- | --- | --- | --- | --- | --- |
+| `nightly-accuracy-8-glm52-ppu` | `test_ppu_glm52_accuracy.py` | GLM-5.2 (2 quantisations) | GSM8K, C-Eval, IFEval | 6 + 1 smoke | 8 |
+| `nightly-accuracy-8-kimi26-ppu` | `test_ppu_kimi_k26_accuracy.py` | Kimi-K2.6 (1 quantisation) | GSM8K, C-Eval, IFEval | 3 + 1 smoke | 8 |
+| `nightly-accuracy-8-minimax27-ppu` | `test_ppu_minimax_m27_accuracy.py` | MiniMax-M2.7 (2 quantisations) | GSM8K, C-Eval, IFEval | 6 + 1 smoke | 8 |
+| `nightly-accuracy-8-qwen35-ppu` | `test_ppu_qwen35_accuracy.py` | Qwen3.5-397B-A17B (2 quantisations) | GSM8K, C-Eval, IFEval | 6 + 1 smoke | 8 |
 
-Two configs sit behind that one suite and differ only in `limit`:
-`fp8-channelwise-144g-gsm8k.json` evaluates the whole 1319-prompt split, and
-`fp8-channelwise-144g-gsm8k-smoke.json` evaluates 20. The workflow selects which
-by naming it in `SGLANG_PPU_ACCURACY_TEST_CONFIG`; a suite is a file, because
-`register_ppu_ci` registers per file.
+Twenty-eight configs behind the four files: 21 full evaluations (7 checkpoints ×
+3 datasets) and one GSM8K smoke config per checkpoint. The full and smoke configs
+of a checkpoint differ only in `limit` — the smoke one evaluates 20 samples. The
+workflow selects which config runs by naming it in
+`SGLANG_PPU_ACCURACY_TEST_CONFIG`; a suite is a file, because `register_ppu_ci`
+registers per file, and the number in each suite name is 8 because every config
+declares eight devices.
 
-One entry rather than twenty-one because two facts about this line could only be
-established by running it, and each of them would have been wrong twenty-one
-times over: whether the pip index carries EvalScope, and where these datasets
-live on the NAS. Both are now measured rather than assumed, in a 1-PPU probe
-(runs `34374868204` and `34376132868`) that cost minutes instead of a night:
+GLM-5.2 GSM8K went first and alone, deliberately, because two facts about this
+line could only be established by running it and each would have been wrong
+twenty-one times over: whether the pip index carries EvalScope, and where these
+datasets live on the NAS. Both were measured rather than assumed, in a 1-PPU
+probe (runs `34374868204` and `34376132868`) that cost minutes instead of a
+night:
 
 * the index carries `evalscope` up to and including the pinned `1.11.1`, so
   `setup_evalscope.sh` needs no wheelhouse on this cluster;
 * `/nas_aisw/datasets` held only `checkpoints`, `dsmManager`, `hf_cache` and
   `packages` — no dataset area existed at all — and it is writable from a pod,
   so `evalscope/<dataset_id>` was created there and GSM8K staged into it. That
-  is the path the two configs name.
+  is the path the configs name.
 
-Neither is a fact about a model, so paying for it once was enough. That entry has
-since run green, so the remaining twenty follow.
+Neither is a fact about a model, so paying for it once was enough. That entry
+then ran green (run `34376918707`), so the remaining twenty were ported behind
+the same shape. They are code now, not runs: only GSM8K is staged on the NAS, so
+the fourteen C-Eval and IFEval entries fail in the board script before a
+checkpoint loads, with the `modelscope download` command that stages them — the
+designed behaviour, and not a reason to withhold the config.
 
 ### What the first green run measured
 
@@ -228,25 +240,47 @@ subset and identity level, and invents no key the library does not write.
 ## Departures from the source cases
 
 The `evaluation` block of each config is the source case faithfully: dataset,
-`eval_batch_size`, `generation_config` and the threshold band all come across. The
-`server` block does not, and this is the one substantive departure on the line.
+`generation` and the threshold band all come across, and `eval_batch_size` is set
+to the server's own concurrency (below). The `server` block does not come across,
+and that is the one substantive departure on the line: each config serves the
+checkpoint with the parameters the Answer line has already stood up on this board,
+not the parameters the source case names. The reason is what the two
+configurations would tell you — a run on parameters this board has never started
+measures the startup path, not the model, and an accuracy number should be a
+number about the model. What that drops, per checkpoint:
 
-The source case serves GLM-5.2 with `prefill_attention_backend: fa3`,
-`decode_attention_backend: flashmla` and EAGLE speculative decoding at 2 steps.
-The config here serves it with the `dsa` sparse-attention configuration that the
-Answer and perf lines have actually started on this board, and no speculative
-decoding. The reason is what the two configurations would tell you: a run on
-parameters this board has never started measures the startup path, not the model,
-and a first accuracy number should be a number about the model. The source
-serving configuration is worth porting once it has been stood up somewhere, and
-the schema already models the parameters it needs — `test_ppu_glm52_accuracy.py`
-records the departure at its point of use.
+- **GLM-5.2 (both quantisations).** The source serves it with
+  `prefill_attention_backend: fa3`, `decode_attention_backend: flashmla` and
+  EAGLE speculative decoding at 2 steps; the config serves it with the `dsa`
+  sparse-attention configuration the Answer and perf lines run, and no
+  speculative decoding.
+- **MiniMax-M2.7 (both quantisations).** Served at tp 8, not the source's tp 4
+  (FP8) / tp 2 (MXFP4). `reasoning_parser: minimax` rather than the source's
+  `minimax-append-think`, matching the Answer line. `top_k: 40` from the source
+  travels into `generation` unchanged.
+- **Qwen3.5-397B-A17B (both quantisations).** Served at tp 8, not the source's
+  tp 4. `mamba_scheduler_strategy`, and the MXFP4 case's `page_size: 64` and
+  `disable_shared_experts_fusion`, are left off — the Answer line starts these
+  checkpoints without them. Its source cases pin the widest sampling of the
+  seven (`top_k` 20 with `min_p`, `presence_penalty` and `repetition_penalty`),
+  which is why the schema models the penalty keys; all of it travels into
+  `generation`.
+- **Kimi-K2.6 MXFP4-FP8.** One quantisation only, the one this board has served.
 
-Two smaller ones:
+tp 8 throughout, including the two models the source and perf lines serve at tp 2
+and tp 4: a job here holds the whole board for the night either way, a full split
+is generation-bound, and a narrower split would leave six cards idle. The suite
+name's number is 8 for the same reason. Each test file records its own departure
+at its point of use.
 
-- **`eval_batch_size` 128 → 40.** In `openai_api` mode this is the client's
-  concurrency, and the server is configured for 40 concurrent requests. The extra
-  88 would queue, adding latency and no throughput.
+Two smaller ones, on every config:
+
+- **`eval_batch_size` set to the server's concurrency.** In `openai_api` mode
+  this is the client's concurrency: GLM-5.2, MiniMax-M2.7 and Qwen3.5 serve 40
+  concurrent requests (the source's own `max_running_requests`), Kimi-K2.6
+  serves 32 (its source's `eval_batch_size`). The source cases' 128 would only
+  queue behind these, adding latency and no throughput; the Answer configs
+  declare no concurrency at all, which for a 32768-token budget is worse.
 - **`limit: 0` is refused.** The source cases spell "the whole split" that way;
   EvalScope spells it as no `--limit` at all, so a config that copied the 0 across
   would evaluate nothing and report a perfect score on it. The schema refuses 0
@@ -254,9 +288,9 @@ Two smaller ones:
 
 ## Workflow
 
-| Workflow | Suite | Boards | Trigger |
-| --- | --- | --- | --- |
-| `test-ppu-accuracy-k8s.yml` | `nightly-accuracy-8-glm52-ppu` | 1 | dispatch, `workflow_call` |
+| Workflow | Suites | Jobs | Boards each | Trigger |
+| --- | --- | --- | --- | --- |
+| `test-ppu-accuracy-k8s.yml` | the four above | 28 (21 full + 7 smoke) | 1 | dispatch, `workflow_call` |
 
 Not on a schedule: cron is honoured only from the default branch and this file
 lives on a version branch, so a cron here would never fire.
@@ -269,13 +303,18 @@ in `scripts/ci/ppu/`, because a local composite action is not available to this
 runner group's container-hooked jobs; and two checkouts per job, because the
 github.com egress is the least reliable step in the run.
 
-The `mode` input picks which of the two configs runs. `full` is the default and
-evaluates the whole split; `smoke` evaluates 20 samples, which is not an accuracy
-measurement and is not meant to be — it is proof that the environment, the staged
-dataset, the server, the tool and the report reader all agree, for the price of
-one weight load. `both` runs the smoke first and then the full split on the same
-lane, ordered by `needs` plus `if: ${{ !cancelled() }}` so they never hold two
-boards at once.
+Two inputs choose what runs. `mode` picks the kind: `full` evaluates the whole
+split, `smoke` evaluates 20 samples — not an accuracy measurement and not meant
+to be, but proof that the environment, the staged dataset, the server, the tool
+and the report reader all agree, for the price of one weight load — and `both`
+runs the smoke first and then the full split on the same lane, ordered by `needs`
+plus `if: ${{ !cancelled() }}` so they never hold two boards at once.
+
+`entries` picks which. A job here holds a whole board for most of a night, so it
+is a selection rather than a filter: empty runs `glm52-fp8chan-gsm8k` alone — the
+one entry that has run green — a comma-separated list runs exactly those, and the
+literal `all` is what a caller writes to mean all twenty-one. That default is why
+a stray dispatch cannot ask the farm for twenty-one boards until morning.
 
 Evidence is collected by `scripts/ci/ppu/collect_accuracy_evidence.sh`, which
 reads the report back off the NAS and prints the score as an annotation whether or
@@ -299,7 +338,10 @@ The budget here is an order of magnitude larger than the perf line's: 1319 GSM8K
 prompts against a reasoning model at `max_tokens` 32768 and a concurrency of 40 is
 hours of generation, not minutes. The full entry is given
 `ACCURACY_TIMEOUT_PER_FILE=30600` (8.5 h) around a 6-hour EvalScope timeout, with
-the pod and job timeouts above that; the smoke entry is given 12600 s, almost all
-of which is the weight load. **Every one of these numbers is an estimate a cold
-run has to survive, not a measured budget** — the first green run is what should
-replace them, here and in `register_ppu_ci(est_time=...)`.
+the pod and job timeouts above that. The smoke entry is given 7200 s (2 h), drawn
+to the one measured run — 35 minutes of board time, almost all of it the weight
+load — with room to spare. The full number is deliberately *not* drawn tight: the
+full split is some thirty batches of the smoke one, and killing a run that is
+merely slower than that extrapolation costs the same night that letting a hung one
+sit there does. The first green full run is what replaces it, here and in
+`register_ppu_ci(est_time=...)`.
