@@ -37,7 +37,9 @@ register_ppu_ci(est_time=5400, suite="nightly-perf-8-kimi26-ppu", nightly=True)
 
 
 class TestPPUKimiK26Perf(PerfSuiteMixin, unittest.TestCase):
-    default_test_config_path = DATA_ROOT / "configs" / "kimi2.6" / "mxfp4-fp8-144g-prefill.json"
+    default_test_config_path = (
+        DATA_ROOT / "configs" / "kimi2.6" / "mxfp4-fp8-144g-prefill.json"
+    )
 
 
 if __name__ == "__main__":

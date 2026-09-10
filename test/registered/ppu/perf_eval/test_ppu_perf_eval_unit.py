@@ -121,7 +121,9 @@ class TestPPUPerfEval(unittest.TestCase):
         cls.sparse_config = load_json(
             CONFIG_DIR / "glm5.2" / "fp8-channelwise-144g-prefill-64k.json"
         )
-        cls.four_node = load_json(CONFIG_DIR / "qwen3.8" / "2.4t-a95b-fp8-144g-prefill-4n.json")
+        cls.four_node = load_json(
+            CONFIG_DIR / "qwen3.8" / "2.4t-a95b-fp8-144g-prefill-4n.json"
+        )
 
     def setUp(self):
         self.plan_entry = resolve_measurement_plan(self.test_config)[0]
@@ -861,7 +863,9 @@ class TestPPUPerfMultiNodeExchange(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.four_node = load_json(CONFIG_DIR / "qwen3.8" / "2.4t-a95b-fp8-144g-prefill-4n.json")
+        cls.four_node = load_json(
+            CONFIG_DIR / "qwen3.8" / "2.4t-a95b-fp8-144g-prefill-4n.json"
+        )
         cls.single_node = load_json(
             CONFIG_DIR / "qwen3.5" / "397b-a17b-mxfp4-fp8-144g-prefill.json"
         )
