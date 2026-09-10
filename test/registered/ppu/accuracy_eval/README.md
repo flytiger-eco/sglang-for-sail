@@ -59,7 +59,7 @@ scores worse than it used to, not that the board trails a GPU. A score twice its
 baseline is not a triumph; it is evidence that something changed that nobody
 meant to change, usually in the harness.
 
-### Three entries are judged; the rest are measured
+### Twenty entries are judged; one is still measured
 
 A config without a baseline ships `baseline: null`, and the schema then refuses a
 ratio band as well: a band without a baseline judges nothing, and one that quietly
@@ -69,9 +69,8 @@ a baseline is a reviewed change, made from a green *full* run of this line on th
 hardware — not from the vendor's published number for the unquantised model, and
 not from a smoke run's twenty samples.
 
-Three entries have earned one, from runs `34429388425` and `34444244262` (see
-below), and are the only entries on the line that a future night can be red
-against:
+Three entries earned one first, from runs `34429388425` and `34444244262` (see
+below):
 
 | Entry | Metric | Baseline | Floor | Ceiling (2.00) | H20 cross-check | Ratio to H20 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -102,13 +101,84 @@ would suggest: this checkpoint has exactly one recorded H20 result (0.981, from
 2026-06-28 on sglang0.5.13), so that row is a point comparison rather than a
 range, and a second GPU record could move it either way.
 
-The other eighteen full entries still carry `baseline: null`. Filling those in is
-the same reviewed change, one green full run at a time, and each fill states its
-own floor and cross-check alongside the score. One thing to know before the next
-fill: the GSM8K config is also the unit suite's fixture, so the tests that are
-about the *absence* of a baseline take it off explicitly (`unjudged_config`)
-rather than rely on the file lacking one — which they did until this entry earned
-its baseline and took six of them red.
+Seventeen more earned one on 2026-09-10, in one sweep that put the remaining
+entries on the eight boards the cluster holds, one entry per board, all off the
+same commit of `feat/ppu-accuracy-nightly`. Every score below is a green full run
+at full sample count; the run that produced it is named so a later reader can go
+back to the same evidence:
+
+| Entry | Metric | Baseline | Floor | Run |
+| --- | --- | --- | --- | --- |
+| `glm52-mxfp4-ceval` | `accuracy` | 0.9413 | 0.9037 | `34490180523` |
+| `glm52-mxfp4-gsm8k` | `accuracy` | 0.9788 | 0.9510 | `34490180523` |
+| `glm52-mxfp4-ifeval` | `prompt_level_strict` | 0.9131 | 0.8393 | `34490180523` |
+| `kimi26-mxfp4-ceval` | `accuracy` | 0.9487 | 0.9128 | `34514316218` |
+| `kimi26-mxfp4-gsm8k` | `accuracy` | 0.9765 | 0.9479 | `34491756098` |
+| `minimax27-fp8chan-ceval` | `accuracy` | 0.8678 | 0.8187 | `34511238101` |
+| `minimax27-fp8chan-gsm8k` | `accuracy` | 0.9666 | 0.9348 | `34491756098` |
+| `minimax27-fp8chan-ifeval` | `prompt_level_strict` | 0.8891 | 0.8103 | `34504212646` |
+| `minimax27-mxfp4-ceval` | `accuracy` | 0.8447 | 0.7931 | `34510853997` |
+| `minimax27-mxfp4-gsm8k` | `accuracy` | 0.9606 | 0.9272 | `34491756098` |
+| `minimax27-mxfp4-ifeval` | `prompt_level_strict` | 0.8965 | 0.8192 | `34503998306` |
+| `qwen35-fp8chan-ceval` | `accuracy` | 0.9353 | 0.8965 | `34510461015` |
+| `qwen35-fp8chan-gsm8k` | `accuracy` | 0.9773 | 0.9490 | `34491756098` |
+| `qwen35-fp8chan-ifeval` | `prompt_level_strict` | 0.9168 | 0.8439 | `34503624251` |
+| `qwen35-mxfp4-ceval` | `accuracy` | 0.9324 | 0.8930 | `34509367014` |
+| `qwen35-mxfp4-gsm8k` | `accuracy` | 0.9765 | 0.9479 | `34491756098` |
+| `qwen35-mxfp4-ifeval` | `prompt_level_strict` | 0.9094 | 0.8348 | `34500832228` |
+
+The ceiling is inert on all seventeen for the same reason it is inert on the first
+three, and the same one-time GPU cross-check was run before these were written.
+It reaches eleven of the seventeen. The GPU side of the source cases records a
+score per (model, dataset) and not per quantisation, so one GPU record answers
+for both quantisations of a model; the column below states which record was read.
+
+| Entry | Baseline here | Same board, red line | H20 record | Ratio to H20 |
+| --- | --- | --- | --- | --- |
+| `glm52-mxfp4-ceval` | 0.9413 | 0.9391 | 0.9435 (fp8) | 0.9977 |
+| `glm52-mxfp4-gsm8k` | 0.9788 | 0.9742 | 0.9810 (fp8) | 0.9978 |
+| `glm52-mxfp4-ifeval` | 0.9131 | 0.9242 | 0.9335 (fp8) | 0.9781 |
+| `kimi26-mxfp4-ceval` | 0.9487 | 0.9547 | 0.9495 (int4) | 0.9992 |
+| `kimi26-mxfp4-gsm8k` | 0.9765 | 0.9727 | 0.9757 (int4) | 1.0008 |
+| `minimax27-fp8chan-ceval` | 0.8678 | — | 0.8603 (fp8) | 1.0087 |
+| `minimax27-fp8chan-gsm8k` | 0.9666 | — | 0.9659 (fp8) | 1.0007 |
+| `minimax27-fp8chan-ifeval` | 0.8891 | — | 0.9150 (fp8) | 0.9717 |
+| `minimax27-mxfp4-ceval` | 0.8447 | 0.8462 | 0.8603 (fp8) | 0.9819 |
+| `minimax27-mxfp4-gsm8k` | 0.9606 | 0.9636 | 0.9659 (fp8) | 0.9945 |
+| `minimax27-mxfp4-ifeval` | 0.8965 | 0.8928 | 0.9150 (fp8) | 0.9798 |
+
+The middle column is the closer of the two comparisons and the one that settles
+the question the cross-check exists to ask. It is the same checkpoint on the same
+board type, measured by the red line's own harness rather than this one — a
+different batch size (128 against 40) and EAGLE3 enabled where this line leaves
+it off, so the numbers are not expected to coincide. They agree to within 0.011
+everywhere it is populated, which is what a healthy port looks like: the spread
+between two harnesses on one board is smaller than the spread between two boards.
+
+That middle column also disposes of the one entry that looked wrong. MiniMax-M2.7
+scores 0.84–0.87 on C-Eval where every other checkpoint here scores above 0.93,
+which reads as a porting fault until you see that the GPU records 0.8603 and the
+red line records 0.8462 for the same checkpoint. The low score is the model on
+this dataset, not this board.
+
+Six entries have no GPU record to read. Qwen3.5-397B-A17B has five accuracy
+results on the reference build and all five failed in start-up — under twenty-two
+minutes each, `core_indicator.eval` empty and no `kpi_result` at all — so there is
+nothing to compare its six baselines against. They are written from this line's
+own green runs, without the blind-spot check the other eleven got, and that is the
+weakest claim on the page. `kimi26-mxfp4-ifeval` has the opposite gap: the GPU and
+red-line records both exist (0.9427 and 0.9464), but this line has no score to
+put beside them, for the reason below.
+
+One full entry still carries `baseline: null`: `kimi26-mxfp4-ifeval`. Its run
+(`34505832120`) went red after 82 minutes with `incomplete_samples` — the report
+scored 540 of IFEval's 541 prompts — and the harness refuses to write a baseline
+from a short sample rather than quietly dividing by a smaller denominator. Filling
+it in is the same reviewed change as the rest, once a run reports all 541. One
+thing to know before that fill: the GSM8K config is also the unit suite's fixture,
+so the tests that are about the *absence* of a baseline take it off explicitly
+(`unjudged_config`) rather than rely on the file lacking one — which they did until
+the first entry earned its baseline and took six of them red.
 
 ### The floor is computed, not inherited
 
@@ -125,26 +195,46 @@ baseline is itself a single measurement and not a known truth:
 | `glm52-fp8chan-ceval` | 1346 | 0.9420 | 0.9046 (r = 0.9603) | 0.9232 | 50 vs 25 samples |
 | `glm52-fp8chan-ifeval` | 541 | 0.9279 | 0.8577 (r = 0.9244) | 0.9093 | 38 vs 10 samples |
 | `glm52-fp8chan-gsm8k` | 1319 | 0.9803 | 0.9531 (r = 0.9722) | 0.9607 | 36 vs 26 samples |
+| `glm52-mxfp4-ceval` | 1346 | 0.9413 | 0.9037 (r = 0.9601) | 0.9225 | 51 vs 25 samples |
+| `glm52-mxfp4-ifeval` | 541 | 0.9131 | 0.8393 (r = 0.9192) | 0.8948 | 40 vs 10 samples |
+| `glm52-mxfp4-gsm8k` | 1319 | 0.9788 | 0.9510 (r = 0.9716) | 0.9592 | 37 vs 26 samples |
+| `kimi26-mxfp4-ceval` | 1346 | 0.9487 | 0.9128 (r = 0.9621) | 0.9297 | 48 vs 26 samples |
+| `kimi26-mxfp4-gsm8k` | 1319 | 0.9765 | 0.9479 (r = 0.9707) | 0.9570 | 38 vs 26 samples |
+| `minimax27-fp8chan-ceval` | 1346 | 0.8678 | 0.8187 (r = 0.9435) | 0.8504 | 66 vs 23 samples |
+| `minimax27-fp8chan-ifeval` | 541 | 0.8891 | 0.8103 (r = 0.9114) | 0.8713 | 43 vs 10 samples |
+| `minimax27-fp8chan-gsm8k` | 1319 | 0.9666 | 0.9348 (r = 0.9671) | 0.9473 | 42 vs 25 samples |
+| `minimax27-mxfp4-ceval` | 1346 | 0.8447 | 0.7931 (r = 0.9389) | 0.8278 | 69 vs 23 samples |
+| `minimax27-mxfp4-ifeval` | 541 | 0.8965 | 0.8192 (r = 0.9138) | 0.8786 | 42 vs 10 samples |
+| `minimax27-mxfp4-gsm8k` | 1319 | 0.9606 | 0.9272 (r = 0.9652) | 0.9414 | 44 vs 25 samples |
+| `qwen35-fp8chan-ceval` | 1346 | 0.9353 | 0.8965 (r = 0.9585) | 0.9166 | 52 vs 25 samples |
+| `qwen35-fp8chan-ifeval` | 541 | 0.9168 | 0.8439 (r = 0.9205) | 0.8985 | 39 vs 10 samples |
+| `qwen35-fp8chan-gsm8k` | 1319 | 0.9773 | 0.9490 (r = 0.9710) | 0.9578 | 37 vs 26 samples |
+| `qwen35-mxfp4-ceval` | 1346 | 0.9324 | 0.8930 (r = 0.9578) | 0.9138 | 53 vs 25 samples |
+| `qwen35-mxfp4-ifeval` | 541 | 0.9094 | 0.8348 (r = 0.9180) | 0.8912 | 40 vs 10 samples |
+| `qwen35-mxfp4-gsm8k` | 1319 | 0.9765 | 0.9479 (r = 0.9707) | 0.9570 | 38 vs 26 samples |
 
 The √2 is applied to the sample count (`n_eff = n/2`), not to the half-width, and
 z is the exact 3.3042 rather than the rounded 3.30 — both stated because the
 rounded z does not reproduce the IFEval floor to four places.
 
-`0.98` is tighter than the statistics support on all three, and markedly so on
+`0.98` is tighter than the statistics support on all twenty, and markedly so on
 IFEval, whose 541 prompts leave only ten flipped answers between a pass and a red
-— less than sampled decoding (`temperature: 1.0`) produces on its own. These
-three entries therefore state `min_ratio` rather than inherit the default. The
-conclusion does not rest on the family size: correcting across three judged
-entries instead of twenty-one still puts the honest floors at r = 0.9686,
-r = 0.9408 and r = 0.9787, all below `0.98`.
+— less than sampled decoding (`temperature: 1.0`) produces on its own. Every
+judged entry therefore states its own `min_ratio` rather than inherit the
+default. The gap widens as the baseline falls, which is the whole point of
+computing it: `0.98` allows MiniMax-M2.7 twenty-three flipped C-Eval answers
+where the statistics ask for sixty-nine, and it allows GSM8K twenty-six where the
+statistics ask for thirty-seven. No entry on the line is looser than `0.98`
+would have been.
 
-Two limits on that arithmetic, both in the direction of the floors being
-conservative rather than lax. The binomial model treats each prompt as a fixed
-coin and so understates the spread under sampled decoding, which makes these
-floors a lower bound on the tolerance actually needed. And correcting across all
-21 entries is right for the line once it is fully judged, not for today's three —
-held deliberately, so that a floor does not move every time another baseline
-lands.
+One limit on that arithmetic, in the direction of the floors being conservative
+rather than lax: the binomial model treats each prompt as a fixed coin and so
+understates the spread under sampled decoding, which makes these floors a lower
+bound on the tolerance actually needed. The Bonferroni family is no longer the
+question it was when three entries were judged — correcting across all 21 now
+matches 20 of them, and the twenty-first will not move a floor when it lands,
+because the family size was fixed at 21 from the start rather than at whatever
+was judged that week.
 
 ## The suites
 
@@ -203,13 +293,13 @@ the same shape. C-Eval and IFEval were then staged the same way, each in its own
 subject directories of parquet (3.9 MB), IFEval as a single jsonl beside its
 `dataset_infos.json` (220 KB).
 
-Eighteen of the twenty-one full entries are still code rather than runs. Each is
-one dispatch away from a number — nothing about them is unproven except the
-checkpoint's score itself.
+All twenty-one full entries have now run at full sample count, twenty of them
+green. Nothing on the line is unproven except `kimi26-mxfp4-ifeval`'s score,
+which is one dispatch away.
 
 ### What has actually run
 
-Three dispatches, in the order they answered something:
+Three dispatches first, in the order they answered something:
 
 | Run | Entry | Result | Registered file |
 | --- | --- | --- | --- |
@@ -233,8 +323,9 @@ tokens per prompt than C-Eval's multiple choice, and so run longest. It ran
 *shortest* of the three: 3889s against C-Eval's 9956s, of which 2674s was inside
 `evalscope eval` against C-Eval's 8787s. Why C-Eval costs more per prompt is not
 settled by this run; what is settled is that the prediction rested on reasoning
-about token volume that nothing had measured, and that the entry which sizes the
-timeouts is C-Eval, not GSM8K.
+about token volume that nothing had measured. Which entry sizes the timeouts was
+not settled either — this run said C-Eval, and the sweep below shows that holds
+for GLM-5.2 and inverts for every other family.
 
 The seven smoke entries answered a narrower question, and only that one. They are
 the first time the other six checkpoints have served a request on this line since
@@ -243,9 +334,66 @@ resolve in 5% steps, so `0.9500` is `19/20` and nothing more: seven checkpoints 
 comparable strength land on the same step by arithmetic, not by agreement. They
 are evidence that the service path works, and are not scores.
 
+### The sweep of 2026-09-10
+
+The remaining eighteen full entries ran in one afternoon, dispatched one entry per
+board across the eight boards the cluster holds and refilled as boards came free.
+Wall clock was 4h49m (14:58Z to 19:47Z) for 28.7 board-hours of work, which is
+what eight-way saturation looks like when each entry needs a whole board:
+
+| Run | Entry | Result | Job |
+| --- | --- | --- | --- |
+| `34490180523` | `glm52-mxfp4-ceval` | `accuracy=0.9413`, 1346/1346 | 9519s |
+| `34490180523` | `glm52-mxfp4-ifeval` | `prompt_level_strict=0.9131`, 541/541 | 8712s |
+| `34490180523` | `glm52-mxfp4-gsm8k` | `accuracy=0.9788`, 1319/1319 | 7610s |
+| `34491756098` | `qwen35-fp8chan-gsm8k` | `accuracy=0.9773`, 1319/1319 | 9684s |
+| `34491756098` | `minimax27-mxfp4-gsm8k` | `accuracy=0.9606`, 1319/1319 | 8325s |
+| `34491756098` | `kimi26-mxfp4-gsm8k` | `accuracy=0.9765`, 1319/1319 | 6888s |
+| `34491756098` | `qwen35-mxfp4-gsm8k` | `accuracy=0.9765`, 1319/1319 | 6560s |
+| `34491756098` | `minimax27-fp8chan-gsm8k` | `accuracy=0.9666`, 1319/1319 | 4914s |
+| `34500832228` | `qwen35-mxfp4-ifeval` | `prompt_level_strict=0.9094`, 541/541 | 4844s |
+| `34503624251` | `qwen35-fp8chan-ifeval` | `prompt_level_strict=0.9168`, 541/541 | 4138s |
+| `34504212646` | `minimax27-fp8chan-ifeval` | `prompt_level_strict=0.8891`, 541/541 | 4000s |
+| `34503998306` | `minimax27-mxfp4-ifeval` | `prompt_level_strict=0.8965`, 541/541 | 3731s |
+| `34505832120` | `kimi26-mxfp4-ifeval` | red: `incomplete_samples`, 540 of 541 | 4951s |
+| `34514316218` | `kimi26-mxfp4-ceval` | `accuracy=0.9487`, 1346/1346 | 4746s |
+| `34510461015` | `qwen35-fp8chan-ceval` | `accuracy=0.9353`, 1346/1346 | 4271s |
+| `34509367014` | `qwen35-mxfp4-ceval` | `accuracy=0.9324`, 1346/1346 | 3905s |
+| `34511238101` | `minimax27-fp8chan-ceval` | `accuracy=0.8678`, 1346/1346 | 3354s |
+| `34510853997` | `minimax27-mxfp4-ceval` | `accuracy=0.8447`, 1346/1346 | 3309s |
+
+Three things this table settles, and one it does not.
+
+The longest job was 9684s, so `est_time=12000` holds for all eighteen and is now a
+measurement across every entry on the line rather than an extrapolation from one
+family. Margin is thinnest on GSM8K, not C-Eval.
+
+Which contradicts what the C-Eval run above concluded. That run found C-Eval the
+longer of the two and said C-Eval sizes the timeouts; across eighteen entries the
+ordering flips with the model. GLM-5.2 does spend longer on C-Eval than on GSM8K
+(9519s against 7610s), but every other family spends longer on GSM8K — Qwen3.5
+FP8-Channelwise runs 9684s on GSM8K against 4271s on C-Eval, more than double.
+So neither dataset sizes the timeouts by itself; the pair (checkpoint, dataset)
+does, and the earlier conclusion was one family generalised too far.
+
+Eighteen dispatches carried the `Executing the custom container implementation
+failed` and `Failed to CreateArtifact: ECONNRESET` annotations on their check runs,
+including runs whose every step reports success on attempt 1 with a full-sample
+score. They are artifact-upload retries that the runner absorbed internally. The
+annotation is noise on this cluster and not a signal about the job — worth writing
+down because a reader who trusts the annotation panel over the step list will
+misread a green sweep as eighteen partial failures.
+
+What the table does not settle is why `kimi26-mxfp4-ifeval` lost one prompt of 541
+while the other five IFEval entries reported all of theirs. One prompt is
+consistent with a single generation exceeding a limit and with a defect that would
+recur; the predictions are kept at
+`/wl_nas/devops/34505832120-1/kimi26-mxfp4-ifeval/accuracy-results/kimi2.6-mxfp4-fp8-ifeval/evalscope`
+and a re-dispatch of the one entry distinguishes the two.
+
 ### Where a smoke run's 35 minutes went
 
-From run `34376918707`, and the reason the timeouts and `est_time` are drawn to a
+From run `34376918707`, and the reason the timeouts and `est_time` were drawn to a
 measurement rather than guessed:
 
 | Phase | Measured |
