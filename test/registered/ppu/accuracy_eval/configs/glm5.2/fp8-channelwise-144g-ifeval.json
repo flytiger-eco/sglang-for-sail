@@ -53,7 +53,7 @@
     "eval_batch_size": 40,
     "limit": null,
     "primary_metric": "prompt_level_strict",
-    "baseline": null,
+    "baseline": 0.9279,
     "generation": {
       "max_tokens": 32768,
       "temperature": 1.0,

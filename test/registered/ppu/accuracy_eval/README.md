@@ -54,14 +54,31 @@ a different measurement that can pass a band it has no right to.
 baseline. A score twice its baseline is not a triumph; it is evidence that
 something changed that nobody meant to change, usually in the harness.
 
-### No baseline yet, so nothing is judged yet
+### Two entries are judged; the rest are measured
 
-Every config here ships with `baseline: null`, and the schema then refuses a ratio
-band as well: a band without a baseline judges nothing, and one that quietly
+A config without a baseline ships `baseline: null`, and the schema then refuses a
+ratio band as well: a band without a baseline judges nothing, and one that quietly
 defaulted would be a rule nobody reviewed. Such a run reports `measured`, carries
 a `no_baseline` warning, and says so on the run page in as many words. Filling in
-a baseline is a reviewed change, made from a green run of this line on this
-hardware — not from the vendor's published number for the unquantised model.
+a baseline is a reviewed change, made from a green *full* run of this line on this
+hardware — not from the vendor's published number for the unquantised model, and
+not from a smoke run's twenty samples.
+
+Two entries have earned one, from run `34429388425` (see below), and are the only
+entries on the line that a future night can be red against:
+
+| Entry | Metric | Baseline | Floor (0.98) | Ceiling (2.00) |
+| --- | --- | --- | --- | --- |
+| `glm52-fp8chan-ceval` | `accuracy` | 0.9420 | 0.9232 | refused above 1.0 anyway |
+| `glm52-fp8chan-ifeval` | `prompt_level_strict` | 0.9279 | 0.9093 | refused above 1.0 anyway |
+
+The ceiling is inert for scores this high — twice either baseline exceeds the 1.0
+the metric can reach — so in practice these two are floors. That is the expected
+shape for a benchmark a checkpoint already scores well on; the ceiling earns its
+keep on a dataset where a harness fault can inflate a low score, not here.
+
+The other nineteen full entries still carry `baseline: null`. Filling those in is
+the same reviewed change, one green full run at a time.
 
 ## The suites
 
@@ -114,28 +131,41 @@ night:
 
 Neither is a fact about a model, so paying for it once was enough. That entry
 then ran green (run `34376918707`), so the remaining twenty were ported behind
-the same shape. They are code now, not runs: only GSM8K is staged on the NAS, so
-the fourteen C-Eval and IFEval entries fail in the board script before a
-checkpoint loads, with the `modelscope download` command that stages them — the
-designed behaviour, and not a reason to withhold the config.
+the same shape. C-Eval and IFEval were then staged the same way, each in its own
+1-PPU probe (runs `34427746656` and `34427755288`), which is why all three
+`dataset_dir` paths in the configs now point at data that exists: C-Eval as 52
+subject directories of parquet (3.9 MB), IFEval as a single jsonl beside its
+`dataset_infos.json` (220 KB).
 
-### What the first green run measured
+Nineteen of the twenty-one full entries are still code rather than runs. Each is
+one dispatch away from a number — nothing about them is unproven except the
+checkpoint's score itself.
 
-Run `34376918707`, the smoke config on `board-type=ZW-M890P`:
+### What has actually run
 
-```
-gsm8k | accuracy=0.9500 | samples=20/20 shots=4 | baseline=none
-Evaluations: 1/1 measured
-gsm8k | no_baseline | gsm8k has no measured baseline on this hardware yet,
-                     so this score is recorded and not judged
-```
+Three runs, in the order they answered something:
 
-Reported as `no_baseline` by design: the score is recorded, and what fills
-`evaluation.baseline` in is a reviewed change made from a *full* run, not from
-twenty samples.
+| Run | Entry | Result | Registered file |
+| --- | --- | --- | --- |
+| `34376918707` | `glm52-fp8chan-gsm8k-smoke` | `accuracy=0.9500`, 20/20 samples, 4 shots | 1454s |
+| `34429388425` | `glm52-fp8chan-ceval` | `accuracy=0.9420`, 1346/1346 samples, 5 shots | 9956s |
+| `34429388425` | `glm52-fp8chan-ifeval` | `prompt_level_strict=0.9279`, 541/541 samples, 0 shots | 4740s |
 
-Where the 35 minutes of board time went, because the timeouts and `est_time` are
-now drawn to it rather than guessed:
+The two full entries ran on the same dispatch, one board each, and both reported
+the whole split — 1346 of 1346 and 541 of 541, which is what earns them a
+baseline. Their scores are the two rows in the baseline table above. The other
+twenty-six jobs of that dispatch were skipped by the `entries` gate, which is the
+selection behaviour working rather than a fault.
+
+Both came in under the `est_time=12000` the registered file declares, which is
+now a measurement rather than a guess for these two datasets. GSM8K's full split
+is still unmeasured and is the one to watch: 1319 prompts of arithmetic reasoning
+at 4 shots generate far more tokens per prompt than C-Eval's multiple choice.
+
+### Where a smoke run's 35 minutes went
+
+From run `34376918707`, and the reason the timeouts and `est_time` are drawn to a
+measurement rather than guessed:
 
 | Phase | Measured |
 | --- | --- |
@@ -145,11 +175,14 @@ now drawn to it rather than guessed:
 | `evalscope eval`, twenty samples in one batch | 278s |
 | The registered file, end to end | 1454s |
 
-Two things are worth carrying forward from that table. The evaluation is the
-cheap part — bringing the server up costs four times what scoring the smoke split
-does — so a full split is where the hours go, not the setup. And the venv is
-rebuilt per run, which is 305s that a wheelhouse on the NAS would remove if a
-night ever needs it back.
+Two things carry forward from that table, and the full runs since have inverted
+one of them. The evaluation is the cheap part of a *smoke* run — bringing the
+server up cost four times what scoring twenty samples did — but on a full split
+the scoring dominates: C-Eval spent 8787s of its 9956s inside `evalscope eval`
+and IFEval 3530s of 4740s, against a CUDA graph capture that stayed near 1050s in
+both. Setup is a fixed cost the split amortises. And the venv is rebuilt per run,
+which is 305s that a wheelhouse on the NAS would remove if a night ever needs it
+back.
 
 ## The datasets
 
@@ -311,10 +344,11 @@ runs the smoke first and then the full split on the same lane, ordered by `needs
 plus `if: ${{ !cancelled() }}` so they never hold two boards at once.
 
 `entries` picks which. A job here holds a whole board for most of a night, so it
-is a selection rather than a filter: empty runs `glm52-fp8chan-gsm8k` alone — the
-one entry that has run green — a comma-separated list runs exactly those, and the
-literal `all` is what a caller writes to mean all twenty-one. That default is why
-a stray dispatch cannot ask the farm for twenty-one boards until morning.
+is a selection rather than a filter: empty runs `glm52-fp8chan-gsm8k` alone, a
+comma-separated list runs exactly those, and the literal `all` is what a caller
+writes to mean all twenty-one. That default is why a stray dispatch cannot ask the
+farm for twenty-one boards until morning. Run `34429388425` is what that gate
+looks like when it works: two named entries ran, twenty-six were skipped.
 
 Evidence is collected by `scripts/ci/ppu/collect_accuracy_evidence.sh`, which
 reads the report back off the NAS and prints the score as an annotation whether or
@@ -339,9 +373,17 @@ prompts against a reasoning model at `max_tokens` 32768 and a concurrency of 40 
 hours of generation, not minutes. The full entry is given
 `ACCURACY_TIMEOUT_PER_FILE=30600` (8.5 h) around a 6-hour EvalScope timeout, with
 the pod and job timeouts above that. The smoke entry is given 7200 s (2 h), drawn
-to the one measured run — 35 minutes of board time, almost all of it the weight
-load — with room to spare. The full number is deliberately *not* drawn tight: the
-full split is some thirty batches of the smoke one, and killing a run that is
-merely slower than that extrapolation costs the same night that letting a hung one
-sit there does. The first green full run is what replaces it, here and in
-`register_ppu_ci(est_time=...)`.
+to the one measured smoke run — 35 minutes of board time, almost all of it the
+weight load — with room to spare.
+
+The two measured full runs put numbers under the full budget for the first time:
+C-Eval held its board for 9956 s and IFEval for 4740 s, against the 30600 s
+ceiling. Both are comfortably inside it, and the ceiling is deliberately left
+where it is rather than drawn down to them. GSM8K is the reason — its full split
+is the generation-heaviest of the three and still unmeasured, so tightening the
+fence to a C-Eval-shaped run would risk killing the first GSM8K night on a budget
+that was never measured against it. A run that is merely slower than an
+extrapolation costs the same night that letting a hung one sit there does. What
+replaces 30600 is a green GSM8K full run, here and in
+`register_ppu_ci(est_time=...)` — where 12000 s already covers both measured
+datasets.
