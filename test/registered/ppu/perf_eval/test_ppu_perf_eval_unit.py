@@ -34,6 +34,8 @@ from sglang.test.kits.perf_eval_kit import (
     METRIC_FIELDS,
     REASON_CODES,
     SERVER_PARAMETER_STORE_TRUE,
+    TREND_POINT_SCHEMA_VERSION,
+    TREND_PROVENANCE_FIELDS,
     MeasurementError,
     PerfEvalError,
     build_perf_server_args,
@@ -49,8 +51,10 @@ from sglang.test.kits.perf_eval_kit import (
     perf_server_environment,
     render_junit,
     render_summary,
+    render_trend_jsonl,
     resolve_distributed_runtime,
     resolve_measurement_plan,
+    trend_points,
     validate_test_config,
     write_report_files,
 )
@@ -864,7 +868,7 @@ class TestPPUPerfEval(unittest.TestCase):
             write_report_files(report, output_dir)
             self.assertEqual(
                 sorted(path.name for path in output_dir.iterdir()),
-                ["junit.xml", "result.json", "summary.md"],
+                ["junit.xml", "result.json", "summary.md", "trend.jsonl"],
             )
             written = load_json(output_dir / "result.json")
             # Unlike the Answer report there is no redaction pass, because a
@@ -875,6 +879,18 @@ class TestPPUPerfEval(unittest.TestCase):
             )
             self.assertEqual(
                 written["provenance"]["workload"], self.test_config["workload"]
+            )
+            # The trend rows are written next to the report rather than derived
+            # from it later, so a measurement taken before anything publishes
+            # them is still on the data branch once something does.
+            self.assertEqual(
+                [
+                    json.loads(line)
+                    for line in (output_dir / "trend.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ],
+                trend_points(report),
             )
 
         suite = ET.fromstring(render_junit(report))
@@ -889,6 +905,104 @@ class TestPPUPerfEval(unittest.TestCase):
         self.assertEqual(
             json.loads(cases[0].find("system-out").text)["metrics"]["duration_s"], 12.34
         )
+
+    def test_trend_rows_key_a_series_and_carry_what_moves_it(self):
+        # One row per measurement, for the branch the nightly numbers accumulate
+        # on. What a row owes a reader months later is fixed by what that reader
+        # cannot otherwise recover: which series the row belongs to, the numbers,
+        # and the inputs that legitimately move them.
+        plan = resolve_measurement_plan(self.test_config)
+        report = build_report(
+            self.test_config,
+            [
+                measurement_record(plan[0], benchmark_result()),
+                failed_measurement_record(plan[1], "server_start_failed", "no port"),
+            ],
+            provenance=perf_provenance(self.test_config),
+        )
+        rows = trend_points(report)
+        self.assertEqual(len(rows), 2)
+        measured, unmeasured = rows
+        for row in rows:
+            self.assertEqual(row["schema_version"], TREND_POINT_SCHEMA_VERSION)
+            self.assertEqual(row["test_id"], report["test_id"])
+            self.assertEqual(row["generated_at"], report["generated_at"])
+            self.assertEqual(row["config_digest"], canonical_digest(self.test_config))
+        self.assertEqual(
+            [row["measurement_id"] for row in rows], [entry["id"] for entry in plan]
+        )
+        self.assertEqual(measured["status"], "measured")
+        self.assertEqual(measured["metrics"]["ttft_mean_ms"], 1234.5)
+        self.assertIsNone(measured["reason_code"])
+        # A night that could not measure stays in the series with no numbers, so
+        # a reader can tell it from a night on which nothing ran at all. Dropping
+        # it would leave a gap that reads as a scheduling hole.
+        self.assertEqual(unmeasured["status"], "failed")
+        self.assertEqual(unmeasured["reason_code"], "server_start_failed")
+        self.assertIsNone(unmeasured["metrics"])
+        # The workload shape is repeated into every row on purpose: a row has to
+        # be readable without resolving its digest back to a config file that may
+        # since have been edited or deleted.
+        for key in ("input_len", "output_len", "num_prompts", "concurrency"):
+            self.assertEqual(measured[key], plan[0][key])
+        self.assertEqual(measured["tc_name"], plan[0]["tc_name"])
+        self.assertEqual(measured["source_case"], plan[0]["source_case"])
+        # Exactly the reviewed provenance fields, so widening what a row explains
+        # a step change with is a reviewed change rather than whatever the report
+        # happened to be carrying that month.
+        self.assertEqual(
+            sorted(measured["provenance"]), sorted(TREND_PROVENANCE_FIELDS)
+        )
+        self.assertEqual(
+            measured["provenance"]["expected_hardware"],
+            perf_expected_hardware(self.test_config),
+        )
+        self.assertEqual(
+            measured["provenance"]["package_versions"],
+            report["provenance"]["package_versions"],
+        )
+
+    def test_a_config_edit_starts_a_new_trend_series(self):
+        # Editing a config ends one series and starts another. The numbers either
+        # side of that edit were never comparable, so a comparison keyed on the
+        # digest reads the break as a break instead of as a regression -- which
+        # is why the digest is part of the key and not a passenger.
+        plan = resolve_measurement_plan(self.test_config)
+        edited = copy.deepcopy(self.test_config)
+        edited["server"]["parameters"]["mem_fraction_static"] = 0.5
+        rows = [
+            trend_points(
+                build_report(config, [measurement_record(plan[0], benchmark_result())])
+            )[0]
+            for config in (self.test_config, edited)
+        ]
+        self.assertEqual(rows[0]["measurement_id"], rows[1]["measurement_id"])
+        self.assertNotEqual(rows[0]["config_digest"], rows[1]["config_digest"])
+
+    def test_trend_rows_render_as_one_json_object_per_line(self):
+        # The series is read back as the concatenation of every run's file, so the
+        # unit of the format is a line, not a document. Sorted keys and compact
+        # separators are what make a diff on the data branch show only the numbers
+        # that moved.
+        plan = resolve_measurement_plan(self.test_config)
+        report = build_report(
+            self.test_config,
+            [measurement_record(entry, benchmark_result()) for entry in plan],
+            provenance=perf_provenance(self.test_config),
+        )
+        rendered = render_trend_jsonl(report)
+        self.assertTrue(rendered.endswith("\n"))
+        lines = rendered.splitlines()
+        self.assertEqual(len(lines), len(plan))
+        rows = trend_points(report)
+        self.assertEqual([json.loads(line) for line in lines], rows)
+        self.assertEqual(
+            lines[0],
+            json.dumps(rows[0], sort_keys=True, separators=(",", ":")),
+        )
+        # A report with nothing in it renders an empty file rather than a line
+        # that would be read back as a measurement.
+        self.assertEqual(render_trend_jsonl(build_report(self.test_config, [])), "")
 
     def test_provenance_describes_the_run_the_numbers_came_from(self):
         with mock.patch.dict(

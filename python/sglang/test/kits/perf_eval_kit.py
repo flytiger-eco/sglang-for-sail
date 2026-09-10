@@ -45,6 +45,12 @@ from sglang.test.kits.answer_eval_kit import (
 
 PERF_CONFIG_SCHEMA_VERSION = "ppu-perf-test-config/v1"
 PERF_REPORT_SCHEMA_VERSION = "ppu-perf-report/v1"
+# The row shape the trend series is built out of.  Versioned separately from the
+# report because the two are read by different things: a report is read once, by
+# whoever opens that run's artifact, while a row is read months later alongside
+# rows written by every version since, and a reader of that mixture needs to tell
+# a row that predates a field from a row that lost one.
+TREND_POINT_SCHEMA_VERSION = "ppu-perf-trend-point/v1"
 
 
 class PerfEvalError(RuntimeError):
@@ -1229,6 +1235,93 @@ def render_junit(report: dict[str, Any]) -> bytes:
     return ET.tostring(suite, encoding="utf-8", xml_declaration=True)
 
 
+# What a row records about the run that produced it, beyond the numbers.  These
+# are the inputs that legitimately move a measurement, and a series carrying only
+# the numbers cannot tell a regression from a changed input: a throughput drop on
+# the night the base image moved is a different finding from the same drop on an
+# unchanged image.  ``package_versions`` is four keys, so it travels whole rather
+# than as a chosen subset that would have to be widened the first time a fifth
+# one matters.
+TREND_PROVENANCE_FIELDS = (
+    "source_revision",
+    "github_run_id",
+    "github_run_url",
+    "base_image",
+    "base_image_digest",
+    "checkpoint_name",
+    "checkpoint_config_sha256",
+    "expected_hardware",
+    "package_versions",
+)
+
+
+def trend_points(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten a report into one row per measurement, for the trend series.
+
+    A row is one point in a series keyed by ``(test_id, measurement_id,
+    config_digest)``.  The digest belongs to the key rather than riding along as
+    a passenger, for the reason ``build_report`` already states about reports:
+    two rows whose digests differ were measured on different settings, so a
+    comparison that ignores it reads a config change as a performance change.
+    Editing a config ends one series and starts another, which is the intended
+    behaviour -- the numbers either side of that edit were never comparable.
+
+    A failed measurement is carried too, with ``metrics`` null.  A series has to
+    distinguish a night that could not measure from a night that never ran, and
+    the internal corpus is the argument for keeping both: most of its
+    disaggregated records are failures, and it is counting them that tells a
+    reader whether a configuration is measurable at all rather than merely slow.
+    """
+
+    provenance = report.get("provenance") or {}
+    shared = {
+        "schema_version": TREND_POINT_SCHEMA_VERSION,
+        "generated_at": report["generated_at"],
+        "test_id": report["test_id"],
+        "config_digest": report["config_digest"],
+        "provenance": {
+            field: provenance.get(field) for field in TREND_PROVENANCE_FIELDS
+        },
+    }
+    return [
+        {
+            **shared,
+            "measurement_id": record["id"],
+            # The workload shape is repeated into every row, denormalised on
+            # purpose: a row has to be readable without resolving its digest back
+            # to a config file that may since have been edited or deleted.
+            "input_len": record["input_len"],
+            "output_len": record["output_len"],
+            "num_prompts": record["num_prompts"],
+            "concurrency": record["concurrency"],
+            "source_case": record["source_case"],
+            "tc_name": record["tc_name"],
+            "status": record["status"],
+            "reason_code": record["reason_code"],
+            "metrics": record["metrics"],
+        }
+        for record in report["measurements"]
+    ]
+
+
+def render_trend_jsonl(report: dict[str, Any]) -> str:
+    """The trend rows as one JSON object per line.
+
+    Lines rather than one document, because the series is read back as the
+    concatenation of every run's file: a JSON array per run would have to be
+    unwrapped before the points could be streamed together.  Keys are sorted and
+    the separators are compact so that two runs measuring the same thing produce
+    rows that differ only where the numbers do, which is what makes a diff on the
+    data branch worth reading.
+    """
+
+    return "".join(
+        json.dumps(point, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+        for point in trend_points(report)
+    )
+
+
 def write_report_files(report: dict[str, Any], output_dir: Path) -> None:
     """Write the report next to the raw benchmark output.
 
@@ -1243,6 +1336,13 @@ def write_report_files(report: dict[str, Any], output_dir: Path) -> None:
     )
     (output_dir / "summary.md").write_text(render_summary(report), encoding="utf-8")
     (output_dir / "junit.xml").write_bytes(render_junit(report))
+    # Written here, next to the report, rather than derived later from
+    # result.json: the collector copies this directory wholesale, so the rows
+    # reach the artifact whether or not anything is yet publishing them to the
+    # data branch, and a run measured before that step exists is not lost.
+    (output_dir / "trend.jsonl").write_text(
+        render_trend_jsonl(report), encoding="utf-8"
+    )
 
 
 def perf_provenance(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
@@ -1299,6 +1399,8 @@ __all__ = [
     "SUPPORTED_SERVER_ENVIRONMENT",
     "SUPPORTED_SERVER_PARAMETERS",
     "SUPPORTED_WORKLOAD_DATASETS",
+    "TREND_POINT_SCHEMA_VERSION",
+    "TREND_PROVENANCE_FIELDS",
     "build_perf_server_args",
     "build_report",
     "checkpoint_config_digest",
@@ -1313,8 +1415,10 @@ __all__ = [
     "perf_server_environment",
     "render_junit",
     "render_summary",
+    "render_trend_jsonl",
     "resolve_distributed_runtime",
     "resolve_measurement_plan",
+    "trend_points",
     "validate_hardware",
     "validate_model",
     "validate_test_config",

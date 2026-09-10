@@ -34,8 +34,8 @@ both the achieved and the ceiling concurrency — the nineteen fields of
 `perf_eval_kit.METRIC_FIELDS`, each defined from the first token and so recorded
 truthfully whether a case decodes or not. They reach the run page as
 annotations, one notice per measurement, and the machine-readable copy
-(`result.json`, `junit.xml`, the raw `bench_serving` JSONL) travels in the
-artifact.
+(`result.json`, `junit.xml`, `trend.jsonl`, the raw `bench_serving` JSONL) travels
+in the artifact.
 
 A measurement that decodes more than one output token records nine further
 fields — time per output token (mean, median, std, p99) and inter-token latency
@@ -162,6 +162,54 @@ invalidated by it: the first shakeout ran with `disable_radix_cache=False` and
 still logged `#cached-token: 0` on all 100 requests, because a `random-ids`
 workload at `random_range_ratio` 1.0 and concurrency 1 shares no prefix. The flag
 is set for parity with the source cases, not to undo an inflated number.
+
+## The trend series
+
+Alongside `result.json`, `write_report_files` writes `trend.jsonl`: one line per
+measurement, flattened so that a night's numbers can be appended to a series and
+read back months later. The collector copies the report directory wholesale, so
+the rows reach the artifact without a workflow change, and a run measured before
+anything publishes them is not lost when the step arrives.
+
+A row is a point in a series keyed by **`(test_id, measurement_id,
+config_digest)`**. The digest is part of the key, not a passenger. Two rows whose
+digests differ were measured on different settings, whatever their file names
+say, so editing a config ends one series and starts another — which is the
+intended behaviour, because the numbers either side of that edit were never
+comparable. A comparison that ignores the digest reads a config change as a
+performance change.
+
+Each row carries, beyond the key: the workload shape (`input_len`, `output_len`,
+`num_prompts`, `concurrency`) denormalised on purpose, so a row stays readable
+without resolving its digest back to a config file that may since have been
+edited; `source_case` and `tc_name`, so it can be matched against the internal
+corpus; `status` and `reason_code`; the metrics block, verbatim from the report;
+and the `TREND_PROVENANCE_FIELDS` subset of provenance — the inputs that
+legitimately move a measurement. That last part is what separates "throughput
+fell 8 % on the 20th" from "throughput fell 8 % on the 20th, the night the base
+image moved". A row is about two kilobytes.
+
+A failed measurement is kept, with `metrics` null. A series has to distinguish a
+night that could not measure from a night on which nothing ran, and dropping the
+failures would leave a gap that reads as a scheduling hole. The internal corpus
+argues the same way round: most of its disaggregated records are failures, and
+counting them is what says whether a configuration is measurable at all rather
+than merely slow.
+
+### What is not here yet
+
+**Nothing compares two rows.** This line still enforces no threshold, and adding
+one before the run-to-run spread has been measured would turn the nightly red on
+noise. The order of work is: accumulate rows; measure the spread by repeating one
+config on one revision; only then compare against a rolling median, and only as a
+`- WARN` annotation. TTFT p50, mean time per output token and output-token
+throughput are the intended subjects. TTFT p99 and ITL p99 are recorded but are
+not comparison candidates yet — they are the noisiest fields and still carry
+warm-up residue.
+
+`base_image_digest` is null on this line: `PPU_BASE_IMAGE_DIGEST` is exported by
+the Answer nightly workflow and by no performance one, so a row currently
+attributes an image by its mutable tag only.
 
 ## Environment
 
