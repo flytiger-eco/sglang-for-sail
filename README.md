@@ -43,6 +43,19 @@ The workflow-level grant in those files stays read-only, so nothing that launche
 a server or runs a benchmark can push here. The rows come from the artifact each
 measuring job already uploaded; this branch is never written by hand.
 
+## What protects it
+
+No ruleset covers this branch. The repository's `deletion` rules apply to the
+default branch only, so this one can be deleted or force-pushed by anyone who can
+push, and the person who set it up holds no admin rights to change that. Adding a
+ruleset over `refs/heads/nightly-test-data` with `deletion` and
+`non_fast_forward` is the fix, and needs repository admin.
+
+Until then, the recovery window is the artifact retention: rows from runs of the
+last thirty days can be refiled by re-dispatching those runs' publishing jobs,
+because each row is still in its run's artifact. Anything older than that is gone
+with the branch, which is exactly the loss this branch exists to prevent.
+
 ## What is not here
 
 Nothing in this branch compares two rows. The nightly performance line enforces
