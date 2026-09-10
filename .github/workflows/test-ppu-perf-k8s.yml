@@ -819,3 +819,89 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+
+  # ============================================== the trend series ===============================================
+  # Move the rows the entries above already wrote onto the nightly-test-data
+  # branch. Nothing is measured, judged or recomputed here: write_report_files put
+  # a trend.jsonl next to each report, and this job only files those bytes where
+  # they outlive the thirty-day artifact retention that would otherwise erase the
+  # series. The other perf workflows carry the same job and refer back to this note.
+  #
+  # `always()`, and every entry in `needs`, because a night that could not measure
+  # is a point in the series too: a failed measurement is filed with null metrics
+  # and its reason code, and dropping it would leave a gap indistinguishable from a
+  # night on which nothing was scheduled.
+  #
+  # This is the only job in the file granted write. The workflow-level grant stays
+  # read-only, so nothing that launches a server or runs a benchmark can push, and
+  # the write is confined to a job that touches no model and no board.
+  #
+  # A caller matters here: a `workflow_call` invocation cannot be granted more than
+  # its caller holds, so whoever eventually wires this workflow into a parent has to
+  # grant `contents: write` and `actions: read` there as well, or this job will run
+  # with the read-only default and every push will 403.
+  publish-trend-rows:
+    name: file the trend rows
+    needs:
+      - glm52-fp8chan-4k
+      - glm52-fp8chan-64k
+      - kimi26-mxfp4
+      - kimi26-w4a8
+      - glm52-mxfp4-4k
+      - glm52-mxfp4-64k
+      - qwen35-mxfp4
+      - qwen35-fp8chan
+      - minimax27-mxfp4
+      - minimax27-fp8chan
+    if: always()
+    # Not a board runner: this job needs github.com and a Python, and holds no
+    # device. Putting it on the CPU orchestration group would queue it behind the
+    # very measurements it is waiting for.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # download-artifact reads this run's own artifacts through the Actions API,
+      # which the repository's read-only default does not cover at all.
+      actions: read
+    timeout-minutes: 15
+    steps:
+      # Two checkouts, because the two things this job needs are on different
+      # branches: the script comes from the source, and the branch it writes to
+      # carries measurements only. Giving the data branch a copy of the script
+      # would make it something that has to be kept in step with the code, which
+      # is what keeping it an orphan branch avoids.
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+          path: source
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          # Full history, unlike every other checkout here: this is the one that
+          # gets pushed, and pushing or rebasing out of a shallow clone is a
+          # failure mode not worth inviting for a branch this small.
+          fetch-depth: 0
+          path: series
+      # Best effort, like the uploads that produced them: an entry can finish with
+      # no artifact at all, and that is a gap in the series rather than a reason to
+      # fail a job that measured nothing itself.
+      - name: Download this run's reports
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-perf-k8s-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: incoming
+      # Downloaded outside the data-branch checkout on purpose, so that the only
+      # thing untracked in it is nothing at all.
+      - name: File the rows on the data branch
+        if: steps.download.outcome == 'success'
+        shell: bash
+        working-directory: series
+        env:
+          INCOMING_DIR: ../incoming
+          TREND_DATA_BRANCH: nightly-test-data
+        run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh

@@ -229,3 +229,46 @@ jobs:
           # and v4 refuses a name it already holds.
           overwrite: true
           retention-days: 30
+
+  # =============================================== the trend series ===============================================
+  # File the rows this run measured on the nightly-test-data branch, so that the
+  # series outlives the thirty-day artifact retention above. See the note on the
+  # same job in test-ppu-perf-k8s.yml for why it runs on always(), why the write is
+  # confined to this one job, and what a `workflow_call` caller has to grant for it.
+  publish-trend-rows:
+    name: file the trend rows
+    needs: [perf-16-k8s]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+          path: source
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          fetch-depth: 0
+          path: series
+      - name: Download this run's report
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
+          path: incoming
+      - name: File the rows on the data branch
+        if: steps.download.outcome == 'success'
+        shell: bash
+        working-directory: series
+        env:
+          INCOMING_DIR: ../incoming
+          TREND_DATA_BRANCH: nightly-test-data
+        run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
