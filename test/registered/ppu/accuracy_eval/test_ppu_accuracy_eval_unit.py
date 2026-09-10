@@ -408,6 +408,46 @@ class TestEvalscopeCommandLine(unittest.TestCase):
         )
 
 
+class TestScorerResources(unittest.TestCase):
+    """What a dataset's scorer needs before it scores anything.
+
+    IFEval lost one prompt of 541 on 2026-09-10 because EvalScope fetched the
+    sentence tokenizer while scoring rather than before, and charged the failure
+    to that prompt's score instead of to the run. The contract names the corpus
+    so the suite can resolve it first; these assert the naming, since nothing
+    else on a CPU can.
+    """
+
+    def test_every_dataset_declares_what_its_scorer_needs(self):
+        for dataset, contract in DATASET_CONTRACTS.items():
+            with self.subTest(dataset=dataset):
+                self.assertIn("nltk_resources", contract)
+                for resource in contract["nltk_resources"]:
+                    download_id, lookup_path = resource
+                    self.assertTrue(download_id)
+                    self.assertIn("/", lookup_path)
+
+    def test_ifeval_names_the_tokenizer_that_cost_it_a_prompt(self):
+        self.assertEqual(
+            DATASET_CONTRACTS["ifeval"]["nltk_resources"],
+            (("punkt_tab", "tokenizers/punkt_tab"),),
+        )
+
+    def test_the_datasets_that_need_nothing_say_so(self):
+        self.assertEqual(DATASET_CONTRACTS["gsm8k"]["nltk_resources"], ())
+        self.assertEqual(DATASET_CONTRACTS["ceval"]["nltk_resources"], ())
+
+    def test_the_plan_carries_them_so_the_suite_need_not_know_the_dataset(self):
+        for path in sorted(CONFIG_DIR.rglob("*.json")):
+            config = load_json(path)
+            with self.subTest(config=path.name):
+                plan = resolve_evaluation_plan(config)
+                self.assertEqual(
+                    plan["nltk_resources"],
+                    DATASET_CONTRACTS[plan["dataset"]]["nltk_resources"],
+                )
+
+
 class TestReportReader(unittest.TestCase):
     def _written(self, report, dataset="gsm8k", model="GLM-5.2"):
         directory = Path(tempfile.mkdtemp())

@@ -109,6 +109,15 @@ REPORT_SCHEMA_VERSION = 2
 # silently scored on something else.  `samples` is the published size of the
 # evaluation split, which is what makes a truncated dataset visible as a number
 # instead of as a lower score.
+#
+# `nltk_resources` names the NLTK corpora the dataset's *scorer* needs, as
+# (download id, lookup path) pairs.  It exists because EvalScope fetches them
+# lazily, inside the scoring of the first sample that needs one, and swallows the
+# failure per sample: on 2026-09-10 `kimi26-mxfp4-ifeval` reached that sample 29
+# seconds before the download finished and scored 540 of 541 prompts, while the
+# five other IFEval entries won the same race and scored all 541.  A missing
+# corpus therefore does not fail a run, it shrinks the denominator -- so the
+# suite fetches these before evaluation starts, leaving no race to lose.
 DATASET_CONTRACTS = {
     "gsm8k": {
         "dataset_id": "AI-ModelScope/gsm8k",
@@ -116,6 +125,7 @@ DATASET_CONTRACTS = {
         "primary_metric": "accuracy",
         "default_few_shot_num": 4,
         "samples": 1319,
+        "nltk_resources": (),
     },
     "ceval": {
         "dataset_id": "evalscope/ceval",
@@ -123,6 +133,7 @@ DATASET_CONTRACTS = {
         "primary_metric": "accuracy",
         "default_few_shot_num": 5,
         "samples": 1346,
+        "nltk_resources": (),
     },
     "ifeval": {
         "dataset_id": "opencompass/ifeval",
@@ -130,6 +141,8 @@ DATASET_CONTRACTS = {
         "primary_metric": "prompt_level_strict",
         "default_few_shot_num": 0,
         "samples": 541,
+        # Sentence tokenisation, for the instructions that count sentences.
+        "nltk_resources": (("punkt_tab", "tokenizers/punkt_tab"),),
     },
 }
 
@@ -678,6 +691,7 @@ def resolve_evaluation_plan(config: dict[str, Any]) -> dict[str, Any]:
     plan["expected_samples"] = plan["limit"] or contract["samples"]
     plan["dataset_id"] = contract["dataset_id"]
     plan["split"] = contract["split"]
+    plan["nltk_resources"] = contract["nltk_resources"]
     return plan
 
 

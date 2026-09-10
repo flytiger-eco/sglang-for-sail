@@ -180,6 +180,59 @@ so the tests that are about the *absence* of a baseline take it off explicitly
 (`unjudged_config`) rather than rely on the file lacking one — which they did until
 the first entry earned its baseline and took six of them red.
 
+#### Where that one prompt went
+
+Not to the board, and not to the model. The evidence is in the run's own
+artifact, and it is unambiguous:
+
+* EvalScope's performance table records `Num 541` — the server answered every
+  prompt — while the metric table records `num 540`. The prompt was generated
+  and then not scored.
+* The log carries exactly one `Error calculating ifeval metrics`, at 01:51:24,
+  and its cause is `Resource 'punkt_tab' not found`: the NLTK sentence tokenizer
+  some IFEval instructions need in order to be checked.
+* The next line is EvalScope fetching that tokenizer, finishing at 01:51:53 —
+  **29 seconds after** the sample that needed it arrived.
+
+So the fetch is lazy: EvalScope resolves the corpus inside the scoring of the
+first sample that needs it, and charges a failed resolve to that sample rather
+than to the run. All six IFEval entries of the sweep ran that same race — every
+one of their logs carries the same `punkt_tab not found, downloading from mirror`
+line, because nothing on this line stages the corpus or exports `NLTK_DATA`. Five
+won it, with the download landing 62s to 229s in and no sample scored before it.
+This one lost it by 29 seconds:
+
+| Entry | Fetch finished at | Metric errors | Generated | Scored |
+| --- | --- | --- | --- | --- |
+| `glm52-mxfp4-ifeval` | +229s | 0 | 541 | 541 |
+| `qwen35-fp8chan-ifeval` | +219s | 0 | 541 | 541 |
+| `qwen35-mxfp4-ifeval` | +173s | 0 | 541 | 541 |
+| `minimax27-fp8chan-ifeval` | +69s | 0 | 541 | 541 |
+| `minimax27-mxfp4-ifeval` | +62s | 0 | 541 | 541 |
+| `kimi26-mxfp4-ifeval` | +161s (first error at +132s) | 1 | 541 | 540 |
+
+Two things follow. The first is that this run's score is very nearly known:
+0.9519 over 540 is 514 correct, so the whole split is 514/541 = 0.9501 if the
+lost prompt would have failed and 515/541 = 0.9519 if it would have passed. The
+missing prompt can move the baseline by at most 0.0018, and both ends sit above
+the red line's 0.9464 and the GPU's 0.9427 for this checkpoint. The entry is not
+suspect; it is unmeasured, and refusing it a baseline over 0.0018 of uncertainty
+is the rule being conservative rather than the rule being wrong.
+
+The second is that the harness had no way to prevent this and now does. A missing
+corpus does not fail an evaluation, it silently shrinks the denominator, and the
+only thing standing between that and a baseline written from 540 samples was the
+sample-count check — which is exactly what fired. `DATASET_CONTRACTS` now names
+the corpora a dataset's *scorer* needs, and the suite fetches them before the
+server starts, so there is no race left to lose. That fetch is best effort by
+design: EvalScope reaches its own mirror where this reaches NLTK's index, and
+refusing a run because our route failed would take five entries that score all
+541 today and make them red. A failed fetch prints a warning naming the exposure;
+the sample-count check stays the thing that stops a short run being read as a
+score. Staging the corpus on shared storage and exporting `NLTK_DATA` — the same
+treatment the three splits got — would remove the fetch entirely, and is the
+follow-up this leaves open.
+
 ### The floor is computed, not inherited
 
 `0.98` arrived from the source cases as one constant for every dataset. Accuracy

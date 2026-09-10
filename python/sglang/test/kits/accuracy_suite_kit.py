@@ -70,6 +70,29 @@ DATASET_DIR_ENV = "SGLANG_PPU_ACCURACY_DATASET_DIR"
 # it, and a stack trace or an HTTP error from the last request fits.
 LOG_TAIL_LINES = 60
 
+# How long the NLTK corpora a scorer needs get to arrive.  Generous because the
+# pods reach a mirror rather than a local copy, and small against the hours the
+# evaluation itself takes -- the point is to bound a hang, not to be tight.
+NLTK_FETCH_TIMEOUT_SECONDS = 600
+
+# The program that resolves one corpus inside EvalScope's own environment.  A
+# subprocess rather than an import because EvalScope lives in a virtual
+# environment of its own, so this test process may have no `nltk` at all and
+# certainly not the one that will do the scoring.
+_NLTK_RESOLVE_PROGRAM = """
+import sys
+
+import nltk
+
+download_id, lookup_path = sys.argv[1], sys.argv[2]
+try:
+    nltk.data.find(lookup_path)
+except LookupError:
+    nltk.download(download_id, quiet=True)
+    nltk.data.find(lookup_path)
+print(nltk.data.find(lookup_path))
+"""
+
 
 class AccuracySuiteMixin:
     """The reviewed Accuracy contract, executed against a live server.
@@ -187,6 +210,93 @@ class AccuracySuiteMixin:
         return resolved
 
     @classmethod
+    def _evalscope_interpreter(cls):
+        """The Python that will do the scoring.
+
+        Taken from beside the `evalscope` entry point rather than from
+        `sys.executable`: the two are different interpreters here by design, and
+        the one worth asking about a corpus is the one that will look for it.
+        """
+
+        bin_dir = Path(cls.evalscope_bin).parent
+        for name in ("python3", "python"):
+            candidate = bin_dir / name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        raise RuntimeError(
+            f"no python interpreter beside {cls.evalscope_bin}; EvalScope is "
+            "expected to be installed into an environment whose entry point and "
+            "interpreter share a directory"
+        )
+
+    @classmethod
+    def _resolve_metric_resources(cls):
+        """Make the scorer's corpora present before a single sample is scored.
+
+        EvalScope fetches them lazily, inside the scoring of the first sample
+        that needs one, and charges a failed fetch to that sample rather than to
+        the run: the cost of losing the race is a smaller denominator, which only
+        the sample-count check downstream makes visible. Fetching here moves the
+        whole download before the first sample, so there is no race to lose.
+
+        Best effort on purpose. This is an improvement on a run that would
+        otherwise fetch mid-scoring, not a precondition for one -- EvalScope
+        reaches its own mirror where this reaches NLTK's index, and refusing a
+        run because *our* route failed would turn five entries that score all 541
+        prompts today into red ones. So a failure here is a warning that names
+        the exposure, and the sample-count check remains the thing that stops a
+        short run from being read as a score.
+
+        Deliberately before the server: a corpus this line can fetch takes a
+        minute or two, against the tens of minutes a weight load takes.
+        """
+
+        resources = cls.plan["nltk_resources"]
+        if not resources:
+            return
+        for download_id, lookup_path in resources:
+            try:
+                completed = subprocess.run(
+                    [
+                        cls._evalscope_interpreter(),
+                        "-c",
+                        _NLTK_RESOLVE_PROGRAM,
+                        download_id,
+                        lookup_path,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=cls._evalscope_environment(),
+                    timeout=NLTK_FETCH_TIMEOUT_SECONDS,
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                cls._warn_unresolved_resource(
+                    download_id, f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if completed.returncode != 0:
+                cls._warn_unresolved_resource(
+                    download_id, completed.stderr.strip()[-800:]
+                )
+                continue
+            print(
+                f"the NLTK corpus {download_id} that scores {cls.plan['dataset']} "
+                f"is at {completed.stdout.strip()}",
+                flush=True,
+            )
+
+    @classmethod
+    def _warn_unresolved_resource(cls, download_id, detail):
+        print(
+            f"warning: could not resolve the NLTK corpus {download_id!r} that "
+            f"scores {cls.plan['dataset']} before evaluation, so EvalScope will "
+            "fetch it while scoring and may score one sample fewer than the "
+            "split holds; staging it on shared storage and exporting NLTK_DATA "
+            f"would remove the fetch: {detail}",
+            flush=True,
+        )
+
+    @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.test_config, cls.test_config_path = cls._load_test_config()
@@ -249,6 +359,8 @@ class AccuracySuiteMixin:
                     f"visible PPU devices; found {torch.cuda.device_count()}"
                 )
 
+            cls._resolve_metric_resources()
+
             cls.evalscope_command = build_evalscope_command(
                 cls.test_config,
                 cls.plan,
@@ -292,9 +404,15 @@ class AccuracySuiteMixin:
         """The environment EvalScope runs in.
 
         Inherited wholesale and then narrowed, because the offline settings the
-        pod already exports -- the Hugging Face cache and its offline flag, and
-        `NLTK_DATA` for the benchmarks that tokenize sentences -- are the
-        runner's to set and this process has no better value for them.
+        pod already exports -- the Hugging Face cache and its offline flag -- are
+        the runner's to set and this process has no better value for them.
+
+        `NLTK_DATA` is not among them: nothing on this line sets it, which is why
+        the corpora a scorer needs are fetched from a mirror on every run and why
+        `_resolve_metric_resources` fetches them before the scoring rather than
+        leaving EvalScope to do it during.  Staging them on shared storage and
+        exporting the variable would remove the fetch entirely; until then this
+        inherits whatever the pod happens to have.
 
         The two cache directories are redirected under the work directory so a
         run leaves nothing in a home directory that the next run would inherit:
