@@ -63,6 +63,22 @@ CONFIG_DIR = DATA_ROOT / "configs"
 GSM8K_CONFIG = CONFIG_DIR / "glm5.2" / "fp8-channelwise-144g-gsm8k.json"
 
 
+def unjudged_config():
+    """The reviewed GSM8K config with its baseline taken back off.
+
+    The tests about the *absence* of a baseline used to get that absence by
+    loading this config as it stands, which held only until the entry earned one
+    — a routine reviewed change, made the moment it had a green full run. Six
+    tests went red on the day it did. So the absence is stated here instead of
+    borrowed from a file that was always going to stop supplying it.
+    """
+
+    config = load_json(GSM8K_CONFIG)
+    config["evaluation"]["baseline"] = None
+    config["evaluation"].pop("min_ratio", None)
+    return config
+
+
 def evalscope_report(
     *,
     metric_name="accuracy",
@@ -267,7 +283,7 @@ class TestConfigValidation(unittest.TestCase):
 
     def test_a_ratio_band_without_a_baseline_is_refused(self):
         self._refuses(
-            lambda config: config["evaluation"].update(min_ratio=0.9),
+            lambda config: config["evaluation"].update(baseline=None, min_ratio=0.9),
             "judges nothing",
         )
 
@@ -498,32 +514,33 @@ class TestGrading(unittest.TestCase):
         return resolve_evaluation_plan(config)
 
     def test_without_a_baseline_a_score_is_measured_and_not_judged(self):
-        record = measurement_record(self.plan, self._reading())
+        plan = resolve_evaluation_plan(unjudged_config())
+        record = measurement_record(plan, self._reading())
         self.assertEqual(record["status"], "measured")
         self.assertIsNone(record["ratio"])
         self.assertEqual([w["code"] for w in record["warnings"]], ["no_baseline"])
 
     def test_a_score_within_the_band_passes(self):
-        plan = self._plan(baseline=0.95)
+        plan = self._plan(baseline=0.95, min_ratio=0.90)
         record = measurement_record(plan, self._reading())
         self.assertEqual(record["status"], "measured")
         self.assertAlmostEqual(record["ratio"], 0.94 / 0.95)
         self.assertEqual(record["warnings"], [])
 
     def test_a_score_below_the_floor_fails(self):
-        plan = self._plan(baseline=0.99)
+        plan = self._plan(baseline=0.99, min_ratio=0.98)
         record = measurement_record(plan, self._reading(score=0.80))
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["reason_code"], "below_baseline")
 
     def test_a_score_above_the_ceiling_fails_rather_than_being_celebrated(self):
-        plan = self._plan(baseline=0.4)
+        plan = self._plan(baseline=0.4, min_ratio=0.90)
         record = measurement_record(plan, self._reading(score=0.94))
         self.assertEqual(record["status"], "failed")
         self.assertEqual(record["reason_code"], "above_baseline")
 
     def test_an_incomplete_run_is_not_compared_against_a_baseline(self):
-        plan = self._plan(baseline=0.95)
+        plan = self._plan(baseline=0.95, min_ratio=0.90)
         reading = self._reading(
             score=0.50,
             execution={
@@ -577,21 +594,28 @@ class TestReportShape(unittest.TestCase):
             self.config, accelerator={"visible_device_count": 8}
         )
 
-    def _report(self, record):
-        return build_report(self.config, [record], provenance=self.provenance)
+    def _report(self, record, config=None):
+        return build_report(
+            config if config is not None else self.config,
+            [record],
+            provenance=self.provenance,
+        )
 
-    def _measured(self):
+    def _measured(self, config=None, score=0.98):
+        # 0.98 sits inside this entry's reviewed band; the no-baseline tests below
+        # pass an unjudged config, for which any score is recorded rather than
+        # compared.
         return measurement_record(
-            self.plan,
+            resolve_evaluation_plan(config if config is not None else self.config),
             {
-                "score": 0.94,
+                "score": score,
                 "metric_name": "accuracy",
                 "metric_display_name": "accuracy:mean",
                 "samples": 1319,
                 "execution": None,
                 "unavailable_reason": None,
-                "metrics": {"accuracy:mean": 0.94},
-                "subsets": {"main": 0.94},
+                "metrics": {"accuracy:mean": score},
+                "subsets": {"main": score},
             },
         )
 
@@ -621,11 +645,19 @@ class TestReportShape(unittest.TestCase):
         self.assertEqual(report["provenance"]["test_config_id"], self.config["test_id"])
 
     def test_the_summary_prefixes_the_workflow_reads_are_stable(self):
-        report = self._report(self._measured())
-        summary = render_summary(report)
+        config = unjudged_config()
+        summary = render_summary(
+            self._report(self._measured(config, score=0.94), config)
+        )
         self.assertIn("- MEASURED gsm8k | accuracy=0.9400", summary)
         self.assertIn("- WARN gsm8k | no_baseline", summary)
         self.assertNotIn("- FAIL", summary)
+
+    def test_a_judged_summary_states_what_it_was_judged_against(self):
+        summary = render_summary(self._report(self._measured()))
+        self.assertIn("- MEASURED gsm8k | accuracy=0.9800", summary)
+        self.assertIn("| baseline=0.9803 ratio=", summary)
+        self.assertNotIn("- WARN gsm8k | no_baseline", summary)
 
     def test_a_failure_is_rendered_as_an_error_annotation(self):
         record = failed_measurement_record(
@@ -635,7 +667,10 @@ class TestReportShape(unittest.TestCase):
         self.assertIn("- FAIL gsm8k | report_missing |", summary)
 
     def test_no_other_line_of_the_summary_starts_with_a_prefix(self):
-        summary = render_summary(self._report(self._measured()))
+        config = unjudged_config()
+        summary = render_summary(
+            self._report(self._measured(config, score=0.94), config)
+        )
         prefixed = [
             line
             for line in summary.splitlines()
@@ -648,7 +683,7 @@ class TestReportShape(unittest.TestCase):
         suite = ET.fromstring(render_junit(report))
         self.assertEqual(suite.attrib["failures"], "0")
         payload = json.loads(suite.find("testcase/system-out").text)
-        self.assertEqual(payload["score"], 0.94)
+        self.assertEqual(payload["score"], 0.98)
 
     def test_write_report_files_produces_the_three_artifacts(self):
         report = self._report(self._measured())

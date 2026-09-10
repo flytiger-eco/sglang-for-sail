@@ -59,7 +59,7 @@ scores worse than it used to, not that the board trails a GPU. A score twice its
 baseline is not a triumph; it is evidence that something changed that nobody
 meant to change, usually in the harness.
 
-### Two entries are judged; the rest are measured
+### Three entries are judged; the rest are measured
 
 A config without a baseline ships `baseline: null`, and the schema then refuses a
 ratio band as well: a band without a baseline judges nothing, and one that quietly
@@ -69,18 +69,21 @@ a baseline is a reviewed change, made from a green *full* run of this line on th
 hardware — not from the vendor's published number for the unquantised model, and
 not from a smoke run's twenty samples.
 
-Two entries have earned one, from run `34429388425` (see below), and are the only
-entries on the line that a future night can be red against:
+Three entries have earned one, from runs `34429388425` and `34444244262` (see
+below), and are the only entries on the line that a future night can be red
+against:
 
 | Entry | Metric | Baseline | Floor | Ceiling (2.00) | H20 cross-check | Ratio to H20 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `glm52-fp8chan-ceval` | `accuracy` | 0.9420 | 0.9046 | refused above 1.0 anyway | 0.9435–0.9443 | 0.9976–0.9984 |
 | `glm52-fp8chan-ifeval` | `prompt_level_strict` | 0.9279 | 0.8577 | refused above 1.0 anyway | 0.9242–0.9335 | 0.9940–1.0040 |
+| `glm52-fp8chan-gsm8k` | `accuracy` | 0.9803 | 0.9531 | refused above 1.0 anyway | 0.981, one record | 0.9993 |
 
-The ceiling is inert for scores this high — twice either baseline exceeds the 1.0
-the metric can reach — so in practice these two are floors. That is the expected
-shape for a benchmark a checkpoint already scores well on; the ceiling earns its
-keep on a dataset where a harness fault can inflate a low score, not here.
+The ceiling is inert for scores this high — twice any of these baselines exceeds
+the 1.0 the metric can reach — so in practice all three are floors. That is the
+expected shape for a benchmark a checkpoint already scores well on; the ceiling
+earns its keep on a dataset where a harness fault can inflate a low score, not
+here.
 
 The last two columns are not part of the judgement. A baseline taken from this
 board's own first run has one blind spot: if that first run was itself degraded
@@ -88,17 +91,24 @@ by a porting fault, the fault is frozen into the baseline and no later night can
 see it. The cross-check closes that gap once, at the moment the baseline is
 filled, by comparing against the H20 scores the source cases record for the same
 model and dataset (`kpi_result.core_indic_list`, quoted as the range across the
-recorded history). Both entries sit within half a percent of the GPU, so what
-went into the baseline is a healthy number rather than a frozen defect. The
-check is advisory and manual: it is run when a baseline is written, not on every
-night. It also carries different weight per dataset — the recorded H20 history is
-tight on C-Eval and GSM8K (within 1% for these checkpoints) but wide on IFEval,
-where some models span 0.74–0.92, so there only the order of magnitude is worth
-reading.
+recorded history). All three sit within a percent of the GPU — IFEval's lower
+edge, 0.9940, is the furthest off — so what went into each baseline is a healthy
+number rather than a frozen defect. The check is advisory and manual: it is run
+when a baseline is written, not on every night. It also carries different weight
+per dataset — the recorded H20 history is tight on C-Eval and GSM8K (within 1% for
+these checkpoints) but wide on IFEval, where some models span 0.74–0.92, so there
+only the order of magnitude is worth reading. On GSM8K it is thinner than a range
+would suggest: this checkpoint has exactly one recorded H20 result (0.981, from
+2026-06-28 on sglang0.5.13), so that row is a point comparison rather than a
+range, and a second GPU record could move it either way.
 
-The other nineteen full entries still carry `baseline: null`. Filling those in is
+The other eighteen full entries still carry `baseline: null`. Filling those in is
 the same reviewed change, one green full run at a time, and each fill states its
-own floor and cross-check alongside the score.
+own floor and cross-check alongside the score. One thing to know before the next
+fill: the GSM8K config is also the unit suite's fixture, so the tests that are
+about the *absence* of a baseline take it off explicitly (`unjudged_config`)
+rather than rely on the file lacking one — which they did until this entry earned
+its baseline and took six of them red.
 
 ### The floor is computed, not inherited
 
@@ -107,27 +117,32 @@ is a binomial proportion, so its sampling noise depends on how many samples the
 split holds and on how high the score already sits; one constant cannot be right
 for three splits that run from 541 to 1346 samples. The floors above are computed
 instead — a one-sided 99% Wilson bound, Bonferroni-corrected across the 21 full
-entries a night (per-test α = 0.01/21, z = 3.30), then widened by √2 because the
+entries a night (per-test α = 0.01/21, z = 3.3042), then widened by √2 because the
 baseline is itself a single measurement and not a known truth:
 
 | Entry | n | Baseline | Computed floor | `0.98` would give | Slack: computed vs `0.98` |
 | --- | --- | --- | --- | --- | --- |
 | `glm52-fp8chan-ceval` | 1346 | 0.9420 | 0.9046 (r = 0.9603) | 0.9232 | 50 vs 25 samples |
 | `glm52-fp8chan-ifeval` | 541 | 0.9279 | 0.8577 (r = 0.9244) | 0.9093 | 38 vs 10 samples |
+| `glm52-fp8chan-gsm8k` | 1319 | 0.9803 | 0.9531 (r = 0.9722) | 0.9607 | 36 vs 26 samples |
 
-`0.98` is tighter than the statistics support on both, and markedly so on IFEval,
-whose 541 prompts leave only ten flipped answers between a pass and a red — less
-than sampled decoding (`temperature: 1.0`) produces on its own. These two entries
-therefore state `min_ratio` rather than inherit the default. The conclusion does
-not rest on the family size: correcting across two judged entries instead of
-twenty-one still puts the honest floors at r = 0.9705 and r = 0.9444, both below
-`0.98`.
+The √2 is applied to the sample count (`n_eff = n/2`), not to the half-width, and
+z is the exact 3.3042 rather than the rounded 3.30 — both stated because the
+rounded z does not reproduce the IFEval floor to four places.
+
+`0.98` is tighter than the statistics support on all three, and markedly so on
+IFEval, whose 541 prompts leave only ten flipped answers between a pass and a red
+— less than sampled decoding (`temperature: 1.0`) produces on its own. These
+three entries therefore state `min_ratio` rather than inherit the default. The
+conclusion does not rest on the family size: correcting across three judged
+entries instead of twenty-one still puts the honest floors at r = 0.9686,
+r = 0.9408 and r = 0.9787, all below `0.98`.
 
 Two limits on that arithmetic, both in the direction of the floors being
 conservative rather than lax. The binomial model treats each prompt as a fixed
 coin and so understates the spread under sampled decoding, which makes these
 floors a lower bound on the tolerance actually needed. And correcting across all
-21 entries is right for the line once it is fully judged, not for today's two —
+21 entries is right for the line once it is fully judged, not for today's three —
 held deliberately, so that a floor does not move every time another baseline
 lands.
 
@@ -188,30 +203,45 @@ the same shape. C-Eval and IFEval were then staged the same way, each in its own
 subject directories of parquet (3.9 MB), IFEval as a single jsonl beside its
 `dataset_infos.json` (220 KB).
 
-Nineteen of the twenty-one full entries are still code rather than runs. Each is
+Eighteen of the twenty-one full entries are still code rather than runs. Each is
 one dispatch away from a number — nothing about them is unproven except the
 checkpoint's score itself.
 
 ### What has actually run
 
-Three runs, in the order they answered something:
+Three dispatches, in the order they answered something:
 
 | Run | Entry | Result | Registered file |
 | --- | --- | --- | --- |
 | `34376918707` | `glm52-fp8chan-gsm8k-smoke` | `accuracy=0.9500`, 20/20 samples, 4 shots | 1454s |
 | `34429388425` | `glm52-fp8chan-ceval` | `accuracy=0.9420`, 1346/1346 samples, 5 shots | 9956s |
 | `34429388425` | `glm52-fp8chan-ifeval` | `prompt_level_strict=0.9279`, 541/541 samples, 0 shots | 4740s |
+| `34444244262` | `glm52-fp8chan-gsm8k` | `accuracy=0.9803`, 1319/1319 samples, 4 shots | 3889s |
+| `34444244262` | the seven `*-gsm8k-smoke` entries | `accuracy=0.9500` on every one, 20/20 samples | 1541–3007s (job) |
 
-The two full entries ran on the same dispatch, one board each, and both reported
-the whole split — 1346 of 1346 and 541 of 541, which is what earns them a
-baseline. Their scores are the two rows in the baseline table above. The other
-twenty-six jobs of that dispatch were skipped by the `entries` gate, which is the
-selection behaviour working rather than a fault.
+The three full entries each ran on one board and each reported the whole split —
+1346 of 1346, 541 of 541, 1319 of 1319 — which is what earns them a baseline.
+Their scores are the three rows in the baseline table above. The jobs of each
+dispatch that `entries` did not name were skipped by the selection gate, which is
+that gate working rather than a fault.
 
-Both came in under the `est_time=12000` the registered file declares, which is
-now a measurement rather than a guess for these two datasets. GSM8K's full split
-is still unmeasured and is the one to watch: 1319 prompts of arithmetic reasoning
-at 4 shots generate far more tokens per prompt than C-Eval's multiple choice.
+All three came in under the `est_time=12000` the registered file declares, which
+is now a measurement rather than a guess for all three datasets — and the GSM8K
+measurement contradicts what this file used to predict about it. The prediction
+was that 1319 prompts of arithmetic reasoning at 4 shots would generate far more
+tokens per prompt than C-Eval's multiple choice, and so run longest. It ran
+*shortest* of the three: 3889s against C-Eval's 9956s, of which 2674s was inside
+`evalscope eval` against C-Eval's 8787s. Why C-Eval costs more per prompt is not
+settled by this run; what is settled is that the prediction rested on reasoning
+about token volume that nothing had measured, and that the entry which sizes the
+timeouts is C-Eval, not GSM8K.
+
+The seven smoke entries answered a narrower question, and only that one. They are
+the first time the other six checkpoints have served a request on this line since
+it moved to `tp_size: 8`, and all seven came up and scored. But twenty samples
+resolve in 5% steps, so `0.9500` is `19/20` and nothing more: seven checkpoints of
+comparable strength land on the same step by arithmetic, not by agreement. They
+are evidence that the service path works, and are not scores.
 
 ### Where a smoke run's 35 minutes went
 
@@ -229,11 +259,11 @@ measurement rather than guessed:
 Two things carry forward from that table, and the full runs since have inverted
 one of them. The evaluation is the cheap part of a *smoke* run — bringing the
 server up cost four times what scoring twenty samples did — but on a full split
-the scoring dominates: C-Eval spent 8787s of its 9956s inside `evalscope eval`
-and IFEval 3530s of 4740s, against a CUDA graph capture that stayed near 1050s in
-both. Setup is a fixed cost the split amortises. And the venv is rebuilt per run,
-which is 305s that a wheelhouse on the NAS would remove if a night ever needs it
-back.
+the scoring dominates: C-Eval spent 8787s of its 9956s inside `evalscope eval`,
+IFEval 3530s of 4740s and GSM8K 2674s of 3889s, against a CUDA graph capture that
+stayed near 1050s in all three. Setup is a fixed cost the split amortises. And
+the venv is rebuilt per run, which is 305s that a wheelhouse on the NAS would
+remove if a night ever needs it back.
 
 ## The datasets
 
