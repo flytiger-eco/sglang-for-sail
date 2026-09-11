@@ -166,19 +166,20 @@ results on the reference build and all five failed in start-up — under twenty-
 minutes each, `core_indicator.eval` empty and no `kpi_result` at all — so there is
 nothing to compare its six baselines against. They are written from this line's
 own green runs, without the blind-spot check the other eleven got, and that is the
-weakest claim on the page. `kimi26-mxfp4-ifeval` has the opposite gap: the GPU and
-red-line records both exist (0.9427 and 0.9464), but this line has no score to
-put beside them, for the reason below.
+weakest claim on the page. `kimi26-mxfp4-ifeval` took the longest to earn one, for
+the reason below, and its score reads against both records: 0.9482 measured here
+against the GPU's 0.9427 and the red line's 0.9464.
 
-One full entry still carries `baseline: null`: `kimi26-mxfp4-ifeval`. Its run
-(`34505832120`) went red after 82 minutes with `incomplete_samples` — the report
-scored 540 of IFEval's 541 prompts — and the harness refuses to write a baseline
-from a short sample rather than quietly dividing by a smaller denominator. Filling
-it in is the same reviewed change as the rest, once a run reports all 541. One
-thing to know before that fill: the GSM8K config is also the unit suite's fixture,
-so the tests that are about the *absence* of a baseline take it off explicitly
-(`unjudged_config`) rather than rely on the file lacking one — which they did until
-the first entry earned its baseline and took six of them red.
+Every full entry now carries a baseline. `kimi26-mxfp4-ifeval` was the last to get
+one, and it took two runs. The first (`34505832120`) went red after 82 minutes with
+`incomplete_samples` — the report scored 540 of IFEval's 541 prompts — and the
+harness refuses to write a baseline from a short sample rather than quietly
+dividing by a smaller denominator. The re-run (`34545561589`) scored all 541 and
+reported no metric errors at all, which is the prefetch working; 0.9482 is that
+run. One thing worth knowing about that fill: the GSM8K config is also the unit
+suite's fixture, so the tests that are about the *absence* of a baseline take it
+off explicitly (`unjudged_config`) rather than rely on the file lacking one — which
+they did until the first entry earned its baseline and took six of them red.
 
 #### Where that one prompt went
 
@@ -211,13 +212,19 @@ scored before it. This one lost it by 29 seconds:
 | `minimax27-mxfp4-ifeval` | +62s | 0 | 541 | 541 |
 | `kimi26-mxfp4-ifeval` | +161s (first error at +132s) | 1 | 541 | 540 |
 
-Two things follow. The first is that this run's score is very nearly known:
-0.9519 over 540 is 514 correct, so the whole split is 514/541 = 0.9501 if the
-lost prompt would have failed and 515/541 = 0.9519 if it would have passed. The
-missing prompt can move the baseline by at most 0.0018, and both ends sit above
-the red line's 0.9464 and the GPU's 0.9427 for this checkpoint. The entry is not
-suspect; it is unmeasured, and refusing it a baseline over 0.0018 of uncertainty
-is the rule being conservative rather than the rule being wrong.
+Two things follow. The first is what the missing prompt was worth, and the estimate
+made here before the re-run was wrong in an instructive way. It read: 0.9519 over
+540 is 514 correct, so the whole split is 514/541 = 0.9501 or 515/541 = 0.9519
+depending on the lost prompt, and the baseline can move by at most 0.0018. The
+re-run measured 0.9482 — 513 of 541 — which is outside that interval. The estimate
+assumed the other 540 verdicts would reproduce, and they do not: generation is
+`temperature: 1.0` and the server draws a fresh `random_seed` per run, so a re-run
+is a new sample of the whole split rather than the old one with a gap filled. The
+0.0037 between the two runs is run-to-run noise worth about two prompts, which is
+exactly the effect the floor section below says `0.98` fails to leave room for. The
+conclusion the estimate reached still holds — both runs sit above the red line's
+0.9464 and the GPU's 0.9427 — but it holds because the entry was measured again,
+not because the interval was right.
 
 The second is that the harness had no way to prevent this and now does. A missing
 corpus does not fail an evaluation, it silently shrinks the denominator, and the
@@ -267,6 +274,7 @@ baseline is itself a single measurement and not a known truth:
 | `glm52-mxfp4-gsm8k` | 1319 | 0.9788 | 0.9510 (r = 0.9716) | 0.9592 | 37 vs 26 samples |
 | `kimi26-mxfp4-ceval` | 1346 | 0.9487 | 0.9128 (r = 0.9621) | 0.9297 | 48 vs 26 samples |
 | `kimi26-mxfp4-gsm8k` | 1319 | 0.9765 | 0.9479 (r = 0.9707) | 0.9570 | 38 vs 26 samples |
+| `kimi26-mxfp4-ifeval` | 541 | 0.9482 | 0.8838 (r = 0.9321) | 0.9292 | 35 vs 10 samples |
 | `minimax27-fp8chan-ceval` | 1346 | 0.8678 | 0.8187 (r = 0.9435) | 0.8504 | 66 vs 23 samples |
 | `minimax27-fp8chan-ifeval` | 541 | 0.8891 | 0.8103 (r = 0.9114) | 0.8713 | 43 vs 10 samples |
 | `minimax27-fp8chan-gsm8k` | 1319 | 0.9666 | 0.9348 (r = 0.9671) | 0.9473 | 42 vs 25 samples |
@@ -284,9 +292,9 @@ The √2 is applied to the sample count (`n_eff = n/2`), not to the half-width, 
 z is the exact 3.3042 rather than the rounded 3.30 — both stated because the
 rounded z does not reproduce the IFEval floor to four places.
 
-`0.98` is tighter than the statistics support on all twenty, and markedly so on
-IFEval, whose 541 prompts leave only ten flipped answers between a pass and a red
-— less than sampled decoding (`temperature: 1.0`) produces on its own. Every
+`0.98` is tighter than the statistics support on all twenty-one, and markedly so
+on IFEval, whose 541 prompts leave only ten flipped answers between a pass and a
+red — less than sampled decoding (`temperature: 1.0`) produces on its own. Every
 judged entry therefore states its own `min_ratio` rather than inherit the
 default. The gap widens as the baseline falls, which is the whole point of
 computing it: `0.98` allows MiniMax-M2.7 twenty-three flipped C-Eval answers
@@ -297,11 +305,14 @@ would have been.
 One limit on that arithmetic, in the direction of the floors being conservative
 rather than lax: the binomial model treats each prompt as a fixed coin and so
 understates the spread under sampled decoding, which makes these floors a lower
-bound on the tolerance actually needed. The Bonferroni family is no longer the
-question it was when three entries were judged — correcting across all 21 now
-matches 20 of them, and the twenty-first will not move a floor when it lands,
-because the family size was fixed at 21 from the start rather than at whatever
-was judged that week.
+bound on the tolerance actually needed. Kimi-K2.6's IFEval score is the reading
+that makes that concrete: two runs of the same config on the same weights came
+out 0.9519 and 0.9482, about two prompts apart, against a `0.98` that allows ten.
+The Bonferroni family is no longer the question it was when three entries were
+judged — correcting across all 21 now matches exactly the 21 that carry a
+baseline, and no floor in the table moved as the later entries filled in, because
+the family size was fixed at 21 from the start rather than at whatever was judged
+that week.
 
 ## The suites
 
@@ -360,9 +371,9 @@ the same shape. C-Eval and IFEval were then staged the same way, each in its own
 subject directories of parquet (3.9 MB), IFEval as a single jsonl beside its
 `dataset_infos.json` (220 KB).
 
-All twenty-one full entries have now run at full sample count, twenty of them
-green. Nothing on the line is unproven except `kimi26-mxfp4-ifeval`'s score,
-which is one dispatch away.
+All twenty-one full entries have now run at full sample count and all twenty-one
+are green, `kimi26-mxfp4-ifeval` last (run `34545561589`, 541 of 541 prompts
+scored and no metric errors). Nothing on the line is unproven.
 
 ### What has actually run
 
