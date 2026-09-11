@@ -2220,6 +2220,23 @@ def checkpoint_config_digest(model_path: str) -> str | None:
     return digest.hexdigest()
 
 
+# Strings that mean "nobody supplied a version" rather than naming one. Bare
+# ``0.0.0`` is what setuptools writes when a ``dynamic`` version has no
+# provider; ``0.0.0.dev0`` is this project's configured setuptools-scm
+# fallback_version. Both look like versions and compare unequal to every real
+# one, which is the same failure mode as an empty base_image_digest: recorded,
+# plausible, and wrong. Absent is what they actually are.
+_PLACEHOLDER_VERSIONS = frozenset({"0.0.0", "0.0.0.dev0"})
+
+
+def _real_version(version: object) -> str | None:
+    """Return ``version`` only when it names a build, else None."""
+
+    if not isinstance(version, str) or not version:
+        return None
+    return None if version in _PLACEHOLDER_VERSIONS else version
+
+
 def _sglang_version() -> str | None:
     """Return the version the imported sglang reports for itself.
 
@@ -2228,6 +2245,12 @@ def _sglang_version() -> str | None:
     whichever dist-info comes first on ``sys.path``, which is how run
     33587101038 recorded ``0.0.0`` for a 0.5.13 image.  ``__version__``
     describes the package that was actually imported, so prefer it.
+
+    Prefer it, but do not trust it blindly.  Until the install line composed a
+    version for itself, ``__version__`` was itself ``0.0.0`` -- the editable
+    install had written that into the metadata this reads through -- so this
+    preference was a no-op dressed as a safeguard.  Screening placeholders is
+    what makes it one again if the install line ever stops supplying one.
     """
 
     try:
@@ -2236,7 +2259,7 @@ def _sglang_version() -> str | None:
         version = sglang.__version__
     except Exception:
         return None
-    return version if isinstance(version, str) and version else None
+    return _real_version(version)
 
 
 def _installed_package_versions() -> dict[str, str | None]:
@@ -2246,7 +2269,9 @@ def _installed_package_versions() -> dict[str, str | None]:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
             versions[package] = None
-    versions["sglang"] = _sglang_version() or versions["sglang"]
+    # Only sglang is screened: it is the one built here, and so the only one
+    # whose version can come out a placeholder.  The rest arrive as wheels.
+    versions["sglang"] = _sglang_version() or _real_version(versions["sglang"])
     return versions
 
 

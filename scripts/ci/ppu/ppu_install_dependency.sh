@@ -57,6 +57,42 @@ ${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --for
 ${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
 
 # ==================== Install SGLang from source ==================== #
+# The version this install reports for itself, settled before pyproject.toml is
+# replaced. pyproject_other.toml declares `dynamic = ["version"]` -- upstream's
+# arrangement, which expects setuptools-scm to supply the number -- while this
+# fork's own pyproject.toml pins it statically. Swapping the files therefore
+# hands the question to a setuptools-scm that --no-build-isolation never
+# installs, and setuptools falls back to its own default: every run before this
+# recorded `sglang 0.0.0` in provenance, having first uninstalled the image's
+# perfectly good 0.5.13+v0.1.0.ppu2.1.1 (observed, run 34548547824).
+#
+# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_<DIST> is setuptools-scm's own answer for
+# builds whose git metadata cannot answer the question -- its "Usage from
+# Docker" section prescribes exactly this for `pip install -e`, and prefers the
+# per-distribution form over the bare one. It also short-circuits the SCM
+# lookup, so no tag has to be reachable: these checkouts are --depth=2 without
+# tags, and git_describe_command would exit 1 here.
+#
+# --no-deps on setuptools-scm is deliberate. Its requirements (setuptools>=61,
+# packaging>=20) are already satisfied by the image, and the header above
+# records what moving setuptools costs: torch 2.11.0 requires setuptools<82.
+# --no-deps makes it impossible for this line to move the pinned stack.
+SGLANG_STATIC_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' "${REPO_ROOT}/python/pyproject.toml" | head -1)
+SGLANG_SHORT_SHA=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "")
+if [[ -n "${SGLANG_STATIC_VERSION}" && -n "${SGLANG_SHORT_SHA}" ]]; then
+    ${PIP_INSTALL} --no-deps "setuptools-scm>=8,<10"
+    # The local segment names the commit rather than a distance from a tag: the
+    # commit is what provenance already treats as authoritative, and unlike a
+    # tag distance it is derivable on a shallow checkout.
+    export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="${SGLANG_STATIC_VERSION}+g${SGLANG_SHORT_SHA}"
+    echo "sglang version for this install: ${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG}"
+else
+    # Not fatal. A missing version leaves the install as it was before this
+    # block existed, and the report collector records the field as absent
+    # rather than as 0.0.0.
+    echo "::warning::could not compose an sglang version (static='${SGLANG_STATIC_VERSION}' sha='${SGLANG_SHORT_SHA}'); the install will report a placeholder"
+fi
+
 rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
 # tracing: the v2.1.1 image dropped opentelemetry (v2.1.0 shipped it), and

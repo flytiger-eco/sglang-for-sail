@@ -1254,14 +1254,46 @@ characters that UTF-8 cannot encode stay escaped there.
 
 In provenance, `source_revision` is the authoritative identifier of what ran: it
 is the full commit SHA of the checkout, injected by the workflow.
-`package_versions.sglang` reads `0.0.0`, which is a property of the CI install
-path rather than a collection defect. `ppu_install_dependency.sh` swaps in
-`pyproject_other.toml`, whose version is dynamic, and installs with
-`--no-build-isolation`, so `setuptools-scm` is never present to supply one; had
-it run and found no tag, the configured `fallback_version` would have produced
-`0.0.0.dev0` instead. The checkout is `--no-tags --depth=2` in any case, so no
-tag is reachable on the machine to describe against. Recover the version number
-from the SHA in a full clone:
+`package_versions.sglang` now names that same commit, as `0.5.13+g<short sha>`.
+`ppu_install_dependency.sh` composes that string and hands it to setuptools-scm
+as `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG` — setuptools-scm's own
+prescription for builds whose git metadata cannot answer the question — before
+swapping `pyproject.toml` for `pyproject_other.toml`. The order is the point:
+the static `version` this fork pins is only readable before the swap.
+
+Every run before 2026-09-11 recorded `0.0.0` instead, and it was worse than a
+missing field. `pyproject_other.toml` keeps upstream's `dynamic = ["version"]`,
+which expects setuptools-scm to answer; `--no-build-isolation` meant it was
+never installed to answer; so setuptools supplied its own default. Run
+34548547824's log has the sequence, including
+`Uninstalling sglang-0.5.13+v0.1.0.ppu2.1.1` immediately before
+`adding '__editable__.sglang-0.0.0.pth'`: the image knew its own version, and
+the install replaced that knowledge with a placeholder. The same log mentions
+`setuptools_scm` zero times and `0.0.0.dev0` — the configured `fallback_version`
+— zero times, which is how we know scm never ran at all rather than running and
+failing to find a tag.
+
+The collector's own defence against this was not working either.
+`_sglang_version()` prefers `sglang.__version__` over distribution metadata,
+because metadata resolves whichever dist-info comes first on `sys.path`; but the
+editable install had written `0.0.0` into both, so
+`_sglang_version() or versions["sglang"]` was replacing `0.0.0` with `0.0.0` — a
+safeguard that could not fire. It now screens `0.0.0` and `0.0.0.dev0` and
+records the field as absent instead, on the same reasoning that gives
+`base_image_digest` its `or None`: a placeholder shaped like a version is worse
+than a null, because it reads as something that was recorded while comparing
+unequal to every real version.
+
+Run 34556054338 is the 1-PPU probe of the install path that settled the four
+things a laptop cannot: `setuptools` unchanged at 69.5.1 (it is installed with
+`--no-deps` precisely so it cannot move a stack where torch requires
+`setuptools<82`), `pip show sglang` reporting `0.5.13+g5617d13`,
+`sglang/_version.py` written with a matching `__version__`, and
+`_installed_package_versions()` recording that same string. A pretend version
+also short-circuits the SCM lookup, so nothing here depends on a tag being
+reachable — which matters, because the checkout is `--no-tags --depth=2`. For
+reports that predate the fix, or for the canonical tag-relative version, recover
+it from the SHA in a full clone:
 
 ```bash
 git checkout <source_revision>
