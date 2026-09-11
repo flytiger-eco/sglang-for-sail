@@ -24,12 +24,24 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    packed_modules_mapping = {
+        **DeepseekV3ForCausalLMNextN.packed_modules_mapping,
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
+        layer_prefix = f"model.layers.{text_config.num_hidden_layers}"
+        language_layer_prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
         return WeightsMapper(
             orig_to_new_substr={
-                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
+                **{
+                    f"{language_layer_prefix}.{name}": f"model.{name}"
+                    for name in ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+                },
+                language_layer_prefix: "model.decoder",
+                layer_prefix: "model.decoder",
             },
         )
 
