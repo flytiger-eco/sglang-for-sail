@@ -95,10 +95,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
 
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run nightly-pd-perf-16-qwen35-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into a
           # PodGroup with minMember 2, so the group either gets both boards or
           # waits. That guarantee matters more here than on the colocated line: a
@@ -113,7 +119,7 @@ jobs:
           # a node serves is decided from the rank the action injects, not here.
           command: bash /workspace/source/scripts/ci/ppu/run_pd_perf_suite_node.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=${{ env.PERF_SUITE }},PERF_TIMEOUT_PER_FILE=13800,SGLANG_PPU_PD_PERF_TEST_CONFIG=/workspace/source/${{ env.PD_CONFIG }},SGLANG_PPU_PD_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=${{ env.PERF_SUITE }},PERF_TIMEOUT_PER_FILE=13800,SGLANG_PPU_PD_PERF_TEST_CONFIG=/workspace/source/${{ env.PD_CONFIG }},SGLANG_PPU_PD_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
           container_options: |
             privileged: true
             host_ipc: true
@@ -153,6 +159,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload PD Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -164,3 +171,89 @@ jobs:
           # v4 refuses a name it already holds.
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload PD Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pd-perf-k8s-16-qwen35-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost PD Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: nightly-pd-perf-16-qwen35-ppu
+          PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
+
+  # =============================================== the trend series ===============================================
+  # File the rows this run measured on the nightly-test-data branch, so that the
+  # series outlives the thirty-day artifact retention above. See the note on the
+  # same job in test-ppu-perf-k8s.yml for why it runs on always(), why the write is
+  # confined to this one job, and what a `workflow_call` caller has to grant for it.
+  publish-trend-rows:
+    name: file the trend rows
+    needs: [pd-perf-16-k8s]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+          path: source
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          fetch-depth: 0
+          path: series
+      - name: Download this run's report
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-pd-perf-k8s-16-qwen35-${{ github.run_id }}-${{ github.run_attempt }}
+          path: incoming
+      - name: File the rows on the data branch
+        if: steps.download.outcome == 'success'
+        shell: bash
+        working-directory: series
+        env:
+          INCOMING_DIR: ../incoming
+          TREND_DATA_BRANCH: nightly-test-data
+        run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
+      # After the filing rather than before it, so that what gets counted is what
+      # the step above actually read. Unconditional, because the download is
+      # allowed to fail outright and a run that filed nothing is the case where the
+      # count matters most. Reads from the workspace root, not from series/, which
+      # is why INCOMING_DIR differs from the one above.
+      - name: Account for the reports that did not arrive
+        if: always()
+        shell: bash
+        env:
+          INCOMING_DIR: incoming
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py

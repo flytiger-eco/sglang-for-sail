@@ -101,16 +101,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run glm5.2-fp8-channelwise-4k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -145,6 +151,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -154,6 +161,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   glm52-fp8chan-64k:
     name: glm5.2-fp8-channelwise-64k (btv1.5)
@@ -181,16 +219,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run glm5.2-fp8-channelwise-64k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -219,6 +263,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -228,6 +273,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane B: the two Kimi-K2.6 configs at tp 8, back to back. Each carries both a
   # 4k and a 64k prefill in one launch, since the load dominates the measurement.
@@ -255,16 +331,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run kimi2.6-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -293,6 +375,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -302,6 +385,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   kimi26-w4a8:
     name: kimi2.6-w4a8-int8 (btv1.5)
@@ -329,16 +443,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run kimi2.6-w4a8-int8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -367,6 +487,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -376,6 +497,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: kimi2.6-w4a8-int8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane C: GLM-5.2 mxfp4 at tp 4, one config (the 4k prefill), on a board of its
   # own. The tp-4 mxfp4 checkpoint splits its two lengths across two configs
@@ -405,16 +557,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run glm5.2-mxfp4-fp8-4k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -443,6 +601,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -452,6 +611,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane D: GLM-5.2 mxfp4 at tp 4, the 64k prefill config, on a board of its own.
   glm52-mxfp4-64k:
@@ -478,16 +668,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run glm5.2-mxfp4-fp8-64k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -516,6 +712,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -525,6 +722,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane E: Qwen3.5-397B-A17B mxfp4 at tp 4. Its two lengths share one launch --
   # the plan's mxfp4 and channelwise cases differ only in the weights they read,
@@ -553,16 +781,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run qwen3.5-397b-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -591,6 +825,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -600,6 +835,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane F: Qwen3.5-397B-A17B fp8 channelwise at tp 4.
   qwen35-fp8chan:
@@ -626,16 +892,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run qwen3.5-397b-fp8-channelwise via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise"
           container_options: |
             privileged: true
             host_ipc: true
@@ -664,6 +936,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -673,6 +946,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane G: MiniMax-M2.7 mxfp4 at tp 2, the smallest board request of the line.
   minimax27-mxfp4:
@@ -699,16 +1003,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run minimax2.7-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -737,6 +1047,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -746,6 +1057,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane H: MiniMax-M2.7 fp8 channelwise at tp 2.
   minimax27-fp8chan:
@@ -772,16 +1114,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 2
+      # What the tag resolves to now, and what the pods are then pinned to. The
+      # script's header records why a digest recorded without pinning to it would
+      # name an image the measurement need not have used, and why it never fails.
+      - name: Resolve the base image digest
+        shell: bash
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run minimax2.7-fp8-channelwise via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise"
           container_options: |
             privileged: true
             host_ipc: true
@@ -810,6 +1158,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -819,3 +1168,132 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
+
+  # ============================================== the trend series ===============================================
+  # Move the rows the entries above already wrote onto the nightly-test-data
+  # branch. Nothing is measured, judged or recomputed here: write_report_files put
+  # a trend.jsonl next to each report, and this job only files those bytes where
+  # they outlive the thirty-day artifact retention that would otherwise erase the
+  # series. The other perf workflows carry the same job and refer back to this note.
+  #
+  # `always()`, and every entry in `needs`, because a night that could not measure
+  # is a point in the series too: a failed measurement is filed with null metrics
+  # and its reason code, and dropping it would leave a gap indistinguishable from a
+  # night on which nothing was scheduled.
+  #
+  # This is the only job in the file granted write. The workflow-level grant stays
+  # read-only, so nothing that launches a server or runs a benchmark can push, and
+  # the write is confined to a job that touches no model and no board.
+  #
+  # A caller matters here: a `workflow_call` invocation cannot be granted more than
+  # its caller holds, so whoever eventually wires this workflow into a parent has to
+  # grant `contents: write` and `actions: read` there as well, or this job will run
+  # with the read-only default and every push will 403.
+  publish-trend-rows:
+    name: file the trend rows
+    needs:
+      - glm52-fp8chan-4k
+      - glm52-fp8chan-64k
+      - kimi26-mxfp4
+      - kimi26-w4a8
+      - glm52-mxfp4-4k
+      - glm52-mxfp4-64k
+      - qwen35-mxfp4
+      - qwen35-fp8chan
+      - minimax27-mxfp4
+      - minimax27-fp8chan
+    if: always()
+    # Not a board runner: this job needs github.com and a Python, and holds no
+    # device. Putting it on the CPU orchestration group would queue it behind the
+    # very measurements it is waiting for.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # download-artifact reads this run's own artifacts through the Actions API,
+      # which the repository's read-only default does not cover at all.
+      actions: read
+    timeout-minutes: 15
+    steps:
+      # Two checkouts, because the two things this job needs are on different
+      # branches: the script comes from the source, and the branch it writes to
+      # carries measurements only. Giving the data branch a copy of the script
+      # would make it something that has to be kept in step with the code, which
+      # is what keeping it an orphan branch avoids.
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+          path: source
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          # Full history, unlike every other checkout here: this is the one that
+          # gets pushed, and pushing or rebasing out of a shallow clone is a
+          # failure mode not worth inviting for a branch this small.
+          fetch-depth: 0
+          path: series
+      # Best effort, like the uploads that produced them: an entry can finish with
+      # no artifact at all, and that is a gap in the series rather than a reason to
+      # fail a job that measured nothing itself.
+      - name: Download this run's reports
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-perf-k8s-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: incoming
+      # Downloaded outside the data-branch checkout on purpose, so that the only
+      # thing untracked in it is nothing at all.
+      - name: File the rows on the data branch
+        if: steps.download.outcome == 'success'
+        shell: bash
+        working-directory: series
+        env:
+          INCOMING_DIR: ../incoming
+          TREND_DATA_BRANCH: nightly-test-data
+        run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
+      # After the filing rather than before it, so that what gets counted is what
+      # the step above actually read. Unconditional, because the download is
+      # allowed to fail outright and a run that filed nothing is the case where the
+      # count matters most. Reads from the workspace root, not from series/, which
+      # is why INCOMING_DIR differs from the one above.
+      - name: Account for the reports that did not arrive
+        if: always()
+        shell: bash
+        env:
+          INCOMING_DIR: incoming
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py

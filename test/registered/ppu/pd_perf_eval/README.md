@@ -79,7 +79,17 @@ measurement is red only when it produced no usable numbers at all, per
 `perf_eval_kit.REASON_CODES`. A slow server is never red. The nineteen fields of
 `perf_eval_kit.METRIC_FIELDS` are recorded for every measurement, reaching the
 run page as one annotation per measurement with the machine-readable copy in the
-artifact.
+artifact. The `trend.jsonl` rows are written by the same `write_report_files`, so
+this line accumulates a series on the same terms the colocated README describes —
+keyed on `(test_id, measurement_id, config_digest)`, with nothing yet comparing
+two rows.
+
+Both of this line's workflows carry the same `publish-trend-rows` job, filing
+their rows on the `nightly-test-data` branch under the `test_id` each row names.
+A disaggregated `test_id` encodes its 1P1D shape, so these rows sort into their
+own directories without the publishing side knowing anything about
+disaggregation. See [the colocated README](../perf_eval/README.md#where-the-rows-go)
+for how that job is granted its write and why it runs even when nothing measured.
 
 ### TPOT and ITL are recorded here, because this case decodes
 
