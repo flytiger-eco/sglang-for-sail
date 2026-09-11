@@ -195,6 +195,28 @@ NIGHTLY_SUITES = {
         # Whole boards, one suite each.
         "nightly-perf-16-ppu",
         "nightly-perf-32-ppu",
+        # Public-benchmark accuracy suites, scored by EvalScope against a served
+        # model and driven by test-ppu-accuracy-k8s.yml. Kept out of the
+        # nightly-1..8 chain for the same reason as the two lines above, and more
+        # so: a full split is 1319 prompts against a reasoning model, which is
+        # most of a night on one board.
+        #
+        # Unlike the perf line these do judge, when a baseline exists: the config
+        # states a ratio band around a recorded score and a run outside it is red.
+        # Where no baseline has been recorded on this hardware yet the score is
+        # published and nothing is judged, which the report says in as many words.
+        #
+        # One per model for the reason the answer comment above gives. Each holds
+        # that model's quantisations across all three datasets -- eight configs
+        # behind three of these names, four behind Kimi's -- and the workflow names
+        # which one runs. The number is 8 throughout because every config declares
+        # eight devices, including the two models the internal plan serves at tp 2
+        # and tp 4: a full split is generation-bound and the job holds the whole
+        # board either way.
+        "nightly-accuracy-8-glm52-ppu",
+        "nightly-accuracy-8-kimi26-ppu",
+        "nightly-accuracy-8-minimax27-ppu",
+        "nightly-accuracy-8-qwen35-ppu",
     ],
 }
 
