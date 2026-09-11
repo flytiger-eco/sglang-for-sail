@@ -151,6 +151,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -160,6 +161,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   glm52-fp8chan-64k:
     name: glm5.2-fp8-channelwise-64k (btv1.5)
@@ -231,6 +263,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -240,6 +273,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane B: the two Kimi-K2.6 configs at tp 8, back to back. Each carries both a
   # 4k and a 64k prefill in one launch, since the load dominates the measurement.
@@ -311,6 +375,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -320,6 +385,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   kimi26-w4a8:
     name: kimi2.6-w4a8-int8 (btv1.5)
@@ -391,6 +487,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -400,6 +497,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: kimi2.6-w4a8-int8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane C: GLM-5.2 mxfp4 at tp 4, one config (the 4k prefill), on a board of its
   # own. The tp-4 mxfp4 checkpoint splits its two lengths across two configs
@@ -473,6 +601,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -482,6 +611,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane D: GLM-5.2 mxfp4 at tp 4, the 64k prefill config, on a board of its own.
   glm52-mxfp4-64k:
@@ -552,6 +712,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -561,6 +722,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane E: Qwen3.5-397B-A17B mxfp4 at tp 4. Its two lengths share one launch --
   # the plan's mxfp4 and channelwise cases differ only in the weights they read,
@@ -633,6 +825,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -642,6 +835,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane F: Qwen3.5-397B-A17B fp8 channelwise at tp 4.
   qwen35-fp8chan:
@@ -712,6 +936,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -721,6 +946,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane G: MiniMax-M2.7 mxfp4 at tp 2, the smallest board request of the line.
   minimax27-mxfp4:
@@ -791,6 +1047,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -800,6 +1057,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # Lane H: MiniMax-M2.7 fp8 channelwise at tp 2.
   minimax27-fp8chan:
@@ -870,6 +1158,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -879,6 +1168,37 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # ============================================== the trend series ===============================================
   # Move the rows the entries above already wrote onto the nightly-test-data
@@ -965,3 +1285,15 @@ jobs:
           INCOMING_DIR: ../incoming
           TREND_DATA_BRANCH: nightly-test-data
         run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
+      # After the filing rather than before it, so that what gets counted is what
+      # the step above actually read. Unconditional, because the download is
+      # allowed to fail outright and a run that filed nothing is the case where the
+      # count matters most. Reads from the workspace root, not from series/, which
+      # is why INCOMING_DIR differs from the one above.
+      - name: Account for the reports that did not arrive
+        if: always()
+        shell: bash
+        env:
+          INCOMING_DIR: incoming
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py

@@ -159,6 +159,7 @@ jobs:
         shell: bash
         run: sleep 30
       - name: Upload PD Perf evidence (second attempt)
+        id: upload_evidence_2
         if: always() && steps.upload_evidence.outcome == 'failure'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -170,6 +171,37 @@ jobs:
           # v4 refuses a name it already holds.
           overwrite: true
           retention-days: 30
+      # Both attempts above fell inside forty-five seconds of each other in run
+      # 34548547824 and both were reset: the first while finalising an artifact
+      # whose content had already landed, the second before it could create one at
+      # all. A third attempt this much later is what covers a congestion window
+      # that outlasts a thirty-second wait.
+      - name: Wait out a longer artifact egress congestion
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+      - name: Upload PD Perf evidence (third attempt)
+        id: upload_evidence_3
+        if: always() && steps.upload_evidence_2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-pd-perf-k8s-16-qwen35-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+      # Reached only when the third attempt was reset too, because a skipped step
+      # has outcome 'skipped' rather than 'failure'. Best effort itself: saying
+      # that nothing arrived must not be the thing that turns this job red.
+      - name: Report the lost PD Perf evidence
+        if: always() && steps.upload_evidence_3.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        env:
+          ENTRY: nightly-pd-perf-16-qwen35-ppu
+          PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
+        run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # =============================================== the trend series ===============================================
   # File the rows this run measured on the nightly-test-data branch, so that the
@@ -213,3 +245,15 @@ jobs:
           INCOMING_DIR: ../incoming
           TREND_DATA_BRANCH: nightly-test-data
         run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
+      # After the filing rather than before it, so that what gets counted is what
+      # the step above actually read. Unconditional, because the download is
+      # allowed to fail outright and a run that filed nothing is the case where the
+      # count matters most. Reads from the workspace root, not from series/, which
+      # is why INCOMING_DIR differs from the one above.
+      - name: Account for the reports that did not arrive
+        if: always()
+        shell: bash
+        env:
+          INCOMING_DIR: incoming
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py
