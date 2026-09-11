@@ -407,12 +407,12 @@ class AccuracySuiteMixin:
         pod already exports -- the Hugging Face cache and its offline flag -- are
         the runner's to set and this process has no better value for them.
 
-        `NLTK_DATA` is not among them: nothing on this line sets it, which is why
-        the corpora a scorer needs are fetched from a mirror on every run and why
-        `_resolve_metric_resources` fetches them before the scoring rather than
-        leaving EvalScope to do it during.  Staging them on shared storage and
-        exporting the variable would remove the fetch entirely; until then this
-        inherits whatever the pod happens to have.
+        `NLTK_DATA` is among them wherever the dataset's scorer needs a corpus:
+        the IFEval jobs export it, pointing at a corpus staged on the shared NAS,
+        so `_resolve_metric_resources` finds it there and fetches nothing. Where
+        it is unset the resolver falls back to a download into the interpreter's
+        default search path, which still beats leaving EvalScope to fetch during
+        the scoring and charge a failure to whichever sample was unlucky.
 
         The two cache directories are redirected under the work directory so a
         run leaves nothing in a home directory that the next run would inherit:

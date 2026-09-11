@@ -198,9 +198,9 @@ So the fetch is lazy: EvalScope resolves the corpus inside the scoring of the
 first sample that needs it, and charges a failed resolve to that sample rather
 than to the run. All six IFEval entries of the sweep ran that same race — every
 one of their logs carries the same `punkt_tab not found, downloading from mirror`
-line, because nothing on this line stages the corpus or exports `NLTK_DATA`. Five
-won it, with the download landing 62s to 229s in and no sample scored before it.
-This one lost it by 29 seconds:
+line, because at the time nothing on this line staged the corpus or exported
+`NLTK_DATA`. Five won it, with the download landing 62s to 229s in and no sample
+scored before it. This one lost it by 29 seconds:
 
 | Entry | Fetch finished at | Metric errors | Generated | Scored |
 | --- | --- | --- | --- | --- |
@@ -229,9 +229,23 @@ design: EvalScope reaches its own mirror where this reaches NLTK's index, and
 refusing a run because our route failed would take five entries that score all
 541 today and make them red. A failed fetch prints a warning naming the exposure;
 the sample-count check stays the thing that stops a short run being read as a
-score. Staging the corpus on shared storage and exporting `NLTK_DATA` — the same
-treatment the three splits got — would remove the fetch entirely, and is the
-follow-up this leaves open.
+score.
+
+The corpus is now staged as well, so on this cluster there is no fetch to be best
+effort about. `punkt_tab` sits at `/nas_aisw/datasets/nltk_data` — 11M, the same
+shared NAS the datasets and the HF cache already come off — and the seven IFEval
+jobs export `NLTK_DATA` at it, which is enough for both the suite's prefetch and
+EvalScope itself because `_evalscope_environment` inherits the pod's environment
+whole. A probe on `ci/accuracy-dataset-probe` established the three facts this
+rests on: a pod resolves the staged copy in 0.000s and reports it served from the
+stage rather than from a download; NLTK's own index answers 200 from inside the
+cluster, so the best-effort prefetch was never fetching into a wall for anyone
+without the stage; and the corpus can only be put there through the environment
+variable. `nltk.download(id, download_dir=...)` refuses the NAS outright —
+`Security Violation [Downloader._download_package]: Unauthorized path`, because
+the downloader authorises writes against `nltk.data.path` and a directory passed
+as a keyword is not in it — while the same download into the same directory
+succeeds when the directory arrives as `NLTK_DATA`.
 
 ### The floor is computed, not inherited
 
