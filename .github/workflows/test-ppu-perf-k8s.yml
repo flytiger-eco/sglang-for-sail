@@ -1,0 +1,821 @@
+name: Perf Test (PPU K8s)
+
+on:
+  # No schedule, for the reason test-ppu-answer-k8s.yml records: cron is honoured
+  # only from the default branch, and this file lives on a version branch, so a
+  # cron here would never fire. The btv1.5 performance line is dispatched by hand
+  # or by a caller through workflow_call.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-perf-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+# The performance twin of test-ppu-answer-k8s.yml, and the same shape for the
+# same reasons -- read that file's header for the full account. In brief:
+#
+#   * One job per entry, never a matrix. flytiger-eco/ppu-distributed-action
+#     builds both its NAS staging path and its K8s job name out of $GITHUB_JOB,
+#     which every leg of a matrix shares, so concurrent legs collide on the NAS
+#     and submit their pods under one job name. Eight lanes give the same
+#     eight-wide cluster request a matrix would, and `needs` plus `!cancelled()`
+#     serialises the entries that share a lane while letting each run on its
+#     predecessor's verdict, good or bad.
+#
+#   * The job body lives in scripts/ci/ppu/, not in a local composite action: this
+#     runner group drives the job through a container hook, so `uses: ./` resolves
+#     against the runner's own filesystem where the checkout wrote nothing (run
+#     34085102675). What is left here per entry is the K8s action's inputs.
+#
+#   * Every job checks out twice, the second time only if the first failed,
+#     because the fetch to github.com is the least reliable step in the run and a
+#     self-clearing egress fault must not judge a model.
+#
+# What differs from the Answer line is only what the two suites do not share: the
+# board body is run_perf_suite_board.sh, which reads PERF_SUITE /
+# PERF_TIMEOUT_PER_FILE / SGLANG_PPU_PERF_TEST_CONFIG / SGLANG_PPU_PERF_RESULTS_DIR
+# rather than the ANSWER_* names, so the two lines can share a board without
+# reading each other's settings; the evidence is collected by
+# collect_perf_evidence.sh; and the report is a set of numbers, delivered as
+# notices, one per measurement -- this line judges nothing, so a green run whose
+# numbers nobody can read would have measured nothing usable.
+#
+# `entry` is what keeps configs apart in the job name, the report path and the
+# artifact, because `suite` no longer identifies one: the two GLM-5.2 tp-8
+# configs share a suite and differ only in prefill length, as do the tp-4 GLM,
+# the two Qwen3.5, the two Kimi and the two MiniMax; a suite is what `--suite`
+# selects and the workflow names the exact config in SGLANG_PPU_PERF_TEST_CONFIG.
+# See the docstring of each registered file.
+#
+# The lanes hold no more than eight boards at once: the two tp-8 families each
+# run their two configs back to back on one lane, and the six lighter tp-2 and
+# tp-4 entries each take a board of their own and free it first. Each job holds a
+# whole board regardless of its tp -- nproc_per_node is a resource request, not
+# device isolation, and the board script narrows CUDA_VISIBLE_DEVICES to the
+# configured set so a tp-4 measurement is a tp-4 measurement rather than a tp-4
+# server on a board the test never checked it had to itself.
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+jobs:
+  # Lane A: the two GLM-5.2 channelwise configs at tp 8, back to back. The 4k
+  # case first, so a break in the shared serving path shows up before the 64k
+  # sweep pays for it.
+  glm52-fp8chan-4k:
+    name: glm5.2-fp8-channelwise-4k (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 190
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise-4k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 165
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      # Best effort, for the reason test-ppu-answer-k8s.yml records: the numbers
+      # have already left this job over the annotations the step above prints, so
+      # a reset on the github egress here must not turn a passing suite red. What
+      # a lost upload costs is the machine-readable copy -- result.json, junit.xml
+      # and the raw bench output -- which the annotations and the on-NAS record
+      # both outlive.
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-fp8chan-64k:
+    name: glm5.2-fp8-channelwise-64k (btv1.5)
+    needs: glm52-fp8chan-4k
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 190
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise-64k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 165
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-fp8-channelwise-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane B: the two Kimi-K2.6 configs at tp 8, back to back. Each carries both a
+  # 4k and a 64k prefill in one launch, since the load dominates the measurement.
+  kimi26-mxfp4:
+    name: kimi2.6-mxfp4-fp8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8 via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 145
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  kimi26-w4a8:
+    name: kimi2.6-w4a8-int8 (btv1.5)
+    needs: kimi26-mxfp4
+    if: ${{ !cancelled() }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-w4a8-int8 via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 145
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-w4a8-int8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-kimi2.6-w4a8-int8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane C: GLM-5.2 mxfp4 at tp 4, one config (the 4k prefill), on a board of its
+  # own. The tp-4 mxfp4 checkpoint splits its two lengths across two configs
+  # because the 64k case serves `dsa` with expert parallelism while the 4k case
+  # serves dense attention -- one server cannot be both.
+  glm52-mxfp4-4k:
+    name: glm5.2-mxfp4-fp8-4k (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8-4k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 145
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-4k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-4k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane D: GLM-5.2 mxfp4 at tp 4, the 64k prefill config, on a board of its own.
+  glm52-mxfp4-64k:
+    name: glm5.2-mxfp4-fp8-64k (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8-64k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 145
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-64k
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-glm5.2-mxfp4-fp8-64k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane E: Qwen3.5-397B-A17B mxfp4 at tp 4. Its two lengths share one launch --
+  # the plan's mxfp4 and channelwise cases differ only in the weights they read,
+  # so their server arguments are identical and both fit one config.
+  qwen35-mxfp4:
+    name: qwen3.5-397b-mxfp4-fp8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-mxfp4-fp8 via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 135
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane F: Qwen3.5-397B-A17B fp8 channelwise at tp 4.
+  qwen35-fp8chan:
+    name: qwen3.5-397b-fp8-channelwise (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-fp8-channelwise via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 135
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-qwen3.5-397b-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane G: MiniMax-M2.7 mxfp4 at tp 2, the smallest board request of the line.
+  minimax27-mxfp4:
+    name: minimax2.7-mxfp4-fp8 (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8 via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 135
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-mxfp4-fp8-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Lane H: MiniMax-M2.7 fp8 channelwise at tp 2.
+  minimax27-fp8chan:
+    name: minimax2.7-fp8-channelwise (btv1.5)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 135
+      - name: Collect Perf evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise
+          PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise
+        run: bash scripts/ci/ppu/collect_perf_evidence.sh
+      - name: Upload Perf evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Perf evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-perf-k8s-minimax2.7-fp8-channelwise-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-perf-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
