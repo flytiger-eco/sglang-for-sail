@@ -50,6 +50,7 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3NextConfig,
     Step3p5Config,
     Step3p7Config,
@@ -102,6 +103,14 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,
+        # A Qwen3.5 MoE checkpoint with no vision tower states the text
+        # sub-config's model_type at the top level and carries its fields flat,
+        # so it never reaches Qwen3_5MoeConfig's sub_configs and would resolve to
+        # the transformers class of the same name. That one describes the layer
+        # layout as layer_types ("full_attention") while the model code reads
+        # layers_block_type keyed by ALL_DECODER_LAYER_TYPES ("attention"), so
+        # loading fails on the first decoder layer.
+        Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
         JetNemotronConfig,
         JetVLMConfig,
