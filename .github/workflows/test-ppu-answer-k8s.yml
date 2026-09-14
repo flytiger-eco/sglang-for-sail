@@ -108,7 +108,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
@@ -120,7 +120,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.8-27b-bf16 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -198,7 +198,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -208,7 +208,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -274,7 +274,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -284,7 +284,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-w8a8-int8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -351,7 +351,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -361,7 +361,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-w8a8-int8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -425,7 +425,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -435,7 +435,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-fp8-channelwise via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -501,7 +501,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -511,7 +511,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -577,7 +577,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -587,7 +587,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-fp8-channelwise via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -652,7 +652,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -662,7 +662,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -728,7 +728,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -738,7 +738,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-fp8-channelwise via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -803,7 +803,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -813,7 +813,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-w4a8-int8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -879,7 +879,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -889,7 +889,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-mxfp4-fp8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -955,7 +955,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -965,7 +965,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-w8a8-int8 via K8s
         uses: flytiger-eco/ppu-distributed-action@main

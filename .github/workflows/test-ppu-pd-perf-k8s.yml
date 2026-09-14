@@ -87,7 +87,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
@@ -101,7 +101,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
 
       # What the tag resolves to now, and what the pods are then pinned to. The
@@ -232,7 +232,7 @@ jobs:
       - name: Checkout the publishing script
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 1
           path: source
       - name: Checkout the data branch

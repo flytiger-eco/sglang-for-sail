@@ -151,7 +151,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -161,7 +161,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-fp8-channelwise gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -225,7 +225,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -235,7 +235,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-fp8-channelwise gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -299,7 +299,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -309,7 +309,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-fp8-channelwise ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -373,7 +373,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -383,7 +383,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-fp8-channelwise ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -452,7 +452,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -462,7 +462,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-mxfp4-fp8 gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -526,7 +526,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -536,7 +536,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-mxfp4-fp8 gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -600,7 +600,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -610,7 +610,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-mxfp4-fp8 ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -674,7 +674,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -684,7 +684,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run glm5.2-mxfp4-fp8 ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -753,7 +753,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -763,7 +763,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-mxfp4-fp8 gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -827,7 +827,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -837,7 +837,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-mxfp4-fp8 gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -901,7 +901,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -911,7 +911,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-mxfp4-fp8 ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -975,7 +975,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -985,7 +985,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run kimi2.6-mxfp4-fp8 ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1054,7 +1054,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1064,7 +1064,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-fp8-channelwise gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1128,7 +1128,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1138,7 +1138,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-fp8-channelwise gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1202,7 +1202,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1212,7 +1212,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-fp8-channelwise ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1276,7 +1276,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1286,7 +1286,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-fp8-channelwise ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1355,7 +1355,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1365,7 +1365,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-mxfp4-fp8 gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1429,7 +1429,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1439,7 +1439,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-mxfp4-fp8 gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1503,7 +1503,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1513,7 +1513,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-mxfp4-fp8 ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1577,7 +1577,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1587,7 +1587,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run minimax2.7-mxfp4-fp8 ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1656,7 +1656,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1666,7 +1666,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1730,7 +1730,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1740,7 +1740,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1804,7 +1804,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1814,7 +1814,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-fp8-channelwise ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1878,7 +1878,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1888,7 +1888,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-fp8-channelwise ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -1957,7 +1957,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1967,7 +1967,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k smoke via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -2031,7 +2031,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -2041,7 +2041,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -2105,7 +2105,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -2115,7 +2115,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ceval via K8s
         uses: flytiger-eco/ppu-distributed-action@main
@@ -2179,7 +2179,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -2189,7 +2189,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ifeval via K8s
         uses: flytiger-eco/ppu-distributed-action@main

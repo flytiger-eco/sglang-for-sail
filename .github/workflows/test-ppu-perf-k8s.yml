@@ -89,7 +89,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -99,7 +99,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -207,7 +207,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -217,7 +217,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -319,7 +319,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -329,7 +329,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -431,7 +431,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -441,7 +441,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -545,7 +545,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -555,7 +555,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -656,7 +656,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -666,7 +666,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -769,7 +769,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -779,7 +779,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -880,7 +880,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -890,7 +890,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -991,7 +991,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1001,7 +1001,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -1102,7 +1102,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -1112,7 +1112,7 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
       # What the tag resolves to now, and what the pods are then pinned to. The
       # script's header records why a digest recorded without pinning to it would
@@ -1253,7 +1253,7 @@ jobs:
       - name: Checkout the publishing script
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 1
           path: source
       - name: Checkout the data branch
