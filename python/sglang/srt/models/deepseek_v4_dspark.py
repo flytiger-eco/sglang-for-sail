@@ -36,6 +36,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     run_markov_block,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -577,6 +578,25 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    # The DSpark draft module tree renames the checkpoint's mtp.X.attn/* to
+    # stages.X.self_attn/*.  These mappings let hybrid quantization configs
+    # (e.g. MoE MXFP4 + dense FP8 per-channel) correctly identify which draft
+    # layers are in fp8_channelwise_layers.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"mtp.": "stages."},
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+    )
 
     def __init__(
         self,
