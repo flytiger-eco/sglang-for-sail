@@ -59,9 +59,31 @@ ${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
 # ==================== Install SGLang from source ==================== #
 rm -f "${REPO_ROOT}/python/pyproject.toml"
 cp "${REPO_ROOT}/python/pyproject_other.toml" "${REPO_ROOT}/python/pyproject.toml"
+
+# Extras must exist, or pip merely warns `does not provide the extra '<name>'`
+# and installs nothing from it. v0.5.13 asked for `all_ppu`, which its
+# pyproject_other.toml defined; v0.5.18 moved the PPU deps to pyproject_ppu.toml
+# and dropped the extra, so the request silently became a no-op and every runtime
+# dependency stopped being installed. That left the image's v0.5.13-era wheels in
+# place -- including an xgrammar predating AnyTokensFormat, which
+# srt/function_call/kimik3_structural_tag.py imports at module scope by way of
+# server_args.py, so every sglang import died (run 34859223040).
+#
+# runtime_common is the portion v0.5.13 actually relied on pip to install
+# (xgrammar==0.2.1, llguidance>=1.7.6, transformers==5.12.1, mistral_common,
+# outlines, timm, compressed-tensors). The platform wheels that `all_ppu` also
+# named -- torch, deep_ep, deep_gemm, flash-attn-3 -- are deliberately left out:
+# the image's +v0.1.0.ppu2.1.1 builds are the ones we want, per the note above.
+for _extra in runtime_common tracing; do
+    if ! grep -qE "^${_extra} *= *\[" "${REPO_ROOT}/python/pyproject.toml"; then
+        echo "::error::pyproject.toml declares no '${_extra}' extra; the dependency install would silently no-op"
+        exit 1
+    fi
+done
+
 # tracing: the v2.1.1 image dropped opentelemetry (v2.1.0 shipped it), and
-# all_ppu doesn't pull it in. test_tracing needs it to exercise the OTLP path.
-cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[all_ppu,tracing]" --no-build-isolation
+# runtime_common doesn't pull it in. test_tracing needs it to exercise the OTLP path.
+cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[runtime_common,tracing]" --no-build-isolation
 
 # ==================== sgl-kernel: PR wheel / source build / PyPI ==================== #
 # Priority 1: install the PR-built wheel downloaded by the build-sgl-kernel
