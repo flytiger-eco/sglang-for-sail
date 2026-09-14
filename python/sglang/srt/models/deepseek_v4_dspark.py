@@ -60,6 +60,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -717,6 +718,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:
         return DeepseekV4ForCausalLM.num_fusable_shared_experts(hf_config)
+
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"mtp.": "stages."},
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+    )
 
     def __init__(
         self,
