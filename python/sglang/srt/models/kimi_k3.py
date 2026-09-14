@@ -539,11 +539,20 @@ class KimiK3MoE(nn.Module):
         )
 
         if self.use_latent_moe:
+            latent_quant_config = (
+                quant_config
+                if getattr(
+                    quant_config,
+                    "supports_kimi_k3_quantized_latent_projections",
+                    False,
+                )
+                else None
+            )
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -555,7 +564,7 @@ class KimiK3MoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
         else:
@@ -1538,17 +1547,24 @@ class KimiK3DeltaAttention(nn.Module):
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
         Called once from load_weights (after all weights are loaded, before
-        cuda graph capture)."""
+        cuda graph capture). Only plain bf16/fp16 dense weights are merged —
+        quantized or mixed-dtype checkpoints keep the unfused path so the
+        quant_method (scales, packed layouts, etc.) is respected."""
         if not self.use_full_rank_gate:
             return
         if self.use_fused_input_projection:
-            self._bfa_w, sizes = _merge_weights_as_views(
-                [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=16
-            )
+            merge_mods = [self.fused_qkvg_proj, self.f_a_proj, self.b_proj]
         else:
-            self._bfa_w, sizes = _merge_weights_as_views(
-                [self.f_a_proj, self.b_proj], pad_rows_to=8
-            )
+            merge_mods = [self.f_a_proj, self.b_proj]
+        dtype_mods = [*merge_mods, self.f_b_proj]
+        dtypes = {m.weight.dtype for m in dtype_mods}
+        if len(dtypes) != 1 or next(iter(dtypes)) not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            return
+        pad_rows = 16 if self.use_fused_input_projection else 8
+        self._bfa_w, sizes = _merge_weights_as_views(merge_mods, pad_rows_to=pad_rows)
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
 
     def _prepare_fused_decode(self) -> None:
@@ -2983,8 +2999,23 @@ class KimiK3ForConditionalGeneration(nn.Module):
         },
     )
 
+    # Fused runtime module -> checkpoint shard names, so quant configs can
+    # match fused prefixes against per-shard exclude_modules
     packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
     }
 
     def __init__(
@@ -3007,10 +3038,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
         self.language_model = None
         if not config.encoder_only:
+            language_prefix = (
+                maybe_prefix(prefix, "language_model") if is_ppu() else prefix
+            )
             self.language_model = KimiK3LinearForCausalLM(
                 config.text_config,
                 quant_config,
-                prefix="",
+                prefix=language_prefix,
             )
 
     @property
