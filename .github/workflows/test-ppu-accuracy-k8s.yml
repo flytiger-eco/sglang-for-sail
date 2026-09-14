@@ -1,0 +1,2240 @@
+name: PPU Accuracy Nightly (K8s)
+
+on:
+  # No schedule, for the reason test-ppu-answer-k8s.yml records: cron is honoured
+  # only from the default branch, and this file lives on a version branch, so a
+  # cron here would never fire. The btv1.5 accuracy line is dispatched by hand or
+  # by a caller through workflow_call.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      mode:
+        description: 'smoke evaluates 20 samples to prove the path; full evaluates the whole split.'
+        required: false
+        type: choice
+        options:
+          - full
+          - smoke
+          - both
+        default: full
+      entries:
+        description: "Comma-separated entries, or 'all'. Empty runs glm52-fp8chan-gsm8k only. Keys: {glm52-fp8chan,glm52-mxfp4,kimi26-mxfp4,minimax27-fp8chan,minimax27-mxfp4,qwen35-fp8chan,qwen35-mxfp4}-{gsm8k,ceval,ifeval} and -gsm8k-smoke."
+        required: false
+        type: string
+        default: ''
+      dataset_dir:
+        description: 'Override the staged dataset directory the configs name. Recorded in the report when set.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      mode:
+        description: 'smoke evaluates 20 samples to prove the path; full evaluates the whole split.'
+        required: false
+        type: string
+        default: full
+      entries:
+        description: "Comma-separated entries, or 'all'. Empty runs glm52-fp8chan-gsm8k only."
+        required: false
+        type: string
+        default: ''
+      dataset_dir:
+        description: 'Override the staged dataset directory the configs name. Recorded in the report when set.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: test-ppu-accuracy-k8s-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+# The accuracy sibling of test-ppu-answer-k8s.yml and test-ppu-perf-k8s.yml, and
+# the same shape for the same reasons -- read the Answer file's header for the
+# full account. In brief: one job per entry and never a matrix, because
+# flytiger-eco/ppu-distributed-action builds both its NAS staging path and its
+# K8s job name out of $GITHUB_JOB which every leg of a matrix shares; the job
+# body lives in scripts/ci/ppu/ rather than in a local composite action, because
+# this runner group drives the job through a container hook so `uses: ./`
+# resolves against the runner's own filesystem where the checkout wrote nothing
+# (run 34085102675); and every job checks out twice, the second time only if the
+# first failed, because a self-clearing egress fault must not judge a model.
+#
+# Three things differ from the other two lines, all of them consequences of what
+# an accuracy run is:
+#
+#   * the score comes from EvalScope, not from a harness of ours, and EvalScope
+#     runs in a virtual environment of its own that setup_evalscope.sh builds --
+#     its dependency closure moves `datasets` and `dill` under the serving stack
+#     otherwise. The board script exports SGLANG_PPU_EVALSCOPE_BIN so the suite
+#     scores with that EvalScope and not with whatever else is on PATH.
+#
+#   * the dataset is a staged directory on the NAS rather than a repository
+#     asset. These are public splits far too large to check in, and although a
+#     pod here can reach ModelScope, a nightly is not given an input that
+#     arrives over egress: an unstaged dataset is a failure the board script
+#     reports before it loads a checkpoint.
+#
+#   * the budget is hours, not minutes. A full GSM8K split is 1319 prompts
+#     against a reasoning model, run at the server's own concurrency, so the
+#     timeouts below are an order of magnitude larger than the perf line's and a
+#     job holds its board for most of a night. That is why `mode: smoke` exists:
+#     20 samples prove the whole path -- install, stage, serve, score, report --
+#     for the price of the weight load alone.
+#
+#     What that price actually is, measured in run 34376918707: 35 minutes of
+#     board time, of which the test body was 1454s -- 1160s to bring the server
+#     up, 1050s of that capturing CUDA graphs, and 278s to score the twenty
+#     samples -- behind 305s of building the EvalScope environment. The smoke
+#     timeout is drawn to that measurement. The full one is deliberately not:
+#     the full split is some thirty batches of the one that was measured, and
+#     killing a full run that is merely slower than that extrapolation costs the
+#     same night that letting a hung one sit there does.
+#
+# `entry` names the config in the job name, the report path and the artifact,
+# because `suite` does not: the eight configs of a model share one registered
+# file and differ only in the config SGLANG_PPU_ACCURACY_TEST_CONFIG selects.
+#
+# Twenty-eight jobs, and the `entries` input is why that is safe. A job here holds
+# a whole board for most of a night, so a dispatch that started all twenty-one
+# full entries would ask the farm for twenty-one boards until morning. `entries`
+# is therefore a selection rather than a filter with a permissive default: empty
+# runs `glm52-fp8chan-gsm8k` alone -- the one entry that has run green -- and
+# `all` is the word a caller has to write to mean all of them. The `needs` edge
+# from each full entry to its checkpoint's smoke entry orders them under
+# `mode: both` without gating them, so a smoke that failed on a flaky server
+# still lets the measurement run, and the two never hold two boards at once.
+#
+# C-Eval and IFEval entries are dispatchable but not yet stageable: only GSM8K is
+# on the NAS. Those runs fail in the board script before a checkpoint is loaded,
+# with the `modelscope download` command that fixes it -- which is the designed
+# behaviour and not a reason to withhold the job.
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  # Where the NLTK corpora an IFEval score depends on are staged, so scoring
+  # resolves them off the shared NAS instead of fetching them mid-evaluation.
+  # Passed only to the IFEval jobs, because they are the only ones whose dataset
+  # contract names a corpus. Staged by the probe on ci/accuracy-dataset-probe;
+  # the corpus must arrive through this variable rather than nltk.download's
+  # download_dir=, which the downloader rejects as an unauthorized path.
+  PPU_NLTK_DATA: /nas_aisw/datasets/nltk_data
+
+jobs:
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  glm52-fp8chan-gsm8k-smoke:
+    name: glm5.2-fp8-channelwise gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == '' || inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-fp8chan-gsm8k:
+    name: glm5.2-fp8-channelwise gsm8k (btv1.5)
+    needs: glm52-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == '' || inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-fp8chan-ceval:
+    name: glm5.2-fp8-channelwise ceval (btv1.5)
+    needs: glm52-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-fp8chan-ifeval:
+    name: glm5.2-fp8-channelwise ifeval (btv1.5)
+    needs: glm52-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-fp8-channelwise ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/fp8-channelwise-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-fp8-channelwise-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  glm52-mxfp4-gsm8k-smoke:
+    name: glm5.2-mxfp4-fp8 gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8 gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-mxfp4-gsm8k:
+    name: glm5.2-mxfp4-fp8 gsm8k (btv1.5)
+    needs: glm52-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8 gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-mxfp4-ceval:
+    name: glm5.2-mxfp4-fp8 ceval (btv1.5)
+    needs: glm52-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8 ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  glm52-mxfp4-ifeval:
+    name: glm5.2-mxfp4-fp8 ifeval (btv1.5)
+    needs: glm52-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run glm5.2-mxfp4-fp8 ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-glm52-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/glm5.2/mxfp4-fp8-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: glm5.2-mxfp4-fp8-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-glm5.2-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  kimi26-mxfp4-gsm8k-smoke:
+    name: kimi2.6-mxfp4-fp8 gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8 gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-kimi26-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  kimi26-mxfp4-gsm8k:
+    name: kimi2.6-mxfp4-fp8 gsm8k (btv1.5)
+    needs: kimi26-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8 gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-kimi26-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  kimi26-mxfp4-ceval:
+    name: kimi2.6-mxfp4-fp8 ceval (btv1.5)
+    needs: kimi26-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8 ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-kimi26-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  kimi26-mxfp4-ifeval:
+    name: kimi2.6-mxfp4-fp8 ifeval (btv1.5)
+    needs: kimi26-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run kimi2.6-mxfp4-fp8 ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-kimi26-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/kimi2.6/mxfp4-fp8-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: kimi2.6-mxfp4-fp8-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-kimi2.6-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  minimax27-fp8chan-gsm8k-smoke:
+    name: minimax2.7-fp8-channelwise gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-fp8chan-gsm8k:
+    name: minimax2.7-fp8-channelwise gsm8k (btv1.5)
+    needs: minimax27-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-fp8chan-ceval:
+    name: minimax2.7-fp8-channelwise ceval (btv1.5)
+    needs: minimax27-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-fp8chan-ifeval:
+    name: minimax2.7-fp8-channelwise ifeval (btv1.5)
+    needs: minimax27-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-fp8-channelwise ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/fp8-channelwise-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-fp8-channelwise-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  minimax27-mxfp4-gsm8k-smoke:
+    name: minimax2.7-mxfp4-fp8 gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8 gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-mxfp4-gsm8k:
+    name: minimax2.7-mxfp4-fp8 gsm8k (btv1.5)
+    needs: minimax27-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8 gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-mxfp4-ceval:
+    name: minimax2.7-mxfp4-fp8 ceval (btv1.5)
+    needs: minimax27-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8 ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  minimax27-mxfp4-ifeval:
+    name: minimax2.7-mxfp4-fp8 ifeval (btv1.5)
+    needs: minimax27-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run minimax2.7-mxfp4-fp8 ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-minimax27-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/minimax2.7/mxfp4-fp8-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: minimax2.7-mxfp4-fp8-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-minimax2.7-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  qwen35-fp8chan-gsm8k-smoke:
+    name: qwen3.5-397b-a17b-fp8-channelwise gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-fp8chan-gsm8k:
+    name: qwen3.5-397b-a17b-fp8-channelwise gsm8k (btv1.5)
+    needs: qwen35-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-fp8-channelwise-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-fp8chan-ceval:
+    name: qwen3.5-397b-a17b-fp8-channelwise ceval (btv1.5)
+    needs: qwen35-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-fp8-channelwise ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-fp8-channelwise-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-fp8chan-ifeval:
+    name: qwen3.5-397b-a17b-fp8-channelwise ifeval (btv1.5)
+    needs: qwen35-fp8chan-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-fp8-channelwise ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-fp8-channelwise-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-fp8-channelwise-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  # Twenty samples of GSM8K, which is not an accuracy measurement and is not
+  # meant to be: it is the proof that the environment, the staged dataset, the
+  # server, the tool and the report reader all agree for this checkpoint, and
+  # it costs one weight load.  Skipped by default -- `mode: full` -- because a
+  # smoke score that reached the run page unlabelled would be mistaken for a
+  # verdict.
+  qwen35-mxfp4-gsm8k-smoke:
+    name: qwen3.5-397b-a17b-mxfp4-fp8 gsm8k smoke (btv1.5)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-mxfp4-gsm8k:
+    name: qwen3.5-397b-a17b-mxfp4-fp8 gsm8k (btv1.5)
+    needs: qwen35-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-mxfp4-fp8-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-mxfp4-ceval:
+    name: qwen3.5-397b-a17b-mxfp4-fp8 ceval (btv1.5)
+    needs: qwen35-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-ceval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ceval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ceval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ceval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-mxfp4-fp8-ceval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ceval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-ceval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  qwen35-mxfp4-ifeval:
+    name: qwen3.5-397b-a17b-mxfp4-fp8 ifeval (btv1.5)
+    needs: qwen35-mxfp4-gsm8k-smoke
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-ifeval,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 2
+      - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ifeval via K8s
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-qwen35-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,NLTK_DATA=${{ env.PPU_NLTK_DATA }},SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-ifeval.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ifeval${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: qwen3.5-397b-a17b-mxfp4-fp8-ifeval
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ifeval
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-qwen3.5-397b-a17b-mxfp4-fp8-ifeval-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30

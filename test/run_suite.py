@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -116,6 +117,14 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.PPU: [
+        # Three-stage serial chain (mirrors pr-test-amd.yml): stage-a is the
+        # < 5 min smoke gate, stage-b the 1-GPU body, stage-c 2-GPU tests.
+        # pr-test-ppu.yml serializes them via .github/actions/wait-for-jobs.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -169,6 +178,86 @@ NIGHTLY_SUITES = {
         "nightly-xpu-2-gpu",
         "nightly-xpu-4-gpu",
     ],
+    HWBackend.PPU: [
+        "nightly-1-ppu",
+        "nightly-2-ppu",
+        "nightly-4-ppu",
+        "nightly-8-ppu",
+        # Answer-quality suites, kept out of the nightly-1..8 serial chain and
+        # driven by their own workflow (nightly-test-ppu-answer.yml) so a 5-hour
+        # 8-card accuracy run cannot push the main nightly chain past its
+        # window. Listed here so the suite names are registered ones and
+        # run_suite.py / the coverage report account for their tests.
+        "nightly-answer-1-ppu",
+        "nightly-answer-8-ppu",
+        # One suite per model, not one per entry: a suite is what --suite runs,
+        # and every file in it executes in the same process off the same
+        # SGLANG_PPU_ANSWER_TEST_CONFIG, so two models could not be given
+        # different checkpoints under one name. Several configs of the same model
+        # do share a suite -- the workflow picks which one by naming its config.
+        # Qwen3.5's four configs are why nightly-answer-8-ppu is not split.
+        "nightly-answer-8-glm52-ppu",
+        "nightly-answer-8-kimi26-ppu",
+        "nightly-answer-8-minimax27-ppu",
+        # Whole boards, one suite each: every node runs the same registered file
+        # and the launcher tells each which rank it is.
+        "nightly-answer-16-ppu",
+        "nightly-answer-16-kimi26-ppu",
+        "nightly-answer-32-ppu",
+        # Serving performance suites, driven by their own workflows for the same
+        # reason the answer ones are: a measurement holds a whole board for as
+        # long as the checkpoint takes to load, and the nightly-1..8 chain must
+        # not wait behind that. A suite records TTFT and throughput and judges
+        # neither -- it is red only when a measurement produced no numbers -- so
+        # the names below carry evidence, not a threshold.
+        #
+        # The number is the devices the configs of that suite declare, not the
+        # board they hold: the plan serves MiniMax-M2.7 at tp 2 and Qwen3.5 and
+        # GLM-5.2-MXFP4 at tp 4, and one suite cannot state two device counts,
+        # which is why GLM-5.2 has two suites while its answer line has one.
+        "nightly-perf-2-minimax27-ppu",
+        "nightly-perf-4-glm52-ppu",
+        "nightly-perf-4-qwen35-ppu",
+        "nightly-perf-8-glm52-ppu",
+        "nightly-perf-8-kimi26-ppu",
+        # Whole boards, one suite each.
+        "nightly-perf-16-ppu",
+        "nightly-perf-32-ppu",
+        # Prefill/decode-disaggregated serving, which is two servers of one
+        # checkpoint plus a router and so always holds more than one board: the
+        # number is again the devices the config declares, sixteen for a 1p1d of
+        # two eight-device boards. Its own suite rather than an entry in
+        # nightly-perf-16-ppu because the two lines run different code -- a PD
+        # node's role, and whether it measures at all, depends on the rank the
+        # launcher handed it -- and its own workflow for the reason every perf
+        # suite has one.
+        "nightly-pd-perf-16-glm52-ppu",
+        # The same PD story for the second checkpoint under review; its own suite
+        # because it is a different model and config, not another line of glm52's.
+        "nightly-pd-perf-16-qwen35-ppu",
+        # Public-benchmark accuracy suites, scored by EvalScope against a served
+        # model and driven by test-ppu-accuracy-k8s.yml. Kept out of the
+        # nightly-1..8 chain for the same reason as the two lines above, and more
+        # so: a full split is 1319 prompts against a reasoning model, which is
+        # most of a night on one board.
+        #
+        # Unlike the perf line these do judge, when a baseline exists: the config
+        # states a ratio band around a recorded score and a run outside it is red.
+        # Where no baseline has been recorded on this hardware yet the score is
+        # published and nothing is judged, which the report says in as many words.
+        #
+        # One per model for the reason the answer comment above gives. Each holds
+        # that model's quantisations across all three datasets -- eight configs
+        # behind three of these names, four behind Kimi's -- and the workflow names
+        # which one runs. The number is 8 throughout because every config declares
+        # eight devices, including the two models the internal plan serves at tp 2
+        # and tp 4: a full split is generation-bound and the job holds the whole
+        # board either way.
+        "nightly-accuracy-8-glm52-ppu",
+        "nightly-accuracy-8-kimi26-ppu",
+        "nightly-accuracy-8-minimax27-ppu",
+        "nightly-accuracy-8-qwen35-ppu",
+    ],
 }
 
 
@@ -191,6 +280,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.PPU,
 }
 
 
