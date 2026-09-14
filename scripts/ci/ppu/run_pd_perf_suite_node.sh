@@ -303,8 +303,8 @@ bash scripts/ci/ppu/ppu_install_dependency.sh
 # The JIT cache is keyed on source mtime, and a fresh checkout stamps every file
 # with the checkout time, so without this every run recompiles.
 JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-if [ "$JIT_MTIME" != 0 ]; then
-  find python/sglang/jit_kernel -type f -exec touch -d @"$JIT_MTIME" {} +
+if [ "$JIT_MTIME" != 0 ] && [ -d "python/sglang/kernels/jit" ]; then
+  find python/sglang/kernels/jit -type f -exec touch -d @"$JIT_MTIME" {} +
   echo 'Pinned JIT source mtimes'
 fi
 
