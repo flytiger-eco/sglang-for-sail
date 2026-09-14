@@ -58,6 +58,20 @@ export HF_HUB_OFFLINE=1
 export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
 export PPU_SUPPORTS_FP8=0
 
+# The image ships the vendor's PPU build of sglang-kernel (0.4.3+v0.1.0.ppu2.1.1)
+# and flashinfer 0.6.12, and ppu_install_dependency.sh keeps them on purpose --
+# there is no PPU wheel to upgrade to, and the PyPI ones are CUDA builds.
+# v0.5.18 raised the minimums `_set_envs_and_config` asserts to sglang-kernel
+# 0.4.6.post1 and flashinfer 0.6.17 (v0.5.13 asked 0.4.3 / 0.6.12, which the
+# image met exactly), and PPU reaches that branch because it presents itself as
+# CUDA (`_is_cuda`, `--device cuda`), so every server launch aborted before a
+# weight was read -- measured in run 34900233869. Those versions are on the PPU
+# vendor's release train rather than the CUDA one, so the comparison carries no
+# meaning here; this is the switch upstream provides for the case. A kernel API
+# that is genuinely missing now fails as itself instead of behind a version
+# string.
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
 # Gloo carries the CPU side of every process group SGLang creates, and left to
 # itself it picks its address by resolving the pod's own hostname, which on
 # several of these nodes has no address: ranks either fall back to loopback or

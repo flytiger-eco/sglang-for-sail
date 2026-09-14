@@ -79,6 +79,13 @@ export HF_HUB_OFFLINE=1
 export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
 export PPU_SUPPORTS_FP8=0
 
+# v0.5.18 asserts sglang-kernel >= 0.4.6.post1 / flashinfer >= 0.6.17 whenever it
+# sees CUDA, and PPU presents itself as CUDA. The image carries the vendor's PPU
+# builds (0.4.3+v0.1.0.ppu2.1.1 / 0.6.12), which sit on a different release train
+# and have no upgrade path here, so the comparison only blocks the launch --
+# measured on the accuracy line, run 34900233869.
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+
 # `lo`, exactly as on the single-board entries and for the same reason: gloo
 # carries the CPU side of every process group SGLang creates, and each server here
 # is one node's worth of ranks in a single network namespace.  The peer of this
