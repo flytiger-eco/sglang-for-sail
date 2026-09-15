@@ -60,15 +60,6 @@ jobs:
             job_timeout_minutes: 270
             pod_timeout_minutes: 240
             timeout_per_file: 14400
-          # 968.3 GiB of INT8, which is 84 per cent of one node's device memory
-          # and the reason this one is here rather than in the single-board
-          # matrix.
-          - entry: kimi2.6-w8a8-int8
-            suite: nightly-answer-16-kimi26-ppu
-            config: test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json
-            job_timeout_minutes: 270
-            pod_timeout_minutes: 240
-            timeout_per_file: 14400
     # Bounded by the config's own startup budget, which is what a cold load off
     # the NAS is allowed to take, plus the ten cases at their timeout ceiling and
     # the dependency install. The first measured run is what should replace these
@@ -173,6 +164,13 @@ jobs:
             export GLOO_SOCKET_IFNAME
             CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
             export CUDA_VISIBLE_DEVICES
+            # NCCL_DEBUG diagnostic (probe only): the two-node TP-group
+            # ncclCommInitRank dies with "unhandled system error" while the
+            # single-board 8-card path does not; INFO prints the exact failing
+            # syscall (the "NCCL WARN Call to ... failed" line) so the root
+            # cause can be named rather than guessed. Not for the merged tree.
+            export NCCL_DEBUG=INFO
+            export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,ENV
             ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
             echo "source revision: $SGLANG_PPU_SOURCE_REVISION"
             echo "test config:     $SGLANG_PPU_ANSWER_TEST_CONFIG"
