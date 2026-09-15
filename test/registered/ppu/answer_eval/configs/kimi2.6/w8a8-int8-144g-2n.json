@@ -46,7 +46,7 @@
       "max_tokens": 2048,
       "separate_reasoning": true,
       "chat_template_kwargs": {
-        "thinking": false
+        "thinking": true
       }
     }
   },
