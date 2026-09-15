@@ -450,7 +450,8 @@ def fused_sigmoid_gating_delta_rule_update(
         max_cache_len = 0
         stride_rawv_slot = stride_rawk_slot = stride_g_slot = stride_beta_slot = 0
 
-    sail_pla_supported = lower_bound is None and not cache_ring
+    # SAIL PLA CUDA kernel supports lower_bound (KDA safe gate); only ReplaySSM ring needs Triton fallback
+    sail_pla_supported = not cache_ring
     if envs.SGLANG_SAIL_PLA_CUDA.get() and sail_pla_supported:
         from pla.decode import fused_sigmoid_gating_delta_rule_forward_k_last
 
@@ -459,9 +460,15 @@ def fused_sigmoid_gating_delta_rule_update(
         )
 
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
-            A_log,
+            # [FLA-KDA-fix] SAIL CUDA FLA kernel dtype requirements:
+            # - decode / CUDA graph capture (mtp_verify=0): A_log and dt_bias must be q.dtype (BFloat16)
+            # - MTP target verify (mtp_verify=1): A_log and dt_bias must remain Float32
+            # The `disable_state_update` parameter corresponds to mtp_verify=1 in the SAIL kernel.
+            # Conditional cast: decode path casts to q.dtype, MTP verify path keeps Float32
+            A_log.to(q.dtype) if (A_log is not None and not disable_state_update) else A_log,
             a,
-            dt_bias,
+            # dt_bias: same conditional cast as A_log above
+            dt_bias.to(q.dtype) if (dt_bias is not None and not disable_state_update) else dt_bias,
             softplus_beta,
             softplus_threshold,
             q,
@@ -479,12 +486,15 @@ def fused_sigmoid_gating_delta_rule_update(
             intermediate_state_indices,
             cache_steps,
             retrieve_parent_token,
+            # Pass lower_bound to SAIL PLA kernel (KDA safe gate)
+            lower_bound if lower_bound is not None else 0.0,
         )
         return output
 
+    # Fallback to Triton when SAIL PLA does not support current config
     if envs.SGLANG_SAIL_PLA_CUDA.get() and not sail_pla_supported:
         logger.info_once(
-            "PPU SAIL CUDA PLA does not expose KDA lower_bound/ReplaySSM ring "
+            "PPU SAIL CUDA FLA does not expose ReplaySSM ring "
             "semantics; using the community Triton recurrent kernel."
         )
 

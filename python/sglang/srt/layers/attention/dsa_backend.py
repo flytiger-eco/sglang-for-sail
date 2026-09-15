@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import sys  # [PPU-int8] added for FlashMLA debug prints
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -3742,10 +3741,9 @@ class DeepseekSparseAttnBackend(
                 device=page_table_1.device,
             )
             page_table_1 = torch.cat([page_table_1, padding], dim=-1)
-            print(
-                f"[PPU-FlashMLA] Padded topk {old_topk} -> {new_topk} for alignment",
-                file=sys.stderr,
-                flush=True,
+            # Replaced verbose stderr print with logger.info_once to reduce noise
+            logger.info_once(
+                f"[PPU-FlashMLA] Padded topk {old_topk} -> {new_topk} for alignment"
             )
         indices_input = page_table_1.unsqueeze(1)
 
