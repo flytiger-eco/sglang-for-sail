@@ -601,8 +601,8 @@ class MqaAttentionBase(nn.Module):
             tp_size=self.attn_tp_size,
             **({} if fp8 else {"params_dtype": torch.bfloat16}),
         )
-        if fp8 and wo_a_quant_config is not None:
-            if isinstance(wo_a_quant_config, Fp8Config):
+        if _FP8_WO_A_GEMM:
+            if isinstance(self.quant_config, Fp8Config):
                 from sglang.srt.layers import deep_gemm_wrapper
 
                 assert hasattr(
