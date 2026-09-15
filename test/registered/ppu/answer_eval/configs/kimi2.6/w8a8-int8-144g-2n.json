@@ -43,10 +43,10 @@
     "generation": {
       "temperature": 0,
       "top_p": 1,
-      "max_tokens": 2048,
+      "max_tokens": 8192,
       "separate_reasoning": true,
       "chat_template_kwargs": {
-        "thinking": false
+        "thinking": true
       }
     }
   },
