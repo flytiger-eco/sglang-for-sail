@@ -1,102 +1,31 @@
-name: PPU v0.5.18 Multi-node Validation Shim
+name: Nightly Test (PPU)
+
+# DISPATCH SHIM -- PROBE BRANCH ONLY.
+#
+# Replaces the indexed nightly caller with a thin launcher for the 32-PPU
+# four-node Answer line. The workflow body is resolved from this branch; the
+# source under test is checked out from the full SHA passed through `ref`.
+#
+# Never merge this branch.
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Validation target.'
-        required: true
-        type: choice
-        options:
-          - answer-32
-          - perf-16
-          - perf-32
-          - pd-glm52-fp8-channelwise
-          - pd-glm52-mxfp4-fp8
-          - pd-qwen35-mxfp4-fp8
-          - pd-qwen35-fp8-channelwise
-          - accuracy
       ref:
-        description: 'Full 40-character source revision tested inside the pods.'
+        description: 'Full 40-character source revision to test.'
         required: true
         type: string
-      accuracy_mode:
-        description: 'Accuracy mode; used only when target=accuracy.'
-        required: false
-        type: choice
-        options:
-          - smoke
-          - full
-          - both
-        default: smoke
-      accuracy_entries:
-        description: "Accuracy entries; empty selects glm52-fp8chan-gsm8k."
-        required: false
-        type: string
-        default: ''
 
 permissions:
   contents: read
 
+concurrency:
+  group: shim-ppu-answer32-${{ inputs.ref }}
+  cancel-in-progress: false
+
 jobs:
-  answer-32:
-    if: inputs.target == 'answer-32'
+  answer32:
     uses: ./.github/workflows/test-ppu-answer-32-k8s.yml
     with:
-      ref: ${{ inputs.ref }}
-    secrets: inherit
-
-  perf-16:
-    if: inputs.target == 'perf-16'
-    uses: ./.github/workflows/test-ppu-perf-16-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-    secrets: inherit
-
-  perf-32:
-    if: inputs.target == 'perf-32'
-    uses: ./.github/workflows/test-ppu-perf-32-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-    secrets: inherit
-
-  pd-glm52-fp8-channelwise:
-    if: inputs.target == 'pd-glm52-fp8-channelwise'
-    uses: ./.github/workflows/test-ppu-pd-perf-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-      pd_config: fp8-channelwise
-    secrets: inherit
-
-  pd-glm52-mxfp4-fp8:
-    if: inputs.target == 'pd-glm52-mxfp4-fp8'
-    uses: ./.github/workflows/test-ppu-pd-perf-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  pd-qwen35-mxfp4-fp8:
-    if: inputs.target == 'pd-qwen35-mxfp4-fp8'
-    uses: ./.github/workflows/test-ppu-qwen35-pd-perf-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  pd-qwen35-fp8-channelwise:
-    if: inputs.target == 'pd-qwen35-fp8-channelwise'
-    uses: ./.github/workflows/test-ppu-qwen35-pd-perf-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-      pd_config: fp8-channelwise
-    secrets: inherit
-
-  accuracy:
-    if: inputs.target == 'accuracy'
-    uses: ./.github/workflows/test-ppu-accuracy-k8s.yml
-    with:
-      ref: ${{ inputs.ref }}
-      mode: ${{ inputs.accuracy_mode }}
-      entries: ${{ inputs.accuracy_entries }}
+      ref: "${{ inputs.ref }}"
     secrets: inherit
