@@ -159,9 +159,18 @@ jobs:
             echo "checkpoint:      $PERF_MODEL_PATH"
             bash scripts/ci/ppu/ppu_install_dependency.sh
             JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            # Kept off the critical path: pinning only lets ninja reuse the NAS
+            # cache, but under the set -e above a find that cannot resolve the
+            # tree takes the whole gang-scheduled job with it. That is how run
+            # 34918954292 lost two boards six minutes in, once v0.5.18 moved this
+            # directory out from under the python/sglang/jit_kernel path these
+            # workflows were written against.
             if [ "$JIT_MTIME" != 0 ]; then
-              find python/sglang/jit_kernel -type f -exec touch -d @$JIT_MTIME {} +
-              echo 'Pinned JIT source mtimes'
+              if find python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} +; then
+                echo 'Pinned JIT source mtimes'
+              else
+                echo 'Skipped JIT mtime pinning; JIT will recompile'
+              fi
             fi
             # The JIT build directory moves off the shared NAS cache before
             # anything can compile; the script it comes from records why.
