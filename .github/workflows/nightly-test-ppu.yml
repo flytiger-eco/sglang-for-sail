@@ -10,7 +10,8 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 concurrency:
   group: shim-ppu-perf32-${{ inputs.ref }}
