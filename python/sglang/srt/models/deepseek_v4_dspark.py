@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -575,14 +574,6 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
-    # Fused-module -> checkpoint-shard names. The loader copies this into the
-    # quant config so should_ignore_layer can match the fused
-    # shared-expert gate_up_proj against the fp8_channelwise_layers list
-    # (mirrors DeepseekV4ForCausalLM; without it the shared experts are
-    # misrouted to the mxfp4 method and weight loading hits a shape assert).
-    packed_modules_mapping = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
 
     def __init__(
         self,
@@ -593,7 +584,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self._remap_quant_layer_lists(quant_config)
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -660,40 +650,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
-
-    # Checkpoint (HF) quant layer name -> dspark module prefix pieces.
-    _QUANT_LAYER_RE = re.compile(r"^mtp\.(\d+)(\..*)$")
-    _QUANT_LAYER_SUBSTR_REMAPS = (
-        (".attn.", ".self_attn."),
-        (".ffn.", ".mlp."),
-    )
-    _QUANT_LAYER_SUFFIX_REMAPS = (
-        (".w1", ".gate_proj"),
-        (".w2", ".down_proj"),
-        (".w3", ".up_proj"),
-    )
-
-    @classmethod
-    def _remap_quant_layer_lists(cls, quant_config) -> None:
-        if quant_config is None:
-            return
-        names = getattr(quant_config, "fp8_channelwise_layers", None)
-        if not names:
-            return
-        remapped = []
-        for name in names:
-            m = cls._QUANT_LAYER_RE.match(name)
-            if m is None:
-                continue
-            stage_id, rest = m.group(1), m.group(2)
-            for old, new in cls._QUANT_LAYER_SUBSTR_REMAPS:
-                rest = rest.replace(old, new, 1)
-            for old, new in cls._QUANT_LAYER_SUFFIX_REMAPS:
-                if rest.endswith(old):
-                    rest = rest[: -len(old)] + new
-                    break
-            remapped.append(f"stages.{stage_id}{rest}")
-        quant_config.fp8_channelwise_layers = remapped
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -831,29 +787,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        # Mirrors DeepseekV4ForCausalLM: when shared-experts fusion is on, the
-        # shared expert lives as an extra slot in the fused MoE pool and its
-        # checkpoint names must be remapped onto it.
-        num_fused_shared_experts = getattr(
-            self.stages[0].mlp, "num_fused_shared_experts", 0
-        )
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + num_fused_shared_experts,
+            num_experts=self.config.n_routed_experts,
         )
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
                 continue
-
-            if num_fused_shared_experts > 0 and ".mlp.shared_experts" in mapped:
-                mapped = mapped.replace(
-                    ".mlp.shared_experts",
-                    f".mlp.experts.{self.config.n_routed_experts}",
-                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
