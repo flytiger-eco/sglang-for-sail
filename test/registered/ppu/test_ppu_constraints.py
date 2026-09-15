@@ -77,7 +77,7 @@ class TestPPUBackendDefaults(CustomTestCase):
             "SGLANG_SAIL_USE_ACEXT_CUDA",
             "SGLANG_SAIL_DEEPGEMM_DENSE",
             "SGLANG_SAIL_DEEPGEMM_MOE",
-            "SGLANG_SAIL_FLA_CUDA",
+            "SGLANG_SAIL_PLA_CUDA",
             "SGLANG_OPT_USE_TOPK_V2",
         ]:
             os.environ.pop(env_name, None)
@@ -91,7 +91,7 @@ class TestPPUBackendDefaults(CustomTestCase):
         self.assertTrue(envs.SGLANG_SAIL_USE_ACEXT_CUDA.get())
         self.assertTrue(envs.SGLANG_SAIL_DEEPGEMM_DENSE.get())
         self.assertTrue(envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
-        self.assertTrue(envs.SGLANG_SAIL_FLA_CUDA.get())
+        self.assertTrue(envs.SGLANG_SAIL_PLA_CUDA.get())
         self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
 
 

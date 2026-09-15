@@ -72,6 +72,26 @@ export PPU_SUPPORTS_FP8=0
 # string.
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
+# ServerArgs._handle_ppu_backends turns SGLANG_SAIL_PLA_CUDA on for every PPU
+# launch, which routes the GDN linear-attention decode through `pla.decode`.
+# `pla` is not in the v2.1.1 image and nothing in this tree installs it: the
+# adaptation that introduced the import (06d440bb7, cherry-picked from
+# v0.5.17_rel) states "Dependency: pla package installed" and leaves that to the
+# environment. v0.5.13 imported `fla` under the old SGLANG_SAIL_FLA_CUDA name,
+# so this only became reachable here. Measured on run 34908645516: both
+# Qwen3.5-397B entries died in CUDA graph capture with
+# `ModuleNotFoundError: No module named 'pla'` raised from
+# fused_recurrent_gated_delta_rule_packed_decode, all eight schedulers went down
+# and the server was reported as exit -9.
+#
+# Turning the flag off takes the community Triton kernel that the same function
+# falls through to (same SOFTPLUS_THRESHOLD=20.0 the vendor path hard-codes), and
+# `is_set()` in _handle_ppu_backends honours an explicit value. Only the linear
+# attention models read this path -- GLM-5.2, Kimi-K2.6 and MiniMax-M2.7 scored
+# without it. Numerics stay guarded: a wrong Triton result shows up as a dropped
+# gsm8k score, not as a pass. Drop this once the image ships `pla`.
+export SGLANG_SAIL_PLA_CUDA=0
+
 # Gloo carries the CPU side of every process group SGLang creates, and left to
 # itself it picks its address by resolving the pod's own hostname, which on
 # several of these nodes has no address: ranks either fall back to loopback or

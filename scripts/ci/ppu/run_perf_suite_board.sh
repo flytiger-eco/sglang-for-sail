@@ -55,6 +55,14 @@ export PPU_SUPPORTS_FP8=0
 # measured on the accuracy line, run 34900233869.
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
+# _handle_ppu_backends enables SGLANG_SAIL_PLA_CUDA on PPU, which sends the GDN
+# linear-attention decode into `pla.decode`. `pla` is absent from the v2.1.1
+# image and nothing installs it, so the Qwen3.5 and Qwen3-Next entries die in
+# CUDA graph capture with `No module named 'pla'` (measured on the accuracy
+# line, run 34908645516). Off takes the community Triton kernel the same
+# function falls through to. Drop this once the image ships `pla`.
+export SGLANG_SAIL_PLA_CUDA=0
+
 # Gloo carries the CPU side of every process group SGLang creates, and left to
 # itself it picks its address by resolving the pod's own hostname, which on
 # several of these nodes has no address: ranks either fall back to loopback or
