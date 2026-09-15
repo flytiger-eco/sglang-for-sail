@@ -246,6 +246,16 @@ export NO_PROXY
 # rather than one sharing a board the test never checked it had to itself.
 CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_PD_PERF_TEST_CONFIG']))['hardware']['visible_devices']))")
 export CUDA_VISIBLE_DEVICES
+# PCCL detects an MNNVL fabric (shared UUID, cliqueSize 8) but the IMEX service
+# is not provisioned on PPU, so fabric rendezvous aborts instead of falling
+# back. sglang v0.5.18 additionally auto-enables custom all-reduce v2 multinode
+# on any detected MNNVL fabric with tp<=8
+# (server_args._handle_custom_all_reduce_v2_multinode), an opt-in that only
+# holds on GB200/GB300. Disable both so the collective falls back to the legacy
+# RoCE path. Each PD role may run single-node here, but the guard is harmless
+# and keeps every PPU launch path uniform.
+export PCCL_MNNVL_ENABLE=0
+export SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=0
 PD_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_PD_PERF_TEST_CONFIG']))['model']['path'])")
 # Which role this node serves is the config's answer to the rank it was handed,
 # and it is echoed rather than acted on: the suite resolves it again, and a log
