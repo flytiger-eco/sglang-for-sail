@@ -169,6 +169,30 @@ jobs:
             # single-board 8-card path does not; INFO prints the exact failing
             # syscall (the "NCCL WARN Call to ... failed" line) so the root
             # cause can be named rather than guessed. Not for the merged tree.
+            # These two boards report an MNNVL fabric -- same fabric UUID, one
+            # clique of eight -- but the fabric does not work here: the IMEX
+            # service it needs is not configured, so pccl fails the very first
+            # communicator with "MNNVL (cliqueSize 8) is available but not
+            # working on this system" (mnnvl.cc:95) and ncclCommInitRank comes
+            # back as "unhandled system error". Measured on run 34929694965.
+            #
+            # Two opt-outs, and both are needed. PCCL_MNNVL_ENABLE=0 is what the
+            # library's own message asks for, and it is what stops the fabric
+            # probe that fails; the image sets it to 1. The sglang switch is the
+            # other half: server_args._handle_custom_all_reduce_v2_multinode
+            # auto-enables the multinode custom all-reduce v2 path whenever
+            # nnodes > 1 on a device that reports an MNNVL fabric, on the
+            # documented assumption that "a failed fabric rendezvous falls back
+            # to the legacy path at init" -- true on GB200, not true here, where
+            # pccl aborts instead of falling back. Setting it to 0 explicitly
+            # also keeps that auto-opt-in from firing, since the handler skips
+            # it once the variable is_set(), and drops the group onto the legacy
+            # CustomAllreduce path over the RoCE data path this workflow already
+            # derives a GID index for.
+            export PCCL_MNNVL_ENABLE=0
+            export SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=0
+            # Kept for this probe so the log still shows which transport the
+            # group settles on once the fabric is out of the way.
             export NCCL_DEBUG=INFO
             export NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,ENV
             ANSWER_MODEL_PATH=$(python3 -c "import json, os; print(json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['model']['path'])")
