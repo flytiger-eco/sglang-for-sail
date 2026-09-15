@@ -68,7 +68,10 @@ of its own, `test-ppu-answer-32-k8s.yml`, dispatch only — see
 [The four-node line](#the-four-node-line). `nightly-answer-16-ppu` is the same
 checkpoint quantised to MXFP4-FP8, 1272.1 GiB, which two nodes hold, and
 `nightly-answer-16-kimi26-ppu` is Kimi-K2.6-W8A8-INT8 at 968.3 GiB, which one
-node does not; both are entries of `test-ppu-answer-16-k8s.yml`, dispatch only.
+node does not. Both entries are in `test-ppu-answer-16-k8s.yml`, remain
+available through dispatch, and have measured 10/10 v0.5.18 runs; periodic
+execution requires a caller on the repository's default branch because GitHub
+only evaluates `schedule` events there.
 
 The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
 ZW810E entries as a `max-parallel: 1` matrix. It has its own workflow instead of
@@ -735,11 +738,11 @@ deterministic generation line already described in
 
 **One value here is a judgement, not a measurement.** The three MiniMax entries
 carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,
-and the one other entry whose thinking cannot be switched off runs at 8192; 16384
-sits between them because MiniMax-M2.7's template has no off switch at all and a
-truncated candidate is a `length` finish reason rather than a verdict. Whether it
-is enough, and whether 900s covers it, is what the first run of these entries
-settles.
+while the measured A95B and two-node Kimi entries whose reasoning cannot be
+safely disabled both run at 8192; 16384 sits between them because MiniMax-M2.7's
+template has no off switch at all and a truncated candidate is a `length` finish
+reason rather than a verdict. Whether it is enough, and whether 900s covers it,
+is what the first run of these entries settles.
 
 **Capacity.** These are headroom checks against the measured checkpoint sizes, not
 predictions of what the server will actually reserve:
@@ -1195,6 +1198,32 @@ Three other creators in this tree have the same `enumerate` shape and would fail
 the same way under `pp_size > 1`: `mimo_v2.py`, `glm4_moe_lite.py`, and
 `qwen3_next.py`. None of the three is an entry of any suite here, so none can be
 verified on this fleet, and they are recorded rather than changed.
+
+### v0.5.18 verification
+
+Both two-node entries reached a clean verdict on 2026-09-15 after the v0.5.18
+port fixes were applied:
+
+| Entry | Run | Source revision | Cases | Suite / job duration |
+| --- | --- | --- | --- | --- |
+| `qwen3.8-2.4t-a95b-mxfp4-fp8` | [34944181107](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34944181107) | `7b0821c36c37b4ad30a1e8f1df4126ed2405d0ae` | 10/10 | 1801 / 2172 s |
+| `kimi2.6-w8a8-int8` | [34961981320](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34961981320) | `5094d105da74282bf76d921fd1d6ad5771f1fafd` | 10/10 | 1527 / 1690 s |
+
+The A95B run verifies the `LazyValue` hardening and the missing
+`PPMissingLayer` guard in `qwen3_5_text.py`; the workflow body also carries the
+PCCL MNNVL opt-out required for two-node initialization on this cluster. The
+Kimi run verifies that `thinking: true` produces balanced reasoning blocks and
+that an 8192-token completion budget is sufficient. With 2048 tokens, eight of
+ten cases ended at `finish_reason=length` before a final answer; with thinking
+disabled, the parser received an unmatched closing tag and reasoning leaked
+into graded text.
+
+These runs satisfy the workflow's original requirement for measured green
+results. `test-ppu-answer-16-k8s.yml` remains dispatch-only until a
+repository-default-branch caller is added; placing a `schedule` trigger only on
+the v0.5.18 branch would not run because GitHub evaluates schedules exclusively
+from the default branch. The current timeout budgets remain conservative until
+repeated cold-cache runs establish a safe lower bound.
 
 **A lost evidence upload no longer reports a passing suite as failed.** Both jobs
 of that run ended `failure`, and for the 10/10 entry the only non-green step was

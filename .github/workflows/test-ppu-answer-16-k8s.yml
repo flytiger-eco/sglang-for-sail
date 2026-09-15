@@ -1,17 +1,16 @@
 name: Answer Test 16-PPU (PPU K8s)
 
 on:
-  # Dispatch only, and deliberately not wired into any nightly caller yet: each
-  # entry here claims two whole ZW-M890P boards, and neither has had a measured
-  # run. This becomes a scheduled line once one has passed, not before.
+  # Dispatch only while the default-branch nightly caller is tracked separately.
+  # Both entries completed measured v0.5.18 runs on 2026-09-15: A95B and
+  # Kimi-K2.6 each passed all ten cases (runs 34944181107 and 34961981320).
   #
-  # It is a workflow of its own rather than two more entries in the btv1.5 matrix
-  # for the same reason the four-node one is: that matrix is the routinely
-  # dispatched path and every entry in it claims one board, so sharing it would
-  # make each dispatch ask the cluster for two more. The pod command below is the
-  # four-node workflow's, differing only in the node count, the suite and the
-  # config; it is duplicated rather than extracted, and the extraction is worth
-  # doing once both multi-node lines have a green run to extract from.
+  # It remains a workflow of its own rather than two more entries in the btv1.5
+  # matrix: that matrix is the routinely dispatched path and every entry in it
+  # claims one board, while each entry here gang-schedules two whole ZW-M890P
+  # boards. The pod command below is the four-node workflow's, differing only in
+  # the node count, suite and config; it stays duplicated until both multi-node
+  # lines have stable measured runs from which to extract shared behavior.
   workflow_dispatch:
     inputs:
       ref:
@@ -71,8 +70,10 @@ jobs:
             timeout_per_file: 14400
     # Bounded by the config's own startup budget, which is what a cold load off
     # the NAS is allowed to take, plus the ten cases at their timeout ceiling and
-    # the dependency install. The first measured run is what should replace these
-    # numbers.
+    # the dependency install. The successful v0.5.18 runs measured suite/job
+    # durations of 1801/2172 seconds for A95B and 1527/1690 seconds for Kimi-K2.6.
+    # Keep the conservative budgets until repeated cold-cache runs establish a
+    # safe lower bound.
     timeout-minutes: ${{ matrix.job_timeout_minutes }}
     env:
       ANSWER_SUITE: ${{ matrix.suite }}
