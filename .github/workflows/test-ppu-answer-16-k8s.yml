@@ -53,10 +53,13 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          # 1272.1 GiB over two nodes at tp 8 x pp 2.
-          - entry: qwen3.8-2.4t-a95b-mxfp4-fp8
-            suite: nightly-answer-16-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g.json
+          # 968.3 GiB of INT8, which is 84 per cent of one node's device memory
+          # and the reason this one is here rather than in the single-board
+          # matrix. a95b already reached 10/10 (run 34944181107); this probe
+          # validates the remaining two-node entry through the same fixes.
+          - entry: kimi2.6-w8a8-int8
+            suite: nightly-answer-16-kimi26-ppu
+            config: test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json
             job_timeout_minutes: 270
             pod_timeout_minutes: 240
             timeout_per_file: 14400
