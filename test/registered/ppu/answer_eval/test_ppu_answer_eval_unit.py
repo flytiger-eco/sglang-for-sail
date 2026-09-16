@@ -119,6 +119,8 @@ class TestPPUAnswerEval(unittest.TestCase):
                 parameters["quantization"],
                 "--reasoning-parser",
                 parameters["reasoning_parser"],
+                "--dist-timeout",
+                str(parameters["dist_timeout"]),
                 "--watchdog-timeout",
                 str(parameters["watchdog_timeout"]),
                 "--served-model-name",
