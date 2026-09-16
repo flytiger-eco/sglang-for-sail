@@ -738,7 +738,18 @@ class TestPPUAnswerEval(unittest.TestCase):
         # environment lookup -- so accepting it would let a config state a setting
         # no run honours.
         config = copy.deepcopy(self.test_config)
-        self.assertEqual(answer_server_environment(config), {})
+        # The reviewed 397B config declares a warmup timeout for its slow start,
+        # so the baseline environment is that one rendered name rather than
+        # empty. The value is read from the config, not copied, so this stays a
+        # single source of truth with the reviewed configuration.
+        self.assertEqual(
+            answer_server_environment(config),
+            {
+                "SGLANG_WARMUP_TIMEOUT": str(
+                    config["server"]["env"]["SGLANG_WARMUP_TIMEOUT"]
+                )
+            },
+        )
 
         config["server"]["env"] = {
             "SGLANG_WARMUP_TIMEOUT": 3600,
