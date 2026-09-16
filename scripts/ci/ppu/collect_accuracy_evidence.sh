@@ -2,7 +2,7 @@
 # Carry one accuracy entry's report off the NAS onto the run page and into the
 # artifact directory.
 #
-# Run by every entry of test-ppu-accuracy-k8s.yml in the orchestration shell,
+# Run by every entry of test-ppu-accuracy.yml in the orchestration shell,
 # held here for the same reason the board-side body is: those jobs cannot call a
 # local composite action, because their runner resolves `uses: ./` on its own
 # filesystem rather than in the container the checkout populated (measured, run

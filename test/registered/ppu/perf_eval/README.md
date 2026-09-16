@@ -267,16 +267,16 @@ They are recorded here so a later reader knows the pass-through was deliberate.
 
 | Workflow | Suites | Boards | Trigger |
 | --- | --- | --- | --- |
-| `test-ppu-perf-k8s.yml` | the five single-board suites | 1 per entry, ≤8 at once | dispatch, `workflow_call` |
-| `test-ppu-perf-16-k8s.yml` | `nightly-perf-16-ppu` | 2 | dispatch, `workflow_call` |
-| `test-ppu-perf-32-k8s.yml` | `nightly-perf-32-ppu` | 4 | dispatch, `workflow_call` |
+| `test-ppu-perf.yml` | the five single-board suites | 1 per entry, ≤8 at once | dispatch, `workflow_call` |
+| `test-ppu-perf-16.yml` | `nightly-perf-16-ppu` | 2 | dispatch, `workflow_call` |
+| `test-ppu-perf-32.yml` | `nightly-perf-32-ppu` | 4 | dispatch, `workflow_call` |
 
 None is on a schedule: cron is honoured only from the default branch, and these
 files live on a version branch, so a cron here would never fire. They are
 dispatched by hand or by a caller through `workflow_call`, and the two multi-node
 lines are wired into no nightly caller until each has had one measured green run.
 
-The single-board workflow is the performance twin of `test-ppu-answer-k8s.yml`
+The single-board workflow is the performance twin of `test-ppu-answer.yml`
 and shares its shape for the reasons that file's header records at length: one
 job per entry rather than a matrix, because `flytiger-eco/ppu-distributed-action`
 derives both its NAS staging path and its K8s job name from `$GITHUB_JOB`, which

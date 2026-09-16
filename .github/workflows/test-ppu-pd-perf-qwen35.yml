@@ -83,7 +83,7 @@ jobs:
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
       # Second attempt only if the first failed; see the note on the github.com
-      # egress in test-ppu-answer-k8s.yml.
+      # egress in test-ppu-answer.yml.
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
         shell: bash
@@ -143,7 +143,7 @@ jobs:
         run: bash scripts/ci/ppu/collect_perf_evidence.sh
 
       # Best effort with one retry; see the note on the artifact egress in
-      # test-ppu-answer-k8s.yml.
+      # test-ppu-answer.yml.
       - name: Upload PD Perf evidence
         id: upload_evidence
         if: always()
@@ -206,7 +206,7 @@ jobs:
   # =============================================== the trend series ===============================================
   # File the rows this run measured on the nightly-test-data branch, so that the
   # series outlives the thirty-day artifact retention above. See the note on the
-  # same job in test-ppu-perf-k8s.yml for why it runs on always(), why the write is
+  # same job in test-ppu-perf.yml for why it runs on always(), why the write is
   # confined to this one job, and what a `workflow_call` caller has to grant for it.
   publish-trend-rows:
     name: file the trend rows

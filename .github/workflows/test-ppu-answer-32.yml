@@ -1,16 +1,17 @@
-name: Answer Test 16-PPU (PPU K8s)
+name: Answer Test 32-PPU (PPU K8s)
 
 on:
-  # Dispatch only while the default-branch nightly caller is tracked separately.
-  # Both entries completed measured v0.5.18 runs on 2026-09-15: A95B and
-  # Kimi-K2.6 each passed all ten cases (runs 34944181107 and 34961981320).
+  # Dispatch only, and deliberately not wired into any nightly caller yet: this
+  # entry claims four whole ZW-M890P boards, and it has never had a measured
+  # run. It becomes a scheduled line once one has passed, not before.
   #
-  # It remains a workflow of its own rather than two more entries in the btv1.5
-  # matrix: that matrix is the routinely dispatched path and every entry in it
-  # claims one board, while each entry here gang-schedules two whole ZW-M890P
-  # boards. The pod command below is the four-node workflow's, differing only in
-  # the node count, suite and config; it stays duplicated until both multi-node
-  # lines have stable measured runs from which to extract shared behavior.
+  # It is a workflow of its own rather than a third entry in the btv1.5 matrix
+  # because that matrix is the routinely dispatched path and its two entries
+  # claim one board each. Sharing the matrix would make every btv1.5 dispatch
+  # ask the cluster for four more boards. The pod command below is close to the
+  # one there and is duplicated rather than extracted: extracting it would put
+  # the two verified entries behind an unverified refactor, which is worth doing
+  # once this entry itself has a green run to extract from.
   workflow_dispatch:
     inputs:
       ref:
@@ -27,7 +28,7 @@ on:
         default: ''
 
 concurrency:
-  group: test-ppu-answer-16-k8s-${{ inputs.ref || github.ref }}
+  group: test-ppu-answer-32-k8s-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
@@ -35,58 +36,31 @@ permissions:
 
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+  ANSWER_SUITE: nightly-answer-32-ppu
+  ANSWER_CONFIG: test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-fp8-144g.json
 
 jobs:
-  answer-16-k8s:
-    name: ${{ matrix.suite }} / ${{ matrix.entry }} (btv1.5)
+  answer-32-k8s:
+    name: nightly-answer-32-ppu (btv1.5)
     # The orchestration shell is CPU-only and holds no device; the action
-    # gang-schedules two worker pods, each onto a board carrying the label.
+    # gang-schedules four worker pods, each onto a board carrying the label.
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    strategy:
-      fail-fast: false
-      # One entry at a time: each claims two boards, and both at once would hold
-      # four of them for hours against a cluster whose single-board matrix already
-      # asks for eight.
-      max-parallel: 1
-      matrix:
-        include:
-          # 1272.1 GiB over two nodes at tp 8 x pp 2.
-          - entry: qwen3.8-2.4t-a95b-mxfp4-fp8
-            suite: nightly-answer-16-ppu
-            config: test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g.json
-            job_timeout_minutes: 270
-            pod_timeout_minutes: 240
-            timeout_per_file: 14400
-          # 968.3 GiB of INT8, which is 84 per cent of one node's device memory
-          # and the reason this one is here rather than in the single-board
-          # matrix.
-          - entry: kimi2.6-w8a8-int8
-            suite: nightly-answer-16-kimi26-ppu
-            config: test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json
-            job_timeout_minutes: 270
-            pod_timeout_minutes: 240
-            timeout_per_file: 14400
-    # Bounded by the config's own startup budget, which is what a cold load off
-    # the NAS is allowed to take, plus the ten cases at their timeout ceiling and
-    # the dependency install. The successful v0.5.18 runs measured suite/job
-    # durations of 1801/2172 seconds for A95B and 1527/1690 seconds for Kimi-K2.6.
-    # Keep the conservative budgets until repeated cold-cache runs establish a
-    # safe lower bound.
-    timeout-minutes: ${{ matrix.job_timeout_minutes }}
+    # Bounded by the config's own 5400s startup budget, which is what a cold
+    # 2324.7 GiB load off the NAS is allowed to take, plus the ten cases at
+    # their 300s ceiling and the dependency install. The first measured run is
+    # what should replace these numbers.
+    timeout-minutes: 270
     env:
-      ANSWER_SUITE: ${{ matrix.suite }}
-      ANSWER_CONFIG: ${{ matrix.config }}
       # Same NAS-as-transport arrangement as the single-board workflow: the pod
       # writes under /mnt/wl_nas and this shell reads the same bytes under
       # /wl_nas. Here the directory carries a second load -- it is also how the
-      # two nodes address each other, for the rendezvous address, the device
+      # four nodes address each other, for the rendezvous address, the device
       # inventories and rank 0's completion -- so it must be the same path in
-      # every pod, which is why the test refuses a relative one. The entry name
-      # keeps two matrix entries from meeting in one rendezvous directory.
-      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
-      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/${{ matrix.entry }}
+      # every pod, which is why the test refuses a relative one.
+      ANSWER_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/nightly-answer-32-ppu
+      ANSWER_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/answer-results/nightly-answer-32-ppu
     steps:
       - name: Checkout code
         id: checkout
@@ -98,7 +72,7 @@ jobs:
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
       # Second attempt only if the first failed; see the note on the
-      # github.com egress in test-ppu-answer-k8s.yml.
+      # github.com egress in test-ppu-answer.yml.
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
         shell: bash
@@ -110,20 +84,17 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
 
-      - name: Run ${{ matrix.suite }} via K8s
+      - name: Run nightly-answer-32-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
-          # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into
-          # a PodGroup with minMember 2, so the group either gets both boards or
-          # waits, rather than one pod holding eight devices while the other
-          # never arrives. Eight per node is the whole board, which is what both
-          # configs' tp 8 x pp 2 needs and the only fence that keeps a second pod
-          # off a board this run has already claimed. Two boards is what each of
-          # these checkpoints needs and no more: 1272.1 GiB and 968.3 GiB against
-          # a 1843 GiB static pool at mem_fraction_static 0.8, where the
-          # single-board pool of 921 GiB holds neither.
-          nnodes: 2
+          # Four nodes of eight, gang-scheduled: the action turns nnodes > 1
+          # into a PodGroup with minMember 4, so the group either gets all four
+          # boards or waits, rather than half a group holding sixteen devices
+          # while the rest never arrives. Eight per node is the whole board,
+          # which is both what TP=32 over four nodes needs and the only fence
+          # that keeps a second pod off a board this run has already claimed.
+          nnodes: 4
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: |
@@ -138,8 +109,8 @@ jobs:
             SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
             export SGLANG_PPU_SOURCE_REVISION
             # First thing after the checkout is in place, and before the install:
-            # rank 0 publishes the address the group meets at, so the other node
-            # never waits on rank 0's install, only on its own. The address the
+            # rank 0 publishes the address the group meets at, so the other three
+            # never wait on rank 0's install, only on their own. The address the
             # action injects as MASTER_ADDR is a *.svc.cluster.local name these
             # hostNetwork pods cannot resolve, so this override is what the
             # rendezvous actually uses -- see the script's own header.
@@ -161,15 +132,17 @@ jobs:
             # every process group. Left to itself gloo resolves the pod's own
             # hostname, and on several of these nodes that name has no address:
             # the group either falls back to loopback and advertises 127.0.0.1
-            # to the other node, or raises out of the resolver at `new_group`
-            # before a weight is read -- "[enforce fail at
+            # to its peers, or raises out of the resolver at `new_group` before
+            # a weight is read -- "[enforce fail at
             # gloo/transport/tcp/device.cc:99] rv == 0. -5 vs 0", EAI_NODATA.
-            # Measured on run 34109451085. The single-board script answers this
-            # with `lo`, correct there and only there; a multi-node group needs
-            # the interface facing its peers, which the script derives from the
-            # rendezvous address rather than naming, since these hosts number
-            # their bonds differently. It fails loudly rather than letting the
-            # group fall back to loopback.
+            # Measured on the two-node entry, run 34109451085; this four-node
+            # entry shares the cause and had only been landing on nodes that
+            # resolve. The single-board script answers this with `lo`, correct
+            # there and only there; a multi-node group needs the interface
+            # facing its peers, which the script derives from the rendezvous
+            # address rather than naming, since these hosts number their bonds
+            # differently. It fails loudly rather than letting the group fall
+            # back to loopback.
             GLOO_SOCKET_IFNAME=$(bash scripts/ci/ppu/answer_gloo_iface.sh "$SGLANG_PPU_ANSWER_DIST_INIT_ADDR")
             export GLOO_SOCKET_IFNAME
             CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_ANSWER_TEST_CONFIG']))['hardware']['visible_devices']))")
@@ -211,13 +184,13 @@ jobs:
             # The JIT build directory moves off the shared NAS cache before
             # anything can compile; the script it comes from records why.
             . scripts/ci/ppu/use_local_jit_cache.sh
-            # No page-cache warm here, as on the four-node entry, though for a
-            # different reason: either checkpoint does fit in one node's 2266 GiB
-            # of memory, but under pp 2 each node loads roughly its own half, so a
-            # warm of the whole tree would read twice what the node needs and
-            # double this run's NAS traffic. Whether a warm of the half would pay
-            # is unmeasured, and there is no per-node shard list to warm from at
-            # this point; the config's startup budget is what the first run tests.
+            # No page-cache warm here, unlike the single-board entries. A warm
+            # reads the whole checkpoint tree, and at 2324.7 GiB that is larger
+            # than one node's 2266 GiB of memory, so the beginning of it is
+            # already evicted by the time the read ends; run on all four nodes it
+            # would also read four times what the group needs, since each node
+            # loads roughly its own quarter. It would cost hours of NAS traffic
+            # to leave the cache no warmer than it started.
             cd test
             # Routed through run_suite.py, as the single-board entries are, so the
             # executed set is exactly what register_ppu_ci declares; the wrapper
@@ -226,7 +199,7 @@ jobs:
             # No --continue-on-error: an Answer-quality regression must turn the
             # run red.
             bash ../scripts/ci/ppu/run_answer_suite_node.sh \
-              ${{ env.ANSWER_SUITE }} ${{ matrix.timeout_per_file }} "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks"
+              ${{ env.ANSWER_SUITE }} 14400 "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks"
           host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
           extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
           container_options: |
@@ -234,7 +207,7 @@ jobs:
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: ${{ matrix.pod_timeout_minutes }}
+          timeout_minutes: 240
 
       # Read, not moved: the pods write as root and this shell is a different,
       # non-root uid, so an rm here fails with EPERM on every file and turns the
@@ -256,7 +229,7 @@ jobs:
             echo "::warning::the group produced no Answer report at ${ANSWER_RESULTS_ON_RUNNER}"
           fi
           # A node's exit code is a workflow-level fact the report cannot carry:
-          # rank 0's verdict is written before the worker is released, so a
+          # rank 0's verdict is written before the workers are released, so a
           # worker that then failed is only visible here and in its own log.
           for status_file in "${destination}"/ranks/rank-*.status; do
             [ -f "${status_file}" ] || continue
@@ -292,14 +265,14 @@ jobs:
           fi
 
       # Best effort with one retry; see the note on the artifact egress in
-      # test-ppu-answer-k8s.yml.
+      # test-ppu-answer.yml.
       - name: Upload Answer evidence
         id: upload_evidence
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-answer-k8s-16-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-answer-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
           retention-days: 30
@@ -312,7 +285,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-answer-k8s-16-${{ matrix.entry }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-answer-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-answer-artifacts/
           if-no-files-found: warn
           # The first attempt can be reset after it has created the

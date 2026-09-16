@@ -237,7 +237,7 @@ NIGHTLY_SUITES = {
         # because it is a different model and config, not another line of glm52's.
         "nightly-pd-perf-16-qwen35-ppu",
         # Public-benchmark accuracy suites, scored by EvalScope against a served
-        # model and driven by test-ppu-accuracy-k8s.yml. Kept out of the
+        # model and driven by test-ppu-accuracy.yml. Kept out of the
         # nightly-1..8 chain for the same reason as the two lines above, and more
         # so: a full split is 1319 prompts against a reasoning model, which is
         # most of a night on one board.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run one single-board serving performance entry inside the worker pod.
 #
-# This is the body every entry of test-ppu-perf-k8s.yml executes on its board,
+# This is the body every entry of test-ppu-perf.yml executes on its board,
 # held here rather than in the workflow for the reason the Answer board script
 # records: that workflow needs one job id per concurrent entry, because
 # flytiger-eco/ppu-distributed-action derives both its NAS staging path and its

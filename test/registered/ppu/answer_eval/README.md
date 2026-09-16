@@ -53,7 +53,7 @@ reviewed config.
 | Board | Config suffix | Workflow | Trigger |
 | --- | --- | --- | --- |
 | ZW810E, 96GiB | none | `nightly-test-ppu-answer.yml` | cron 05:00 Beijing, dispatch |
-| ZW-M890P, 144GiB | `-144g` | `test-ppu-answer-k8s.yml` | dispatch only |
+| ZW-M890P, 144GiB | `-144g` | `test-ppu-answer.yml` | dispatch only |
 
 The other three 8-device suites, and the two two-node ones, have 144GiB configs
 only: their checkpoints are 116.2 GiB to 1272.1 GiB, and a ZW810E comparison is
@@ -64,11 +64,11 @@ came from and what it costs.
 `nightly-answer-32-ppu` has one config and one board. Its checkpoint is 2324.7
 GiB over 213 shards, which no 96GiB node count this cluster can gang-schedule
 would hold, so there is no ZW810E sibling to compare against; it has a workflow
-of its own, `test-ppu-answer-32-k8s.yml`, dispatch only — see
+of its own, `test-ppu-answer-32.yml`, dispatch only — see
 [The four-node line](#the-four-node-line). `nightly-answer-16-ppu` is the same
 checkpoint quantised to MXFP4-FP8, 1272.1 GiB, which two nodes hold, and
 `nightly-answer-16-kimi26-ppu` is Kimi-K2.6-W8A8-INT8 at 968.3 GiB, which one
-node does not. Both entries are in `test-ppu-answer-16-k8s.yml`, remain
+node does not. Both entries are in `test-ppu-answer-16.yml`, remain
 available through dispatch, and have measured 10/10 v0.5.18 runs; periodic
 execution requires a caller on the repository's default branch because GitHub
 only evaluates `schedule` events there.
@@ -219,7 +219,7 @@ finishes before the HTTP server listens and is bounded by
 
 ## The ZW-M890P line
 
-`.github/workflows/test-ppu-answer-k8s.yml` runs the single-board suites against
+`.github/workflows/test-ppu-answer.yml` runs the single-board suites against
 the 144GiB board, which is reachable only through the K8s cluster. It is a sibling
 workflow rather than a second matrix dimension of the bare-metal one because
 everything around the test differs, while the test itself does not:
@@ -523,7 +523,7 @@ deliberate on a node whose memory is smaller than the checkpoint tree.
 within 27s of rank 0.
 
 **The workflow is its own file, and dispatch only.**
-`.github/workflows/test-ppu-answer-32-k8s.yml` claims four whole boards, so it is
+`.github/workflows/test-ppu-answer-32.yml` claims four whole boards, so it is
 not one more lane in the btv1.5 workflow — adding it there would make every
 routine btv1.5 dispatch ask the cluster for four more boards — and it is not
 wired into any nightly caller until it has passed once. `nnodes: 4` is what makes
@@ -772,7 +772,7 @@ MiniMax, both 2.4T suites, and the two-node Kimi one, and 5400 for the
 single-board Kimi suite; none of these is measured either, and the first
 successful run of each is what should replace it.
 
-**The two-node line.** `.github/workflows/test-ppu-answer-16-k8s.yml` runs
+**The two-node line.** `.github/workflows/test-ppu-answer-16.yml` runs
 `nightly-answer-16-ppu` and `nightly-answer-16-kimi26-ppu` on two ZW-M890P nodes
 each at TP=8 × PP=2, one entry at a time. It is the four-node workflow with
 `nnodes: 2`, so it keeps every mechanism that line established —
@@ -1219,7 +1219,7 @@ disabled, the parser received an unmatched closing tag and reasoning leaked
 into graded text.
 
 These runs satisfy the workflow's original requirement for measured green
-results. `test-ppu-answer-16-k8s.yml` remains dispatch-only until a
+results. `test-ppu-answer-16.yml` remains dispatch-only until a
 repository-default-branch caller is added; placing a `schedule` trigger only on
 the v0.5.18 branch would not run because GitHub evaluates schedules exclusively
 from the default branch. The current timeout budgets remain conservative until

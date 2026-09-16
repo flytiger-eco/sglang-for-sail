@@ -1,7 +1,7 @@
 name: PPU Accuracy Nightly (K8s)
 
 on:
-  # No schedule, for the reason test-ppu-answer-k8s.yml records: cron is honoured
+  # No schedule, for the reason test-ppu-answer.yml records: cron is honoured
   # only from the default branch, and this file lives on a version branch, so a
   # cron here would never fire. The btv1.5 accuracy line is dispatched by hand or
   # by a caller through workflow_call.
@@ -61,7 +61,7 @@ concurrency:
 permissions:
   contents: read
 
-# The accuracy sibling of test-ppu-answer-k8s.yml and test-ppu-perf-k8s.yml, and
+# The accuracy sibling of test-ppu-answer.yml and test-ppu-perf.yml, and
 # the same shape for the same reasons -- read the Answer file's header for the
 # full account. In brief: one job per entry and never a matrix, because
 # flytiger-eco/ppu-distributed-action builds both its NAS staging path and its

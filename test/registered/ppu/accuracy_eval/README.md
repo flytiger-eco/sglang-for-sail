@@ -630,12 +630,12 @@ Two smaller ones, on every config:
 
 | Workflow | Suites | Jobs | Boards each | Trigger |
 | --- | --- | --- | --- | --- |
-| `test-ppu-accuracy-k8s.yml` | the four above | 28 (21 full + 7 smoke) | 1 | dispatch, `workflow_call` |
+| `test-ppu-accuracy.yml` | the four above | 28 (21 full + 7 smoke) | 1 | dispatch, `workflow_call` |
 
 Not on a schedule: cron is honoured only from the default branch and this file
 lives on a version branch, so a cron here would never fire.
 
-It shares its shape with `test-ppu-answer-k8s.yml` for the reasons that file's
+It shares its shape with `test-ppu-answer.yml` for the reasons that file's
 header records at length: one job per entry rather than a matrix, because
 `flytiger-eco/ppu-distributed-action` derives both its NAS staging path and its
 K8s job name from `$GITHUB_JOB`, which every leg of a matrix shares; the job body

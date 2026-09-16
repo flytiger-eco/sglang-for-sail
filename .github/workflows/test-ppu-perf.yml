@@ -1,7 +1,7 @@
 name: Perf Test (PPU K8s)
 
 on:
-  # No schedule, for the reason test-ppu-answer-k8s.yml records: cron is honoured
+  # No schedule, for the reason test-ppu-answer.yml records: cron is honoured
   # only from the default branch, and this file lives on a version branch, so a
   # cron here would never fire. The btv1.5 performance line is dispatched by hand
   # or by a caller through workflow_call.
@@ -27,7 +27,7 @@ concurrency:
 permissions:
   contents: read
 
-# The performance twin of test-ppu-answer-k8s.yml, and the same shape for the
+# The performance twin of test-ppu-answer.yml, and the same shape for the
 # same reasons -- read that file's header for the full account. In brief:
 #
 #   * One job per entry, never a matrix. flytiger-eco/ppu-distributed-action
@@ -130,7 +130,7 @@ jobs:
           ENTRY: glm5.2-fp8-channelwise-4k
           PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k
         run: bash scripts/ci/ppu/collect_perf_evidence.sh
-      # Best effort, for the reason test-ppu-answer-k8s.yml records: the numbers
+      # Best effort, for the reason test-ppu-answer.yml records: the numbers
       # have already left this job over the annotations the step above prints, so
       # a reset on the github egress here must not turn a passing suite red. What
       # a lost upload costs is the machine-readable copy -- result.json, junit.xml

@@ -261,10 +261,10 @@ they need a draft checkpoint established outside this repository first.
 
 | Workflow | Suite | Boards | Trigger |
 | --- | --- | --- | --- |
-| `test-ppu-pd-perf-k8s.yml` | `nightly-pd-perf-16-glm52-ppu` | 2 | dispatch, `workflow_call` |
-| `test-ppu-qwen35-pd-perf-k8s.yml` | `nightly-pd-perf-16-qwen35-ppu` | 2 | dispatch, `workflow_call` |
+| `test-ppu-pd-perf-glm52.yml` | `nightly-pd-perf-16-glm52-ppu` | 2 | dispatch, `workflow_call` |
+| `test-ppu-pd-perf-qwen35.yml` | `nightly-pd-perf-16-qwen35-ppu` | 2 | dispatch, `workflow_call` |
 
-A workflow of its own rather than a lane in `test-ppu-perf-k8s.yml`, for the
+A workflow of its own rather than a lane in `test-ppu-perf.yml`, for the
 reason the colocated 16-board entry has one: every lane in that file claims a
 single board, so folding a two-board entry in would make each dispatch ask the
 cluster for two more.

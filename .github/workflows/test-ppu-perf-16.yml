@@ -1,17 +1,18 @@
-name: Perf Test 32-PPU (PPU K8s)
+name: Perf Test 16-PPU (PPU K8s)
 
 on:
   # Dispatch only, and deliberately not wired into any nightly caller yet: this
-  # entry claims four whole ZW-M890P boards and has never had a measured run. It
+  # entry claims two whole ZW-M890P boards and has never had a measured run. It
   # becomes a scheduled line once one has passed, not before.
   #
-  # A workflow of its own rather than a lane in test-ppu-perf-k8s.yml for the
-  # reason the Answer 32 line records: that file is the routinely dispatched
-  # single-board path and its lanes claim one board each, so folding a four-board
-  # entry into it would make every dispatch ask the cluster for four more. The
-  # pod command below is close to the two-node one and is duplicated rather than
-  # extracted; extracting it would put a verified entry behind an unverified
-  # refactor, which is worth doing once this entry itself has a green run.
+  # A workflow of its own rather than a third lane in test-ppu-perf.yml for
+  # the reason the Answer 16 line records: that file is the routinely dispatched
+  # single-board path and every lane in it claims one board, so folding a
+  # two-board entry into it would make each dispatch ask the cluster for two
+  # more. The pod command below is the four-node workflow's, differing only in
+  # the node count, the suite and the config; it is duplicated rather than
+  # extracted, and the extraction is worth doing once both multi-node lines have
+  # a green run to extract from.
   workflow_dispatch:
     inputs:
       ref:
@@ -28,7 +29,7 @@ on:
         default: ''
 
 concurrency:
-  group: test-ppu-perf-32-k8s-${{ inputs.ref || github.ref }}
+  group: test-ppu-perf-16-k8s-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
@@ -36,31 +37,31 @@ permissions:
 
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
-  PERF_SUITE: nightly-perf-32-ppu
-  PERF_CONFIG: test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-fp8-144g-prefill-4n.json
+  PERF_SUITE: nightly-perf-16-ppu
+  PERF_CONFIG: test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json
 
 jobs:
-  perf-32-k8s:
-    name: nightly-perf-32-ppu (btv1.5)
+  perf-16-k8s:
+    name: nightly-perf-16-ppu (btv1.5)
     # The orchestration shell is CPU-only and holds no device; the action
-    # gang-schedules four worker pods, each onto a board carrying the label.
+    # gang-schedules two worker pods, each onto a board carrying the label.
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    # Bounded by the config's own 5400s startup budget, which is what a cold load
-    # of the FP8 checkpoint across four nodes is allowed to take, plus the two
-    # prefill sweeps and the dependency install. The first measured run is what
-    # should replace this number.
+    # Bounded by the config's own 5400s startup budget, which is what a cold
+    # 2.4T-checkpoint load off the NAS is allowed to take, plus the two prefill
+    # sweeps and the dependency install. The first measured run is what should
+    # replace this number.
     timeout-minutes: 270
     env:
       # Same NAS-as-transport arrangement as the single-board workflow: the pods
       # write under /mnt/wl_nas and this shell reads the same bytes under
       # /wl_nas. Here the directory carries a second load -- it is also how the
-      # four nodes address each other, for the rendezvous address, the device
+      # two nodes address each other, for the rendezvous address, the device
       # inventories and rank 0's completion -- so it must be the same path in
       # every pod, which is why the test refuses a relative one.
-      PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-perf-32-ppu
-      PERF_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-perf-32-ppu
+      PERF_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-perf-16-ppu
+      PERF_RESULTS_IN_POD: /mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/nightly-perf-16-ppu
     steps:
       - name: Checkout code
         id: checkout
@@ -72,7 +73,7 @@ jobs:
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
       # Second attempt only if the first failed; see the note on the github.com
-      # egress in test-ppu-answer-k8s.yml.
+      # egress in test-ppu-answer.yml.
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
         shell: bash
@@ -90,17 +91,17 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
-      - name: Run nightly-perf-32-ppu via K8s
+      - name: Run nightly-perf-16-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
-          # Four nodes of eight, gang-scheduled: the action turns nnodes > 1 into
-          # a PodGroup with minMember 4, so the group either gets all four boards
-          # or waits, rather than half a group holding sixteen devices while the
-          # rest never arrives. Eight per node is the whole board, which is both
-          # what tp 8 x pp 4 over four nodes needs and the only fence that keeps a
-          # second pod off a board this run has already claimed.
-          nnodes: 4
+          # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into
+          # a PodGroup with minMember 2, so the group either gets both boards or
+          # waits, rather than one pod holding eight devices while the other
+          # never arrives. Eight per node is the whole board, which is what the
+          # config's tp 8 x pp 2 needs and the only fence that keeps a second pod
+          # off a board this run has already claimed.
+          nnodes: 2
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: |
@@ -115,8 +116,8 @@ jobs:
             SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
             export SGLANG_PPU_SOURCE_REVISION
             # First thing after the checkout is in place, and before the install:
-            # rank 0 publishes the address the group meets at, so the other three
-            # never wait on rank 0's install, only on their own. The address the
+            # rank 0 publishes the address the group meets at, so the other node
+            # never waits on rank 0's install, only on its own. The address the
             # action injects as MASTER_ADDR is a *.svc.cluster.local name these
             # hostNetwork pods cannot resolve, so this override is what the
             # rendezvous actually uses. The rendezvous, GID and gloo helper
@@ -126,24 +127,24 @@ jobs:
             export SGLANG_PPU_PERF_DIST_INIT_ADDR
             # And the GID the RoCE data path must use. Left to itself pccl picks
             # index 0 here, the link-local address formed from the bond's MAC,
-            # which does not cross the fabric between nodes: the group builds its
-            # queue pairs over the out-of-band TCP channel, logs "Connected all
-            # rings", then dies on its first payload with IBV_WC_RETRY_EXC_ERR.
-            # Only the RoCE v2 entry of the routable fd03::/8 address carries
-            # traffic on these boards, and the script derives its index rather
-            # than hard-coding it.
+            # which does not cross the fabric between two nodes: the group builds
+            # its queue pairs over the out-of-band TCP channel, logs "Connected
+            # all rings", then dies on its first payload with
+            # IBV_WC_RETRY_EXC_ERR. Only the RoCE v2 entry of the routable
+            # fd03::/8 address carries traffic on these boards, and the script
+            # derives its index rather than hard-coding it.
             NCCL_IB_GID_INDEX=$(bash scripts/ci/ppu/answer_gid_index.sh)
             export NCCL_IB_GID_INDEX
             # And the interface gloo binds to, which carries the CPU side of every
             # process group. Left to itself gloo resolves the pod's own hostname,
             # and on several of these nodes that name has no address: the group
-            # either falls back to loopback and advertises 127.0.0.1 to its peers,
-            # or raises out of the resolver at `new_group` before a weight is
-            # read. The single-board script answers this with `lo`, correct there
-            # and only there; a multi-node group needs the interface facing its
-            # peers, which the script derives from the rendezvous address rather
-            # than naming, since these hosts number their bonds differently. It
-            # fails loudly rather than falling back to loopback.
+            # either falls back to loopback and advertises 127.0.0.1 to the other
+            # node, or raises out of the resolver at `new_group` before a weight
+            # is read. The single-board script answers this with `lo`, correct
+            # there and only there; a multi-node group needs the interface facing
+            # its peers, which the script derives from the rendezvous address
+            # rather than naming, since these hosts number their bonds
+            # differently. It fails loudly rather than falling back to loopback.
             GLOO_SOCKET_IFNAME=$(bash scripts/ci/ppu/answer_gloo_iface.sh "$SGLANG_PPU_PERF_DIST_INIT_ADDR")
             export GLOO_SOCKET_IFNAME
             CUDA_VISIBLE_DEVICES=$(python3 -c "import json, os; print(','.join(str(int(device)) for device in json.load(open(os.environ['SGLANG_PPU_PERF_TEST_CONFIG']))['hardware']['visible_devices']))")
@@ -185,13 +186,12 @@ jobs:
             # The JIT build directory moves off the shared NAS cache before
             # anything can compile; the script it comes from records why.
             . scripts/ci/ppu/use_local_jit_cache.sh
-            # No page-cache warm here, unlike the single-board entries. A warm
-            # reads the whole checkpoint tree, and at this size that is larger
-            # than one node's memory, so the beginning of it is already evicted by
-            # the time the read ends; run on all four nodes it would also read
-            # four times what the group needs, since each node loads roughly its
-            # own quarter. It would cost hours of NAS traffic to leave the cache
-            # no warmer than it started.
+            # No page-cache warm here, as on the four-node entry: the checkpoint
+            # does fit in one node's memory, but under pp 2 each node loads
+            # roughly its own half, so a warm of the whole tree would read twice
+            # what the node needs and double this run's NAS traffic. There is no
+            # per-node shard list to warm from at this point; the config's startup
+            # budget is what the first run tests.
             cd test
             # Routed through run_suite.py, as the single-board entries are, so the
             # executed set is exactly what register_ppu_ci declares; the wrapper
@@ -222,19 +222,19 @@ jobs:
         if: always()
         shell: bash
         env:
-          ENTRY: nightly-perf-32-ppu
+          ENTRY: nightly-perf-16-ppu
           PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
         run: bash scripts/ci/ppu/collect_perf_evidence.sh
 
       # Best effort with one retry; see the note on the artifact egress in
-      # test-ppu-answer-k8s.yml.
+      # test-ppu-answer.yml.
       - name: Upload Perf evidence
         id: upload_evidence
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-perf-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-perf-artifacts/
           if-no-files-found: warn
           retention-days: 30
@@ -248,7 +248,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-perf-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-perf-artifacts/
           if-no-files-found: warn
           # The first attempt can be reset after it has created the artifact,
@@ -270,7 +270,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: ppu-perf-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ppu-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
           path: ppu-perf-artifacts/
           if-no-files-found: warn
           overwrite: true
@@ -283,18 +283,18 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          ENTRY: nightly-perf-32-ppu
+          ENTRY: nightly-perf-16-ppu
           PERF_RESULTS_ON_RUNNER: ${{ env.PERF_RESULTS_ON_RUNNER }}
         run: bash scripts/ci/ppu/report_lost_perf_artifact.sh
 
   # =============================================== the trend series ===============================================
   # File the rows this run measured on the nightly-test-data branch, so that the
   # series outlives the thirty-day artifact retention above. See the note on the
-  # same job in test-ppu-perf-k8s.yml for why it runs on always(), why the write is
+  # same job in test-ppu-perf.yml for why it runs on always(), why the write is
   # confined to this one job, and what a `workflow_call` caller has to grant for it.
   publish-trend-rows:
     name: file the trend rows
-    needs: [perf-32-k8s]
+    needs: [perf-16-k8s]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -319,7 +319,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: ppu-perf-k8s-32-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: ppu-perf-k8s-16-${{ github.run_id }}-${{ github.run_attempt }}
           path: incoming
       - name: File the rows on the data branch
         if: steps.download.outcome == 'success'

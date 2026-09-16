@@ -80,7 +80,7 @@ jobs:
           # leaves HEAD~1 nonexistent, so detection always failed.
           fetch-depth: 2
       # Second attempt only if the first failed; see the note on the
-      # github.com egress in test-ppu-answer-k8s.yml.
+      # github.com egress in test-ppu-answer.yml.
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
         shell: bash

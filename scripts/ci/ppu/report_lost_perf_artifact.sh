@@ -1,7 +1,7 @@
 #!/bin/bash
 # Say that this entry measured something the run will not be able to read back.
 #
-# Run by an entry of the test-ppu-*perf*-k8s.yml workflows only when every upload
+# Run by an entry of the test-ppu-*perf*.yml workflows only when every upload
 # attempt was reset, and held in a script rather than a composite action for the
 # reason collect_perf_evidence.sh records: these jobs cannot resolve `uses: ./`
 # against the checkout at all.

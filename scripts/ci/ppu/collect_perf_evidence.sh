@@ -2,7 +2,7 @@
 # Carry one performance entry's report off the NAS onto the run page and into the
 # artifact directory.
 #
-# Run by every entry of the three test-ppu-perf-*-k8s.yml workflows in the
+# Run by every entry of the three test-ppu-perf-*.yml workflows in the
 # orchestration shell, held here for the same reason the board-side body is:
 # those jobs cannot call a local composite action, because their runner resolves
 # `uses: ./` on its own filesystem rather than in the container the checkout

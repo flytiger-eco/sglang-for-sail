@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run one single-board Answer entry inside the worker pod.
 #
-# This is the body every entry of test-ppu-answer-k8s.yml executes on its board,
+# This is the body every entry of test-ppu-answer.yml executes on its board,
 # held here rather than in the workflow because that workflow needs one job id
 # per concurrent entry -- flytiger-eco/ppu-distributed-action derives both its
 # NAS staging path and its K8s job name from $GITHUB_JOB, which every leg of one

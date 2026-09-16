@@ -5,7 +5,7 @@ on:
   # claims two whole ZW-M890P boards and has never had a measured run. It becomes
   # a scheduled line once one has passed, not before.
   #
-  # A workflow of its own rather than a lane in test-ppu-perf-k8s.yml, for the
+  # A workflow of its own rather than a lane in test-ppu-perf.yml, for the
   # reason the colocated 16-board entry has one: that file is the routinely
   # dispatched single-board path and every lane in it claims one board, so folding
   # a two-board entry into it would make each dispatch ask the cluster for two
@@ -92,7 +92,7 @@ jobs:
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
       # Second attempt only if the first failed; see the note on the github.com
-      # egress in test-ppu-answer-k8s.yml.
+      # egress in test-ppu-answer.yml.
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
         shell: bash
@@ -152,7 +152,7 @@ jobs:
         run: bash scripts/ci/ppu/collect_perf_evidence.sh
 
       # Best effort with one retry; see the note on the artifact egress in
-      # test-ppu-answer-k8s.yml.
+      # test-ppu-answer.yml.
       - name: Upload PD Perf evidence
         id: upload_evidence
         if: always()
@@ -217,7 +217,7 @@ jobs:
   # series outlives the thirty-day artifact retention above. The disaggregated line
   # shares write_report_files with the colocated one, so its rows are the same shape
   # and accumulate in the same series. See the note on the same job in
-  # test-ppu-perf-k8s.yml for why it runs on always(), why the write is confined to
+  # test-ppu-perf.yml for why it runs on always(), why the write is confined to
   # this one job, and what a `workflow_call` caller has to grant for it.
   publish-trend-rows:
     name: file the trend rows
