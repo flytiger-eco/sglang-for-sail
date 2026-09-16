@@ -1772,24 +1772,35 @@ class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
             )
 
     def test_each_node_states_the_group_to_its_own_server(self):
-        # The variables the internal framework exports around the same launch.
-        # MASTER_ADDR comes from the rendezvous in force rather than from the
-        # injected variable of the same name, so an override that exists because
-        # the injected address does not resolve is not undone here.
+        # The config's own reviewed variables are applied first and the group's
+        # description of itself second, so each node launches with server.env
+        # rendered plus the three rendezvous variables. MASTER_ADDR comes from
+        # the rendezvous in force rather than from the injected variable of the
+        # same name, so an override that exists because the injected address does
+        # not resolve is not undone here. The value is read from the config to
+        # keep one source of truth with the reviewed configuration.
+        warmup = str(self.four_node["server"]["env"]["SGLANG_WARMUP_TIMEOUT"])
         for node_rank in range(4):
             with self.subTest(node_rank=node_rank):
                 self.assertEqual(
                     self.node(node_rank)._server_environment(),
                     {
+                        "SGLANG_WARMUP_TIMEOUT": warmup,
                         "MASTER_ADDR": "10.0.0.1",
                         "NNODES": "4",
                         "RANK": str(node_rank),
                     },
                 )
-        # A single-node launch that names no variables inherits its environment
-        # untouched.
-        self.assertIsNone(
+        # A single-node launch inherits its environment plus only the variables
+        # its config names; the reviewed 397B config names a warmup timeout, so
+        # that one rendered name is what it launches with.
+        self.assertEqual(
             self.node(0, config=self.single_node)._server_environment(),
+            {
+                "SGLANG_WARMUP_TIMEOUT": str(
+                    self.single_node["server"]["env"]["SGLANG_WARMUP_TIMEOUT"]
+                )
+            },
         )
 
     def test_a_config_that_names_variables_gets_them_on_a_single_node_too(self):
