@@ -38,6 +38,17 @@ class TestPPUBasic(CustomTestCase):
             "0.6",
             "--batch-size",
             "1",
+            # The offline bench_one_batch entrypoint does not call
+            # load_plugins(), so the acext PPU-native FA3 override (which
+            # accepts only_qv) is never installed. The default fa3 path then
+            # resolves flash_attn_with_kvcache from the base image's sgl_kernel
+            # binary, which predates the only_qv parameter and raises TypeError
+            # during prefill CUDA-graph capture. Pin the self-contained triton
+            # backend so this offline smoke exercises engine init + one decode
+            # step without the plugin-provided fa3 kernel. Server-path fa3
+            # coverage on the same model lives in test_ppu_fa3_eval (stage-b).
+            "--attention-backend",
+            "triton",
         ]
         if is_in_ci():
             args += ["--input", "64", "--output", "4"]
