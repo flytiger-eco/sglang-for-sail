@@ -1,9 +1,12 @@
 name: Answer Test 32-PPU (PPU K8s)
 
 on:
-  # Dispatch only, and deliberately not wired into any nightly caller yet: this
-  # entry claims four whole ZW-M890P boards, and it has never had a measured
-  # run. It becomes a scheduled line once one has passed, not before.
+  # Dispatchable, and now also reached by the nightly-test-ppu-answer.yml
+  # orchestrator through workflow_call. This entry claims four whole ZW-M890P
+  # boards and has not yet had a green measured run, so every scheduled or
+  # dispatched orchestrator run asks the cluster for those four boards on an
+  # as-yet-unproven line; drop it from the orchestrator's job list if that cost
+  # is unwanted before its first pass.
   #
   # It is a workflow of its own rather than a third entry in the btv1.5 matrix
   # because that matrix is the routinely dispatched path and its two entries

@@ -1,9 +1,10 @@
 name: Answer Test 16-PPU (PPU K8s)
 
 on:
-  # Dispatch only while the default-branch nightly caller is tracked separately.
-  # Both entries completed measured v0.5.18 runs on 2026-09-15: A95B and
-  # Kimi-K2.6 each passed all ten cases (runs 34944181107 and 34961981320).
+  # Dispatchable, and now also reached by the nightly-test-ppu-answer.yml
+  # orchestrator through workflow_call. Both entries completed measured v0.5.18
+  # runs on 2026-09-15: A95B and Kimi-K2.6 each passed all ten cases (runs
+  # 34944181107 and 34961981320), so this line is a proven orchestrator entry.
   #
   # It remains a workflow of its own rather than two more entries in the btv1.5
   # matrix: that matrix is the routinely dispatched path and every entry in it

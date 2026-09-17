@@ -185,9 +185,10 @@ NIGHTLY_SUITES = {
         "nightly-4-ppu",
         "nightly-8-ppu",
         # Answer-quality suites, kept out of the nightly-1..8 serial chain and
-        # driven by their own workflow (nightly-test-ppu-answer.yml) so a 5-hour
-        # 8-card accuracy run cannot push the main nightly chain past its
-        # window. Listed here so the suite names are registered ones and
+        # driven by their own workflows -- the test-ppu-answer* K8s files that
+        # nightly-test-ppu-answer.yml orchestrates -- so a multi-hour accuracy
+        # run holds its own K8s boards instead of the nightly-1..8 `ppu` runner.
+        # Listed here so the suite names are registered ones and
         # run_suite.py / the coverage report account for their tests.
         "nightly-answer-1-ppu",
         "nightly-answer-8-ppu",

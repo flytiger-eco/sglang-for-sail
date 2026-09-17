@@ -45,45 +45,50 @@ suites differ from each other only in which model they hold. Kimi-K2.6 is the on
 model whose name appears on two different device counts, which is why its
 two-node suite keeps the model in the name as well.
 
-The first two suites are executed on two boards each. That is a matter of
-configuration rather than of registration: the model, the corpus, and the judging
-standard are the same, so a board is chosen by handing the suite a different
-reviewed config.
+Every suite is now executed on the ZW-M890P (144GiB) K8s boards through the
+`-144g` reviewed configs. The ZW810E (96GiB) line has been retired from active
+execution: no workflow schedules or dispatches it any more, and its no-suffix
+configs stay in the tree only as the measured baseline the 144GiB numbers are
+read against — see [Measured baseline (ZW810E)](#measured-baseline-zw810e).
 
-| Board | Config suffix | Workflow | Trigger |
+| Line | Suites | Devices | Workflow |
 | --- | --- | --- | --- |
-| ZW810E, 96GiB | none | `nightly-test-ppu-answer.yml` | cron 05:00 Beijing, dispatch |
-| ZW-M890P, 144GiB | `-144g` | `test-ppu-answer.yml` | dispatch only |
+| single board | the five 8-device suites, `nightly-answer-1-ppu` included | 1–8 | `test-ppu-answer.yml` |
+| two nodes | `nightly-answer-16-ppu`, `nightly-answer-16-kimi26-ppu` | 16 | `test-ppu-answer-16.yml` |
+| four nodes | `nightly-answer-32-ppu` | 32 | `test-ppu-answer-32.yml` |
 
-The other three 8-device suites, and the two two-node ones, have 144GiB configs
-only: their checkpoints are 116.2 GiB to 1272.1 GiB, and a ZW810E comparison is
-not something this cluster can schedule at those sizes. See
+The 8-device suites, and the two two-node ones, have 144GiB configs only: their
+checkpoints are 116.2 GiB to 1272.1 GiB, and a ZW810E comparison is not something
+this cluster can schedule at those sizes. See
 [The ported 144GiB entries](#the-ported-144gib-entries) for where each config
 came from and what it costs.
 
-`nightly-answer-32-ppu` has one config and one board. Its checkpoint is 2324.7
+`nightly-answer-32-ppu` has one config and four nodes. Its checkpoint is 2324.7
 GiB over 213 shards, which no 96GiB node count this cluster can gang-schedule
 would hold, so there is no ZW810E sibling to compare against; it has a workflow
-of its own, `test-ppu-answer-32.yml`, dispatch only — see
+of its own, `test-ppu-answer-32.yml` — see
 [The four-node line](#the-four-node-line). `nightly-answer-16-ppu` is the same
 checkpoint quantised to MXFP4-FP8, 1272.1 GiB, which two nodes hold, and
 `nightly-answer-16-kimi26-ppu` is Kimi-K2.6-W8A8-INT8 at 968.3 GiB, which one
-node does not. Both entries are in `test-ppu-answer-16.yml`, remain
-available through dispatch, and have measured 10/10 v0.5.18 runs; periodic
-execution requires a caller on the repository's default branch because GitHub
-only evaluates `schedule` events there.
+node does not. Both entries are in `test-ppu-answer-16.yml` and have measured
+10/10 v0.5.18 runs.
 
-The dedicated `.github/workflows/nightly-test-ppu-answer.yml` workflow runs both
-ZW810E entries as a `max-parallel: 1` matrix. It has its own workflow instead of
-being dispatched by the general `nightly-test-ppu.yml` workflow, so Answer
-failures, timeouts, scheduling, and artifacts remain isolated; its cron is
-offset to 05:00 Beijing so the two workflows do not contend for the same runner.
-Both entries are executed through `run_suite.py`, so the executed set is exactly
-what the registry declares. `fail-fast` is off: one model's verdict must not
-suppress the other's evidence, and the single-card entry runs first so a break in
-the shared serving path appears hours before the 8-card entry would report it.
-The ZW-M890P workflow keeps all of that and differs only where the cluster forces
-it to; see [The ZW-M890P line](#the-zw-m890p-line).
+Each of the three lines keeps its own file, concurrency group, artifacts, and
+dispatch entry. `.github/workflows/nightly-test-ppu-answer.yml` is the
+orchestrator over all three: it owns no runner and runs no test itself, but fans
+out to the three reusable workflows through `workflow_call`, pinning each to one
+commit through `ref` so all three judge the same revision and handing down the
+PPU credentials with `secrets: inherit`. It gives the Answer line a single
+scheduled and dispatchable entry point, kept separate from the general
+`nightly-test-ppu.yml` so Answer failures, timeouts, scheduling, and artifacts
+stay isolated; its cron is offset to 05:00 Beijing. The three callees carry no
+`needs` between them — the boards they claim are disjoint (a single board, two
+nodes, four nodes) so they run in parallel, and a failure in one does not
+suppress another's evidence. Periodic execution requires this file (or a caller)
+to sit on the repository's default branch, because GitHub evaluates `schedule`
+only there; until then the line is exercised by dispatch, on the orchestrator or
+on any single callee. See [The ZW-M890P line](#the-zw-m890p-line) for the
+single-board file's internals.
 
 The current phase enforces only request integrity and deterministic facts and
 quality checks. LLM-as-Judge is intentionally deferred. Open-ended cases are
@@ -522,11 +527,12 @@ deliberate on a node whose memory is smaller than the checkpoint tree.
 `WORKER_HOLD_MARGIN_SECONDS` 900 was never approached — the workers finished
 within 27s of rank 0.
 
-**The workflow is its own file, and dispatch only.**
+**The workflow is its own file, dispatchable and orchestrated.**
 `.github/workflows/test-ppu-answer-32.yml` claims four whole boards, so it is
 not one more lane in the btv1.5 workflow — adding it there would make every
-routine btv1.5 dispatch ask the cluster for four more boards — and it is not
-wired into any nightly caller until it has passed once. `nnodes: 4` is what makes
+routine btv1.5 dispatch ask the cluster for four more boards — but it is now
+also reached by the `nightly-test-ppu-answer.yml` orchestrator through
+`workflow_call`, even though it has not yet had a green measured run. `nnodes: 4` is what makes
 the action gang-schedule: it creates a PodGroup with `minMember: 4`, so the group
 either gets all four boards or waits, rather than half a group holding sixteen
 devices while the rest never arrives. `nproc_per_node: 8` is the whole board on
