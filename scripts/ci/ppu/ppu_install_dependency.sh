@@ -122,35 +122,18 @@ done
 # runtime_common doesn't pull it in. test_tracing needs it to exercise the OTLP path.
 cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[runtime_common,tracing]" --no-build-isolation
 
-# ==================== sgl-kernel: PR wheel / source build / PyPI ==================== #
-# Priority 1: install the PR-built wheel downloaded by the build-sgl-kernel
-#   CI job (SGL_KERNEL_WHEEL_DIR points at the artifact directory), so tests
-#   exercise kernels built from the PR's own code.
-# Priority 2: if this PR touches sgl-kernel source but no wheel is available,
-#   rebuild from source. Detect by checking git diff against the previous
-#   commit. Force with SGL_KERNEL_BUILD_FROM_SOURCE=1.
-# Priority 3: the PyPI wheel installed above.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-_kernel_source_changed() {
-    if git -C "${REPO_ROOT}" rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-        git -C "${REPO_ROOT}" diff --name-only HEAD~1 -- sgl-kernel/ | grep -qE '\.(py|cc|cu|cpp|h|hpp|cuh|toml|cmake)$|CMakeLists\.txt$'
-    else
-        return 1
-    fi
-}
-
-# Note: the PR build names its wheel sglang_kernel-* (setup_ppu.py dist name).
-# Install with --no-deps, mirroring ppu_build_kernel.sh for source builds.
-if [[ -n "${SGL_KERNEL_WHEEL_DIR:-}" ]] && ls "${SGL_KERNEL_WHEEL_DIR}"/sglang_kernel*.whl >/dev/null 2>&1; then
-    echo "Installing PR-built sgl-kernel wheel from ${SGL_KERNEL_WHEEL_DIR}..."
-    ${PIP_INSTALL} --force-reinstall --no-deps "${SGL_KERNEL_WHEEL_DIR}"/sglang_kernel*.whl
-elif [[ "${SGL_KERNEL_BUILD_FROM_SOURCE:-0}" == "1" ]] || _kernel_source_changed; then
-    echo "sgl-kernel source changed (or SGL_KERNEL_BUILD_FROM_SOURCE=1) — building from source..."
-    bash "${SCRIPT_DIR}/ppu_build_kernel.sh"
-else
-    echo "sgl-kernel source unchanged — using PyPI wheel."
-fi
+# ==================== sgl-kernel: build from source and override ==================== #
+# On PPU we build the repo's own kernel sources (python/sglang/kernels/aot,
+# dist name sglang-kernel 0.4.6.post1) and force-reinstall over the image's
+# 0.4.3+v0.1.0.ppu2.1.1, so the kernel under test matches the tested commit
+# (tested == code). See scripts/ci/ppu/ppu_build_kernel.sh for the build/override
+# details and the measured 0.4.6-vs-0.4.3 op-surface caveat (the source tree
+# registers 5 fewer sgl_kernel:: ops, all deliberately retired in 0.4.6).
+#
+# Note on DSA (FlashMLA): ppu_flashmla_hooks.py REPLACEs sgl_kernel.flash_mla.*
+# at runtime with a thin wrapper over the standalone flash_mla package (from the
+# image), so this override does not change DSA behavior either way.
+bash "${REPO_ROOT}/scripts/ci/ppu/ppu_build_kernel.sh"
 
 # ==================== EIC SDK + mooncake-barex (for disaggregation tests) ==================== #
 EIC_PKG_DIR=/nas_aisw/datasets/packages/eic-sdk
