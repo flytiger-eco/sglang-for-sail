@@ -1659,7 +1659,7 @@ class DeepseekV4AttnBackend(
 
         assert attn_sink.shape[0] == q.shape[1], (
             f"attn_sink head count ({attn_sink.shape[0]}) must match "
-            f"q head count ({q.shape[2]})"
+            f"q head count ({q.shape[1]})"
         )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
