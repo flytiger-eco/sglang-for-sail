@@ -59,7 +59,10 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_shared_experts_fusion_disabled,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -1357,37 +1360,33 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if not getattr(text_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
         elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
+            return "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
+            return "Shared experts fusion requires SM80 or newer GPUs."
         elif get_parallel().moe_ep_size > 1:
-            disable_reason = (
+            return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
         elif get_moe_a2a_backend().is_deepep():
-            disable_reason = (
+            return (
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
             )
+        return None
 
-        if disable_reason is not None:
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
+    def determine_num_fused_shared_experts(self):
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
+        if self.num_fused_shared_experts == 0:
             return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
         assert (
             self.num_fused_shared_experts == 1
         ), f"Only 1 fused shared expert is supported for {type(self).__name__}"

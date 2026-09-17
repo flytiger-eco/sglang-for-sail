@@ -192,6 +192,38 @@ class TestGlmMoeGate(_FusionGateCase):
         )
 
 
+class TestGlm5NextGate(_FusionGateCase):
+    def _config(self, **kw):
+        base = dict(text_config=SimpleNamespace(n_shared_experts=1))
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_expert_parallelism_blocks_fusion(self):
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        self._seed()
+        with unittest.mock.patch("sglang.srt.models.glm5_next._is_cuda", True):
+            reason = self._reason(
+                Glm5NextForConditionalGeneration, self._config(), moe_ep_size=8
+            )
+        self.assertIn("expert parallelism", reason)
+
+    def test_deepep_blocks_fusion(self):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+
+        self._seed()
+        with (
+            unittest.mock.patch("sglang.srt.models.glm5_next._is_cuda", True),
+            unittest.mock.patch(
+                "sglang.srt.models.glm5_next.get_moe_a2a_backend",
+                return_value=MoeA2ABackend.DEEPEP,
+            ),
+        ):
+            reason = self._reason(Glm5NextForConditionalGeneration, self._config())
+        self.assertIn("Deepep", reason)
+
+
 class TestMiniMaxGates(_FusionGateCase):
     def test_a_config_without_shared_experts_cannot_fuse(self):
         from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
