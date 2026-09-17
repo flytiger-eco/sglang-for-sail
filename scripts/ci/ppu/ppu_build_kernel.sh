@@ -56,7 +56,7 @@
 #                                  satisfied (that guard keys on a 'ppu' marker in
 #                                  the installed version string).
 #   SGL_KERNEL_WHEEL_CACHE       — set to 0 to disable the NAS wheel cache
-#   SGL_KERNEL_WHEEL_CACHE_DIR   — cache root (default /nas_aisw/cache/sgl-kernel-wheels)
+#   SGL_KERNEL_WHEEL_CACHE_DIR   — cache root (default /mnt/wl_nas/cache/sgl-kernel-wheels)
 
 set -euo pipefail
 
@@ -112,7 +112,7 @@ print(f"{tv}|{cu}|cp{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/n
     fi
 fi
 
-WHEEL_CACHE_DIR="${SGL_KERNEL_WHEEL_CACHE_DIR:-/nas_aisw/cache/sgl-kernel-wheels}"
+WHEEL_CACHE_DIR="${SGL_KERNEL_WHEEL_CACHE_DIR:-/mnt/wl_nas/cache/sgl-kernel-wheels}"
 KEY_DIR=""
 if [ -n "${CACHE_KEY}" ]; then
     KEY_DIR="${WHEEL_CACHE_DIR}/${CACHE_KEY}"
