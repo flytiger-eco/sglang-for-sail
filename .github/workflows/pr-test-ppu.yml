@@ -160,15 +160,26 @@ jobs:
   # ==================== Wait for Stage A ==================== #
   # Mirrors wait-for-stage-a-amd (pr-test-amd.yml): hardware-neutral GitHub
   # API polling on ubuntu-latest, so no PPU runner is occupied while waiting.
-  # Only pull_request runs serialize; workflow_dispatch/workflow_call runs
-  # skip the wait and dispatch the stages without queuing, matching how AMD
-  # handles scheduled runs.
+  #
+  # This wait only makes sense for a standalone pull_request run of THIS
+  # workflow -- of which there are none: the PR path always arrives via
+  # ci.yml's `Full CI` workflow_call. That path (a) inherits
+  # event_name == 'pull_request', so the event check alone cannot tell it apart
+  # from a direct PR run, and (b) renders the stage jobs as
+  # "Full CI / stage-a-...", which the prefix-based wait-for-jobs action never
+  # matches -- so the wait would poll until its 240-minute timeout. ci.yml
+  # signals that gated call by passing require_run_ci_label: false, so we gate
+  # the wait on inputs.require_run_ci_label: it skips on the workflow_call path
+  # (and on workflow_dispatch), and stage-b/c then proceed via their
+  # result == 'skipped' branch -- serialized by `needs: stage-a` and
+  # fast-failed by !failure(), exactly as they already do on dispatch.
   wait-for-stage-a-ppu:
     needs: [check-changes]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
+      inputs.require_run_ci_label &&
       needs.check-changes.outputs.changes_exist == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -270,10 +281,14 @@ jobs:
   # ==================== Wait for Stage B ==================== #
   wait-for-stage-b-ppu:
     needs: [check-changes, wait-for-stage-a-ppu]
+    # Same guard as wait-for-stage-a-ppu: skip on the ci.yml workflow_call path
+    # (require_run_ci_label: false) and on workflow_dispatch; stage-c proceeds
+    # via its result == 'skipped' branch.
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
+      inputs.require_run_ci_label &&
       needs.check-changes.outputs.changes_exist == 'true' &&
       (needs.wait-for-stage-a-ppu.result == 'success' || needs.wait-for-stage-a-ppu.result == 'skipped')
     runs-on: ubuntu-latest

@@ -20,12 +20,20 @@
 # flashinfer; qserve is not vendored), NOT a build defect. Overriding therefore
 # switches the whole run onto the 0.4.6 generation by design.
 #
-# Wheel cache (NAS): the three PPU stages (a/b/c) each run this script and a
-# from-scratch compile costs ~200s. We cache the built wheel on the NAS mount,
-# keyed by the kernel source tree + toolchain, so identical sources are compiled
-# at most once. Most PRs never touch python/sglang/kernels/aot/, so the common
-# case is a cache HIT and a ~10s install with no compile. See the cache section
-# below for the key definition and override knobs.
+# Coverage: this script is the single kernel-install entry point for EVERY PPU
+# suite, because they all reach it through ppu_install_dependency.sh --
+# pr-test-ppu (the three stages a/b/c) and nightly-test-ppu call it directly,
+# while the answer / perf / pd-perf / accuracy(evalscope) suites call it from
+# their run_*_suite_board.sh. So the source-build override applies uniformly to
+# every PPU run, not just the PR gate.
+#
+# Wheel cache (NAS): a from-scratch compile costs ~200s. We cache the built
+# wheel on the shared NAS mount, keyed by the kernel source tree + toolchain, so
+# identical sources are compiled at most once ACROSS ALL of the suites above --
+# whichever job runs first compiles and backfills, the rest get a ~10s install
+# with no compile. Most PRs never touch python/sglang/kernels/aot/, so the common
+# case is a cross-workflow cache HIT. See the cache section below for the key
+# definition and override knobs.
 #
 # Prerequisites (all satisfied inside the PPU CI Docker container):
 #   - torch with PPU CUDA support (already installed in base image; torch.version.cuda != None)
