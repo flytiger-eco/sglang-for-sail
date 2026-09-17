@@ -153,7 +153,7 @@ jobs:
             { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
             cd test &&
             python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
-          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
           # SGLANG_TEST_MAX_RETRY=0: test_ppu_basic.py is a CustomTestCase, so
           # SGLANG_IS_IN_CI=true retries a failure once (2x194.5s ~ 399s > 5 min
           # budget). A smoke gate must fail fast and retries would mask flakiness
@@ -224,7 +224,7 @@ jobs:
             { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
             cd test &&
             python3 run_suite.py --hw ppu --suite stage-b-test-1-gpu-ppu --continue-on-error
-          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
           extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0"
           container_options: |
             host_ipc: true
@@ -286,7 +286,7 @@ jobs:
             { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
             cd test &&
             python3 run_suite.py --hw ppu --suite stage-c-test-2-gpu-ppu --continue-on-error
-          host_volumes: "/nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi"
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
           extra_env: "SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0"
           container_options: |
             host_ipc: true

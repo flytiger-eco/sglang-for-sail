@@ -72,6 +72,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
+            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
@@ -156,6 +158,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
+            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
@@ -223,6 +227,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
+            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
@@ -284,6 +290,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
+            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
@@ -344,6 +352,8 @@ jobs:
             -v ${{ github.workspace }}:/workspace \
             -v /nas_aisw:/nas_aisw \
             -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
+            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
+            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
