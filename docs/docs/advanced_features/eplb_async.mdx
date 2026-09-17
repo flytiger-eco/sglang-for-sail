@@ -65,7 +65,7 @@ graph TB
 
 #### 1. EPLBAsyncRuntime（C++ 运行时）
 
-位于 [eplb_async_runtime.cpp](/python/sglang/jit_kernel/csrc/eplb/eplb_async_runtime.cpp)，是整个异步机制的核心。它包含：
+位于 [eplb_async_runtime.cpp](https://github.com/flytiger-eco/sglang-for-sail/blob/v0.5.18/python/sglang/kernels/jit/csrc/eplb/eplb_async_runtime.cpp)，是整个异步机制的核心。它包含：
 
 - **worker_thread**：协调每层推理与权重更新的时序。每个 forward iteration 开始时，为所有注册的层设置 GPU-stage 信号，然后等待 GPU 完成该层计算（CPU-stage 信号返回）。
 - **update_thread**：执行实际的 H2D 权重拷贝。使用独立的 `copy_stream_` CUDA 流，通过 `cudaMemcpyAsync` 将 Host 镜像中的权重拷贝到 GPU。
@@ -106,7 +106,7 @@ graph TB
 
 #### 2. EPLBAsyncHostMirrorManager（Host 权重镜像）
 
-位于 [eplb_async_host_mirror.py](/python/sglang/srt/eplb/eplb_async_host_mirror.py)，维护所有专家权重的 Host 侧副本。
+位于 [eplb_async_host_mirror.py](https://github.com/flytiger-eco/sglang-for-sail/blob/v0.5.18/python/sglang/srt/eplb/eplb_async_host_mirror.py)，维护所有专家权重的 Host 侧副本。
 
 - **SHM（SharedMemory）镜像**：节点内 rank 0 创建共享内存段存储专家权重，其他 rank 通过 `attach` 复用。支持跨进程复用（`SGLANG_EPLB_ASYNC_HOST_MIRROR_REUSE_SHM`）。
 - **跨节点 P2P 传输**：多节点场景下，通过 NCCL P2P（`isend`/`irecv`）将专家权重从源节点传输到目标节点的 Host 镜像。
@@ -114,7 +114,7 @@ graph TB
 
 #### 3. EPLBManager 异步入口（Python 状态机）
 
-位于 [eplb_manager.py](/python/sglang/srt/eplb/eplb_manager.py)，通过 Python generator 实现三阶段状态机：
+位于 [eplb_manager.py](https://github.com/flytiger-eco/sglang-for-sail/blob/v0.5.18/python/sglang/srt/eplb/eplb_manager.py)，通过 Python generator 实现三阶段状态机：
 
 ```mermaid
 stateDiagram-v2
@@ -144,7 +144,7 @@ stateDiagram-v2
 
 #### 4. ExpertLocationUpdater 异步路径
 
-位于 [expert_location_updater.py](/python/sglang/srt/eplb/expert_location_updater.py)，负责：
+位于 [expert_location_updater.py](https://github.com/flytiger-eco/sglang-for-sail/blob/v0.5.18/python/sglang/srt/eplb/expert_location_updater.py)，负责：
 
 - **`prepare_async_layers()`**：模型加载后，为每层注册到 C++ runtime（创建信号和 flag）。
 - **`submit_prepared_async_plan()`**：将 Python 层计算好的 copy plan 转换为 C++ `PreparedPlan` 并提交。
@@ -154,7 +154,7 @@ stateDiagram-v2
 
 #### 5. 信号机制详解
 
-信号定义在 [eplb_async_signal_runtime.h](/python/sglang/jit_kernel/include/sgl_kernel/eplb_async_signal_runtime.h)：
+信号定义在 [eplb_async_signal_runtime.h](https://github.com/flytiger-eco/sglang-for-sail/blob/v0.5.18/python/sglang/kernels/jit/include/sgl_kernel/eplb_async_signal_runtime.h)：
 
 ```mermaid
 graph LR
