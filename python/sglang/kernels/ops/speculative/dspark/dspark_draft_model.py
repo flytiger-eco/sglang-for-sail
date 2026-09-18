@@ -310,13 +310,7 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
         (out_dim + block - 1) // block,
         (in_dim + block - 1) // block,
     )
-    # Channelwise fp8 layers carry weight_scale ([out, 1]) instead of the
-    # block scale; they are not fusible here and fall back to the per-linear
-    # torch path.
-    scale = getattr(linear, "weight_scale_inv", None)
-    if scale is None:
-        return False
-    return tuple(scale.shape) == expected_scale_shape
+    return tuple(linear.weight_scale_inv.shape) == expected_scale_shape
 
 
 def _fused_commit_kv_proj_supported(*, wkv_linears: list[torch.nn.Module]) -> bool:
