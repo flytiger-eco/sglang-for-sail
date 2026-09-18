@@ -53,6 +53,11 @@
   },
   "evaluation": {
     "dataset": "dataset/answer_cases_zh_v1.json",
-    "quality_profile": "dataset/quality_profile.json"
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 10,
+      "known_failures": [],
+      "note": "Seeded from v0.5.13 Answer PR-stack run 34100574370 (ZW-M890P single board, 10/10 at temperature 0). No known model-capability misses; any miss on the M890P probe reddens as a regression."
+    }
   }
 }

@@ -47,6 +47,13 @@
   },
   "evaluation": {
     "dataset": "dataset/answer_cases_zh_v1.json",
-    "quality_profile": "dataset/quality_profile.json"
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 9,
+      "known_failures": [
+        "deepseek-letter-count"
+      ],
+      "note": "Seeded from the ZW810E measured baseline (ptg-ppu-02, 16 x PPU-ZW810E 96GiB, 2026-09-01, eight devices, 9/10 at temperature 0; see README 'Measured baseline (ZW810E)'). deepseek-letter-count is a model-capability miss (fact_rule_failed, finish_reason=stop), not an infrastructure failure. This ZW810E line is retired from the active nightly and is NOT validated by the M890P probe; the -144g sibling carries the M890P coverage."
+    }
   }
 }
