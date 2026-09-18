@@ -1,0 +1,69 @@
+name: Nightly Answer Test (PPU)
+
+# Orchestrator only: this workflow owns no runner and runs no test itself. It
+# fans out to the three reusable Answer workflows through workflow_call so the
+# whole btv1.5 Answer line has a single scheduled and dispatchable entry point.
+# The single-board matrix, the two-node line, and the four-node line each keep
+# their own file, concurrency group, artifacts, and dispatch entry; this file
+# only starts all three against one commit. It replaces the earlier local-`ppu`
+# (ZW810E, 96GiB) matrix: that hardware is retired from the Answer line and the
+# btv1.5 coverage now runs entirely on the ZW-M890P (144GiB) K8s boards.
+
+on:
+  schedule:
+    # 21:00 UTC == 05:00 Beijing, offset from nightly-test-ppu.yml (0 16 * * *)
+    # so the two nightly lines do not start together. GitHub evaluates schedule
+    # only on the repository's default branch, so this cron fires only once this
+    # file is on the default branch; on a version branch it stays dormant and
+    # the line is exercised by dispatch (or by a default-branch caller).
+    - cron: '0 21 * * *'  # 5:00 AM Beijing Time (UTC+8) every day
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: nightly-test-ppu-answer-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # No `needs` between the three: the boards they claim are disjoint (a single
+  # board, two nodes, four nodes), so they are dispatched together and the
+  # cluster schedules each as capacity frees. A failure in one does not cancel
+  # the others -- one model line's verdict must not suppress another's evidence.
+  # Every callee is pinned to the same commit through `ref` so all three judge
+  # one revision, and `secrets: inherit` hands down the PPU artifactory
+  # credentials the pods need.
+  answer-single-board:
+    name: Answer (single board)
+    uses: ./.github/workflows/test-ppu-answer.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+    secrets: inherit
+
+  answer-two-node:
+    name: Answer (two nodes)
+    uses: ./.github/workflows/test-ppu-answer-16.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+    secrets: inherit
+
+  answer-four-node:
+    name: Answer (four nodes)
+    uses: ./.github/workflows/test-ppu-answer-32.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+    secrets: inherit

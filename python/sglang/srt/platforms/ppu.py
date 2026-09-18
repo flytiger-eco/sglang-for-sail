@@ -73,6 +73,15 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
 # Each module registers @plugin_hook decorators that inject PPU-native ops
 # into the respective backends transparently.
 if is_ppu_available():
+    from sglang.srt.hardware_backend.ppu.kernel_version_check import (
+        check_ppu_kernel_version,
+    )
+
+    # Surface a wrong/mismatched sgl-kernel (e.g. a stray upstream CUDA wheel)
+    # explicitly instead of running silently; the upstream engine.py assertion
+    # is _is_cuda-gated and never fires on PPU.
+    check_ppu_kernel_version()
+
     import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401

@@ -1653,6 +1653,11 @@ class Envs:
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_SAIL_PLA_CUDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
+    # Make the PPU sgl-kernel version guard fatal instead of warn-only.
+    # See hardware_backend/ppu/kernel_version_check.py: by default a kernel
+    # that is not the expected PPU build only logs a WARNING; set this to 1
+    # to raise instead.
+    SGLANG_PPU_KERNEL_VERSION_STRICT = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
     SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)

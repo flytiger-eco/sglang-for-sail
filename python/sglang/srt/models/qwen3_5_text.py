@@ -205,7 +205,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
             }
         )
 
