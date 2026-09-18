@@ -222,10 +222,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self._max_seqlen_q = spec_info.draft_token_num
             else:
                 self._max_seqlen_q = 1
-        if in_capture and forward_batch.forward_mode.is_decode_or_idle():
+        if in_capture and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+            if forward_batch.forward_mode.is_target_verify():
+                # TARGET_VERIFY keeps seq_lens at the committed prefix and
+                # writes draft_token_num new KV entries after it.
+                spec_info = getattr(forward_batch, "spec_info", None)
+                if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+                    self._max_seqlen_k += int(spec_info.draft_token_num)
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -391,12 +400,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
+        base_seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if forward_batch.forward_mode.is_target_verify():
+            # EAGLE TARGET_VERIFY leaves forward_batch.seq_lens at the
+            # committed prefix. The verify tokens are written to
+            # [seq_lens, seq_lens + draft_token_num), so sparse attention must
+            # see the old length as prefix_lens and the post-write length as
+            # seq_lens.
+            prefix_lens = base_seq_lens
+            seq_lens = base_seq_lens + extend_seq_lens
+        elif forward_batch.extend_prefix_lens is not None:
+            seq_lens = base_seq_lens
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
-            # TARGET_VERIFY: the part cached before the draft tokens.
-            # prefix_lens + extend_seq_lens == seq_lens must hold.
+            seq_lens = base_seq_lens
             prefix_lens = seq_lens - extend_seq_lens
 
         # DP attention pads q beyond the real token count for collective alignment;
