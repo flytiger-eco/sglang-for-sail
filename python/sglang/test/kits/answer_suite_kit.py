@@ -255,6 +255,36 @@ class AnswerSuiteMixin:
         print(render_summary(report), flush=True)
 
     @classmethod
+    def _open_server_logs(cls):
+        """Files the launched server's stdout and stderr are teed into.
+
+        `popen_launch_server` otherwise lets the child inherit this process's
+        streams, which in the K8s job reach only the pod console and are gone
+        once the pod is collected.  A `server_start` failure then leaves the
+        report's `reason_code` and nothing that says why the bringup died, so
+        the traceback is persisted beside the report the workflow already
+        collects.  Each node opens its own pair under its own report directory,
+        because a worker's bringup crash is as much the run's cause as rank 0's
+        and would otherwise be written over the same two names.
+
+        The pair is line-buffered and left open on purpose: the streaming
+        threads flush every line, so whatever the server managed to say is on
+        disk even when it dies before the API answers, and the pod's own exit
+        is what closes them -- which happens before the workflow reads the
+        directory back.
+        """
+
+        cls.report_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            (cls.report_dir / "server.stdout.log").open(
+                "w", encoding="utf-8", buffering=1
+            ),
+            (cls.report_dir / "server.stderr.log").open(
+                "w", encoding="utf-8", buffering=1
+            ),
+        )
+
+    @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.test_config, cls.test_config_path = cls._load_test_config()
@@ -329,6 +359,10 @@ class AnswerSuiteMixin:
             cls.base_url = DEFAULT_URL_FOR_TEST
             stage = "server_start"
             failure_class = "server_error"
+            # Persist the server's own streams beside the report; see
+            # _open_server_logs.  Without this a bringup crash leaves only the
+            # generic reason_code, because the child's output would reach only
+            # the pod console and vanish with the pod.
             cls.process = popen_launch_server(
                 model=cls.model_path,
                 base_url=cls.base_url,
@@ -337,6 +371,7 @@ class AnswerSuiteMixin:
                     cls.test_config, distributed=cls.distributed
                 ),
                 env=cls._server_environment(),
+                return_stdout_stderr=cls._open_server_logs(),
             )
             # A worker rank serves a dummy health endpoint once its own
             # schedulers are ready, so the launch above returns on every node and
