@@ -42,13 +42,16 @@ jobs:
     uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 
-  # Stage 4: 完整业务 CI
+  # Stage 4: 完整业务 CI —— 人工审批通过后，经 workflow_call 串起完整 PPU 套件。
+  # 被调 workflow 继承本 workflow 的 pull_request 事件，其 run-ci label 门禁会默认
+  # 静默跳过全部作业，故显式传 require_run_ci_label: false 绕过（human-review 已放行）。
+  # 同仓 ./ 引用：被调方从本次 commit（PR merge ref）加载；不额外传 ref，其
+  # `inputs.ref || github.ref` 回退到 PR merge ref。PPU_ARTIFACTORY 凭据经
+  # secrets: inherit 传递。
   ci:
     name: Full CI
     needs: human-review
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run full CI
-        run: |
-          echo "在此替换为你的完整 CI 命令（构建 / 单测 / 打包等）"
+    uses: ./.github/workflows/pr-test-ppu.yml
+    with:
+      require_run_ci_label: false
+    secrets: inherit
