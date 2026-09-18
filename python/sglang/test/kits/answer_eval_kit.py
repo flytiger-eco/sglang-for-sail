@@ -536,9 +536,7 @@ def validate_baseline(baseline: Any) -> None:
         )
     min_score = baseline.get("min_score")
     if min_score is not None and (
-        not isinstance(min_score, int)
-        or isinstance(min_score, bool)
-        or min_score < 0
+        not isinstance(min_score, int) or isinstance(min_score, bool) or min_score < 0
     ):
         raise AnswerEvalError(
             "evaluation.baseline.min_score must be a non-negative integer"
