@@ -505,6 +505,45 @@ def validate_test_config(config: dict[str, Any]) -> None:
                 f"evaluation.{field} must stay relative to the Answer data root"
             )
 
+    validate_baseline(config["evaluation"].get("baseline"))
+
+
+def validate_baseline(baseline: Any) -> None:
+    """Validate the optional per-model regression baseline.
+
+    The baseline is what turns the nightly from an absolute pass/fail into a
+    regression gate: ``known_failures`` lists case ids the checkpoint is known
+    to miss for model-capability (not infrastructure) reasons, and
+    ``min_score`` is the floor of passing cases below which the run reddens
+    even if every remaining miss was expected.  Absent baseline keeps the old
+    strict behaviour (any miss reddens).
+    """
+
+    if baseline is None:
+        return
+    if not isinstance(baseline, dict):
+        raise AnswerEvalError("evaluation.baseline must be an object")
+    known = baseline.get("known_failures", [])
+    if not isinstance(known, list) or any(
+        not isinstance(item, str) or not item for item in known
+    ):
+        raise AnswerEvalError(
+            "evaluation.baseline.known_failures must be a list of case ids"
+        )
+    if len(set(known)) != len(known):
+        raise AnswerEvalError(
+            "evaluation.baseline.known_failures must not repeat a case id"
+        )
+    min_score = baseline.get("min_score")
+    if min_score is not None and (
+        not isinstance(min_score, int)
+        or isinstance(min_score, bool)
+        or min_score < 0
+    ):
+        raise AnswerEvalError(
+            "evaluation.baseline.min_score must be a non-negative integer"
+        )
+
 
 def resolve_evaluation_paths(
     config: dict[str, Any], data_root: Path
@@ -811,10 +850,18 @@ def _finding(
     threshold: Any,
     evidence: str | None = None,
     rule_description: str | None = None,
+    severity: str = "critical",
 ) -> dict[str, Any]:
+    # severity separates infrastructure/contract breakage ("critical": bad
+    # serving stack, garbled output, wrong finish_reason) from model-capability
+    # misses ("model": a fact rule the checkpoint simply gets wrong).  Engine
+    # internal checks default to "critical"; fact-rule findings are re-stamped
+    # with the rule's severity in evaluate_case.  The per-case verdict ignores
+    # severity; only the run-level regression gate reads it.
     result = {
         "reason_code": reason_code,
         "action": action,
+        "severity": severity,
         "observed": observed,
         "threshold": threshold,
     }
@@ -1611,6 +1658,10 @@ def evaluate_case(
     for rule in case["rules"]:
         finding = _evaluate_rule(rule, normalized)
         if finding:
+            # A fact rule reflects model capability by default; a rule may opt
+            # into "critical" when its miss would instead signal a broken
+            # contract that must always gate.
+            finding["severity"] = rule.get("severity", "model")
             findings.append(finding)
 
     result = {
@@ -1809,11 +1860,74 @@ def build_label_candidates(
     return candidates
 
 
+def _evaluate_regression_gate(
+    results: list[dict[str, Any]],
+    baseline: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Decide whether a run regressed, given a per-model baseline.
+
+    The per-case verdict stays strict (any hard_fail -> failed); this gate is a
+    separate, run-level judgement layered on top so a known model-capability
+    miss no longer reddens the nightly on every run.  A run regresses when:
+      * a failure carries a "critical" severity finding (broken serving stack,
+        garbled output, wrong finish_reason) -- never tolerated;
+      * a "model" failure lands on a case that is NOT in known_failures -- a
+        genuinely new miss;
+      * the count of passing cases drops below min_score (the floor guard).
+    Cases listed in known_failures that now pass are reported as
+    unexpected_passes so the baseline can be tightened.  With no baseline the
+    allowlist is empty and the floor is unset, so any miss regresses -- exactly
+    the old strict behaviour.
+    """
+
+    baseline = baseline or {}
+    known = set(baseline.get("known_failures", []))
+    min_score = baseline.get("min_score")
+
+    critical_failures: list[str] = []
+    new_regressions: list[str] = []
+    known_failures_hit: list[str] = []
+    unexpected_passes: list[str] = []
+
+    for result in results:
+        case_id = result["case_id"]
+        if result["verdict"] == "failed":
+            has_critical = any(
+                finding["action"] == "hard_fail"
+                and finding.get("severity", "critical") == "critical"
+                for finding in result["findings"]
+            )
+            if has_critical:
+                critical_failures.append(case_id)
+            elif case_id in known:
+                known_failures_hit.append(case_id)
+            else:
+                new_regressions.append(case_id)
+        elif case_id in known:
+            unexpected_passes.append(case_id)
+
+    passed = sum(result["verdict"] == "passed" for result in results)
+    score_below_baseline = min_score is not None and passed < int(min_score)
+    regressed = bool(critical_failures or new_regressions) or score_below_baseline
+    return {
+        "baseline_applied": bool(baseline),
+        "min_score": min_score,
+        "passed": passed,
+        "regressed": regressed,
+        "critical_failures": sorted(critical_failures),
+        "new_regressions": sorted(new_regressions),
+        "known_failures_hit": sorted(known_failures_hit),
+        "unexpected_passes": sorted(unexpected_passes),
+        "score_below_baseline": score_below_baseline,
+    }
+
+
 def build_report(
     dataset: dict[str, Any],
     profile: dict[str, Any],
     responses: dict[str, dict[str, Any]],
     provenance: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_dataset(dataset)
     validate_profile(profile)
@@ -1882,6 +1996,7 @@ def build_report(
         any(finding["action"] == "suspect" for finding in result["findings"])
         for result in results
     )
+    gate = _evaluate_regression_gate(results, baseline)
     report = {
         "schema_version": "ppu-answer-result/v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1906,6 +2021,7 @@ def build_report(
             "failed": hard_failed,
             "suspect": suspects,
             "verdict": "passed" if hard_failed == 0 else "failed",
+            "gate": gate,
             "semantic_coverage": "L0/L1 only; LLM-as-Judge deferred",
         },
         "cases": results,
