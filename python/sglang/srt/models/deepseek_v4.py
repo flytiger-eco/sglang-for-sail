@@ -615,7 +615,7 @@ class MqaAttentionBase(nn.Module):
                 # channelwise
                 assert hasattr(
                     self.wo_a, "weight_scale"
-                ), "FP8 quant_config must create weight_scale"
+                ), "FP8 quant_config must create weight_scale_inv"
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
