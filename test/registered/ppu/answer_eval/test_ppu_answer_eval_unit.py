@@ -1942,6 +1942,38 @@ class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
                 self.root / "ranks" / f"rank-{node_rank}",
             )
 
+    def test_each_node_persists_its_server_streams_beside_its_report(self):
+        # A server_start crash is the run's cause yet the report carries only a
+        # generic reason_code; the traceback survives only because the child's
+        # streams are teed to files under the node's own report directory,
+        # where the workflow already collects the results.  Each node opens its
+        # own pair so a worker's bringup crash is not written over rank 0's.
+        for node_rank in range(4):
+            node = self.node(node_rank)
+            stdout, stderr = node._open_server_logs()
+            self.addCleanup(stdout.close)
+            self.addCleanup(stderr.close)
+            self.assertEqual(
+                (Path(stdout.name), Path(stderr.name)),
+                (
+                    node.report_dir / "server.stdout.log",
+                    node.report_dir / "server.stderr.log",
+                ),
+            )
+            # Line-buffered and flushed per line, so a server that dies before
+            # the API answers still leaves what it said on disk.
+            stdout.write("bringing up\n")
+            self.assertEqual(
+                (node.report_dir / "server.stdout.log").read_text(encoding="utf-8"),
+                "bringing up\n",
+            )
+        # Rank 0's pair lands where the workflow collects; a worker's under its
+        # own rank directory, so the four servers do not share two names.
+        self.assertTrue((self.root / "server.stdout.log").is_file())
+        self.assertTrue(
+            (self.root / "ranks" / "rank-3" / "server.stderr.log").is_file()
+        )
+
     def test_each_node_states_the_group_to_its_own_server(self):
         # The config's own reviewed variables are applied first and the group's
         # description of itself second, so each node launches with server.env
