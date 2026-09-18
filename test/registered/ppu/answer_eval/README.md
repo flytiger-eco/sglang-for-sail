@@ -1073,16 +1073,34 @@ config is unaffected.
 
 ### Seeding a baseline
 
-A baseline is seeded only from a run verified correct. The two seeded configs —
-`qwen3.8/27b-bf16-144g.json` (7/10) and `qwen3.5/397b-a17b-w8a8-int8-144g.json`
-(9/10) — take their `known_failures` from the temperature-0 runs confirmed
-byte-identical to the v0.5.13 answers. To seed another model: run its suite
-once, confirm each miss is a genuine model-capability result (clean request
-path, `finish_reason=stop`, rule correct) rather than an infrastructure
+A baseline is seeded only from a run verified correct. To seed a model: run its
+suite once, confirm each miss is a genuine model-capability result (clean
+request path, `finish_reason=stop`, rule correct) rather than an infrastructure
 failure, then record those case ids in `known_failures` and set `min_score` to
 the passing count. Never add a case to `known_failures` to silence a `critical`
 finding — severity keeps that impossible by construction, and doing so would
 hide a real regression.
+
+Fourteen of the seventeen configs carry a baseline, each seeded from the
+temperature-0 verdicts of the v0.5.13 Answer PR-stack. The twelve M890P entries
+take their `known_failures` and `min_score` from the reference grading — run
+`34100574370` for the ten single-board `-144g` entries, run `34944181107` for
+the two-node `qwen3.8/2.4t-a95b-mxfp4-fp8-144g`, and run `33849322347` for the
+four-node `qwen3.8/2.4t-a95b-fp8-144g` — where every miss is a `fact_rule_failed`
+on a shared-corpus golden case (`deepseek-letter-count` in eight entries,
+`red-ball-probability` and `henan-bordering-provinces` on the weaker
+checkpoints) with `finish_reason=stop` and a clean request path. The two retired
+ZW810E (`-96g`) configs take their baselines from the on-machine ptg-ppu-02
+measured baseline above; they are not validated by the M890P probe.
+
+The remaining three configs stay unseeded and therefore strict, because the
+v0.5.13 stack never produced a valid model verdict for them:
+`kimi2.6/w4a8-int8-144g.json` and `kimi2.6/w8a8-int8-144g-2n.json` reddened on
+`server_start_failed` (the open ACEXT W4A8 kernel gap and a pipeline-parallel
+defect — infrastructure, never eligible for `known_failures`), and
+`minimax2.7/mxfp4-fp8-144g.json` crashed the report builder before grading.
+Each earns its first baseline only from a clean v0.5.18 M890P probe on this
+branch, not from v0.5.13 history.
 
 ## Measured baseline (ZW-M890P)
 
