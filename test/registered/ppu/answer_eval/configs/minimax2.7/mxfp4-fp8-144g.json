@@ -45,6 +45,11 @@
   },
   "evaluation": {
     "dataset": "dataset/answer_cases_zh_v1.json",
-    "quality_profile": "dataset/quality_profile.json"
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 9,
+      "known_failures": ["henan-bordering-provinces"],
+      "note": "Seeded from the v0.5.18 M890P probe run 35315230192 (ZW-M890P eight devices, 9/10 at temperature 0). The single miss is henan-bordering-provinces, a fact_rule_failed with severity=model, finish_reason=stop and a clean request path (no critical finding); the same case is an accepted known model-capability miss on qwen3.8/27b-bf16-144g. v0.5.13 produced no valid verdict for this config (report-builder crash on the empty-answer invariant), so this is its first baseline; any additional miss on the M890P probe reddens as a regression."
+    }
   }
 }
