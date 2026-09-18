@@ -25,9 +25,10 @@ name: Nightly Answer Test (PPU)
 
 on:
   schedule:
-    # 21:00 UTC == 05:00 Beijing, offset from nightly-test-ppu.yml (0 16 * * *)
-    # so the two nightly lines do not start together.
-    - cron: '0 21 * * *'  # 5:00 AM Beijing Time (UTC+8) every day
+    # 16:00 UTC == 00:00 Beijing (UTC+8). This answer scheduler is the only PPU
+    # nightly cron on `main` (nightly-test-ppu.yml lives on v0.5.18, not here), so
+    # there is no sibling nightly line to offset against.
+    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
   workflow_dispatch:
     inputs:
       ref:
