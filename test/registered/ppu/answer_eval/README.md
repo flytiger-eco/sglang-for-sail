@@ -1081,7 +1081,7 @@ the passing count. Never add a case to `known_failures` to silence a `critical`
 finding — severity keeps that impossible by construction, and doing so would
 hide a real regression.
 
-Fourteen of the seventeen configs carry a baseline, each seeded from the
+Fifteen of the seventeen configs carry a baseline. Fourteen are seeded from the
 temperature-0 verdicts of the v0.5.13 Answer PR-stack. The twelve M890P entries
 take their `known_failures` and `min_score` from the reference grading — run
 `34100574370` for the ten single-board `-144g` entries, run `34944181107` for
@@ -1093,14 +1093,92 @@ checkpoints) with `finish_reason=stop` and a clean request path. The two retired
 ZW810E (`-96g`) configs take their baselines from the on-machine ptg-ppu-02
 measured baseline above; they are not validated by the M890P probe.
 
-The remaining three configs stay unseeded and therefore strict, because the
-v0.5.13 stack never produced a valid model verdict for them:
-`kimi2.6/w4a8-int8-144g.json` and `kimi2.6/w8a8-int8-144g-2n.json` reddened on
-`server_start_failed` (the open ACEXT W4A8 kernel gap and a pipeline-parallel
-defect — infrastructure, never eligible for `known_failures`), and
-`minimax2.7/mxfp4-fp8-144g.json` crashed the report builder before grading.
-Each earns its first baseline only from a clean v0.5.18 M890P probe on this
-branch, not from v0.5.13 history.
+The fifteenth baseline, `minimax2.7/mxfp4-fp8-144g.json`, is seeded not from
+v0.5.13 but from the v0.5.18 M890P probe run `35315230192` (9/10 at
+temperature 0), because v0.5.13 never produced a valid verdict for it — the
+report builder crashed on the empty-answer invariant before grading. Its one
+miss, `henan-bordering-provinces`, is a model-severity `fact_rule_failed` with
+`finish_reason=stop` and a clean request path, the same case already accepted as
+a known model-capability miss on `qwen3.8/27b-bf16-144g`. See the cross-version
+comparison below.
+
+The remaining two configs stay unseeded and therefore strict, because no run has
+yet produced a clean, stable model verdict for them.
+`kimi2.6/w4a8-int8-144g.json` reddens on `server_start_failed` — the open ACEXT
+W4A8 kernel gap, infrastructure that is never eligible for `known_failures`.
+`kimi2.6/w8a8-int8-144g-2n.json` is not stable across v0.5.18 runs: it graded
+10/10 on run `34961981320` but 6/10 on the probe run `35315230192`, where
+`spring-dawn-poem` exhausted its whole 8192-token budget in reasoning and
+returned an empty answer at `finish_reason=length` — a `critical` finding, never
+eligible for `known_failures`. Each earns its first baseline only from a clean,
+repeatable M890P probe, not by silencing a critical.
+
+## v0.5.18 cross-version regression comparison
+
+The v0.5.18 branch was probed in full on 2026-09-18 as run
+[35315230192](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/35315230192),
+source revision `83dbd4295b341b6892e7fc8db652503db814f06f`, fifteen M890P
+entries on the `sglang0.5.13-py312` base image, one shared dataset digest
+(`891275f6`). Each entry was compared case-for-case against its v0.5.13 Answer
+PR-stack history (single-board run `34100574370`, two-node `34132812028`,
+four-node `33849322347`). The comparison judges on verdict, reason_code, and the
+failing-case set rather than byte-identical answers: greedy decoding at
+temperature 0 is not byte-reproducible across kernels or SDK versions, so an
+objective answer whose text differs but still grades correct is a benign format
+difference, not a regression.
+
+Eleven entries had comparable v0.5.13 history:
+
+| Entry | v0.5.13 | v0.5.18 | Classification |
+| --- | --- | --- | --- |
+| `qwen3.8-27b-bf16` | 7/10 | 7/10 | consistent |
+| `qwen3.5-397b-fp8-channelwise` | 9/10 | 9/10 | consistent |
+| `qwen3.5-397b-w8a8-int8` | 9/10 | 9/10 | benign byte diff |
+| `qwen3.5-397b-mxfp4-fp8` | 9/10 | 9/10 | benign byte diff |
+| `glm5.2-fp8-channelwise` | 8/10 | 8/10 | benign byte diff |
+| `glm5.2-mxfp4-fp8` | 10/10 | 10/10 | benign byte diff |
+| `minimax2.7-w8a8-int8` | 10/10 | 10/10 | benign byte diff |
+| `kimi2.6-mxfp4-fp8` | 9/10 | 9/10 | benign byte diff |
+| `32` (four-node) | 10/10 | 10/10 | benign byte diff |
+| `glm5.2-w8a8-int8` | 8/10 | **0/10** | **real regression** |
+| `minimax2.7-fp8-channelwise` | 10/10 | **9/10** | **real regression** |
+
+Nine of the eleven are regression-consistent: the same cases pass, the same
+cases miss, and every miss keeps its v0.5.13 reason_code and severity. The seven
+marked "benign byte diff" differ only in the byte form of one or more objective
+answers that still grade correct — for example `glm5.2-mxfp4-fp8`, where six
+objective answers changed text but all ten still passed. Their baselines are
+unchanged.
+
+Two entries are real regressions and stay red; neither baseline is loosened to
+hide them:
+
+- `glm5.2-w8a8-int8` fell from 8/10 to **0/10**. All ten cases now degenerate:
+  `finish_reason=length` with `periodic_fragment_repeat` and
+  `repeated_4gram_coverage` (`critical`) on every case. The gate reads
+  `regressed=true`, `score_below_baseline=true` against its `min_score=8` — the
+  baseline catches the regression exactly as intended.
+- `minimax2.7-fp8-channelwise` fell from 10/10 to **9/10**. The open-ended
+  `xian-three-day-trip` newly fails with a `fact_rule_failed`
+  (`finish_reason=stop`, model severity). The gate reads `regressed=true`,
+  `new_regressions=[xian-three-day-trip]` against its `min_score=10`.
+
+The remaining four probe entries had no comparable v0.5.13 verdict in this set:
+
+- `16-qwen3.8-2.4t-a95b-mxfp4-fp8` graded 10/10, matching its existing
+  `min_score=10` baseline. That baseline was seeded from the two-node run
+  `34944181107`, which is not among the three history runs downloaded for this
+  comparison, so the 10/10 here simply satisfies the gate rather than being
+  re-diffed against an artifact.
+- `minimax2.7-mxfp4-fp8` graded 9/10 with one model-severity miss and no
+  critical, and is seeded from this run (above).
+- `kimi2.6-w4a8-int8` reddened on `server_start_failed` (ACEXT W4A8 kernel gap)
+  and `kimi2.6-w8a8-int8-2n` carried a `critical` token-exhaustion finding; both
+  stay unseeded (above).
+
+The two retired ZW810E (`-96g`) configs are not part of this fifteen-entry M890P
+probe; they keep their own measured baselines and are excluded from the probe's
+coverage claim.
 
 ## Measured baseline (ZW-M890P)
 
@@ -1295,10 +1373,15 @@ The A95B run verifies the `LazyValue` hardening and the missing
 `PPMissingLayer` guard in `qwen3_5_text.py`; the workflow body also carries the
 PCCL MNNVL opt-out required for two-node initialization on this cluster. The
 Kimi run verifies that `thinking: true` produces balanced reasoning blocks and
-that an 8192-token completion budget is sufficient. With 2048 tokens, eight of
-ten cases ended at `finish_reason=length` before a final answer; with thinking
-disabled, the parser received an unmatched closing tag and reasoning leaked
-into graded text.
+that an 8192-token completion budget was sufficient on that run. With 2048
+tokens, eight of ten cases ended at `finish_reason=length` before a final
+answer; with thinking disabled, the parser received an unmatched closing tag and
+reasoning leaked into graded text. The budget is not sufficient on every run,
+however: on the later probe run `35315230192` this entry dropped to 6/10 and
+`spring-dawn-poem` consumed the full 8192 tokens in reasoning, ending at
+`finish_reason=length` with an empty answer. Reasoning-token consumption on this
+checkpoint varies run to run — `red-ball-probability` alone took 4789 reasoning
+tokens on the probe — so the config stays unseeded pending a stable budget.
 
 These runs satisfy the workflow's original requirement for measured green
 results. `test-ppu-answer-16.yml` remains dispatch-only until a
