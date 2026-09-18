@@ -1922,6 +1922,22 @@ def _evaluate_regression_gate(
     }
 
 
+def _reasoning_capture_needed(result: dict[str, Any]) -> bool:
+    """Whether a case's chain-of-thought is worth persisting for diagnosis.
+
+    True for the exhaustion signature -- a ``length`` finish_reason or an empty
+    final answer -- where the reasoning text is the only surface that explains
+    why the model produced nothing usable, letting a reader tell a runaway
+    reasoning loop from a genuinely long answer clipped at the token ceiling.
+    Every other case keeps just the ``reasoning_sha256`` digest so the artifact
+    stays lean and the disclosure surface stays minimal.
+    """
+
+    if result.get("finish_reason") == "length":
+        return True
+    return not normalize_answer(result.get("final_answer") or "")
+
+
 def build_report(
     dataset: dict[str, Any],
     profile: dict[str, Any],
@@ -1973,11 +1989,16 @@ def build_report(
             )
             result["returned_model"] = response.get("model")
             result["usage"] = response.get("usage")
+            reasoning_text = response.get("reasoning_content")
             result["reasoning_sha256"] = (
-                _text_digest(response["reasoning_content"])
-                if response.get("reasoning_content")
-                else None
+                _text_digest(reasoning_text) if reasoning_text else None
             )
+            if reasoning_text and _reasoning_capture_needed(result):
+                # Keep the chain-of-thought only for the exhaustion cases whose
+                # empty or truncated answer leaves it as the sole diagnostic
+                # surface; it rides the same disclosure switch as raw_response
+                # (kept in result.raw.json, stripped from the public report).
+                result["reasoning_content"] = reasoning_text
             if expected_model and response.get("model") != expected_model:
                 result["findings"].append(
                     _finding(
@@ -2116,6 +2137,7 @@ def redact_report(report: dict[str, Any]) -> dict[str, Any]:
         result.pop("sample_id", None)
         result.pop("answer_sha256", None)
         result.pop("reasoning_sha256", None)
+        result.pop("reasoning_content", None)
         result.pop("raw_response", None)
         result.pop("final_answer", None)
         result.pop("normalized_answer", None)

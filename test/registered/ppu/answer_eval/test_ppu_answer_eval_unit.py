@@ -1847,6 +1847,68 @@ class TestPPUAnswerEval(unittest.TestCase):
         self.assertNotIn("final_answer", public["cases"][0])
         self.assertEqual({row["candidate_answer"] for row in candidates}, {"答案是3"})
 
+    def test_reasoning_content_captured_only_for_exhausted_cases(self):
+        # A length-truncated response that spent its whole budget reasoning
+        # returns an empty answer, so the chain-of-thought is the only surface
+        # that can tell a runaway loop from a genuinely long answer cut off at
+        # the ceiling.  build_report keeps that text for the exhausted case and
+        # only the digest for the healthy ones, and redact_report drops it from
+        # the published report exactly like the other raw fields.
+        long_reasoning = "让我想想。" * 4000
+        responses = {
+            case["id"]: {
+                "content": "候选回答",
+                "reasoning_content": "简短推理",
+                "finish_reason": "stop",
+                "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            }
+            for case in self.dataset["cases"]
+        }
+        responses["deepseek-letter-count"] = {
+            "content": "",
+            "reasoning_content": long_reasoning,
+            "finish_reason": "length",
+            "model": "Qwen3.5-397B-A17B-W8A8-INT8",
+            "usage": {"completion_tokens": 16384},
+        }
+        report = build_report(
+            self.dataset,
+            self.profile,
+            responses,
+            {"served_model_name": "Qwen3.5-397B-A17B-W8A8-INT8"},
+        )
+        by_id = {case["case_id"]: case for case in report["cases"]}
+        exhausted = by_id["deepseek-letter-count"]
+        # The exhausted case keeps the full reasoning text and its digest.
+        self.assertEqual(exhausted["reasoning_content"], long_reasoning)
+        self.assertRegex(exhausted["reasoning_sha256"], r"^[0-9a-f]{64}$")
+        # A healthy case that finished with a real answer keeps only the digest;
+        # carrying every chain-of-thought would bloat the artifact for nothing.
+        healthy = next(
+            case for cid, case in by_id.items() if cid != "deepseek-letter-count"
+        )
+        self.assertNotIn("reasoning_content", healthy)
+        self.assertRegex(healthy["reasoning_sha256"], r"^[0-9a-f]{64}$")
+        # The published report never leaks the chain-of-thought.
+        public = redact_report(report)
+        self.assertTrue(
+            all("reasoning_content" not in case for case in public["cases"])
+        )
+        # It rides the same disclosure switch as the other raw fields: present
+        # in result.raw.json, absent from result.json.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            write_report_files(report, output_dir, include_raw_outputs=True)
+            raw = json.loads((output_dir / "result.raw.json").read_text())
+            published = json.loads((output_dir / "result.json").read_text())
+        raw_by_id = {case["case_id"]: case for case in raw["cases"]}
+        self.assertEqual(
+            raw_by_id["deepseek-letter-count"]["reasoning_content"], long_reasoning
+        )
+        self.assertTrue(
+            all("reasoning_content" not in case for case in published["cases"])
+        )
+
 
 @unittest.skipIf(answer_suite_kit is None, "answer_suite_kit needs torch")
 class TestPPUAnswerMultiNodeExchange(unittest.TestCase):
