@@ -51,6 +51,14 @@
   },
   "evaluation": {
     "dataset": "dataset/answer_cases_zh_v1.json",
-    "quality_profile": "dataset/quality_profile.json"
+    "quality_profile": "dataset/quality_profile.json",
+    "baseline": {
+      "min_score": 8,
+      "known_failures": [
+        "deepseek-letter-count",
+        "red-ball-probability"
+      ],
+      "note": "Seeded from v0.5.13 Answer PR-stack run 34100574370 (ZW-M890P single board, 8/10 at temperature 0). Both misses are model-capability failures on shared-corpus golden cases (fact_rule_failed), reproducible across the v0.5.13 stack, not infrastructure failures."
+    }
   }
 }
