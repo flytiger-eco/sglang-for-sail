@@ -15,6 +15,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.kits.answer_eval_kit import (
     AnswerEvalError,
     CandidateRequestError,
+    _evaluate_regression_gate,
     _repeated_ngram_coverage,
     answer_expected_hardware,
     answer_node_count,
@@ -36,6 +37,7 @@ from sglang.test.kits.answer_eval_kit import (
     resolve_distributed_runtime,
     resolve_evaluation_paths,
     validate_annotation_record,
+    validate_baseline,
     validate_dataset,
     validate_profile,
     validate_test_config,
@@ -82,6 +84,175 @@ class TestPPUAnswerEval(unittest.TestCase):
 
     def reason_codes(self, result):
         return {finding["reason_code"] for finding in result["findings"]}
+
+    @staticmethod
+    def _gate_results(passed, failed_model, failed_critical):
+        """Synthesize the minimal per-case results the gate reads.
+
+        Only case_id/verdict/findings matter to _evaluate_regression_gate, so a
+        test can name exactly which cases passed, missed for model-capability
+        reasons, or broke on infrastructure without driving a full corpus.
+        """
+
+        results = []
+        for case_id in passed:
+            results.append({"case_id": case_id, "verdict": "passed", "findings": []})
+        for case_id in failed_model:
+            results.append(
+                {
+                    "case_id": case_id,
+                    "verdict": "failed",
+                    "findings": [
+                        {
+                            "action": "hard_fail",
+                            "severity": "model",
+                            "reason_code": "fact_rule_failed",
+                        }
+                    ],
+                }
+            )
+        for case_id in failed_critical:
+            results.append(
+                {
+                    "case_id": case_id,
+                    "verdict": "failed",
+                    "findings": [
+                        {
+                            "action": "hard_fail",
+                            "severity": "critical",
+                            "reason_code": "finish_reason_length",
+                        }
+                    ],
+                }
+            )
+        return results
+
+    def test_baseline_tolerates_only_declared_model_failures(self):
+        # A known model miss stays green; the per-case verdict is still failed,
+        # but the run does not regress and the tolerated case is surfaced.
+        results = self._gate_results(
+            passed=[f"c{i}" for i in range(9)],
+            failed_model=["deepseek-letter-count"],
+            failed_critical=[],
+        )
+        gate = _evaluate_regression_gate(
+            results,
+            {"known_failures": ["deepseek-letter-count"], "min_score": 9},
+        )
+        self.assertFalse(gate["regressed"])
+        self.assertEqual(gate["known_failures_hit"], ["deepseek-letter-count"])
+        self.assertEqual(gate["new_regressions"], [])
+        self.assertEqual(gate["passed"], 9)
+
+    def test_new_model_miss_reddens_even_at_the_score_floor(self):
+        # A miss on a case outside the allowlist is a new regression, and it
+        # reddens even though the passing count still meets min_score -- the
+        # allowlist, not the raw score, is the primary signal.
+        results = self._gate_results(
+            passed=[f"c{i}" for i in range(9)],
+            failed_model=["henan-bordering-provinces"],
+            failed_critical=[],
+        )
+        gate = _evaluate_regression_gate(
+            results,
+            {"known_failures": ["deepseek-letter-count"], "min_score": 9},
+        )
+        self.assertTrue(gate["regressed"])
+        self.assertEqual(gate["new_regressions"], ["henan-bordering-provinces"])
+        self.assertFalse(gate["score_below_baseline"])
+
+    def test_infrastructure_failure_is_never_tolerated(self):
+        # Even a case in known_failures reddens when it breaks on a critical
+        # (infrastructure) finding rather than a model-capability miss.
+        results = self._gate_results(
+            passed=[f"c{i}" for i in range(9)],
+            failed_model=[],
+            failed_critical=["deepseek-letter-count"],
+        )
+        gate = _evaluate_regression_gate(
+            results,
+            {"known_failures": ["deepseek-letter-count"], "min_score": 9},
+        )
+        self.assertTrue(gate["regressed"])
+        self.assertEqual(gate["critical_failures"], ["deepseek-letter-count"])
+        self.assertEqual(gate["known_failures_hit"], [])
+
+    def test_score_floor_reddens_without_a_new_miss(self):
+        # Two tolerated misses, no new case, but the passing count falls below
+        # min_score -- the floor guard still reddens.
+        results = self._gate_results(
+            passed=[f"c{i}" for i in range(8)],
+            failed_model=["deepseek-letter-count", "red-ball-probability"],
+            failed_critical=[],
+        )
+        gate = _evaluate_regression_gate(
+            results,
+            {
+                "known_failures": ["deepseek-letter-count", "red-ball-probability"],
+                "min_score": 9,
+            },
+        )
+        self.assertTrue(gate["regressed"])
+        self.assertTrue(gate["score_below_baseline"])
+        self.assertEqual(gate["new_regressions"], [])
+
+    def test_absent_baseline_keeps_strict_behaviour(self):
+        # With no baseline any miss reddens, matching the pre-baseline gate.
+        results = self._gate_results(
+            passed=[f"c{i}" for i in range(9)],
+            failed_model=["deepseek-letter-count"],
+            failed_critical=[],
+        )
+        gate = _evaluate_regression_gate(results, None)
+        self.assertTrue(gate["regressed"])
+        self.assertFalse(gate["baseline_applied"])
+        self.assertEqual(gate["new_regressions"], ["deepseek-letter-count"])
+
+    def test_case_that_beats_its_baseline_is_flagged_not_failed(self):
+        # A known-failing case that now passes is an unexpected pass: green, but
+        # surfaced so the baseline can be tightened.
+        results = self._gate_results(
+            passed=["deepseek-letter-count"] + [f"c{i}" for i in range(9)],
+            failed_model=[],
+            failed_critical=[],
+        )
+        gate = _evaluate_regression_gate(
+            results, {"known_failures": ["deepseek-letter-count"], "min_score": 7}
+        )
+        self.assertFalse(gate["regressed"])
+        self.assertEqual(gate["unexpected_passes"], ["deepseek-letter-count"])
+
+    def test_fact_rule_findings_carry_model_severity(self):
+        # A wrong fact answer is a model-severity miss; a bad finish_reason on
+        # the same case is a critical finding.
+        wrong = self.evaluate("deepseek-letter-count", "答案是 5")
+        fact = next(
+            finding
+            for finding in wrong["findings"]
+            if finding["reason_code"] == "fact_rule_failed"
+        )
+        self.assertEqual(fact["severity"], "model")
+        truncated = self.evaluate("deepseek-letter-count", "答案是 4", "length")
+        finish = next(
+            finding
+            for finding in truncated["findings"]
+            if finding["reason_code"] == "finish_reason_length"
+        )
+        self.assertEqual(finish["severity"], "critical")
+
+    def test_validate_baseline_rejects_malformed_declarations(self):
+        validate_baseline(None)
+        validate_baseline({"known_failures": ["a"], "min_score": 7})
+        with self.assertRaises(AnswerEvalError):
+            validate_baseline({"known_failures": "a"})
+        with self.assertRaises(AnswerEvalError):
+            validate_baseline({"known_failures": ["a", "a"]})
+        with self.assertRaises(AnswerEvalError):
+            validate_baseline({"known_failures": [1]})
+        with self.assertRaises(AnswerEvalError):
+            validate_baseline({"min_score": -1})
+        with self.assertRaises(AnswerEvalError):
+            validate_baseline({"min_score": True})
 
     @staticmethod
     def rendezvous_for(config):

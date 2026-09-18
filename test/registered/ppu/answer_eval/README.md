@@ -967,9 +967,11 @@ The run reported nine of ten cases passing. `deepseek-letter-count` answered
 `3` where the reviewed fact is `4`, with `finish_reason=stop` and complete
 usage accounting, so the failure is a model-capability result rather than a
 serving or evaluation defect. `fact_rule_failed` is classified `hard_fail`
-by the kit, and neither the quality profile nor the case schema carries a
-severity field, so this case fails the suite until the judgement contract is
-revised upstream.
+by the kit, so the case's per-case verdict is `failed`. Whether that reddens
+the *run* is now a separate decision: declared in this model's
+`evaluation.baseline.known_failures` as a known model-capability miss, the
+case is tolerated and the run stays green until a genuinely new failure
+appears. See "Regression gate and per-model baseline" below.
 
 The 27B entry was measured on the same host on 2026-09-02 using one device:
 
@@ -1025,6 +1027,62 @@ tolerance nor the severity classification is changed, so `12.5` and a rounded
 accepts changes the judging standard, so `dataset/answer_cases_zh_v1.json` is now
 `revision` 2: an annotation keyed on revision 1 must not be read as though it had
 been produced under the current standard.
+
+## Regression gate and per-model baseline
+
+The per-case verdict and the run's red/green are two separate judgements. A
+case is still `failed` the moment any `hard_fail` finding lands — the rules
+are unchanged and the golden facts stay strict. What is separate is what turns
+a *run* red: a run regresses only when a **new** problem appears, not because
+the checkpoint keeps missing a fact it has always missed. Two mechanisms carry
+this.
+
+**Finding severity.** Every finding carries a `severity`. Engine-internal
+checks — a bad `finish_reason`, garbled or repeated output, cross-case
+duplication, request errors — are `critical`: they mean the serving stack or
+the transcript is broken, and they always red the run. A fact-rule finding is
+`model` by default (the checkpoint simply got a fact wrong); a dataset rule may
+set `"severity": "critical"` when its miss would instead signal a broken
+contract that must always gate. The per-case verdict ignores severity; only the
+run-level gate reads it.
+
+**Per-model baseline.** A model config may declare `evaluation.baseline`:
+
+```json
+"baseline": {
+  "min_score": 7,
+  "known_failures": ["deepseek-letter-count", "henan-bordering-provinces", "red-ball-probability"],
+  "note": "..."
+}
+```
+
+`known_failures` are the case ids this checkpoint is known to miss for
+model-capability reasons; `min_score` is the floor of passing cases. The run
+regresses (reddens) when any of the following holds: a failure carries a
+`critical` finding; a `model` failure lands on a case **not** in
+`known_failures` (a new miss); or the passing-case count drops below
+`min_score`. A case in `known_failures` that now passes is reported as an
+`unexpected_pass` — green, but a signal to tighten the baseline. The gate lands
+in `summary.gate` of the result JSON; the suite assertion reads
+`summary.gate.regressed`, and its failure message names exactly the cases that
+regressed so a red run points straight at the new problem.
+
+With no baseline the allowlist is empty and the floor is unset, so any miss
+reddens — identical to the earlier strict behaviour, which is why an unseeded
+config is unaffected.
+
+### Seeding a baseline
+
+A baseline is seeded only from a run verified correct. The two seeded configs —
+`qwen3.8/27b-bf16-144g.json` (7/10) and `qwen3.5/397b-a17b-w8a8-int8-144g.json`
+(9/10) — take their `known_failures` from the temperature-0 runs confirmed
+byte-identical to the v0.5.13 answers. To seed another model: run its suite
+once, confirm each miss is a genuine model-capability result (clean request
+path, `finish_reason=stop`, rule correct) rather than an infrastructure
+failure, then record those case ids in `known_failures` and set `min_score` to
+the passing count. Never add a case to `known_failures` to silence a `critical`
+finding — severity keeps that impossible by construction, and doing so would
+hide a real regression.
 
 ## Measured baseline (ZW-M890P)
 

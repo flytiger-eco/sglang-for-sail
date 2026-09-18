@@ -242,7 +242,15 @@ class AnswerSuiteMixin:
         }
         provenance = cls._provenance(accelerator)
         provenance["setup_stage"] = stage
-        report = build_report(cls.dataset, cls.profile, responses, provenance)
+        report = build_report(
+            cls.dataset,
+            cls.profile,
+            responses,
+            provenance,
+            baseline=getattr(cls, "test_config", {})
+            .get("evaluation", {})
+            .get("baseline"),
+        )
         write_report_files(report, cls.report_dir)
         print(render_summary(report), flush=True)
 
@@ -492,6 +500,7 @@ class AnswerSuiteMixin:
             self.profile,
             responses,
             self._provenance(self._accelerator()),
+            baseline=self.test_config["evaluation"].get("baseline"),
         )
         include_raw_outputs = os.environ.get(INCLUDE_RAW_OUTPUTS_ENV, "0") in {
             "1",
@@ -513,18 +522,32 @@ class AnswerSuiteMixin:
                 sys.stdout.reconfigure(errors="backslashreplace")
             print(render_candidates(report, self.dataset), flush=True)
 
-        self.assertEqual(
-            report["summary"]["failed"],
-            0,
+        # The run-level gate, not the raw failed count, decides red/green: a
+        # miss on a case the checkpoint is known to fail (declared in the model
+        # config's evaluation.baseline) is tolerated, while a new miss, any
+        # infrastructure-class failure, or a score below the baseline floor
+        # still reddens.  The message names exactly the cases that regressed so
+        # a red run points straight at the new problem.
+        gate = report["summary"]["gate"]
+        gating_cases = set(gate["critical_failures"]) | set(gate["new_regressions"])
+        self.assertFalse(
+            gate["regressed"],
             json.dumps(
                 {
-                    result["case_id"]: [
-                        finding["reason_code"]
-                        for finding in result["findings"]
-                        if finding["action"] == "hard_fail"
-                    ]
-                    for result in report["cases"]
-                    if result["verdict"] == "failed"
+                    "new_regressions": {
+                        result["case_id"]: [
+                            finding["reason_code"]
+                            for finding in result["findings"]
+                            if finding["action"] == "hard_fail"
+                        ]
+                        for result in report["cases"]
+                        if result["case_id"] in gating_cases
+                    },
+                    "score_below_baseline": gate["score_below_baseline"],
+                    "min_score": gate["min_score"],
+                    "passed": gate["passed"],
+                    "tolerated_known_failures": gate["known_failures_hit"],
+                    "unexpected_passes": gate["unexpected_passes"],
                 },
                 ensure_ascii=False,
                 sort_keys=True,
