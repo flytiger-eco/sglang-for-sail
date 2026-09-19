@@ -16,6 +16,7 @@ from sglang.srt.layers.moe.moe_runner.triton import (
     fused_experts_none_to_triton,
 )
 from sglang.srt.utils import is_sail
+from sglang.utils import info_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -55,6 +56,13 @@ def fused_experts_none_to_acext(
     assert is_sail(), (
         f"Only PPU support acext MoE backend, use other MoE backend on current platform please!"
     )
+
+    if runner_config.activation == "situ":
+        info_once(
+            "ACEXT fused MoE does not expose a standalone activation stage; "
+            "using Triton GEMMs with naive SiTU on PPU."
+        )
+        return fused_experts_none_to_triton(dispatch_output, quant_info, runner_config)
 
     from acext import (
         fusedmoe_wrapper,
