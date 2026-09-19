@@ -1,6 +1,6 @@
 import torch
 
-from sglang.jit_kernel.dsv4.topk import top_k_per_row_prefill_bf16
+from sglang.kernels.ops.attention.dsv4.topk import top_k_per_row_prefill_bf16
 
 B, K, topk = 4, 40000, 2048  # K > 32768 → 走 stream kernel
 torch.manual_seed(0)
