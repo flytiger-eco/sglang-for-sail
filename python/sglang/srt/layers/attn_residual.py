@@ -9,10 +9,13 @@
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
 #           SM. Taken on SM100+ except SM12x with H=7168.
+#   sm8x  — one Triton CTA per token, fusing an optional prefix add, online
+#           softmax aggregation, output RMSNorm, and optional bank write.
+#           Taken on the PPU SM80/SM89-compatible path.
 #   hip   — single Triton kernel, everything in one launch; taken on ROCm
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
-#           everywhere the fast kernel does not apply.
+#           everywhere the specialized kernels do not apply.
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
@@ -24,13 +27,14 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_sail
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
+_SM8X_FUSED_SUPPORTED = None
 
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
@@ -61,6 +65,18 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
+
+
+def _use_sm8x_fused(hidden_size: int) -> bool:
+    """The single-CTA Triton kernel is tuned for PPU K3's SM8x path only."""
+    global _SM8X_FUSED_SUPPORTED
+    if _SM8X_FUSED_SUPPORTED is None:
+        _SM8X_FUSED_SUPPORTED = (
+            is_sail()
+            and torch.version.hip is None
+            and torch.cuda.get_device_capability() in ((8, 0), (8, 9))
+        )
+    return _SM8X_FUSED_SUPPORTED and hidden_size == 7168
 
 
 def get_cw(
@@ -117,6 +133,40 @@ def _aggregate_fast(
     return out
 
 
+def _aggregate_sm8x(
+    prefix_sum: torch.Tensor,
+    bank: torch.Tensor,
+    nvb: int,
+    score_proj: ReplicatedLinear,
+    score_norm: RMSNorm,
+    out_norm: RMSNorm,
+    delta: Optional[torch.Tensor] = None,
+    write_bank_row: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SM80/SM89 aggregate returning ``(normed, prefix)``.
+
+    The optional pending addition is rounded and written to a newly allocated
+    prefix buffer by this kernel. This preserves input aliasing while avoiding
+    a separate prefix-add or copy launch.
+    """
+    assert score_norm.variance_epsilon == out_norm.variance_epsilon
+    assert prefix_sum.is_contiguous() and bank.is_contiguous()
+    assert delta is None or delta.is_contiguous()
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_sm8x
+
+    return attn_res_fused_sm8x(
+        prefix_sum,
+        bank,
+        nvb,
+        get_cw(score_proj, score_norm),
+        out_norm.weight,
+        score_norm.variance_epsilon,
+        delta=delta,
+        write_bank_row=write_bank_row,
+    )
+
+
+# ---- Kernel 1: per-row scoring (2D grid [T, NVB+1]) -------------------------
 @triton.jit
 def _score_kernel(
     prefix_ptr,  # [T, H]
@@ -408,10 +458,10 @@ def _aggregate(
 ) -> torch.Tensor:
     """Single aggregation point: score → softmax → mix → norm.
 
-    Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
-    write_bank_row is fast-path only (in-kernel snapshot of the prefix row
-    into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
-    the caller (AttnResidual.forward) owns that fallback.
+    The caller handles non-write nvb == 0 (layer 0: just out_norm(prefix_sum)).
+    Specialized paths can snapshot ``prefix_sum`` into ``bank[:, nvb, :]`` in
+    the same launch; the SM8x path also handles an initial nvb == 0 snapshot.
+    The 2-kernel Triton fallback keeps the standalone copy.
     """
     if prefix_sum.shape[0] == 0:
         return prefix_sum
@@ -425,6 +475,16 @@ def _aggregate(
             out_norm,
             write_bank_row=write_bank_row,
         )
+    if _use_sm8x_fused(prefix_sum.shape[1]):
+        return _aggregate_sm8x(
+            prefix_sum,
+            bank,
+            nvb,
+            score_proj,
+            score_norm,
+            out_norm,
+            write_bank_row=write_bank_row,
+        )[0]
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
             prefix_sum,
@@ -493,7 +553,7 @@ class AttnResidual:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
-        fast kernel (the row streams through its score pass anyway), a
+        specialized kernel (the row streams through its score pass anyway), a
         standalone .write() copy on every other path."""
         if rows is None and self.written_on_slice:
             raise RuntimeError(
@@ -504,6 +564,21 @@ class AttnResidual:
         # Layer 0 attention side: nothing banked yet
         if nvb == 0:
             assert prefix_sum is None
+            if write and _use_sm8x_fused(hidden_states.shape[1]):
+                bank = (
+                    self.block_residual if rows is None else self.block_residual[rows]
+                )
+                normed, prefix = _aggregate_sm8x(
+                    hidden_states,
+                    bank,
+                    nvb,
+                    score_proj,
+                    score_norm,
+                    out_norm,
+                    write_bank_row=True,
+                )
+                self._count_write(rows)  # row 0 written in-kernel
+                return normed, prefix
             if write:
                 self.write(hidden_states, rows)
             return out_norm(hidden_states), hidden_states
@@ -517,6 +592,7 @@ class AttnResidual:
 
         fused_write = write and (
             _use_fast(hidden_states.shape[1])
+            or _use_sm8x_fused(hidden_states.shape[1])
             or _use_hip_fused(hidden_states.shape[1], nvb)
         )
         if prefix_sum is None:
@@ -532,6 +608,19 @@ class AttnResidual:
                 write_bank_row=fused_write,
             )
             prefix = hidden_states
+        elif _use_sm8x_fused(hidden_states.shape[1]):
+            # The fused kernel materializes the running prefix into its own
+            # output buffer, leaving a caller-owned prefix_sum untouched.
+            normed, prefix = _aggregate_sm8x(
+                prefix_sum,
+                block_residual,
+                nvb,
+                score_proj,
+                score_norm,
+                out_norm,
+                delta=hidden_states,
+                write_bank_row=fused_write,
+            )
         else:
             # Pending add: materialize the prefix, then aggregate.
             normed, prefix = _aggregate_fused_add(
