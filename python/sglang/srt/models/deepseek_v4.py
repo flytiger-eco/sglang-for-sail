@@ -3559,6 +3559,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
 
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+
         # update_weights_from_disk/_tensor/_distributed re-enter load_weights
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
@@ -3625,6 +3630,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.dsa_enable_prefill_cp:
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    cp_local_indexer_metadata=(
+                        get_attn_backend().forward_metadata.cp_local_indexer_metadata
+                        if is_dsa_prefill_cp_round_robin_split()
+                        else None
+                    ),
+                )
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related(is_prefill=True)
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            attn_backend.init_forward_metadata_indexer(core_meta)
+                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(

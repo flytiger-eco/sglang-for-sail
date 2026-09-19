@@ -108,6 +108,12 @@ class DeepseekV4ModelNextN(nn.Module):
             compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
 
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_size = None
+
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -212,6 +218,13 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
 
         self.model = DeepseekV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -237,6 +250,30 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                    cp_local_indexer_metadata=(
+                        get_attn_backend().forward_metadata.cp_local_indexer_metadata
+                        if is_dsa_prefill_cp_round_robin_split()
+                        else None
+                    ),
+                )
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related(is_prefill=True)
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            attn_backend.init_forward_metadata_indexer(core_meta)
+                        )
 
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
