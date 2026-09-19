@@ -1,0 +1,73 @@
+name: Nightly Perf Test (PPU)
+
+# Default-branch scheduler for the btv1.5 Performance line. GitHub evaluates
+# `schedule` only on the repository's default branch, so the cron that actually
+# drives the nightly run has to live here on `main`. The perf test harness itself
+# -- the three reusable workflows and the board scripts/configs -- does not: it
+# lives on the `v0.5.18` product line, which is what we want the nightly to
+# exercise. So this file stays deliberately thin. It owns no runner and runs no
+# test; it only fans out to the three reusable Perf workflows and pins them to
+# `v0.5.18`.
+#
+# Two things are pinned to v0.5.18, for two different reasons:
+#   * `uses: .../test-ppu-perf*.yml@v0.5.18` resolves the callee workflow
+#     *definition* from the v0.5.18 tip. A local `uses: ./` would resolve it from
+#     this commit on `main`, where the file does not exist; and `uses:` cannot
+#     take an expression, so the ref is the literal branch name and tracks its
+#     tip. This keeps the whole harness single-sourced on v0.5.18 with no copy to
+#     drift against.
+#   * `ref: v0.5.18` is passed down so each callee's in-pod checkout stages the
+#     v0.5.18 *code* (scripts, configs) -- without it the callee would fall back
+#     to github.sha, i.e. this main commit, and test the wrong tree.
+#
+# A manual dispatch may override the code ref (the callee definition stays at
+# v0.5.18); a scheduled run leaves inputs.ref empty and both default to v0.5.18.
+
+on:
+  schedule:
+    # 16:00 UTC == 00:00 Beijing (UTC+8). Shares the slot with the Answer
+    # scheduler (nightly-test-ppu-answer.yml): the btv1.5 boards are dedicated
+    # test hardware available around the clock, so the two lines are allowed to
+    # start together and the cluster serialises whatever cannot run at once.
+    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Code ref (branch, tag, or SHA) to check out in-pod. Defaults to v0.5.18.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: nightly-test-ppu-perf-${{ inputs.ref || 'v0.5.18' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # No `needs` between the three: the boards they claim are disjoint (a single
+  # board, two nodes, four nodes), so they are dispatched together and the
+  # cluster schedules each as capacity frees. A failure in one does not cancel
+  # the others -- one board size's verdict must not suppress another's evidence.
+  # `secrets: inherit` hands down the PPU artifactory credentials the pods need.
+  perf-single-board:
+    name: Perf (single board)
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf.yml@v0.5.18
+    with:
+      ref: ${{ inputs.ref || 'v0.5.18' }}
+    secrets: inherit
+
+  perf-two-node:
+    name: Perf (two nodes)
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf-16.yml@v0.5.18
+    with:
+      ref: ${{ inputs.ref || 'v0.5.18' }}
+    secrets: inherit
+
+  perf-four-node:
+    name: Perf (four nodes)
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf-32.yml@v0.5.18
+    with:
+      ref: ${{ inputs.ref || 'v0.5.18' }}
+    secrets: inherit
