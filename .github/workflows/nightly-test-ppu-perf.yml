@@ -42,8 +42,17 @@ concurrency:
   group: nightly-test-ppu-perf-${{ inputs.ref || 'v0.5.18' }}
   cancel-in-progress: true
 
+# A `workflow_call` invocation is capped by the permissions its caller holds: a
+# callee job cannot be granted more than this scheduler grants here. Each of the
+# three reusable Perf workflows ends with a `publish-trend-rows` job that pushes
+# result rows to the `nightly-test-data` orphan branch and therefore declares
+# `contents: write` + `actions: read`. If this scheduler passed down only the
+# read-only default, that job would be rejected at graph-compile time
+# (startup_failure -- no job, no annotation) or 403 on push, and every nightly
+# run would silently drop its trend rows. So grant both here at the top.
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 jobs:
   # No `needs` between the three: the boards they claim are disjoint (a single
