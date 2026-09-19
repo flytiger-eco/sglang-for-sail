@@ -159,7 +159,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(text_config)
 
-        # For EAGLE3 support
+        # For EAGLE3 auxiliary hidden-state capture.
         self.capture_aux_hidden_states = False
 
     @classmethod
@@ -235,6 +235,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return get_video_feature(self.vision_tower, items, self.use_data_parallel)
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
