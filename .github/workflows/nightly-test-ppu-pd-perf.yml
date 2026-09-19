@@ -20,11 +20,13 @@ name: Nightly PD Perf Test (PPU)
 #     v0.5.18 *code* (scripts, configs) -- without it the callee would fall back
 #     to github.sha, i.e. this main commit, and test the wrong tree.
 #
-# Each reusable PD-perf workflow serves one checkpoint per invocation (its
-# `pd_config` input selects which), so a full nightly of both model families
-# across both quantisations is four caller jobs, not two: GLM-5.2 and Qwen3.5,
-# each at fp8-channelwise and mxfp4-fp8. This matches the four PD-perf series the
-# `nightly-test-data` branch already carries.
+# Each reusable PD-perf workflow now fans both its checkpoints out itself, as
+# two static per-checkpoint jobs under distinct job keys -- the split that keeps
+# ppu-distributed-action's $GITHUB_JOB-derived NAS staging paths from colliding
+# when one run invokes the workflow for both checkpoints. So a full nightly of
+# both model families across both quantisations is two caller jobs, not four:
+# GLM-5.2 and Qwen3.5, each with `pd_config: all`. Between them they still file
+# the four PD-perf series the `nightly-test-data` branch carries, two per caller.
 #
 # A manual dispatch may override the code ref (the callee definition stays at
 # v0.5.18); a scheduled run leaves inputs.ref empty and both default to v0.5.18.
@@ -61,40 +63,25 @@ permissions:
   actions: read
 
 jobs:
-  # No `needs` between the four: each caller gang-schedules its own two nodes
-  # (sixteen cards) and the boards they claim are otherwise disjoint, so they are
-  # dispatched together and the cluster schedules each as capacity frees. A
-  # failure in one does not cancel the others -- one config's verdict must not
-  # suppress another's evidence. `secrets: inherit` hands down the PPU
-  # artifactory credentials the pods need.
-  glm52-fp8-channelwise:
-    name: PD Perf (GLM-5.2 fp8-channelwise)
+  # No `needs` between the two: each caller fans out its own two per-checkpoint
+  # jobs, each gang-scheduling two nodes (sixteen cards), and the boards they
+  # claim are otherwise disjoint, so they are dispatched together and the cluster
+  # schedules each as capacity frees. A failure in one does not cancel the others
+  # -- one config's verdict must not suppress another's evidence, and `pd_config:
+  # all` lets each callee's checkpoints proceed independently for the same reason.
+  # `secrets: inherit` hands down the PPU artifactory credentials the pods need.
+  glm52:
+    name: PD Perf (GLM-5.2)
     uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-glm52.yml@v0.5.18
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: fp8-channelwise
+      pd_config: all
     secrets: inherit
 
-  glm52-mxfp4-fp8:
-    name: PD Perf (GLM-5.2 mxfp4-fp8)
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-glm52.yml@v0.5.18
-    with:
-      ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  qwen35-mxfp4-fp8:
-    name: PD Perf (Qwen3.5 mxfp4-fp8)
+  qwen35:
+    name: PD Perf (Qwen3.5)
     uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-qwen35.yml@v0.5.18
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  qwen35-fp8-channelwise:
-    name: PD Perf (Qwen3.5 fp8-channelwise)
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-qwen35.yml@v0.5.18
-    with:
-      ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: fp8-channelwise
+      pd_config: all
     secrets: inherit
