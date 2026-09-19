@@ -7,10 +7,13 @@ name: Nightly Test (PPU)
 # schedulers cannot be dispatched by their own names. This file borrows the
 # already-registered `nightly-test-ppu.yml` handle (workflow id 333448550, still
 # active) purely to trigger a one-off baseline run: dispatch it with --ref on
-# this probe branch and the dispatched version is this file, which fans out to
-# the same reusable workflows the two schedulers call, pinned to @v0.5.18. The
-# original nightly board jobs are deliberately gone so this dispatch ignites
-# nothing but the lines selected below.
+# this probe branch and the dispatched version is this file. The PD-Perf callees
+# are resolved locally with `uses: ./` from *this* commit, because the branch
+# carries the per-checkpoint split (distinct static job keys) that is not yet on
+# v0.5.18 -- a `@v0.5.18` ref would resolve the old single-job callee and race on
+# the tar the way run 35440393512 did. Accuracy is unchanged, so it still borrows
+# the callee from @v0.5.18. The original nightly board jobs are deliberately gone
+# so this dispatch ignites nothing but the lines selected below.
 #
 # Delete this branch once the baseline runs have filed.
 
@@ -43,40 +46,26 @@ permissions:
   actions: read
 
 jobs:
-  glm52-fp8-channelwise:
-    name: PD Perf (GLM-5.2 fp8-channelwise)
+  # One caller per family, pd_config: all -- the exact fan-out PR#45's scheduler
+  # now uses. Each callee runs both its checkpoints as two static per-checkpoint
+  # jobs, so this baseline stages four measuring jobs to four distinct
+  # $GITHUB_JOB NAS paths and the tar no longer races.
+  glm52:
+    name: PD Perf (GLM-5.2)
     if: inputs.case == 'all' || inputs.case == 'pd-perf'
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-glm52.yml@v0.5.18
+    uses: ./.github/workflows/test-ppu-pd-perf-glm52.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: fp8-channelwise
+      pd_config: all
     secrets: inherit
 
-  glm52-mxfp4-fp8:
-    name: PD Perf (GLM-5.2 mxfp4-fp8)
+  qwen35:
+    name: PD Perf (Qwen3.5)
     if: inputs.case == 'all' || inputs.case == 'pd-perf'
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-glm52.yml@v0.5.18
+    uses: ./.github/workflows/test-ppu-pd-perf-qwen35.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  qwen35-mxfp4-fp8:
-    name: PD Perf (Qwen3.5 mxfp4-fp8)
-    if: inputs.case == 'all' || inputs.case == 'pd-perf'
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-qwen35.yml@v0.5.18
-    with:
-      ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: mxfp4-fp8
-    secrets: inherit
-
-  qwen35-fp8-channelwise:
-    name: PD Perf (Qwen3.5 fp8-channelwise)
-    if: inputs.case == 'all' || inputs.case == 'pd-perf'
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-qwen35.yml@v0.5.18
-    with:
-      ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: fp8-channelwise
+      pd_config: all
     secrets: inherit
 
   accuracy:
