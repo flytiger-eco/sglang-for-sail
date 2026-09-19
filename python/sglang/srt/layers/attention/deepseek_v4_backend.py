@@ -49,6 +49,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -1488,30 +1492,97 @@ class DeepseekV4AttnBackend(
         metadata.prefill_shared_reads_snapshotted = True
 
     def _build_sparse_prefill_chunk_cache(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        num_qo_tokens: int,
+        core_attn_metadata: Optional[DSV4AttnMetadata] = None,
     ) -> SparsePrefillChunkCache:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        cp_positions = None
+        max_seq_len = int(
+            seq_lens_cpu.max().item()
+            if isinstance(seq_lens_cpu, torch.Tensor)
+            else max(seq_lens_cpu)
+        )
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
-        seq_lens_cpu_list = seq_lens_cpu.tolist()
-        total_swa = sum(
-            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-            for seq_len, extend_len in zip(
-                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
+        if can_dsa_prefill_cp_round_robin_split(forward_batch):
+            if isinstance(extend_seq_lens_cpu, torch.Tensor):
+                extend_seq_lens_cpu = [int(x) for x in extend_seq_lens_cpu.tolist()]
+            (
+                cp_extend_seq_lens_cpu,
+                extend_seq_lens,
+                cp_bs_idx_cpu,
+                cp_bs_idx,
+            ) = dsa_cp_round_robin_split_q_seqs(
+                extend_seq_lens_cpu,
+                extend_seq_lens,
             )
-        )
+            seq_lens = seq_lens[cp_bs_idx].contiguous()
+            req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+            max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
+            assert (
+                core_attn_metadata is not None
+            ), "CP round-robin split sparse prefill requires core_attn_metadata"
+            cp_positions = core_attn_metadata.positions_casual[
+                :num_qo_tokens
+            ].contiguous()
+            assert sum(cp_extend_seq_lens_cpu) <= num_qo_tokens, (
+                f"CP-local extend sum {sum(cp_extend_seq_lens_cpu)} exceeds "
+                f"q token count {num_qo_tokens}"
+            )
+            # Mirror build_swa_token_ids' CP branch on the CPU side so
+            # total_swa stays sync-free: the split is a carry-propagated
+            # round-robin over the concatenated extend stream, so request
+            # j's first CP-local token sits at in-req offset
+            # (cp_rank - stream_offset_j) % cp_size.
+            from sglang.srt.runtime_context import get_parallel
+
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            seq_lens_list = (
+                seq_lens_cpu.tolist()
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else [int(x) for x in seq_lens_cpu]
+            )
+            first_tok_off = []
+            stream_off = 0
+            for e in extend_seq_lens_cpu:
+                first_tok_off.append((cp_rank - stream_off) % cp_size)
+                stream_off += e
+            total_swa = 0
+            for j in cp_bs_idx_cpu:
+                first_pos = (
+                    seq_lens_list[j] - int(extend_seq_lens_cpu[j]) + first_tok_off[j]
+                )
+                swa_first = max(0, first_pos - SWA_WINDOW + 1)
+                total_swa += seq_lens_list[j] - swa_first
+        else:
+            total_swa = sum(
+                min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len, extend_len in zip(
+                    seq_lens_cpu.tolist(), extend_seq_lens_cpu, strict=True
+                )
+            )
+        # ``swa_window_size`` on the pool is its storage page size, not the
+        # model's SWA window, so pass both explicitly.
         return SparsePrefillChunkCache.build(
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
-            extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            seq_lens=seq_lens,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
             swa_page_size=self.token_to_kv_pool.swa_page_size,
             num_qo_tokens=num_qo_tokens,
-            max_seq_len=max(seq_lens_cpu_list),
+            max_seq_len=max_seq_len,
             total_swa=total_swa,
+            cp_positions=cp_positions,
         )
 
     def _build_forward_metadata(
@@ -1988,7 +2059,9 @@ class DeepseekV4AttnBackend(
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
+                forward_batch,
+                num_qo_tokens=q_flat.shape[0],
+                core_attn_metadata=core_attn_metadata,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -2163,7 +2236,9 @@ class DeepseekV4AttnBackend(
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
             cache = self._build_sparse_prefill_chunk_cache(
-                forward_batch, num_qo_tokens=q_flat.shape[0]
+                forward_batch,
+                num_qo_tokens=q_flat.shape[0],
+                core_attn_metadata=core_attn_metadata,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
