@@ -98,6 +98,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -618,6 +619,7 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        is_nextn: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -628,8 +630,14 @@ class TopK(BaseFusedOp):
 
         self.layer_id = layer_id
 
+        self.is_nextn = is_nextn
+
         self.enable_waterfill = (
             num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+        )
+
+        self.enable_deepep_waterfill = (
+            num_fused_shared_experts > 0 and get_exec().moe.enable_deepep_waterfill
         )
 
         self.waterfill_balancer = None
@@ -720,6 +728,10 @@ class TopK(BaseFusedOp):
         """router_logits_partials (ROCm decode router): fp32 split-K partials whose
         fixed-order sum is the logits; router_logits is then a buffer the fused gate
         fills, and any other reader first reduces the partials into it."""
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
+
         if dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
@@ -782,6 +794,8 @@ class TopK(BaseFusedOp):
             )
         else:
             self.topk_config.torch_native = False
+            if updater is not None:
+                updater.wait_gpu_stage()
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
