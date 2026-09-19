@@ -5,28 +5,27 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
-# E2E test for Kimi-K3 MXFP4-W4A16 on PPU.
-# Verifies the server boots and GSM8K accuracy is correct for a
-# mixed MXFP4 quantized Kimi K3 model.
+# E2E test for the opt-in Kimi-K3 MXFP4-W4A16 MMA path on PPU.
+# Verifies direct MXFP4 weights, permuted scales, and fused TP GEMM1 together.
 
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
     "Kimi-K3-MXFP4-W4A16",
 )
-SERVED_MODEL_NAME = "Kimi-K3-MXFP4-W4A16"
-BASE_URL = "http://127.0.0.1:8999"
+SERVED_MODEL_NAME = "Kimi-K3-MXFP4-W4A16-MMA"
+BASE_URL = "http://127.0.0.1:9000"
 SERVER_LAUNCH_TIMEOUT = 24000
 
 GSM8K_DATA_PATH = os.environ.get("GSM8K_DATA_PATH", None)
 
 SERVER_ENV = {
-    "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16": "1",
+    "SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA": "1",
     "SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED": "1",
 }
 
 
-class TestKimiK3MXFp4W4A16Ppu(GSM8KMixin, CustomTestCase):
-    """E2E: Kimi-K3 MXFP4-W4A16 on PPU."""
+class TestKimiK3MXFp4W4A16MmaPpu(GSM8KMixin, CustomTestCase):
+    """E2E: opt-in Kimi-K3 MXFP4-W4A16 MMA on PPU."""
 
     model = SERVED_MODEL_NAME
     gsm8k_score_threshold = 0.50
