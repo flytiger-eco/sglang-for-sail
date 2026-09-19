@@ -117,8 +117,23 @@ def situ_and_mul(
     return impl(input, out, beta, linear_beta)
 
 
+def situ_and_mul_masked(
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: Optional[float],
+    topk: int = 8,
+    expected_m: Optional[int] = None,
+) -> torch.Tensor:
+    from .kimi_k3_situ_and_mul import situ_and_mul_masked as impl
+
+    return impl(input, out, masked_m, beta, linear_beta, topk, expected_m)
+
+
 __all__ = [
     "situ_and_mul",
+    "situ_and_mul_masked",
     "SiluAndMulOp",
     "silu_and_mul",
 ]
@@ -159,6 +174,14 @@ register_kernel(
         op="activation.situ_and_mul",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="activation.situ_and_mul_masked",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul_masked",
         capabilities=CUDA_ONLY,
     )
 )

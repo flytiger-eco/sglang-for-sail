@@ -2137,6 +2137,7 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    SGLANG_K3_KDA_INPUT_PROJ_FUSION = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
@@ -2212,12 +2213,16 @@ class Envs:
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
+    # Opt into the direct MXFP4 W4A16 MMA weight layout instead of VALU.  # codespell:ignore
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
-    SGLANG_SAIL_FLA_CUDA = EnvBool(False)
+    SGLANG_SAIL_PLA_CUDA = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_SAIL_FLA_CUDA"
+    )
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.

@@ -22,6 +22,11 @@ SERVER_LAUNCH_TIMEOUT = 24000
 
 GSM8K_DATA_PATH = os.environ.get("GSM8K_DATA_PATH", None)
 
+SERVER_ENV = {
+    **os.environ,
+    "SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED": "1",
+}
+
 
 class TestKimiK3INT4W4A16Ppu(GSM8KMixin, CustomTestCase):
     """E2E: Kimi-K3 INT4-W4A16 on PPU."""
@@ -59,7 +64,7 @@ class TestKimiK3INT4W4A16Ppu(GSM8KMixin, CustomTestCase):
             BASE_URL,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
-            env=os.environ,
+            env=SERVER_ENV,
         )
 
     @classmethod

@@ -1045,6 +1045,8 @@ def is_mnnvl_fabric_device() -> bool:
     by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
+    if is_sail():
+        return True
     name = (torch.cuda.get_device_name(0) or "").upper()
     if any(tag in name for tag in ("GB200", "GB300")):
         return True

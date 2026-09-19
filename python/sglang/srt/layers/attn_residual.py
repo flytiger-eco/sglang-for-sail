@@ -158,7 +158,7 @@ def _aggregate_sm8x(
         prefix_sum,
         bank,
         nvb,
-        get_cw(score_proj, score_norm),
+        get_cw(score_proj, score_norm, dtype=torch.bfloat16),
         out_norm.weight,
         score_norm.variance_epsilon,
         delta=delta,
