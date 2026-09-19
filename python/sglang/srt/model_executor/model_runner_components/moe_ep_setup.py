@@ -101,6 +101,38 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
             return
 
 
+def maybe_warmup_eplb_cpp_extensions(
+    *, model_config: ModelConfig, is_draft_worker: bool
+) -> None:
+    if not get_exec().moe.enable_eplb or is_draft_worker:
+        return
+
+    from sglang.srt.eplb import eplb_algorithms
+    from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+    from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+    from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
+    from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+
+    config = ModelConfigForExpertLocation.from_model_config(model_config)
+    if config is None:
+        return
+
+    logger.info("Warming up EPLB C++ extensions.")
+    warmup_eplb_expert_location_cpp()
+    algorithm = eplb_algorithms.compute_algorithm(
+        raw_algorithm=get_exec().moe.eplb_algorithm,
+        num_groups=config.num_groups,
+        num_nodes=get_parallel().nnodes,
+    )
+    if algorithm in [
+        eplb_algorithms.EplbAlgorithm.deepseek,
+        eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+    ]:
+        warmup_eplb_deepseek_cpp()
+    if get_exec().moe.enable_eplb_async:
+        warmup_eplb_async_runtime_cpp()
+
+
 def init_lplb_solvers(*, model_config: ModelConfig) -> None:
     """Initialize per-layer LPLB solvers from current expert location metadata."""
     from sglang.srt.runtime_context import get_parallel

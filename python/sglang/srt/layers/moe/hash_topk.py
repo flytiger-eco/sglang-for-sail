@@ -14,6 +14,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
@@ -67,6 +68,7 @@ class HashTopK(nn.Module):
         self.topk = topk + self.num_shared_topk_slots
         self.routed_scaling_factor = routed_scaling_factor
         self.score_func = scoring_func
+        self.layer_id = layer_id
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk, dtype=torch.int32),
             requires_grad=False,
@@ -237,6 +239,10 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_draft)
+            updater.wait_gpu_stage()
         num_token_non_padded, expert_location_dispatch_info = resolve_routing_inputs(
             layer_id=self.layer_id,
             is_draft=self.is_draft,

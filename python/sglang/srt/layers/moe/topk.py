@@ -101,6 +101,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -727,6 +728,10 @@ class TopK(BaseFusedOp):
 
         shared_experts = get_model().shared_experts
         self.enable_waterfill = shared_experts.use_waterfill
+        self.enable_deepep_waterfill = (
+            shared_experts.num_shared_topk_slots > 0
+            and get_exec().moe.enable_deepep_waterfill
+        )
         self.waterfill_balancer = None
         num_shared_slots = shared_experts.num_shared_topk_slots
 
@@ -874,6 +879,10 @@ class TopK(BaseFusedOp):
         """router_logits_partials (ROCm decode router): fp32 split-K partials whose
         fixed-order sum is the logits; router_logits is then a buffer the fused gate
         fills, and any other reader first reduces the partials into it."""
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_draft)
+
         explicit_dispatch_info = expert_location_dispatch_info is not None
         num_token_non_padded, expert_location_dispatch_info = (
             self._resolve_routing_inputs(
@@ -940,6 +949,8 @@ class TopK(BaseFusedOp):
             )
         else:
             self.topk_config.torch_native = False
+            if updater is not None:
+                updater.wait_gpu_stage()
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
