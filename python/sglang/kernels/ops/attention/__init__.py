@@ -358,6 +358,21 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _mod, _fn in [
+    ("dsa.indexer_k", "fused_k_indexer_norm_rope_store_mxfp4"),
+    ("dsa.indexer_q", "fused_q_indexer_rope_first_fp4_quant"),
+    ("dsa.indexer_q", "fused_q_indexer_rope_first_int8_quant"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _mod, _fn
+
 register_kernel(
     KernelSpec(
         op="attention.fused_rope_wo_a_bf16",
