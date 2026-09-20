@@ -141,9 +141,14 @@ PD_PARAMETER_CLI_ORDER = SERVER_PARAMETER_CLI_ORDER + (
 # `SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER` has a read point in this tree --
 # it is declared in `sglang.srt.environ` and consulted in
 # `sglang.srt.disaggregation.common.conn` -- so it belongs with the supported
-# names.
+# names.  `SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED` is likewise declared in
+# `sglang.srt.environ` and consulted by the PPU DeepEP hook
+# (`_is_mnnvl_fabric_supported`), which gates whether `use_fabric` reaches the
+# DeepEP `Buffer`; the PD roles set it to 0 on the btv1.5 image whose DeepEP
+# build rejects that kwarg.
 PD_SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER",
+    "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED",
 }
 
 # These have no read point in this tree and are accepted anyway, for the reason
