@@ -506,7 +506,10 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     if get_platform().is_xpu:
         return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        return view.linear_attn_backend == "triton"
+        return view.linear_attn_backend == "triton" or (
+            model_arch == "KimiK3ForConditionalGeneration"
+            and view.linear_attn_backend == "flashkda"
+        )
     return False
 
 
@@ -544,7 +547,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, model_arch
         ):
