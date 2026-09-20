@@ -459,15 +459,12 @@ def fused_sigmoid_gating_delta_rule_update(
             f"USE PPU SAIL CUDA PLA kernel: fused_sigmoid_gating_delta_rule_forward_k_last"
         )
 
+        # GDN(is_kda=False)必须传 None，否则内核 host 端抛
+        # RuntimeError: lower_bound is only supported for KDA（传 0.0 也会触发）。
+        kda_lower_bound = (lower_bound if lower_bound is not None else 0.0) if is_kda else None
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
-            # [FLA-KDA-fix] SAIL CUDA FLA kernel dtype requirements:
-            # - decode / CUDA graph capture (mtp_verify=0): A_log and dt_bias must be q.dtype (BFloat16)
-            # - MTP target verify (mtp_verify=1): A_log and dt_bias must remain Float32
-            # The `disable_state_update` parameter corresponds to mtp_verify=1 in the SAIL kernel.
-            # Conditional cast: decode path casts to q.dtype, MTP verify path keeps Float32
             A_log.to(q.dtype) if (A_log is not None and not disable_state_update) else A_log,
             a,
-            # dt_bias: same conditional cast as A_log above
             dt_bias.to(q.dtype) if (dt_bias is not None and not disable_state_update) else dt_bias,
             softplus_beta,
             softplus_threshold,
@@ -486,8 +483,7 @@ def fused_sigmoid_gating_delta_rule_update(
             intermediate_state_indices,
             cache_steps,
             retrieve_parent_token,
-            # Pass lower_bound to SAIL PLA kernel (KDA safe gate)
-            lower_bound if lower_bound is not None else 0.0,
+            kda_lower_bound,
         )
         return output
 
