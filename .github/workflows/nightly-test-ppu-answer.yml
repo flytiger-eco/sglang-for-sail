@@ -25,9 +25,12 @@ name: Nightly Answer Test (PPU)
 
 on:
   schedule:
-    # 16:00 UTC == 00:00 Beijing (UTC+8). This answer scheduler is the only PPU
-    # nightly cron on `main` (nightly-test-ppu.yml lives on v0.5.18, not here), so
-    # there is no sibling nightly line to offset against.
+    # 16:00 UTC == 00:00 Beijing (UTC+8). Shares the slot with the sibling PPU
+    # schedulers -- Perf (nightly-test-ppu-perf.yml), PD-Perf
+    # (nightly-test-ppu-pd-perf.yml) and Accuracy (nightly-test-ppu-accuracy.yml):
+    # the btv1.5 boards are dedicated test hardware available around the clock, so
+    # the lines start together and the cluster serialises whatever cannot run at
+    # once.
     - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
   workflow_dispatch:
     inputs:
