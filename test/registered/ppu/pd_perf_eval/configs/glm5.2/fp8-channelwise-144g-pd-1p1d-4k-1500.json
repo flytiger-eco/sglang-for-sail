@@ -73,6 +73,7 @@
       "enable_metrics": true
     },
     "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
       "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": 1,
       "SGLANG_SAIL_DEEPEP_RECV_HOOK": 0,
       "DG_USE_MOE_DYNAMIC_TILE": 1,
@@ -116,6 +117,7 @@
       "enable_metrics": true
     },
     "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
       "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": 1,
       "SGLANG_SAIL_DEEPEP_RECV_HOOK": 0,
       "DG_USE_MOE_DYNAMIC_TILE": 1,
