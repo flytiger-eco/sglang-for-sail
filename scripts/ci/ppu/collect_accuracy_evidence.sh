@@ -55,6 +55,19 @@ if [ -d "${ACCURACY_RESULTS_ON_RUNNER}" ]; then
     cp -a "${ACCURACY_RESULTS_ON_RUNNER}/evalscope/reports" \
       "${destination}/evalscope/"
   fi
+  # PROBE-ONLY (2026-09-20): also carry EvalScope's per-sample predictions and
+  # reviews into the artifact. The block above deliberately leaves them on the
+  # NAS because a full split is gigabytes; this probe narrows C-Eval to two
+  # subjects (~37 samples), so the generated text is kilobytes and is exactly
+  # what tells apart "final answer systematically wrong" from "long CoT never
+  # converged to the answer format". Remove with the rest of the probe.
+  for probe_dir in predictions reviews; do
+    if [ -d "${ACCURACY_RESULTS_ON_RUNNER}/evalscope/${probe_dir}" ]; then
+      mkdir -p "${destination}/evalscope"
+      cp -a "${ACCURACY_RESULTS_ON_RUNNER}/evalscope/${probe_dir}" \
+        "${destination}/evalscope/"
+    fi
+  done
   echo "::notice::${ENTRY}: EvalScope predictions and reviews remain at ${ACCURACY_RESULTS_ON_RUNNER}/evalscope"
 else
   echo "::warning::the pod produced no accuracy report at ${ACCURACY_RESULTS_ON_RUNNER}"

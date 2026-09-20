@@ -78,11 +78,21 @@ jobs:
     secrets: inherit
 
   accuracy:
-    name: Accuracy (all entries, full)
+    name: Accuracy (GLM-5.2 mxfp4 C-Eval, 2-subject DSA review probe)
     if: inputs.case == 'all' || inputs.case == 'accuracy'
     uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@v0.5.18
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
       mode: full
-      entries: all
+      # DSA REVIEW PROBE (2026-09-20): the v0.5.18 accuracy baseline (run
+      # 35440401306) put GLM-5.2 as the only regressing model, and per-subject
+      # C-Eval showed advanced_mathematics (0/19) and probability_and_statistics
+      # (0/18) scoring exactly zero on both quants -- the long-reasoning STEM
+      # subjects, and GLM-5.2 is the only model on attention_backend=dsa. This
+      # narrows to that one entry; its config is narrowed to just those two
+      # subjects (subset_list) with the baseline nulled, and the collector is
+      # widened to upload per-sample predictions/reviews, so the generated text
+      # can settle whether the answers are wrong or the CoT never converges.
+      # Requires -f ref=<probe branch> so the in-pod checkout carries these edits.
+      entries: glm52-mxfp4-ceval
     secrets: inherit
