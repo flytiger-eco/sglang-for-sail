@@ -62,6 +62,7 @@
       "mamba_scheduler_strategy": "no_buffer"
     },
     "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
       "MC_NUM_QP_PER_EP": 4,
       "MC_TE_METRIC": 1,
       "MC_LOG_LEVEL": "TRACE",
@@ -100,6 +101,7 @@
       "mamba_scheduler_strategy": "no_buffer"
     },
     "env": {
+      "SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED": 0,
       "MC_NUM_QP_PER_EP": 4,
       "MC_TE_METRIC": 1,
       "MC_LOG_LEVEL": "TRACE",
