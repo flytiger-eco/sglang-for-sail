@@ -46,22 +46,31 @@ permissions:
   actions: read
 
 jobs:
-  # One caller per family, pd_config: all -- the exact fan-out PR#45's scheduler
-  # now uses. Each callee runs both its checkpoints as two static per-checkpoint
-  # jobs, so this baseline stages four measuring jobs to four distinct
-  # $GITHUB_JOB NAS paths and the tar no longer races.
+  # REDUCED-DEMAND PROBE (2026-09-20): runs 35447274959 and 35462362936 both timed
+  # out at 240min with every measuring pod Pending -- FailedScheduling reported
+  # `8 Insufficient alibabacloud.com/ppu`, i.e. the eight-board PPU pool is fully
+  # taken by external workloads. The full fan-out below (glm52 + qwen35, each
+  # pd_config: all) stages four 2-node gangs = eight boards that must all free at
+  # once, so it can only schedule when the whole pool is idle. A Pending gang holds
+  # no board, so narrowing to ONE 2-node gang wastes no machine-time and needs only
+  # two boards to free -- vastly likelier to land, and a direct probe of pool
+  # occupancy. glm52 fp8-channelwise is the single checkpoint chosen: it is the
+  # simpler of the two (no EAGLE MTP decode) and the point is to establish whether
+  # the disaggregated shape comes up at all and file a first trend series. Restore
+  # `pd_config: all` and re-enable qwen35 once the pool has capacity.
   glm52:
     name: PD Perf (GLM-5.2)
     if: inputs.case == 'all' || inputs.case == 'pd-perf'
     uses: ./.github/workflows/test-ppu-pd-perf-glm52.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: all
+      pd_config: fp8-channelwise
     secrets: inherit
 
   qwen35:
     name: PD Perf (Qwen3.5)
-    if: inputs.case == 'all' || inputs.case == 'pd-perf'
+    # Gated off for the reduced-demand probe -- see the note on glm52 above.
+    if: false
     uses: ./.github/workflows/test-ppu-pd-perf-qwen35.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
