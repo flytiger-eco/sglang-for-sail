@@ -46,31 +46,25 @@ permissions:
   actions: read
 
 jobs:
-  # REDUCED-DEMAND PROBE (2026-09-20): runs 35447274959 and 35462362936 both timed
-  # out at 240min with every measuring pod Pending -- FailedScheduling reported
-  # `8 Insufficient alibabacloud.com/ppu`, i.e. the eight-board PPU pool is fully
-  # taken by external workloads. The full fan-out below (glm52 + qwen35, each
-  # pd_config: all) stages four 2-node gangs = eight boards that must all free at
-  # once, so it can only schedule when the whole pool is idle. A Pending gang holds
-  # no board, so narrowing to ONE 2-node gang wastes no machine-time and needs only
-  # two boards to free -- vastly likelier to land, and a direct probe of pool
-  # occupancy. glm52 fp8-channelwise is the single checkpoint chosen: it is the
-  # simpler of the two (no EAGLE MTP decode) and the point is to establish whether
-  # the disaggregated shape comes up at all and file a first trend series. Restore
-  # `pd_config: all` and re-enable qwen35 once the pool has capacity.
+  # REMAINING-THREE FAN-OUT (2026-09-20): the reduced-demand probe already filed a
+  # green glm52 fp8-channelwise baseline (run 35501221161, with the
+  # SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED=0 fix now on PR#48). This dispatch fills the
+  # other three PD checkpoints -- glm52 mxfp4-fp8, qwen35 fp8-channelwise, qwen35
+  # mxfp4-fp8 -- so glm52 narrows to mxfp4-fp8 (its fp8chan job is skipped by the
+  # callee gate) and qwen35 runs both. Three 2-node gangs = six boards; they need
+  # not co-schedule across gangs, so they trickle in as the pool frees.
   glm52:
     name: PD Perf (GLM-5.2)
     if: inputs.case == 'all' || inputs.case == 'pd-perf'
     uses: ./.github/workflows/test-ppu-pd-perf-glm52.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      pd_config: fp8-channelwise
+      pd_config: mxfp4-fp8
     secrets: inherit
 
   qwen35:
     name: PD Perf (Qwen3.5)
-    # Gated off for the reduced-demand probe -- see the note on glm52 above.
-    if: false
+    if: inputs.case == 'all' || inputs.case == 'pd-perf'
     uses: ./.github/workflows/test-ppu-pd-perf-qwen35.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
