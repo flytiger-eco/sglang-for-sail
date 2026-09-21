@@ -165,9 +165,9 @@ establish the reviewed checkpoint digest baseline.
 Candidate generation is deterministic for every model: temperature 0 and top-p 1
 throughout, so the rule-based verdict is reproducible. Only the output budget
 moves, and only where a checkpoint's own template forces it to: 2048 tokens for
-the eleven entries that can be asked not to think, 8192 for the two 2.4T entries
-whose template grades the reasoning pass instead of switching it off, and 16384
-for the two MiniMax entries, whose template has no off switch at all.
+the eleven entries that can be asked not to think; 8192 for the two 2.4T entries
+and two-node Kimi entry; 16384 for MiniMax W8A8; and 32768 for MiniMax FP8
+channelwise and MXFP4, whose template has no off switch at all.
 
 Server parameters follow the internal case each config was ported from, so they
 differ by model rather than by house rule. The 397B is TP=8, FA3 attention, static
@@ -742,13 +742,11 @@ deterministic generation line already described in
   rather than a formality: the fallback this replaces is 600 seconds, half of which
   the Qwen3.5 entries already spend.
 
-**One value here is a judgement, not a measurement.** The three MiniMax entries
-carry `max_tokens` 16384 and a 900s request timeout. The source case allows 32768,
-while the measured A95B and two-node Kimi entries whose reasoning cannot be
-safely disabled both run at 8192; 16384 sits between them because MiniMax-M2.7's
-template has no off switch at all and a truncated candidate is a `length` finish
-reason rather than a verdict. Whether it is enough, and whether 900s covers it,
-is what the first run of these entries settles.
+**The MiniMax budgets are run-validated.** All three entries retain a 900s request
+timeout. W8A8 remains at `max_tokens` 16384 after completing nightly run
+35528870244. FP8-channelwise and MXFP4 use 32768: targeted run 35551775837
+completed the previously critical FP8-channelwise case in 6728 output tokens,
+and MXFP4 met its configured threshold with only its accepted known failure.
 
 **Capacity.** These are headroom checks against the measured checkpoint sizes, not
 predictions of what the server will actually reserve:
