@@ -52,7 +52,7 @@ jobs:
     # 2.4T-checkpoint load off the NAS is allowed to take, plus the two prefill
     # sweeps and the dependency install. The first measured run is what should
     # replace this number.
-    timeout-minutes: 270
+    timeout-minutes: 330
     env:
       # Same NAS-as-transport arrangement as the single-board workflow: the pods
       # write under /mnt/wl_nas and this shell reads the same bytes under
@@ -208,7 +208,7 @@ jobs:
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 240
+          timeout_minutes: 300
 
       # Read, not moved: the pods write as root and this shell is a different,
       # non-root uid, so an rm here fails with EPERM on every file and turns the
