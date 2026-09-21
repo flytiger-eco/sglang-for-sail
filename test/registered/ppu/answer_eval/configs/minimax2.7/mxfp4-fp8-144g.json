@@ -38,7 +38,7 @@
     "generation": {
       "temperature": 0,
       "top_p": 1,
-      "max_tokens": 16384,
+      "max_tokens": 32768,
       "separate_reasoning": true,
       "chat_template_kwargs": {}
     }
