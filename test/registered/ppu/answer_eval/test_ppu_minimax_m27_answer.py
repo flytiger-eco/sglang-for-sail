@@ -19,11 +19,12 @@ group comfortably: the largest holds 214.6 GiB against a 921 GiB static pool.
 This model's chat template reads no reasoning switch at all -- its generation
 prompt opens `<think>` unconditionally -- so the reasoning pass cannot be turned
 off and `chat_template_kwargs` is empty rather than absent, stating that shape
-explicitly.  Both configs therefore budget a thinking answer: 32768 output tokens
-and a 900-second per-request timeout, against 2048 and 300 for the entries that
-can be asked not to think.  Targeted run 35551775837 validated this budget: the
-previously critical FP8-channelwise case completed in 6728 output tokens, and
-the MXFP4 entry met its configured threshold with only its accepted known failure.
+explicitly.  FP8-channelwise and MXFP4 therefore budget a thinking answer:
+32768 output tokens and a 900-second per-request timeout.  W8A8 retains 16384
+and 900 seconds after completing nightly run 35528870244 within that budget.
+Targeted run 35551775837 validated the raised budget: the previously critical
+FP8-channelwise case completed in 6728 output tokens, and MXFP4 met its
+configured threshold with only its accepted known failure.
 """
 
 import unittest
