@@ -19,10 +19,11 @@ group comfortably: the largest holds 214.6 GiB against a 921 GiB static pool.
 This model's chat template reads no reasoning switch at all -- its generation
 prompt opens `<think>` unconditionally -- so the reasoning pass cannot be turned
 off and `chat_template_kwargs` is empty rather than absent, stating that shape
-explicitly.  Both configs therefore budget a thinking answer: 16384 output tokens
+explicitly.  Both configs therefore budget a thinking answer: 32768 output tokens
 and a 900-second per-request timeout, against 2048 and 300 for the entries that
-can be asked not to think.  That budget is not measured; it is the assumption
-these two entries carry into their first run.
+can be asked not to think.  Targeted run 35551775837 validated this budget: the
+previously critical FP8-channelwise case completed in 6728 output tokens, and
+the MXFP4 entry met its configured threshold with only its accepted known failure.
 """
 
 import unittest
