@@ -200,7 +200,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 190
+    timeout-minutes: 265
     steps:
       - name: Checkout code
         id: checkout
@@ -240,7 +240,7 @@ jobs:
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 165
+          timeout_minutes: 240
       - name: Collect Perf evidence
         if: always()
         shell: bash
