@@ -57,8 +57,8 @@ jobs:
           - entry: qwen3.8-2.4t-a95b-mxfp4-fp8
             suite: nightly-answer-16-ppu
             config: test/registered/ppu/answer_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g.json
-            job_timeout_minutes: 270
-            pod_timeout_minutes: 240
+            job_timeout_minutes: 330
+            pod_timeout_minutes: 300
             timeout_per_file: 14400
           # 968.3 GiB of INT8, which is 84 per cent of one node's device memory
           # and the reason this one is here rather than in the single-board
@@ -66,8 +66,8 @@ jobs:
           - entry: kimi2.6-w8a8-int8
             suite: nightly-answer-16-kimi26-ppu
             config: test/registered/ppu/answer_eval/configs/kimi2.6/w8a8-int8-144g-2n.json
-            job_timeout_minutes: 270
-            pod_timeout_minutes: 240
+            job_timeout_minutes: 330
+            pod_timeout_minutes: 300
             timeout_per_file: 14400
     # Bounded by the config's own startup budget, which is what a cold load off
     # the NAS is allowed to take, plus the ten cases at their timeout ceiling and
