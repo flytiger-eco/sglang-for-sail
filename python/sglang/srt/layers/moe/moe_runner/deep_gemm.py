@@ -351,6 +351,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
@@ -391,6 +392,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w13_weight_fp8,
                 gateup_output,
                 m_indices,
+                m_rows,
             )
 
         dispose_tensor(hidden_states)
@@ -556,6 +558,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w2_weight_fp8,
                 down_output,
                 m_indices,
+                m_rows,
             )
 
         return down_output
@@ -572,6 +575,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
@@ -602,6 +606,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w13_weight,
                 gateup_output,
                 m_indices,
+                m_rows,
             )
 
         dispose_tensor(hidden_states)
@@ -656,6 +661,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 w2_weight,
                 down_output,
                 m_indices,
+                m_rows,
             )
 
         return down_output
@@ -676,6 +682,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
@@ -699,6 +706,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_quant,
             gateup_output,
             m_indices,
+            m_rows,
         )
 
         dispose_tensor(hidden_states)
@@ -760,6 +768,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_quant,
             down_output,
             m_indices,
+            m_rows,
         )
 
         return down_output
@@ -778,6 +787,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
@@ -801,6 +811,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_quant,
             gateup_output,
             m_indices,
+            m_rows,
         )
 
         dispose_tensor(hidden_states)
@@ -844,6 +855,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_quant,
             down_output,
             m_indices,
+            m_rows,
         )
 
         return down_output
@@ -868,6 +880,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return torch.zeros(
@@ -900,6 +913,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             b13,
             gateup_output,
             m_indices,
+            m_rows,
         )
 
         dispose_tensor(hidden_states)
@@ -954,6 +968,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             b2,
             down_output,
             m_indices,
+            m_rows,
         )
 
         return down_output
@@ -1021,6 +1036,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        m_rows = running_state.get("m_rows")
 
         if all_tokens <= 0:
             return hidden_states.bfloat16()
@@ -1048,6 +1064,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_quant,
             gateup_output,
             m_indices,
+            m_rows,
         )
 
         dispose_tensor(hidden_states)
@@ -1090,6 +1107,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_quant,
             down_output,
             m_indices,
+            m_rows,
         )
 
         return down_output
@@ -2378,6 +2396,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         dispose_tensor(hidden_states_scale)
 
     running_state["output_index"] = output_index
+    running_state["m_rows"] = num_recv_tokens_per_expert_gpu
 
     return DeepGemmRunnerInput(
         hidden_states=input_tensor,
