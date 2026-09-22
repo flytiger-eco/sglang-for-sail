@@ -55,7 +55,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs,
+    dsa_use_prefill_cp,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -2937,7 +2941,14 @@ class DeepseekV4AttnBackend(
         return (
             not self.trtllm_attn
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and not is_cp_active(forward_batch)
+            and (
+                not is_cp_active(forward_batch)
+                or (
+                    is_sail()
+                    and can_dsa_prefill_cp_round_robin_split(forward_batch)
+                    and self.token_to_kv_pool.request_window is None
+                )
+            )
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
             and (
@@ -2989,35 +3000,104 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
         num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
+        legacy_cp = (
+            is_sail()
+            and can_dsa_prefill_cp_round_robin_split(forward_batch)
+            and tail is None
         )
+        if not legacy_cp:
+            assert num_qo_tokens >= num_global_queries, (
+                "DSV4 sparse prefill requires global query rows: "
+                f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
+                "CP-local queries must use paged attention."
+            )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
         if request_layout is not None:
             request_layout = request_layout.leading_rows(num_qo_tokens)
-        seq_lens_cpu_list = seq_lens_cpu.tolist()
-        total_swa = sum(
-            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-            for seq_len, extend_len in zip(
-                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
-            )
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        # Keep global CPU lengths for sync-free CP-local cache sizing.
+        seq_lens_cpu_list = _as_int_list(seq_lens_cpu)
+        extend_seq_lens_cpu_list = (
+            [int(x) for x in extend_seq_lens_cpu.tolist()]
+            if isinstance(extend_seq_lens_cpu, torch.Tensor)
+            else list(extend_seq_lens_cpu)
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
+        max_seq_len = max(seq_lens_cpu_list, default=0)
+        cache_seq_lens_cpu = seq_lens_cpu_list
+        if legacy_cp and not is_cp_active(forward_batch):
+            # Legacy V1 prefill CP round-robin path, used only when no live V2
+            # strategy owns this batch (PPU binds the interleave V2 strategy,
+            # see init_cp_strategy). Restrict the chunk cache
+            # to this CP rank's locally-owned requests and size total_swa with
+            # the carry-propagated round-robin offsets so it stays sync-free.
+            (
+                cp_extend_seq_lens_cpu,
+                cp_query_lens,
+                cp_bs_idx_cpu,
+                cp_bs_idx,
+            ) = dsa_cp_round_robin_split_q_seqs(
+                extend_seq_lens_cpu_list,
+                extend_seq_lens,
+            )
+            seq_lens = seq_lens[cp_bs_idx].contiguous()
+            req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+            cache_seq_lens_cpu = [seq_lens_cpu_list[i] for i in cp_bs_idx_cpu]
+            max_seq_len = max(cache_seq_lens_cpu, default=0)
+            assert request_layout is None, (
+                "Sail V1 request-window CP must use the upstream paged attention path"
+            )
+            assert sum(cp_extend_seq_lens_cpu) <= num_qo_tokens, (
+                f"CP-local extend sum {sum(cp_extend_seq_lens_cpu)} exceeds "
+                f"q token count {num_qo_tokens}"
+            )
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            first_tok_off = []
+            stream_off = 0
+            for e in extend_seq_lens_cpu_list:
+                first_tok_off.append((cp_rank - stream_off) % cp_size)
+                stream_off += e
+            total_swa = 0
+            for j in cp_bs_idx_cpu:
+                first_pos = (
+                    seq_lens_cpu_list[j]
+                    - extend_seq_lens_cpu_list[j]
+                    + first_tok_off[j]
+                )
+                swa_first = max(0, first_pos - SWA_WINDOW + 1)
+                total_swa += seq_lens_cpu_list[j] - swa_first
+            # Query boundaries are local, but the contiguous KV gather spans
+            # every position from the first owned token to the request's end.
+            # Passing local query counts as extend lengths underallocates SWA.
+            first_offsets = torch.tensor(
+                [first_tok_off[j] for j in cp_bs_idx_cpu],
                 dtype=torch.int32,
                 device=extend_seq_lens.device,
             )
+            extend_seq_lens = extend_seq_lens[cp_bs_idx].to(torch.int32) - first_offsets
+            query_lens = cp_query_lens.to(torch.int32)
         else:
-            query_lens = extend_seq_lens.to(torch.int32)
+            total_swa = sum(
+                min(int(seq_len_i), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len_i, extend_len in zip(
+                    seq_lens_cpu_list, extend_seq_lens_cpu_list, strict=True
+                )
+            )
+            if is_cp_active(forward_batch):
+                query_lens = torch.tensor(
+                    interleave_rows_per_request(
+                        _as_int_list(extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    ),
+                    dtype=torch.int32,
+                    device=extend_seq_lens.device,
+                )
+            else:
+                query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if request_layout is not None:
@@ -3026,18 +3106,18 @@ class DeepseekV4AttnBackend(
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens.to(torch.int32),
             query_lens=query_lens,
             query_pos=query_pos,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
             swa_page_size=self.token_to_kv_pool.get_swa_key_page_size(),
             num_qo_tokens=num_qo_tokens,
-            max_seq_len=max(seq_lens_cpu_list),
-            seq_lens_cpu=seq_lens_cpu_list,
+            max_seq_len=max_seq_len,
+            seq_lens_cpu=cache_seq_lens_cpu,
             total_swa=total_swa,
             request_window_layout=request_layout,
         )

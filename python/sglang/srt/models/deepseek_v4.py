@@ -4917,6 +4917,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
 
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
+
         # update_weights_from_disk/_tensor/_distributed re-enter load_weights
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
@@ -5121,6 +5129,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_ids, input_embeds = self.prepare_language_model_inputs(
             input_ids, forward_batch, input_embeds
         )
+        # CP (including Sail V1) is prepared at the runner boundary. Reindexing
+        # here would shard already-local query metadata a second time.
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

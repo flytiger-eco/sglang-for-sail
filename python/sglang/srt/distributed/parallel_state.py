@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
     is_shm_available,
     is_xpu,
 )
@@ -2205,6 +2206,7 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _SHARED_EXPERTS_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -2239,6 +2241,56 @@ def get_shared_experts_tp_group() -> GroupCoordinator:
 
 def get_attn_cp_group() -> GroupCoordinator:
     return get_parallel().attn_cp_group
+
+
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    # Resolve through the stamped primary handle, respecting topology scopes
+    # and failing closed after model-parallel teardown.
+    group = get_attn_cp_group()
+    return group.attn_cp_overlap_group
+
+
+def _init_attn_cp_overlap_group(
+    *,
+    world_size: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    backend: Optional[str],
+    recovered_rank: bool,
+    rank_offset: int,
+    max_world_size: Optional[int],
+) -> None:
+    """RCCL needs separate communicators for concurrent-stream CP collectives."""
+    global _ATTN_CP_OVERLAP
+    assert _ATTN_CP_OVERLAP is None, (
+        "attention context parallel overlap group is already initialized"
+    )
+    if attn_cp_size <= 1:
+        return
+
+    span = attn_tp_size * attn_cp_size
+    group_ranks = [
+        list(range(base + i, base + i + span, attn_tp_size))
+        for base in range(0, world_size, span)
+        for i in range(attn_tp_size)
+    ]
+    # The primary group is not stamped until initialization finishes. Compare
+    # the constructed groups below, after elastic rank offsets are applied.
+    assert _ATTN_CP is not None
+    _ATTN_CP_OVERLAP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name="attn_cp_overlap",
+        recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
+    )
+    assert _ATTN_CP_OVERLAP.ranks == _ATTN_CP.ranks, (
+        "attention CP overlap and primary communicators must span the same ranks"
+    )
+    assert _ATTN_CP_OVERLAP.world_size == attn_cp_size
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2570,6 +2622,7 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
     rank_offset: int = 0,
     max_world_size: Optional[int] = None,
+    duplicate_attn_cp_group: bool = False,
 ) -> None:
     """
     Initialize model parallel groups at the published widths.
@@ -2786,6 +2839,24 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+
+    if (duplicate_attn_cp_group and (is_hip() or is_sail())) or (
+        is_sail() and parallel.enable_prefill_cp
+    ):
+        _init_attn_cp_overlap_group(
+            world_size=world_size,
+            attn_cp_size=attn_cp_size,
+            attn_tp_size=attn_tp_size,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+    # The alternative communicator belongs to the primary coordinator. The
+    # primary is stamped below; no undeclared parallel-config leaf is needed.
+    _ATTN_CP.attn_cp_overlap_group = (
+        _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else _ATTN_CP
+    )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
@@ -3310,12 +3381,16 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
+    if _ATTN_CP_OVERLAP:
+        _ATTN_CP_OVERLAP.destroy()
+    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None

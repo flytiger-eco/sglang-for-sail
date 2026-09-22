@@ -99,9 +99,9 @@ class TestDsaTopkBf16PrefillCrash(CustomTestCase):
             "--disable-custom-all-reduce",
             "--enforce-disable-flashinfer-allreduce-fusion",
             "--disable-shared-experts-fusion",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "4",
-            "--disable-piecewise-cuda-graph",
+            "--disable-prefill-cuda-graph",
         ]
 
         with envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.override(False):

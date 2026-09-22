@@ -60,7 +60,7 @@ class TestGLM52PPNsaSparsePrefill(CustomTestCase):
                 "24000",
                 "--dist-timeout",
                 "24000",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-running-requests",
                 "32",
