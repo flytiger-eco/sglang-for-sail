@@ -57,8 +57,10 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
@@ -796,9 +798,9 @@ class MqaAttentionBase(nn.Module):
             self.wo_a.skip_aiter_bpreshuffle = True
         elif _FP8_WO_A_GEMM:
             # channelwise
-            assert hasattr(
-                self.wo_a, "weight_scale"
-            ), "FP8 quant_config must create weight_scale"
+            assert hasattr(self.wo_a, "weight_scale"), (
+                "FP8 quant_config must create weight_scale"
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1740,13 +1742,13 @@ class MQALayer(MqaAttentionBase):
 
         w = wo_a.weight.data
         assert w.shape == (D, G * R), (
-            f"channelwise wo_a.weight expected ({D}, {G*R}), " f"got {tuple(w.shape)}"
+            f"channelwise wo_a.weight expected ({D}, {G * R}), got {tuple(w.shape)}"
         )
         weight_3d = w.t().contiguous().clone().view(G, R, D)
 
         ws = wo_a.weight_scale.data
         assert ws.numel() == G * R, (
-            f"channelwise weight_scale expected {G*R} elems, "
+            f"channelwise weight_scale expected {G * R} elems, "
             f"got shape {tuple(ws.shape)}"
         )
         scale = ws.reshape(G * R).contiguous().clone().view(G, R, 1)
@@ -1883,7 +1885,9 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink(kernel_num_heads) if not _is_ppu else self.attn_sink
+        attn_sink = (
+            self._local_attn_sink(kernel_num_heads) if not _is_ppu else self.attn_sink
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,

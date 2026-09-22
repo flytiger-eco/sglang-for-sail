@@ -74,7 +74,7 @@ from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
 )
-from sglang.srt.layers.cp.utils import is_cp_active, is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.utils.cp_utils import CPLocalIndexerMetadata
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -1563,9 +1563,9 @@ class DeepseekV4AttnBackend(
                 seq_lens = seq_lens[cp_bs_idx].contiguous()
                 req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
                 max_seq_len = max(int(seq_lens_cpu[i]) for i in cp_bs_idx_cpu)
-            assert (
-                core_attn_metadata is not None
-            ), "CP round-robin split sparse prefill requires core_attn_metadata"
+            assert core_attn_metadata is not None, (
+                "CP round-robin split sparse prefill requires core_attn_metadata"
+            )
             cp_positions = core_attn_metadata.positions_casual[
                 :num_qo_tokens
             ].contiguous()

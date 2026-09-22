@@ -7,18 +7,14 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
-    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
-from sglang.srt.layers.cp.utils import (
-    cp_round_robin_input_ids_v2,
-    is_cp_v2_active,
-)
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     get_global_dp_buffer_len,
@@ -30,11 +26,13 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.cp_utils import prepare_context_parallel_metadata
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
@@ -250,7 +248,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
+        if self.dsa_enable_prefill_cp and not is_cp_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

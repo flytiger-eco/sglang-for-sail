@@ -1,7 +1,7 @@
 """DeepSeek-V4-Flash FP4 sparse prefill with attn-CP.
 
 Launches a real DeepSeek-V4-Flash server with DSA prefill CP in
-round-robin-split mode and forces the FlashMLA sparse-prefill path through
+interleave mode and forces the FlashMLA sparse-prefill path through
 SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1. GSM8K verifies end-to-end accuracy.
 """
 
@@ -48,9 +48,9 @@ class TestDSV4FlashFP4SparsePrefillCP(GSM8KMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--moe-runner-backend",
                 "flashinfer_mxfp4",
             ],

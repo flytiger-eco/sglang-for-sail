@@ -32,7 +32,6 @@ SERVER_ENV = {
 
 
 class TestGLM52PPNsaSparsePrefill(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL
@@ -61,7 +60,7 @@ class TestGLM52PPNsaSparsePrefill(CustomTestCase):
                 "24000",
                 "--dist-timeout",
                 "24000",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "32",
                 "--max-running-requests",
                 "32",
@@ -76,9 +75,9 @@ class TestGLM52PPNsaSparsePrefill(CustomTestCase):
                 "--tool-call-parser",
                 "glm47",
                 "--enforce-disable-flashinfer-allreduce-fusion",
-                "--enable-nsa-prefill-context-parallel",
-                "--nsa-prefill-cp-mode",
-                "round-robin-split",
+                "--enable-prefill-cp",
+                "--cp-strategy",
+                "interleave",
                 "--attn-cp-size",
                 "8",
             ],
