@@ -462,10 +462,24 @@ def fused_sigmoid_gating_delta_rule_update(
         # GDN(is_kda=False)必须传 None，否则内核 host 端抛
         # RuntimeError: lower_bound is only supported for KDA（传 0.0 也会触发）。
         kda_lower_bound = (lower_bound if lower_bound is not None else 0.0) if is_kda else None
+
+        # [fix-87036227-retest] SAIL PLA verify 模式(disable_state_update=True)要求 A_log/dt_bias
+        # 为 Float32；GDN(Qwen3-Next/Qwen3-5 系)的 dt_bias 参数以 torch.ones/zeros 不带 dtype
+        # 创建(qwen3_5.py:337 / qwen3_next.py:183)，bf16 模型下为 BFloat16，原样传入触发
+        # RuntimeError: expected scalar type Float but found BFloat16。
+        # 故 verify 路径显式 cast 到 float32（fp32 张量 .to() 为 no-op，KDA 路径零影响），
+        # decode 路径维持 cast 到 q.dtype 不变。旧代码（verify 原样传）保留如下：
+        # A_log.to(q.dtype) if (A_log is not None and not disable_state_update) else A_log,
+        # dt_bias.to(q.dtype) if (dt_bias is not None and not disable_state_update) else dt_bias,
+        def _sail_gate_cast(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if t is None:
+                return None
+            return t.to(q.dtype) if not disable_state_update else t.to(torch.float32)
+
         output = fused_sigmoid_gating_delta_rule_forward_k_last(
-            A_log.to(q.dtype) if (A_log is not None and not disable_state_update) else A_log,
+            _sail_gate_cast(A_log),
             a,
-            dt_bias.to(q.dtype) if (dt_bias is not None and not disable_state_update) else dt_bias,
+            _sail_gate_cast(dt_bias),
             softplus_beta,
             softplus_threshold,
             q,
