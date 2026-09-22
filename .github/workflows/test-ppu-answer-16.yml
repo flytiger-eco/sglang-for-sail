@@ -12,13 +12,7 @@ on:
   # boards. The pod command below is the four-node workflow's, differing only in
   # the node count, suite and config; it stays duplicated until both multi-node
   # lines have stable measured runs from which to extract shared behavior.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -29,7 +23,7 @@ on:
 
 concurrency:
   group: test-ppu-answer-16-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

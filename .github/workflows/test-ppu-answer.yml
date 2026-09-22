@@ -5,13 +5,7 @@ on:
   # and this file lives on a version branch, so a cron here would never fire
   # and would misdescribe the workflow as scheduled. The btv1.5 line is
   # therefore dispatched: by hand, or by a caller through workflow_call.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -22,7 +16,7 @@ on:
 
 concurrency:
   group: test-ppu-answer-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -184,7 +178,7 @@ jobs:
   # 116 GiB of weights, and the smallest of the new entries; it also cannot be
   # asked not to think, so its ten answers are what dominates its budget rather
   # than its load.
-  minimax27-mxfp4:
+  ans-minimax27-mxfp4:
     name: minimax2.7-mxfp4-fp8 (btv1.5)
     needs: qwen38-27b-bf16
     if: ${{ !cancelled() }}
@@ -791,7 +785,7 @@ jobs:
           retention-days: 30
 
   # Lane G: both single-board Kimi formats, one after the other.
-  kimi26-w4a8:
+  ans-kimi26-w4a8:
     name: kimi2.6-w4a8-int8 (btv1.5)
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -865,9 +859,9 @@ jobs:
           overwrite: true
           retention-days: 30
 
-  kimi26-mxfp4:
+  ans-kimi26-mxfp4:
     name: kimi2.6-mxfp4-fp8 (btv1.5)
-    needs: kimi26-w4a8
+    needs: ans-kimi26-w4a8
     if: ${{ !cancelled() }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
