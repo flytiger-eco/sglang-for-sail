@@ -65,6 +65,9 @@ def _ppu_dsa_init_forward_metadata_in_graph(self, forward_batch):
         self.forward_metadata.flashmla_metadata.flashmla_metadata.have_initialized = (
             False
         )
+        metadata = self.forward_metadata.flashmla_metadata.flashmla_metadata
+        metadata.tile_scheduler_metadata = None
+        metadata.num_splits = None
 
 
 @plugin_hook(
