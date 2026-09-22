@@ -1,0 +1,193 @@
+name: Nightly Test (PPU Global)
+
+on:
+  schedule:
+    # 北京时间每天 00:00；四类 nightly 只保留此定时入口。
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '被测源码的 branch、tag 或 SHA；测试 workflow 定义仍来自 v0.5.18。'
+        type: string
+        default: v0.5.18
+      suite:
+        description: '选择测试类别。'
+        type: choice
+        options: [all, perf, answer, pd-perf, accuracy]
+        default: all
+      mode:
+        description: 'Accuracy 模式：smoke 为 20 条样本，full 为完整数据集。'
+        type: choice
+        options: [full, smoke, both]
+        default: full
+      entries:
+        description: "Accuracy 条目，逗号分隔或 all；留空仅运行 glm52-fp8chan-gsm8k 对应模式。"
+        type: string
+        default: ''
+      dataset_dir:
+        description: '覆盖 Accuracy 配置中的已准备数据集目录。'
+        type: string
+        default: ''
+      pd_config:
+        description: '选择两个 PD 模型家族的量化配置。'
+        type: choice
+        options: [all, fp8-channelwise, mxfp4-fp8]
+        default: all
+  workflow_call:
+    inputs:
+      ref:
+        description: '被测源码的 branch、tag 或 SHA。'
+        type: string
+        default: v0.5.18
+      suite:
+        description: 'all、perf、answer、pd-perf 或 accuracy。'
+        type: string
+        default: all
+      mode:
+        description: 'Accuracy 模式：full、smoke 或 both。'
+        type: string
+        default: full
+      entries:
+        description: 'Accuracy 条目，逗号分隔或 all；保留留空时的单条默认行为。'
+        type: string
+        default: ''
+      dataset_dir:
+        description: '覆盖 Accuracy 配置中的已准备数据集目录。'
+        type: string
+        default: ''
+      pd_config:
+        description: 'all、fp8-channelwise 或 mxfp4-fp8。'
+        type: string
+        default: all
+
+# 锁仅由此入口持有；包装器和底层 workflow 不得使用此 group。
+# 不按 ref 或 suite 拆锁，以免不同入口各取得一份 128 卡额度。
+concurrency:
+  group: ppu-nightly-btv15
+  cancel-in-progress: false
+  queue: max
+
+# Perf/PD 的趋势发布需要写权限；各测试 job 仍保留自己的最小权限。
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  prepare:
+    name: 固定被测源码 SHA
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: 校验类别输入
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
+          MODE: ${{ inputs.mode || 'full' }}
+          PD_CONFIG: ${{ inputs.pd_config || 'all' }}
+        run: |
+          case "$SUITE" in all|perf|answer|pd-perf|accuracy) ;; *) exit 1 ;; esac
+          case "$MODE" in full|smoke|both) ;; *) exit 1 ;; esac
+          case "$PD_CONFIG" in all|fp8-channelwise|mxfp4-fp8) ;; *) exit 1 ;; esac
+      - name: 解析源码 ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'v0.5.18' }}
+          persist-credentials: false
+      - name: 记录源码与 workflow 定义版本
+        id: revision
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.ref || 'v0.5.18' }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf '源码 ref: `%s`\n\n源码 SHA: `%s`\n\n测试 workflow 定义: `@v0.5.18`（分支，非固定 SHA）\n' "$REQUESTED_REF" "$sha" >> "$GITHUB_STEP_SUMMARY"
+
+  # 阶段 1：4 个 16 卡配置，最多 64 卡。
+  pd-glm52:
+    needs: [prepare]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'pd-perf' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-glm52.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+      pd_config: ${{ inputs.pd_config || 'all' }}
+    secrets: inherit
+
+  pd-qwen35:
+    needs: [prepare]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'pd-perf' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-pd-perf-qwen35.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+      pd_config: ${{ inputs.pd_config || 'all' }}
+    secrets: inherit
+
+  # 阶段 2：8 路单板 + 16 卡 + 32 卡，最多 112 卡。
+  # 显式状态函数允许前阶段失败或被 suite 跳过，但不允许取消后继续。
+  perf-8:
+    needs: [prepare, pd-glm52, pd-qwen35]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'perf' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  perf-16:
+    needs: [prepare, pd-glm52, pd-qwen35]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'perf' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf-16.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  perf-32:
+    needs: [prepare, pd-glm52, pd-qwen35]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'perf' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-perf-32.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  # 阶段 3：8 路单板 + 串行的 16 卡 matrix + 32 卡，最多 112 卡。
+  answer-8:
+    needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  answer-16:
+    needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  answer-32:
+    needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+    secrets: inherit
+
+  # 阶段 4：七个 smoke 结束后，full 最多 16 路，即 128 卡。
+  # 定时运行明确全量；手动及 workflow_call 保留 entries 留空的语义。
+  accuracy:
+    needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32, answer-8, answer-16, answer-32]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'accuracy' || inputs.suite == 'all' || inputs.suite == '') }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@v0.5.18
+    with:
+      ref: ${{ needs.prepare.outputs.source_sha }}
+      mode: ${{ inputs.mode || 'full' }}
+      entries: ${{ github.event_name == 'schedule' && 'all' || inputs.entries }}
+      dataset_dir: ${{ inputs.dataset_dir || '' }}
+    secrets: inherit

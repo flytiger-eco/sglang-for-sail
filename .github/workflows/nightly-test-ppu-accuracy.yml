@@ -1,43 +1,9 @@
 name: Nightly Accuracy Test (PPU)
 
-# Default-branch scheduler for the btv1.5 Accuracy (evalscope) line. GitHub
-# evaluates `schedule` only on the repository's default branch, so the cron that
-# actually drives the nightly run has to live here on `main`. The accuracy
-# harness itself -- the reusable workflow, the evalscope suites and the board
-# scripts/configs -- does not: it lives on the `v0.5.18` product line, which is
-# what we want the nightly to exercise. So this file stays deliberately thin. It
-# owns no runner and runs no test; it only fans out to the reusable Accuracy
-# workflow and pins it to `v0.5.18`.
-#
-# Two things are pinned to v0.5.18, for two different reasons:
-#   * `uses: .../test-ppu-accuracy.yml@v0.5.18` resolves the callee workflow
-#     *definition* from the v0.5.18 tip. A local `uses: ./` would resolve it from
-#     this commit on `main`, where the file does not exist; and `uses:` cannot
-#     take an expression, so the ref is the literal branch name and tracks its
-#     tip. This keeps the whole harness single-sourced on v0.5.18 with no copy to
-#     drift against.
-#   * `ref: v0.5.18` is passed down so the callee's in-pod checkout stages the
-#     v0.5.18 *code* (scripts, configs) -- without it the callee would fall back
-#     to github.sha, i.e. this main commit, and test the wrong tree.
-#
-# `mode: full` and `entries: all` are passed so the nightly exercises every
-# registered entry over its whole split; the callee's own defaults (mode full,
-# entries empty) would otherwise run only glm52-fp8chan-gsm8k. Unlike the Perf
-# and PD-Perf lines, the Accuracy line does not push trend rows to the
-# `nightly-test-data` branch: each entry is judged in-pod against the
-# `evaluation.baseline` recorded in its config and its evidence is uploaded as a
-# run artifact, so this scheduler needs only read permission.
-#
-# A manual dispatch may override the code ref (the callee definition stays at
-# v0.5.18); a scheduled run leaves inputs.ref empty and it defaults to v0.5.18.
+# 保留手动入口；定时调度和全局锁只由 global 持有，避免嵌套自锁。
+# 同一提交中的 global 解析源码 SHA，测试定义继续使用 @v0.5.18。
 
 on:
-  schedule:
-    # 16:00 UTC == 00:00 Beijing (UTC+8). Shares the slot with the Answer, Perf
-    # and PD-Perf schedulers: the btv1.5 boards are dedicated test hardware
-    # available around the clock, so the lines are allowed to start together and
-    # the cluster serialises whatever cannot run at once.
-    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
   workflow_dispatch:
     inputs:
       ref:
@@ -45,28 +11,35 @@ on:
         required: false
         type: string
         default: ''
+      mode:
+        description: 'Accuracy 模式：smoke 为 20 条样本，full 为完整数据集。'
+        required: false
+        type: choice
+        options: [full, smoke, both]
+        default: full
+      entries:
+        description: 'Accuracy 条目，逗号分隔或 all；留空保留单条默认行为。'
+        required: false
+        type: string
+        default: ''
+      dataset_dir:
+        description: '覆盖 Accuracy 配置中的已准备数据集目录。'
+        required: false
+        type: string
+        default: ''
 
-concurrency:
-  group: nightly-test-ppu-accuracy-${{ inputs.ref || 'v0.5.18' }}
-  cancel-in-progress: true
-
-# The Accuracy callee declares only `contents: read` -- it uploads evidence
-# artifacts and pushes nothing to the data branch -- so read is all this
-# scheduler needs to grant. `workflow_call` caps the callee's permissions at the
-# caller's grant, so this must not be narrower than what the callee declares.
+# 权限须覆盖 global；Accuracy 测试 job 自身仍仅有 contents: read。
 permissions:
-  contents: read
+  contents: write
+  actions: read
 
 jobs:
-  # A single caller: test-ppu-accuracy.yml runs one job per registered entry
-  # internally (never a matrix), and the cluster serialises whatever cannot run
-  # at once. `secrets: inherit` hands down the PPU artifactory credentials the
-  # pods need.
   accuracy:
-    name: Accuracy (all entries, full)
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@v0.5.18
+    uses: ./.github/workflows/nightly-test-ppu-global.yml
     with:
       ref: ${{ inputs.ref || 'v0.5.18' }}
-      mode: full
-      entries: all
+      suite: accuracy
+      mode: ${{ inputs.mode || 'full' }}
+      entries: ${{ inputs.entries }}
+      dataset_dir: ${{ inputs.dataset_dir }}
     secrets: inherit
