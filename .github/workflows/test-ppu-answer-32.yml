@@ -15,13 +15,7 @@ on:
   # one there and is duplicated rather than extracted: extracting it would put
   # the two verified entries behind an unverified refactor, which is worth doing
   # once this entry itself has a green run to extract from.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -32,7 +26,7 @@ on:
 
 concurrency:
   group: test-ppu-answer-32-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

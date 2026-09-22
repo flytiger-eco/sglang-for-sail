@@ -5,13 +5,7 @@ on:
   # only from the default branch, and this file lives on a version branch, so a
   # cron here would never fire. The btv1.5 performance line is dispatched by hand
   # or by a caller through workflow_call.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -22,7 +16,7 @@ on:
 
 concurrency:
   group: test-ppu-perf-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

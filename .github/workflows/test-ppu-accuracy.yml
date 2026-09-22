@@ -5,32 +5,7 @@ on:
   # only from the default branch, and this file lives on a version branch, so a
   # cron here would never fire. The btv1.5 accuracy line is dispatched by hand or
   # by a caller through workflow_call.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
-      mode:
-        description: 'smoke evaluates 20 samples to prove the path; full evaluates the whole split.'
-        required: false
-        type: choice
-        options:
-          - full
-          - smoke
-          - both
-        default: full
-      entries:
-        description: "Comma-separated entries, or 'all'. Empty runs glm52-fp8chan-gsm8k only. Keys: {glm52-fp8chan,glm52-mxfp4,kimi26-mxfp4,minimax27-fp8chan,minimax27-mxfp4,qwen35-fp8chan,qwen35-mxfp4}-{gsm8k,ceval,ifeval} and -gsm8k-smoke."
-        required: false
-        type: string
-        default: ''
-      dataset_dir:
-        description: 'Override the staged dataset directory the configs name. Recorded in the report when set.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -56,7 +31,7 @@ on:
 
 concurrency:
   group: test-ppu-accuracy-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -112,10 +87,10 @@ permissions:
 # full entries would ask the farm for twenty-one boards until morning. `entries`
 # is therefore a selection rather than a filter with a permissive default: empty
 # runs `glm52-fp8chan-gsm8k` alone -- the one entry that has run green -- and
-# `all` is the word a caller has to write to mean all of them. The `needs` edge
-# from each full entry to its checkpoint's smoke entry orders them under
-# `mode: both` without gating them, so a smoke that failed on a flaky server
-# still lets the measurement run, and the two never hold two boards at once.
+# `all` is the word a caller has to write to mean all of them.
+# 全部 full 先等待七个 smoke；失败或未选中不阻止后续，取消则停止。
+# 前十六项各占一条执行链，末五项接在不同前驱之后，最多同时请求 128 卡。
+# 这是计划请求量上限；异常残留的 worker 仍需在切换前单独确认已清理。
 #
 # C-Eval and IFEval entries are dispatchable but not yet stageable: only GSM8K is
 # on the NAS. Those runs fail in the board script before a checkpoint is loaded,
@@ -213,7 +188,7 @@ jobs:
 
   glm52-fp8chan-gsm8k:
     name: glm5.2-fp8-channelwise gsm8k (btv1.5)
-    needs: glm52-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == '' || inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -287,7 +262,7 @@ jobs:
 
   glm52-fp8chan-ceval:
     name: glm5.2-fp8-channelwise ceval (btv1.5)
-    needs: glm52-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -361,7 +336,7 @@ jobs:
 
   glm52-fp8chan-ifeval:
     name: glm5.2-fp8-channelwise ifeval (btv1.5)
-    needs: glm52-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-fp8chan-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -514,7 +489,7 @@ jobs:
 
   glm52-mxfp4-gsm8k:
     name: glm5.2-mxfp4-fp8 gsm8k (btv1.5)
-    needs: glm52-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -588,7 +563,7 @@ jobs:
 
   glm52-mxfp4-ceval:
     name: glm5.2-mxfp4-fp8 ceval (btv1.5)
-    needs: glm52-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -662,7 +637,7 @@ jobs:
 
   glm52-mxfp4-ifeval:
     name: glm5.2-mxfp4-fp8 ifeval (btv1.5)
-    needs: glm52-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',glm52-mxfp4-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -815,7 +790,7 @@ jobs:
 
   kimi26-mxfp4-gsm8k:
     name: kimi2.6-mxfp4-fp8 gsm8k (btv1.5)
-    needs: kimi26-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -889,7 +864,7 @@ jobs:
 
   kimi26-mxfp4-ceval:
     name: kimi2.6-mxfp4-fp8 ceval (btv1.5)
-    needs: kimi26-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -963,7 +938,7 @@ jobs:
 
   kimi26-mxfp4-ifeval:
     name: kimi2.6-mxfp4-fp8 ifeval (btv1.5)
-    needs: kimi26-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',kimi26-mxfp4-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1116,7 +1091,7 @@ jobs:
 
   minimax27-fp8chan-gsm8k:
     name: minimax2.7-fp8-channelwise gsm8k (btv1.5)
-    needs: minimax27-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1190,7 +1165,7 @@ jobs:
 
   minimax27-fp8chan-ceval:
     name: minimax2.7-fp8-channelwise ceval (btv1.5)
-    needs: minimax27-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1264,7 +1239,7 @@ jobs:
 
   minimax27-fp8chan-ifeval:
     name: minimax2.7-fp8-channelwise ifeval (btv1.5)
-    needs: minimax27-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-fp8chan-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1417,7 +1392,7 @@ jobs:
 
   minimax27-mxfp4-gsm8k:
     name: minimax2.7-mxfp4-fp8 gsm8k (btv1.5)
-    needs: minimax27-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1491,7 +1466,7 @@ jobs:
 
   minimax27-mxfp4-ceval:
     name: minimax2.7-mxfp4-fp8 ceval (btv1.5)
-    needs: minimax27-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1565,7 +1540,7 @@ jobs:
 
   minimax27-mxfp4-ifeval:
     name: minimax2.7-mxfp4-fp8 ifeval (btv1.5)
-    needs: minimax27-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',minimax27-mxfp4-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1718,7 +1693,7 @@ jobs:
 
   qwen35-fp8chan-gsm8k:
     name: qwen3.5-397b-a17b-fp8-channelwise gsm8k (btv1.5)
-    needs: qwen35-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1792,7 +1767,7 @@ jobs:
 
   qwen35-fp8chan-ceval:
     name: qwen3.5-397b-a17b-fp8-channelwise ceval (btv1.5)
-    needs: qwen35-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, glm52-fp8chan-gsm8k]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1866,7 +1841,7 @@ jobs:
 
   qwen35-fp8chan-ifeval:
     name: qwen3.5-397b-a17b-fp8-channelwise ifeval (btv1.5)
-    needs: qwen35-fp8chan-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, glm52-fp8chan-ceval]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-fp8chan-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -2019,7 +1994,7 @@ jobs:
 
   qwen35-mxfp4-gsm8k:
     name: qwen3.5-397b-a17b-mxfp4-fp8 gsm8k (btv1.5)
-    needs: qwen35-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, glm52-fp8chan-ifeval]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-gsm8k,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -2093,7 +2068,7 @@ jobs:
 
   qwen35-mxfp4-ceval:
     name: qwen3.5-397b-a17b-mxfp4-fp8 ceval (btv1.5)
-    needs: qwen35-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, glm52-mxfp4-gsm8k]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-ceval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -2167,7 +2142,7 @@ jobs:
 
   qwen35-mxfp4-ifeval:
     name: qwen3.5-397b-a17b-mxfp4-fp8 ifeval (btv1.5)
-    needs: qwen35-mxfp4-gsm8k-smoke
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, glm52-mxfp4-ceval]
     if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',qwen35-mxfp4-ifeval,')) }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
