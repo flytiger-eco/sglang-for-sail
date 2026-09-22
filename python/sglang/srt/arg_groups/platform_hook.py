@@ -45,6 +45,27 @@ def handle_ppu_backends(server_args: Any):
     # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
     if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
         envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        if cfg.dsa_decode_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_ppu_backends",
+                dsa_decode_backend="flashmla_kv",
+            )
+            logger.info(
+                "PPU fa3 does not support q_v; defaulting the DSA decode "
+                "backend to flashmla_kv."
+            )
+        elif cfg.dsa_decode_backend == "fa3":
+            raise ValueError(
+                "--dsa-decode-backend fa3 is not supported on PPU: the fa3 "
+                'vendor library rejects q_v ("q_v is only supported for '
+                'Hopper GPUs") and the DSA fa3 decode path requires it. Use '
+                "--dsa-decode-backend flashmla_kv instead (the PPU default)."
+            )
     # Read the alias before testing whether the canonical variable is set.
     envs.SGLANG_SAIL_PLA_CUDA.get()
     if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
