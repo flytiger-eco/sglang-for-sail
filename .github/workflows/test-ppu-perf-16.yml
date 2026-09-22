@@ -13,13 +13,7 @@ on:
   # the node count, the suite and the config; it is duplicated rather than
   # extracted, and the extraction is worth doing once both multi-node lines have
   # a green run to extract from.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -30,7 +24,7 @@ on:
 
 concurrency:
   group: test-ppu-perf-16-k8s-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

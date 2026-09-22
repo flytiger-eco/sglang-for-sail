@@ -24,22 +24,7 @@ on:
   # keys give each checkpoint its own path, its own pod name and its own artifact,
   # which is what lets a caller run both in one run. The mxfp4-fp8 case additionally
   # decodes with EAGLE MTP over the base checkpoint.
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
-      pd_config:
-        description: 'Which reviewed GLM-5.2 checkpoint(s) to serve.'
-        required: false
-        type: choice
-        default: 'all'
-        options:
-          - 'all'
-          - 'fp8-channelwise'
-          - 'mxfp4-fp8'
+  # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
       ref:
@@ -55,7 +40,7 @@ on:
 
 concurrency:
   group: test-ppu-pd-perf-k8s-${{ inputs.ref || github.ref }}-${{ inputs.pd_config }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
