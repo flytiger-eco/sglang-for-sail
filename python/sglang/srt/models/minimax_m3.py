@@ -1086,6 +1086,25 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    @staticmethod
+    def _get_msa_decode_idx_q_fp8_out(
+        forward_batch: ForwardBatch, num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        if (
+            not _is_cuda
+            or not forward_batch.forward_mode.is_decode()
+            or not has_forward_context()
+        ):
+            return None
+        sparse_backend = getattr(get_forward_context().attn_backend, "sparse", None)
+        if not getattr(sparse_backend, "use_msa_ppu", False):
+            return None
+        state = getattr(sparse_backend, "_ppu_msa_dec", None)
+        fp8_q_out = getattr(state, "idx_q_fp8", None)
+        if fp8_q_out is None or num_tokens > fp8_q_out.shape[0]:
+            return None
+        return fp8_q_out[:num_tokens]
+
     def _get_aiter_cos_sin_cache(self, packed_qkv: torch.Tensor) -> torch.Tensor:
         source = self.rotary_emb.cos_sin_cache
         cached = self._aiter_cos_sin_cache
