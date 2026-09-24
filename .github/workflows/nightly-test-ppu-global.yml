@@ -1,0 +1,27 @@
+name: Nightly Test (PPU Global)
+run-name: "环境指纹隔离验证：GLM w8a8 / ${{ inputs.ref }}"
+
+# 仅用于 PR #55 验证；此分支不得合并，不保留任何定时或全量作业。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'PR #55 的完整被测源码 SHA'
+        type: string
+        required: true
+
+concurrency:
+  group: ppu-nightly-btv15
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  answer-8:
+    uses: ./.github/workflows/test-ppu-answer.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
