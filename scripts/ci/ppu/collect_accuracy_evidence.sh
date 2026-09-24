@@ -50,6 +50,13 @@ if [ -d "${ACCURACY_RESULTS_ON_RUNNER}" ]; then
       cp -a "${ACCURACY_RESULTS_ON_RUNNER}/${name}" "${destination}/"
     fi
   done
+  # 环境证据仅复制白名单文件；诊断归档失败不改变原评测门禁。
+  for name in environment.json environment-pods.tsv environment-pods.status; do
+    if [ -f "${ACCURACY_RESULTS_ON_RUNNER}/${name}" ]; then
+      cp -a "${ACCURACY_RESULTS_ON_RUNNER}/${name}" "${destination}/" 2>/dev/null ||
+        echo "::warning::环境证据未能归档：${name}"
+    fi
+  done
   if [ -d "${ACCURACY_RESULTS_ON_RUNNER}/evalscope/reports" ]; then
     mkdir -p "${destination}/evalscope"
     cp -a "${ACCURACY_RESULTS_ON_RUNNER}/evalscope/reports" \

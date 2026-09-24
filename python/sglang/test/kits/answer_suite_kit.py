@@ -39,6 +39,7 @@ from sglang.test.kits.answer_eval_kit import (
     validate_test_config,
     write_report_files,
 )
+from sglang.test.kits.environment_fingerprint import EnvironmentRecorder
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
 TEST_CONFIG_PATH_ENV = "SGLANG_PPU_ANSWER_TEST_CONFIG"
@@ -318,6 +319,10 @@ class AnswerSuiteMixin:
             else cls.rank_dir / f"rank-{cls.node_rank}"
         )
         cls.model_path = cls.model_config["path"]
+        cls.process = None
+        cls.environment_recorder = EnvironmentRecorder(
+            cls.report_dir, cls.test_config, node_rank=cls.node_rank
+        )
         stage = "runner_preflight"
         failure_class = "runner_error"
         try:
@@ -363,16 +368,22 @@ class AnswerSuiteMixin:
             # _open_server_logs.  Without this a bringup crash leaves only the
             # generic reason_code, because the child's output would reach only
             # the pod console and vanish with the pod.
+            server_args = build_answer_server_args(
+                cls.test_config, distributed=cls.distributed
+            )
+            server_env = cls._server_environment()
+            cls.environment_recorder.capture(
+                "before_start", server_args=server_args, server_env=server_env
+            )
             cls.process = popen_launch_server(
                 model=cls.model_path,
                 base_url=cls.base_url,
                 timeout=cls.test_config["server"]["startup_timeout_seconds"],
-                other_args=build_answer_server_args(
-                    cls.test_config, distributed=cls.distributed
-                ),
-                env=cls._server_environment(),
+                other_args=server_args,
+                env=server_env,
                 return_stdout_stderr=cls._open_server_logs(),
             )
+            cls.environment_recorder.capture("server_ready", server_pid=cls.process.pid)
             # A worker rank serves a dummy health endpoint once its own
             # schedulers are ready, so the launch above returns on every node and
             # this is the point where each one knows what it holds.
@@ -381,6 +392,9 @@ class AnswerSuiteMixin:
                 failure_class = "runner_error"
                 cls._write_node_inventory()
         except Exception as exc:
+            cls.environment_recorder.capture(
+                "setup_failed", server_pid=getattr(cls.process, "pid", None)
+            )
             try:
                 cls._write_setup_failure(stage, failure_class, exc)
             except Exception as report_error:
@@ -455,6 +469,12 @@ class AnswerSuiteMixin:
 
     @classmethod
     def tearDownClass(cls):
+        recorder = getattr(cls, "environment_recorder", None)
+        if recorder is not None:
+            recorder.capture(
+                "before_stop",
+                server_pid=getattr(getattr(cls, "process", None), "pid", None),
+            )
         # Released before the server is killed, and not the other way round: a
         # worker treats the loss of its own server as a failure, and killing rank
         # 0's process is what makes the workers' schedulers exit, so a teardown
