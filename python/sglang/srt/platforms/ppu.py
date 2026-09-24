@@ -7,6 +7,8 @@ only overrides identity (``_enum``, ``device_name``).
 PPU presence is detected via the ``PPU_SDK`` environment variable.
 """
 
+import os
+
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
@@ -60,10 +62,9 @@ class PPUSRTPlatform(PPUDeviceMixin, SRTPlatform):
 # Load PPU hooks when running on PPU hardware.
 # Each module registers @plugin_hook decorators that inject PPU-native ops
 # into the respective backends transparently.
-import os
-
 if "PPU_SDK" in os.environ:
     import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.ppu.attention.ppu_msa_hook  # noqa: F401
     import sglang.srt.hardware_backend.ppu.moe.ppu_deepep_hooks  # noqa: F401

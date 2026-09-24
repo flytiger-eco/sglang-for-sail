@@ -1257,6 +1257,14 @@ class Envs:
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
 
+    # SAIL MiniMax-M3 MSA backend. Defaults and arch-aware behavior are resolved
+    # in minimax_sparse_ops/msa_ppu.py; see compute_msa_ppu_gate.
+    SGLANG_SAIL_MINIMAX_M3_MSA = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_MEM_BUDGET_MB = EnvInt(256)
+    SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8 = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_SCORE_BF16 = EnvBool(True)
+
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
 
