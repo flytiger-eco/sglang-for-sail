@@ -5864,9 +5864,30 @@ class MHATokenToKOnlyPool(KVCache):
 
 
 def get_minimax_sparse_index_dtype(
-    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+    *,
+    fp8_attn_gemm: bool,
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    model_config,
+    page_size: int,
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    # SAIL must not bypass its MSA gate via another platform's fp8 fast path.
+    # Keep allocation and cell-size estimation on this single dtype decision.
+    # Local import avoids a foundational memory_pool -> attention import cycle.
+    if current_platform.is_sail():
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
+            ppu_msa_indexer_fp8_available,
+        )
+
+        if ppu_msa_indexer_fp8_available(
+            model_config,
+            page_size=page_size,
+            main_dtype=kv_cache_dtype,
+            model_dtype=model_dtype,
+        ):
+            return torch.float8_e4m3fn
+        return model_dtype
     # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too. On Hopper, fp8_e4m3 KV
     # also stores the index K in fp8 for the fp16-widened Triton decode; elsewhere
     # plain fp8 KV keeps the index K in the model dtype.
