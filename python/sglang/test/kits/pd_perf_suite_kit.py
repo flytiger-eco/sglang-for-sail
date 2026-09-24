@@ -40,6 +40,7 @@ import torch
 from sglang.bench_serving import get_auth_headers, run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.test.kits.environment_fingerprint import EnvironmentRecorder
 from sglang.test.kits.pd_perf_eval_kit import (
     DEFAULT_PEER_WAIT_TIMEOUT_SECONDS,
     DEFAULT_ROUTER_STARTUP_TIMEOUT_SECONDS,
@@ -450,6 +451,10 @@ class PDPerfSuiteMixin:
             else cls.rank_dir / f"rank-{cls.node_rank}"
         )
         cls.model_path = cls.model_config["path"]
+        cls.process = None
+        cls.environment_recorder = EnvironmentRecorder(
+            cls.report_dir, cls.test_config, node_rank=cls.node_rank
+        )
         cls.host = get_local_ip_auto()
         cls.server_url = pd_endpoint_url(
             cls.host, cls.disaggregation[f"{cls.role}_port"]
@@ -474,12 +479,17 @@ class PDPerfSuiteMixin:
                 cls._endpoint_path(0).unlink(missing_ok=True)
 
             stage = "server_start"
+            server_args = build_pd_server_args(cls.test_config, cls.role)
+            server_env = cls._server_environment()
+            cls.environment_recorder.capture(
+                "before_start", server_args=server_args, server_env=server_env
+            )
             cls.process = popen_launch_pd_server(
                 model=cls.model_path,
                 base_url=cls.server_url,
                 timeout=cls.test_config[cls.role]["startup_timeout_seconds"],
-                other_args=build_pd_server_args(cls.test_config, cls.role),
-                env=cls._server_environment(),
+                other_args=server_args,
+                env=server_env,
             )
             # Published before the server is ready on purpose: a prefill server
             # and a decode server that each waited for the other's readiness
@@ -495,6 +505,7 @@ class PDPerfSuiteMixin:
                 timeout=cls.test_config[cls.role]["startup_timeout_seconds"],
                 process=cls.process,
             )
+            cls.environment_recorder.capture("server_ready", server_pid=cls.process.pid)
             print(f"the {cls.role} server of node {cls.node_rank} is ready", flush=True)
 
             if cls.node_rank == 0:
@@ -506,6 +517,9 @@ class PDPerfSuiteMixin:
                 stage = "router_start"
                 cls._launch_router()
         except Exception as exc:
+            cls.environment_recorder.capture(
+                "setup_failed", server_pid=getattr(cls.process, "pid", None)
+            )
             try:
                 cls._write_setup_failure(stage, f"{type(exc).__name__}: {exc}")
             except Exception as report_error:
@@ -621,6 +635,12 @@ class PDPerfSuiteMixin:
 
     @classmethod
     def tearDownClass(cls):
+        recorder = getattr(cls, "environment_recorder", None)
+        if recorder is not None:
+            recorder.capture(
+                "before_stop",
+                server_pid=getattr(getattr(cls, "process", None), "pid", None),
+            )
         # Released before anything is killed, and not the other way round: a
         # peer treats the loss of its own server as a failure, and tearing down
         # rank 0's side is what ends the KV path, so the other order would report

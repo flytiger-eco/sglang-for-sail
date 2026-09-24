@@ -32,6 +32,7 @@ import torch
 
 from sglang.bench_serving import get_auth_headers, run_benchmark
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kits.environment_fingerprint import EnvironmentRecorder
 from sglang.test.kits.perf_eval_kit import (
     MeasurementError,
     build_perf_server_args,
@@ -290,6 +291,10 @@ class PerfSuiteMixin:
             else cls.rank_dir / f"rank-{cls.node_rank}"
         )
         cls.model_path = cls.model_config["path"]
+        cls.process = None
+        cls.environment_recorder = EnvironmentRecorder(
+            cls.report_dir, cls.test_config, node_rank=cls.node_rank
+        )
         stage = "runner_preflight"
         try:
             model_dir = Path(cls.model_path)
@@ -331,15 +336,21 @@ class PerfSuiteMixin:
 
             cls.base_url = DEFAULT_URL_FOR_TEST
             stage = "server_start"
+            server_args = build_perf_server_args(
+                cls.test_config, distributed=cls.distributed
+            )
+            server_env = cls._server_environment()
+            cls.environment_recorder.capture(
+                "before_start", server_args=server_args, server_env=server_env
+            )
             cls.process = popen_launch_server(
                 model=cls.model_path,
                 base_url=cls.base_url,
                 timeout=cls.test_config["server"]["startup_timeout_seconds"],
-                other_args=build_perf_server_args(
-                    cls.test_config, distributed=cls.distributed
-                ),
-                env=cls._server_environment(),
+                other_args=server_args,
+                env=server_env,
             )
+            cls.environment_recorder.capture("server_ready", server_pid=cls.process.pid)
             # A worker rank serves a dummy health endpoint once its own
             # schedulers are ready, so the launch above returns on every node
             # and this is the point where each one knows what it holds.
@@ -347,6 +358,9 @@ class PerfSuiteMixin:
                 stage = "node_inventory"
                 cls._write_node_inventory()
         except Exception as exc:
+            cls.environment_recorder.capture(
+                "setup_failed", server_pid=getattr(cls.process, "pid", None)
+            )
             try:
                 cls._write_setup_failure(stage, f"{type(exc).__name__}: {exc}")
             except Exception as report_error:
@@ -410,6 +424,12 @@ class PerfSuiteMixin:
 
     @classmethod
     def tearDownClass(cls):
+        recorder = getattr(cls, "environment_recorder", None)
+        if recorder is not None:
+            recorder.capture(
+                "before_stop",
+                server_pid=getattr(getattr(cls, "process", None), "pid", None),
+            )
         # Released before the server is killed, and not the other way round: a
         # worker treats the loss of its own server as a failure, and killing
         # rank 0's process is what makes the workers' schedulers exit, so a

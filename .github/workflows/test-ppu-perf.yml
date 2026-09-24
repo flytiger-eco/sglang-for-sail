@@ -101,8 +101,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise-4k via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -110,7 +118,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-4k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -219,8 +227,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise-64k via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -228,7 +244,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED=0,PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED=0,PERF_SUITE=nightly-perf-8-glm52-ppu,PERF_TIMEOUT_PER_FILE=9000,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/fp8-channelwise-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-fp8-channelwise-64k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -331,8 +347,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-mxfp4-fp8 via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -340,7 +364,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -443,8 +467,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-w4a8-int8 via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -452,7 +484,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-8-kimi26-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/kimi2.6/w4a8-int8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/kimi2.6-w4a8-int8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -557,8 +589,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8-4k via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -566,7 +606,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-4k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-4k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -668,8 +708,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8-64k via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -677,7 +725,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED=0,PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED=0,PERF_SUITE=nightly-perf-4-glm52-ppu,PERF_TIMEOUT_PER_FILE=7800,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/glm5.2/mxfp4-fp8-144g-prefill-64k.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/glm5.2-mxfp4-fp8-64k"
           container_options: |
             privileged: true
             host_ipc: true
@@ -781,8 +829,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-mxfp4-fp8 via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -790,7 +846,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -892,8 +948,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-fp8-channelwise via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -901,7 +965,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-4-qwen35-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/qwen3.5/397b-a17b-fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/qwen3.5-397b-fp8-channelwise"
           container_options: |
             privileged: true
             host_ipc: true
@@ -1003,8 +1067,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-mxfp4-fp8 via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -1012,7 +1084,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/mxfp4-fp8-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-mxfp4-fp8"
           container_options: |
             privileged: true
             host_ipc: true
@@ -1114,8 +1186,16 @@ jobs:
       - name: Resolve the base image digest
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: ${{ github.job }}
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-fp8-channelwise via K8s
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -1123,7 +1203,7 @@ jobs:
           node_selector: "board-type=ZW-M890P"
           command: bash /workspace/source/scripts/ci/ppu/run_perf_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},PERF_SUITE=nightly-perf-2-minimax27-ppu,PERF_TIMEOUT_PER_FILE=7200,SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/test/registered/ppu/perf_eval/configs/minimax2.7/fp8-channelwise-144g-prefill.json,SGLANG_PPU_PERF_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/perf-results/minimax2.7-fp8-channelwise"
           container_options: |
             privileged: true
             host_ipc: true
