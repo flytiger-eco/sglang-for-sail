@@ -1,27 +1,50 @@
 name: Nightly Test (PPU Global)
-run-name: "环境指纹隔离验证：GLM w8a8 / ${{ inputs.ref }}"
-
-# 仅用于 PR #55 验证；此分支不得合并，不保留任何定时或全量作业。
+run-name: "环境观察器只读诊断 / 35969319431"
 on:
   workflow_dispatch:
-    inputs:
-      ref:
-        description: 'PR #55 的完整被测源码 SHA'
-        type: string
-        required: true
-
-concurrency:
-  group: ppu-nightly-btv15
-  cancel-in-progress: false
-  queue: max
-
 permissions:
   contents: read
-  actions: read
-
+# CPU 诊断不申请 PPU，也不持有计算作业的全局锁。
 jobs:
-  answer-8:
-    uses: ./.github/workflows/test-ppu-answer.yml
-    with:
-      ref: ${{ inputs.ref }}
-    secrets: inherit
+  observer-diagnostic:
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 5
+    steps:
+      - name: 比较有界查询与原生查询
+        shell: bash
+        run: |
+          set -u
+          set +e
+          output="/wl_nas/devops/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/observer-diagnostic.txt"
+          mkdir -p "$(dirname "$output")"
+          exec > >(tee "$output")
+          query='{range .items[*]}{.metadata.name}{"\t"}{.metadata.uid}{"\t"}{.spec.nodeName}{"\t"}{.spec.containers[?(@.name=="worker")].image}{"\t"}{.status.containerStatuses[?(@.name=="worker")].imageID}{"\n"}{end}'
+          for bin in "$(command -v kubectl || true)" /opt/bin/kubectl; do
+            [ -x "$bin" ] || continue
+            printf 'kubectl=%s\n' "$bin"
+            for mode in baseline bounded; do
+              result=$(
+                if [ "$mode" = bounded ]; then ulimit -f 128; fi
+                timeout 20 "$bin" get pods -n default -l ppu-job=ppu-flytiger-eco-35969319431-1-glm52-w8a8 --request-timeout=5s -o "jsonpath=$query" 2>&1
+              )
+              code=$?
+              printf 'mode=%s exit=%s bytes=%s\n' "$mode" "$code" "${#result}"
+              if [ "$code" = 0 ]; then
+                printf '%s\n' "$result" | head -c 4096
+              else
+                case "$result" in
+                  *'File size limit exceeded'*|*'file too large'*) reason=file_size_limit ;;
+                  *Forbidden*|*forbidden*) reason=forbidden ;;
+                  *Unauthorized*|*unauthorized*) reason=unauthorized ;;
+                  *'localhost:8080'*) reason=missing_cluster_config ;;
+                  *'jsonpath'*|*'JSONPath'*) reason=jsonpath_error ;;
+                  *'connection refused'*) reason=connection_refused ;;
+                  *'timeout'*|*'timed out'*) reason=timeout ;;
+                  *) reason=unclassified ;;
+                esac
+                printf 'reason=%s\n' "$reason"
+              fi
+            done
+          done
