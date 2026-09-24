@@ -1,0 +1,39 @@
+name: Nightly Test (PPU Global)
+
+# THROWAWAY PROBE SHIM — NOT FOR MERGE.
+#
+# Isolated single-entry re-run of the glm5.2-w8a8-int8 answer board. In nightly
+# run 35909086988 (2026-09-23) this entry fell from green to 0/10: every case
+# degenerated (finish_reason=length, periodic_fragment_repeat,
+# repeated_4gram_coverage, invalid_unicode) with a cold RTC GEMM compile tripping
+# the 300s soft watchdog. This shim re-runs only that one board against the same
+# in-pod source (v0.5.18 tip) to tell a stable W8A8-INT8 numerical defect apart
+# from a one-off cold-kernel flake, without contending on the other boards.
+#
+# The borrowed filename is the sole workflow_dispatch entry indexed on the
+# default branch; `uses: ./` resolves the trimmed answer callee on this shim.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Full 40-char source SHA to check out in-pod.'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+# Share the nightly lock so this probe never oversubscribes the 128-card budget.
+concurrency:
+  group: ppu-nightly-btv15
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  answer-8:
+    uses: ./.github/workflows/test-ppu-answer.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
