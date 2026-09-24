@@ -44,6 +44,7 @@ from sglang.test.kits.accuracy_eval_kit import (
     validate_test_config,
     write_report_files,
 )
+from sglang.test.kits.environment_fingerprint import EnvironmentRecorder
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
 TEST_CONFIG_PATH_ENV = "SGLANG_PPU_ACCURACY_TEST_CONFIG"
@@ -315,6 +316,7 @@ class AccuracySuiteMixin:
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = None
         cls.evalscope_command = None
+        cls.environment_recorder = EnvironmentRecorder(cls.output_dir, cls.test_config)
         reason_code = "server_start_failed"
         try:
             cls.evalscope_bin = cls._resolve_evalscope()
@@ -368,14 +370,23 @@ class AccuracySuiteMixin:
                 work_dir=cls.work_dir,
                 executable=cls.evalscope_bin,
             )
+            server_args = build_accuracy_server_args(cls.test_config)
+            server_env = cls._server_environment()
+            cls.environment_recorder.capture(
+                "before_start", server_args=server_args, server_env=server_env
+            )
             cls.process = popen_launch_server(
                 model=cls.model_path,
                 base_url=cls.base_url,
                 timeout=cls.test_config["server"]["startup_timeout_seconds"],
-                other_args=build_accuracy_server_args(cls.test_config),
-                env=cls._server_environment(),
+                other_args=server_args,
+                env=server_env,
             )
+            cls.environment_recorder.capture("server_ready", server_pid=cls.process.pid)
         except Exception as exc:
+            cls.environment_recorder.capture(
+                "setup_failed", server_pid=getattr(cls.process, "pid", None)
+            )
             try:
                 cls._write_setup_failure(reason_code, f"{type(exc).__name__}: {exc}")
             except Exception as report_error:
@@ -427,6 +438,12 @@ class AccuracySuiteMixin:
 
     @classmethod
     def tearDownClass(cls):
+        recorder = getattr(cls, "environment_recorder", None)
+        if recorder is not None:
+            recorder.capture(
+                "before_stop",
+                server_pid=getattr(getattr(cls, "process", None), "pid", None),
+            )
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
         super().tearDownClass()
