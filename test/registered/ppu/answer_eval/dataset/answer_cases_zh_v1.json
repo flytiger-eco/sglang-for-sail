@@ -147,7 +147,7 @@
       "reference_facts": {"required_places": ["钟楼", "大雁塔"], "required_days": 3},
       "rules": [
         {"type": "contains_all", "items": [["钟楼"], ["大雁塔"]], "description": "包含钟楼和大雁塔"},
-        {"type": "contains_any", "items": ["三天", "三日", "3天", "3日"], "description": "形成三日行程"},
+        {"type": "contains_any", "items": ["三天", "三日", "3天", "3日", "day3", "day 3"], "description": "形成三日行程"},
         {"type": "length", "min_chars": 35, "max_chars": 100, "description": "约 50 字，MVP 容许 35 至 100 个非空白字符"}
       ],
       "judge_rubric": {"factual_correctness": 3, "relevance": 2, "completeness": 2, "coherence": 2, "no_repetition": 1}
