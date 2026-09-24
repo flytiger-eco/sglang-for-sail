@@ -12,6 +12,25 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 5
     steps:
+      - name: 验证远端 action 执行上下文
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const cp = require('child_process');
+            const query = '{range .items[*]}{.metadata.name}{"\\t"}{.metadata.uid}{"\\t"}{.spec.nodeName}{"\\t"}{.spec.containers[?(@.name=="worker")].image}{"\\t"}{.status.containerStatuses[?(@.name=="worker")].imageID}{"\\n"}{end}';
+            const result = {kubeconfig_configured: Boolean(process.env.KUBECONFIG)};
+            try {
+              result.metadata = cp.execFileSync('/opt/bin/kubectl', ['get', 'pods', '-n', 'default', '-l', 'ppu-job=ppu-flytiger-eco-35969319431-1-glm52-w8a8', '--request-timeout=5s', '-o', `jsonpath=${query}`], {encoding:'utf8', timeout:10000, maxBuffer:65536, stdio:['ignore','pipe','pipe']});
+              result.status = 'ok';
+            } catch (e) {
+              result.status = 'query_failed';
+              result.code = e.status;
+            }
+            const dir = `/wl_nas/devops/${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`;
+            fs.mkdirSync(dir, {recursive:true});
+            fs.writeFileSync(`${dir}/action-observer-diagnostic.json`, JSON.stringify(result));
+            console.log(result);
       - name: 比较有界查询与原生查询
         shell: bash
         run: |
