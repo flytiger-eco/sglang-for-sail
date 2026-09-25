@@ -191,3 +191,61 @@ jobs:
       entries: ${{ github.event_name == 'schedule' && 'all' || inputs.entries }}
       dataset_dir: ${{ inputs.dataset_dir || '' }}
     secrets: inherit
+
+  publish-derived-trend:
+    name: 唯一趋势汇总发布（CPU）
+    needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32, answer-8, answer-16, answer-32, accuracy]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 15
+    env:
+      TREND_TOOL_SHA: ${{ vars.PPU_TREND_TOOL_SHA }}
+    steps:
+      - name: 校验维护者配置的工具版本
+        id: tool-version
+        shell: bash
+        run: |
+          if [[ ! "$TREND_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::必须配置PPU_TREND_TOOL_SHA为已审核工具的完整commit SHA'
+            exit 1
+          fi
+          printf 'TREND_OUTPUT_DIR=%s/trend-publication\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: 固定本次派生UTC日期
+        shell: bash
+        run: printf 'TREND_AS_OF_DATE=%s\n' "$(date -u +%F)" >> "$GITHUB_ENV"
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TREND_TOOL_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: source
+      - name: 核验工具checkout身份
+        id: trusted
+        shell: bash
+        run: test "$(git -C source rev-parse HEAD)" = "$TREND_TOOL_SHA"
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          fetch-depth: 0
+          path: series
+      - name: 重算并发布共享趋势
+        shell: bash
+        working-directory: series
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_SOURCE_SHA: ${{ github.sha }}
+          RUN_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: bash ../source/scripts/ci/ppu/publish_derived_trend.sh
+      - name: 保存候选快照及发布状态
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-derived-trend-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TREND_OUTPUT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 30
