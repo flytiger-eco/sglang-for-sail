@@ -1457,6 +1457,62 @@ class TestPPUAnswerEval(unittest.TestCase):
                 self.assertEqual(result["failure_class"], "candidate_failed")
                 self.assertIn("fact_rule_failed", self.reason_codes(result))
 
+    def test_xian_trip_accepts_bell_and_drum_towers(self):
+        for place in ("钟楼", "钟鼓楼"):
+            with self.subTest(place=place):
+                result = self.evaluate(
+                    "xian-three-day-trip",
+                    f"第一天：{place}、回民街、古城墙；第二天：兵马俑、华清宫；"
+                    "第三天：大雁塔、大唐不夜城、陕历博。",
+                )
+                self.assertEqual(result["verdict"], "passed", result["findings"])
+                self.assertEqual(result["findings"], [])
+
+    def test_xian_trip_rejects_drum_tower_alone(self):
+        result = self.evaluate(
+            "xian-three-day-trip",
+            "第一天：鼓楼、回民街、古城墙；第二天：兵马俑、华清宫；"
+            "第三天：大雁塔、大唐不夜城、陕历博。",
+        )
+        self.assertEqual(result["verdict"], "failed")
+        self.assertIn("fact_rule_failed", self.reason_codes(result))
+        self.assertTrue(
+            any(
+                "钟楼" in aliases
+                for finding in result["findings"]
+                for aliases in finding["observed"].get("missing", [])
+            )
+        )
+
+    def test_xian_trip_alias_still_requires_big_wild_goose_pagoda(self):
+        result = self.evaluate(
+            "xian-three-day-trip",
+            "第一天：钟鼓楼、回民街、古城墙；第二天：兵马俑、华清宫；"
+            "第三天：小雁塔、大唐不夜城、陕历博。",
+        )
+        self.assertEqual(result["verdict"], "failed")
+        finding = next(
+            item
+            for item in result["findings"]
+            if item["reason_code"] == "fact_rule_failed"
+        )
+        self.assertEqual(finding["observed"]["missing"], [["大雁塔"]])
+
+    def test_xian_trip_alias_still_requires_three_days(self):
+        result = self.evaluate(
+            "xian-three-day-trip",
+            "西安游览钟鼓楼、回民街、古城墙，参观兵马俑、华清宫，"
+            "游览大雁塔、大唐不夜城、陕西历史博物馆，感受古都风貌。",
+        )
+        self.assertEqual(result["verdict"], "failed")
+        self.assertTrue(
+            any(
+                finding["observed"].get("rule") == "contains_any"
+                for finding in result["findings"]
+                if finding["reason_code"] == "fact_rule_failed"
+            )
+        )
+
     def test_open_ended_cases_are_only_hard_constraint_covered(self):
         xian = self.evaluate(
             "xian-three-day-trip",
@@ -1668,9 +1724,17 @@ class TestPPUAnswerEval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
             write_report_files(report, output_dir)
+            # This fixture carries no test-config identity, so the trend
+            # conversion cannot build a series key and deliberately leaves a
+            # fixed, candidate-free marker instead of a trend file.  The main
+            # report and gate are unaffected.
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
-                {"result.json", "summary.md", "junit.xml"},
+                {"result.json", "summary.md", "junit.xml", "trend-error.json"},
+            )
+            self.assertEqual(
+                json.loads((output_dir / "trend-error.json").read_text()),
+                {"reason_code": "trend_conversion_failed"},
             )
             for path in output_dir.iterdir():
                 self.assertNotIn(b"PRIVATE-CANDIDATE", path.read_bytes())
@@ -1824,6 +1888,9 @@ class TestPPUAnswerEval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
             write_report_files(report, output_dir, include_raw_outputs=True)
+            # No test-config identity here either, so the sanitized trend marker
+            # sits alongside the raw and redacted artifacts without disturbing
+            # them.
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
                 {
@@ -1832,7 +1899,12 @@ class TestPPUAnswerEval(unittest.TestCase):
                     "junit.xml",
                     "result.raw.json",
                     "label_candidates.jsonl",
+                    "trend-error.json",
                 },
+            )
+            self.assertEqual(
+                json.loads((output_dir / "trend-error.json").read_text()),
+                {"reason_code": "trend_conversion_failed"},
             )
             raw = json.loads((output_dir / "result.raw.json").read_text())
             public = json.loads((output_dir / "result.json").read_text())
