@@ -238,7 +238,7 @@ jobs:
         working-directory: series
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-          RUN_SOURCE_SHA: ${{ github.sha }}
+          RUN_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
           RUN_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: bash ../source/scripts/ci/ppu/publish_derived_trend.sh
       - name: 保存候选快照及发布状态
@@ -246,6 +246,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ppu-derived-trend-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.TREND_OUTPUT_DIR }}/
+          path: ${{ runner.temp }}/trend-publication/
           if-no-files-found: warn
           retention-days: 30
