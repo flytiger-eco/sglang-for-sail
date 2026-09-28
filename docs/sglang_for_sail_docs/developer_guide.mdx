@@ -1,0 +1,270 @@
+---
+title: "Contribution Guide"
+mode: wide
+metatags:
+    description: "SGLang-for-Sail contribution guide: source install, pre-commit, unit tests, CI triggers, code style, PPU development."
+---
+Welcome to **SGLang-for-Sail**! We appreciate your interest in contributing. This guide provides a concise overview of how to set up your environment, run tests, and open a Pull Request (PR). Whether you're fixing a small bug or developing a major feature, we encourage following these steps for a smooth contribution process.
+
+## Install SGLang from Source
+
+### Fork and clone the repository
+
+**Note**: New contributors do **not** have the write permission to push to the official repo. Please fork the repository under your GitHub account, then clone your fork locally.
+
+```bash
+git clone https://github.com/<your_user_name>/sglang-for-sail.git
+```
+
+### Build from source
+
+```bash
+cd sglang-for-sail
+git checkout v0.5.18  # or your target release branch
+pip install -e "python[all]"
+```
+
+## Format code with pre-commit
+
+We use [pre-commit](https://pre-commit.com/) to maintain consistent code style checks. Before pushing your changes, please run:
+
+```bash
+pip3 install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+- **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
+- **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
+
+## Run and add unit tests
+
+If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
+
+### Unit tests (no server required)
+
+Unit tests live under `test/registered/unit/`, organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+
+SGLang supports both Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework and [pytest](https://docs.pytest.org/). Registered CI tests must use `CustomTestCase` instead of raw `unittest.TestCase`, register themselves with `register_*_ci(...)`, and include a standard `__main__` entry point.
+
+**Run tests locally:**
+
+```bash
+# Closest to how CI executes an individual registered test file
+python3 test/registered/unit/mem_cache/test_radix_cache_unit.py
+
+# Run a registered CI suite
+python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
+
+# Pytest remains useful for local directory-level discovery
+pytest test/registered/unit/mem_cache/ -v
+```
+
+### E2E tests (server required)
+
+For tests that require launching a server, refer to `test/registered/README.md` for guidance on where to place your test.
+
+### PPU hardware tests
+
+For PPU-specific tests, the CI suite is organized into three stages:
+
+| Stage | GPU Count | Purpose |
+|-------|-----------|---------|
+| **stage-a** (smoke gate) | 1 GPU | Quick boot validation: offline engine init + HTTP server startup. Fails fast to catch obvious breakage. |
+| **stage-b** (1-GPU body) | 1 GPU | Main single-GPU test suite. |
+| **stage-c** (2-GPU) | 2 GPUs | Multi-GPU / parallelism tests. |
+
+Run PPU tests locally (requires PPU hardware):
+
+```bash
+cd test
+python3 run_suite.py --hw ppu --suite stage-a-test-1-gpu-ppu --continue-on-error
+```
+
+## Write documentation
+
+Documentation is a good way for new contributors to learn the SGLang codebase. See `docs/README.md` for the current Mintlify setup and validation commands.
+
+## Test the accuracy
+
+If your code changes model output, run an accuracy evaluation appropriate for the affected model and feature. For example, after launching a server, run the unified GSM8K evaluator:
+
+```bash
+# Launch a server
+sglang serve --model-path Qwen/Qwen3-8B
+
+# Evaluate
+python3 -m sglang.test.run_eval \
+  --eval-name gsm8k \
+  --port 30000 \
+  --num-examples 200
+```
+
+Please note that the above script is primarily a sanity check, not a rigorous accuracy or speed test. This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine. GSM8K is too easy for many state-of-the-art models, so use a more challenging or feature-specific evaluation when appropriate.
+
+## Benchmark the speed
+
+Refer to [Benchmark and Profiling](https://docs.sglang.ai/docs/developer_guide/benchmark_and_profiling).
+
+## Requesting a review for merge
+
+You can follow the pull request merge process described in `.github/MAINTAINER.md`. You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals. Then your PR can be merged.
+
+## How to Trigger CI Tests
+
+### CI Pipeline Overview
+
+This repository uses a 4-stage gate chain defined in `.github/workflows/ci.yaml`. Each stage must pass before the next one starts:
+
+```
+PR opened
+  │
+  ▼
+Stage 1: Pre-check (secret scanning)
+  │
+  ▼
+Stage 2: Smoke Test  ─┐
+                       ├── (parallel)
+   AI Code Review  ────┘
+  │
+  ▼
+Stage 3: Human Review Gate (requires ≥1 human approval)
+  │
+  ▼
+Stage 4: Full CI (PPU hardware test suite)
+```
+
+| Stage | Workflow | Description |
+|-------|----------|-------------|
+| **Pre-check** | org-level reusable workflow | TruffleHog secret scanning on PR diff. Blocks if any credentials are detected. |
+| **Smoke Test** | inline in `ci.yaml` | Quick validation tests. |
+| **AI Code Review** | org-level reusable workflow | Waits for GitHub Copilot to complete automated code review. |
+| **Human Review** | org-level reusable workflow | Polls and waits until at least 1 human reviewer approves the PR. |
+| **Full CI** | `pr-test-ppu.yml` | Complete PPU hardware test suite (3 sequential stages: A → B → C). |
+
+### Triggering CI
+
+We have limited CI machines, so only trusted contributors have permission to trigger CI tests. Users with permission are listed in `.github/CI_PERMISSIONS.json`.
+
+**PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`.
+
+For CI to run on a pull request, it must have the `run-ci` label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+
+- `/tag-run-ci-label`: Adds the `run-ci` label. Only **future** commits trigger CI; the current commit is unaffected. Add the `extra` argument (`/tag-run-ci-label extra`) to additionally apply the `run-ci-extra` label, opting the PR into the extra test workflow.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed or skipped**.
+- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
+- `/rerun-test <test-spec>`: Reruns one or more specific tests directly.
+- `/rerun-group <group>`: Expands one or more registered test groups and dispatches their tests.
+
+<Warning>
+The human-review gate waits for at least 1 human approval before Full CI starts. You cannot approve your own PR (GitHub restriction). Ask a team member to review and approve.
+</Warning>
+
+If a command isn't recognized, the handler reacts with a confused reaction. A comment with no reaction at all means the handler never saw it — check the command is spelled correctly.
+
+### CI rate limits
+
+We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources. Each CI workflow has a default cooldown period (120 minutes for low-permission users). High-permission users (write/maintain/admin) are exempt. Per-user cooldown overrides can be configured in `.github/CI_PERMISSIONS.json`.
+
+```yaml
+cool-down-minutes:
+  description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
+  type: number
+  default: 120
+```
+
+### Concurrency control
+
+The CI uses `cancel-in-progress` concurrency groups per PR number. When you push new commits, the previous CI run is automatically cancelled and a new one starts. This is the expected behavior.
+
+<Note>
+Do **not** add `pull_request_review` as a CI trigger. The human-review gate polls for approvals within the same run; adding this trigger would cause a new run on every review event, which combined with cancel-in-progress would cancel the old run and restart everything.
+</Note>
+
+## Code style guidance
+
+- Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
+- Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
+- Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
+- Make functions as pure as possible. Avoid in-place modification of arguments.
+- Prefer immutable data and compute configuration-derived values once during initialization when their inputs cannot change.
+- Keep functions under roughly 100 lines and make orchestration functions read like high-level pseudocode by extracting details into focused helpers.
+- Keep files concise. If a file exceeds 2,000 lines of code, split it into cohesive smaller modules.
+- Avoid adding mixins; prefer composition or plain functions. Use `msgspec.Struct` for new data containers instead of `dataclasses.dataclass` or `attrs`.
+- Prefer keyword arguments for calls with two or more arguments, and pass callees the specific values they need instead of a large state-holding object.
+- In a file, put core data structures at the top of the file. Put utility functions at the bottom of the file.
+- Keep tests run fast.
+  - If a single test file runs longer than 500 seconds, split it into multiple smaller files.
+  - If a single job in a GitHub Actions workflow runs longer than 30 minutes, split it into smaller jobs or steps.
+  - Reuse server launches across test methods in E2E test files.
+- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
+- When supporting new hardware or features:
+  - Do not drastically change existing code.
+  - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ppu.py`).
+  - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
+
+## How to update kernels in SGLang
+
+Choose the implementation and release path based on the kernel's dependencies. For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the in-tree JIT kernel path. Use the AOT `sglang-kernel` path for heavyweight kernels, large C++ dependencies, or operations that need wheel packaging and Torch operator registration.
+
+### Update sglang-kernel
+
+The `sglang-kernel` distribution is a separate Python package, but its source lives in this repository under `python/sglang/kernels/aot/`. Normal PR CI builds and installs a PR-local `sglang-kernel` wheel, so it can test an AOT kernel and its caller together. This does not establish compatibility after merge: installed SGLang uses the released version pinned in `python/pyproject.toml`.
+
+For an AOT kernel change:
+
+1. Implement the kernel under `python/sglang/kernels/aot/csrc/` and update its declaration, Torch registration, and CMake source list.
+2. Expose the Python API under `python/sglang/kernels/aot/python/sgl_kernel/`.
+3. Add correctness tests under `python/sglang/kernels/aot/tests/` and a benchmark under `python/sglang/kernels/aot/benchmark/` when applicable.
+4. Build and test from `python/sglang/kernels/aot/` following its README.
+
+### Update JIT kernels
+
+For lightweight operations, prefer the in-tree JIT kernel path. See [JIT Kernels](https://docs.sglang.ai/docs/developer_guide/development_jit_kernel_guide) for the development guide.
+
+## PPU Development Notes
+
+This section covers development considerations specific to the PPU hardware platform.
+
+### Hardware backends
+
+PPU-specific code lives under `python/sglang/srt/hardware_backend/ppu/`. When adding PPU support for new features:
+
+- Follow the multi-layer plugin system: platform entry points, hook framework (`BEFORE`/`AFTER`/`AROUND`/`REPLACE`), attention backend registry, and kernel selector.
+- Refer to the NPU port (`python/sglang/srt/hardware_backend/npu/`) as a reference implementation for non-NVIDIA platforms.
+- Keep PPU-specific paths isolated; the common NVIDIA path should always be the first branch in conditional blocks.
+
+### Commit message conventions
+
+Use structured commit messages with the following format:
+
+```
+<type>(<scope>): <short summary>
+
+<body — explain WHY this change is needed>
+
+<dependency notes if applicable>
+```
+
+Common types: `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `ci`, `chore`.
+
+### Cherry-pick workflow
+
+This repository syncs with upstream SGLang releases via cherry-pick. When porting upstream patches:
+
+- Scan upstream commits for relevant changes and analyze each commit's message and diff.
+- Apply patches one by one, resolving conflicts against the existing PPU adaptations.
+- When resolving conflicts involving new upstream features (e.g., new hardware support), retain both the upstream feature and the existing PPU path.
+- After cherry-picking, verify import paths and run the full test suite on PPU hardware.
+
+## Tips for newcomers
+
+If you want to contribute but don't have a specific idea in mind, pick issues labeled "good first issue" or "help wanted". These tasks typically have lower complexity and provide an excellent introduction to the codebase.
+
+Also check out the following materials as startup guide:
+- [Mini-SGLang](https://github.com/sgl-project/mini-sglang) for a quick overview on the structure of SGLang.
+- [Code Walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang's workflow.
+
+If you have any questions, please feel free to reach out to the team.
+
+Thank you for your interest in SGLang-for-Sail. Happy coding!
