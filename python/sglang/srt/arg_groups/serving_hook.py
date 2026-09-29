@@ -23,6 +23,7 @@ from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
     is_mnnvl_fabric_device,
+    is_ppu,
 )
 from sglang.utils import is_in_ci
 
@@ -419,7 +420,9 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120
+        (is_ppu() and get_platform().device_sm >= 89)
+        or get_platform().is_sm100
+        or get_platform().is_sm120
     ):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
