@@ -392,6 +392,11 @@ def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
 
 
+def get_attention_tp_size() -> int:
+    """Shortcut for get_attn_tensor_model_parallel_world_size."""
+    return get_attn_tensor_model_parallel_world_size()
+
+
 def get_attention_dp_rank() -> int:
     assert _ATTN_DP_RANK is not None, "dp attention not initialized!"
     return _ATTN_DP_RANK
