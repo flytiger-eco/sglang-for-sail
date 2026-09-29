@@ -194,6 +194,7 @@ class GSM8KMixin:
     gsm8k_thinking: bool = False  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
     gsm8k_n_repeats: int = 1  # sgl_eval backend
+    gsm8k_data_path: Optional[str] = None  # local path to GSM8K jsonl
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -228,6 +229,7 @@ class GSM8KMixin:
                 api="completion",
                 max_tokens=512,
                 num_shots=self.gsm8k_num_shots,
+                gsm8k_data_path=self.gsm8k_data_path,
             )
 
 
