@@ -435,6 +435,23 @@ def get_attention_dp_size() -> int:
     return _ATTN_DP_SIZE
 
 
+def dp_slot_in(per_rank) -> int:
+    """Return this process's slot in a per-DP-replica sequence.
+
+    The sequence carries one entry per replica of the gather this process
+    takes part in. Length one is the all-gather-skipped batch, which
+    carries this process's entry alone.
+
+    Fork note: unlike upstream (#40339), the draft scope here does not
+    narrow the attention-DP fields, so get_attention_dp_rank() keeps
+    answering with the target's slot inside draft scopes and no
+    scoped-slot bookkeeping is needed.
+    """
+    if len(per_rank) == 1:
+        return 0
+    return get_attention_dp_rank()
+
+
 @contextmanager
 def disable_dp_size():
     """Run without DP attention until this scope ends.
