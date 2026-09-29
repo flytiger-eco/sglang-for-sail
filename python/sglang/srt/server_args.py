@@ -1988,6 +1988,10 @@ class ServerArgs:
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
         NS("exec.kernel"),
     ] = False
+    enable_custom_all_reduce: A[
+        bool,
+        "Enable the custom all-reduce kernel.",
+    ] = False
     disable_custom_all_reduce: A[
         bool,
         Arg(
