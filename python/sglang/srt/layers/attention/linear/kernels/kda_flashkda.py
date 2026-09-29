@@ -140,21 +140,24 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 return_intermediate_states=return_intermediate_states,
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-            ),
-            None,
+        # Only reachable when return_intermediate_states is False (the True case
+        # is served by the Triton fallback above), so honor the (out) vs (out, h)
+        # return contract and hand back just the output tensor -- kda_nvidia and
+        # kda_ptx do the same. Wrapping into (out, None) here made non-track
+        # batches (track_ssm=False, which never unpack) receive a tuple and fail
+        # on `.shape` downstream (o_norm / fused_norm_gate).
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
 
     @staticmethod
