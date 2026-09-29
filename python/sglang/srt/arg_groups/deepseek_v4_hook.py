@@ -218,11 +218,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
             f"got {cfg.moe_a2a_backend!r}."
         )
     logger.warning(
-        "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 "
-        "context parallelism is enabled."
-    )
-    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
-    logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
