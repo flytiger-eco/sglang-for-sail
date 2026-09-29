@@ -663,6 +663,8 @@ class ModelConfig:
             "DeepseekV32ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+        if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
+            self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
             self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
@@ -1962,6 +1964,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
+    "GlmMoeDsaForCausalLMNextN",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
