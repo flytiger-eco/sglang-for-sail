@@ -95,6 +95,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
     is_xpu,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -113,6 +114,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -1122,10 +1124,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if moe_a2a_backend is None:
                 moe_a2a_backend = get_moe_a2a_backend()
-            if not (
-                moe_a2a_backend.is_deepep()
-                or moe_a2a_backend.is_mooncake()
-                or moe_a2a_backend.is_nixl()
+            if (
+                not (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_mooncake()
+                    or moe_a2a_backend.is_nixl()
+                )
+                and not envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
             ):
                 return False
             from sglang.srt.layers import deep_gemm_wrapper
@@ -2380,6 +2385,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if moe_runner_backend.is_deep_gemm():
+            if _is_ppu:
+                import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
 
         if (
             moe_runner_backend.is_deep_gemm()

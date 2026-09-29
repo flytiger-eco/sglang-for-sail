@@ -2440,7 +2440,7 @@ class ServerArgs:
         NS("exec.moe"),
     ] = 2
     deepep_dispatcher_output_dtype: A[
-        Literal["auto", "bf16", "fp8", "int8", "nvfp4"],
+        Literal["auto", "bf16", "fp8", "int8", "nvfp4", "uint8"],
         "Select DeepEP dispatcher output dtype",
         NS("exec.moe"),
     ] = "auto"
