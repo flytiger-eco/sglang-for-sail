@@ -2002,6 +2002,21 @@ class DeepseekV4AttnBackend(
                     req_pool_indices=req_pool_indices,
                 )
             )
+            # Attention-TP padding may add a partial verify block. Use the same
+            # dummy rows as ragged/prefill expansion, keeping num_q_tokens logical
+            # so compressors do not consume the padding as real request tokens.
+            pad_size = out_cache_loc.shape[0] - num_q_tokens
+            assert pad_size >= 0
+            if pad_size:
+                seq_lens_casual = torch.nn.functional.pad(
+                    seq_lens_casual, (0, pad_size), value=1
+                )
+                req_pool_indices_repeated = torch.cat(
+                    (
+                        req_pool_indices_repeated,
+                        req_pool_indices_repeated[-1:].expand(pad_size),
+                    )
+                )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,

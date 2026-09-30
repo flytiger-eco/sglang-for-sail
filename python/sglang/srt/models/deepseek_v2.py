@@ -111,7 +111,13 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    StandardTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    _post_process_topk_ids,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -1458,19 +1464,43 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
-                **topk_kwargs,
+            dispatch_info = (
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
             )
+            if self.gate.e_score_correction_bias_vl is not None:
+                # IDs follow the same local row order as hidden_states, including
+                # CP sharding and the attention-TP scatter before DeepEP.
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                )
+                # VL selects logical experts. DeepEP needs the same physical
+                # expert mapping and padding handling as the regular router.
+                topk_ids, topk_weights, recorder_ids = _post_process_topk_ids(
+                    topk_ids=topk_output.topk_ids,
+                    topk_weights=topk_output.topk_weights,
+                    topk_config=self.topk.topk_config,
+                    router_logits=router_logits,
+                    layer_id=self.layer_id,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                )
+                get_global_expert_distribution_recorder().on_select_experts(
+                    topk_ids=recorder_ids
+                )
+                topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id

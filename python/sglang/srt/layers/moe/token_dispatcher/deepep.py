@@ -193,6 +193,10 @@ class DeepEPBuffer:
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                low_latency_layout=None,
+                registered_layouts=set(),
+                num_rdma_bytes=0,
+                num_qps_per_rank=0,
             )
             buffers["deepep_ep_state"] = state
         return state
@@ -208,7 +212,21 @@ class DeepEPBuffer:
         num_experts: int = -1,
     ):
         state = cls._state()
+        layout = (num_max_dispatch_tokens_per_rank, hidden_size, num_experts)
         if state.buffer is not None:
+            if deepep_mode.enable_low_latency():
+                required_bytes = Buffer.get_low_latency_rdma_size_hint(
+                    layout[0], layout[1], group.size(), layout[2]
+                )
+                if (
+                    not state.buffer.low_latency_mode
+                    or required_bytes > state.num_rdma_bytes
+                    or num_experts // group.size() > state.num_qps_per_rank
+                ):
+                    raise RuntimeError(
+                        f"DeepEP buffer cannot accommodate low-latency layout {layout}; "
+                        "register all target/draft layouts before allocating the buffer"
+                    )
             return state.buffer
 
         state.hidden_size = hidden_size
@@ -235,15 +253,17 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
-            num_rdma_bytes = max(
-                Buffer.get_low_latency_rdma_size_hint(
-                    num_max_dispatch_tokens_per_rank,
-                    hidden_size,
-                    group.size(),
-                    num_experts,
-                ),
-                num_rdma_bytes,
-            )
+            # Reserve all layouts registered before the first dispatch, even
+            # when the smaller draft runs first. Later layouts must fit this
+            # allocation; growing a live/captured buffer is not safe.
+            layouts = state.registered_layouts | {layout}
+            for max_tokens, width, experts in layouts:
+                num_rdma_bytes = max(
+                    Buffer.get_low_latency_rdma_size_hint(
+                        max_tokens, width, group.size(), experts
+                    ),
+                    num_rdma_bytes,
+                )
 
         # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
@@ -260,6 +280,12 @@ class DeepEPBuffer:
             )
         else:
             raise NotImplementedError
+
+        if deepep_mode.enable_low_latency():
+            num_qps_per_rank = max(
+                num_qps_per_rank,
+                max(experts // group.size() for _, _, experts in layouts),
+            )
 
         if not _is_npu:
             total_num_sms = torch.cuda.get_device_properties(
@@ -294,6 +320,8 @@ class DeepEPBuffer:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        state.num_rdma_bytes = num_rdma_bytes
+        state.num_qps_per_rank = num_qps_per_rank
         if DEEPEP_SUPPORT_TIMEOUT_CONTROL:
             timeout = envs.SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT.get()
             state.buffer.set_timeout_seconds(timeout)
@@ -315,16 +343,34 @@ class DeepEPBuffer:
         cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
-    def set_dispatch_mode_as_low_latency(cls):
+    def set_dispatch_mode_as_low_latency(cls, layout=None):
         state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+        if layout is None:
+            layout = (
+                state.num_max_dispatch_tokens_per_rank,
+                state.hidden_size,
+                state.num_experts,
+            )
+        if state.buffer is None:
+            state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+            return
+        layout_changed = state.low_latency_layout != layout
+        # Use the NEW layout to locate both signaling regions. Cleaning with
+        # the old expert count leaves the new layout's counters dirty.
+        (
+            state.num_max_dispatch_tokens_per_rank,
+            state.hidden_size,
+            state.num_experts,
+        ) = layout
+        if layout_changed or state.dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
+        state.low_latency_layout = layout
         state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
-    def set_dispatch_mode(cls, mode: DeepEPMode):
+    def set_dispatch_mode(cls, mode: DeepEPMode, layout=None):
         if mode.is_low_latency():
-            cls.set_dispatch_mode_as_low_latency()
+            cls.set_dispatch_mode_as_low_latency(layout)
         elif mode.is_normal():
             cls.set_dispatch_mode_as_normal()
         else:
@@ -394,6 +440,10 @@ class _DeepEPDispatcherImplBase:
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
+        if deepep_mode.enable_low_latency():
+            DeepEPBuffer._state().registered_layouts.add(
+                (self.num_max_dispatch_tokens_per_rank, hidden_size, num_experts)
+            )
 
         self.handle = None
 
@@ -969,8 +1019,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
-        DeepEPBuffer.set_dispatch_mode_as_low_latency()
-        return DeepEPBuffer.get_deepep_buffer(
+        buffer = DeepEPBuffer.get_deepep_buffer(
             self.group,
             self.hidden_size,
             self.params_bytes,
@@ -978,6 +1027,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
         )
+        DeepEPBuffer.set_dispatch_mode_as_low_latency(
+            (self.num_max_dispatch_tokens_per_rank, self.hidden_size, self.num_experts)
+        )
+        return buffer
 
 
 @dataclass

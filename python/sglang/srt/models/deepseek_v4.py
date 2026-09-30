@@ -3145,8 +3145,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
             _a2a_scatter_chunks = list(hidden_states.tensor_split(s))
             hidden_states = _a2a_scatter_chunks[r].contiguous()
-            # The DSpark draft stages build their MoE with is_nextn=True, so
-            # is_hash is False and they pass no ids at all.
+            # DSpark draft stages have neither hash nor vision routing and pass
+            # no token IDs. Keep IDs aligned with hidden states when provided.
             if input_ids is not None:
                 input_ids = input_ids.tensor_split(s)[r].contiguous()
             if input_ids_global is not None:
@@ -4310,8 +4310,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-            if get_pp_group().world_size != 1 or not get_moe_a2a_backend().is_none():
-                raise ValueError("V4.1 vision currently does not support PP or MoE A2A")
+            if get_pp_group().world_size != 1:
+                raise ValueError("V4.1 vision currently does not support PP")
+            if not (
+                get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_deepep()
+            ):
+                raise ValueError(
+                    "V4.1 vision supports MoE A2A backends none and deepep"
+                )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
             self.vision = ViT(args)
@@ -4511,6 +4517,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
+            )
+        if (
+            hf_config.model_type == "deepseek_v41"
+            and hf_config.vision_n_layers > 0
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            return (
+                "V4.1 vision routing with DeepEP requires separate shared experts; "
+                "per-rank fused shared slots are not supported."
             )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
