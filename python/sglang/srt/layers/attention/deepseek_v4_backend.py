@@ -156,6 +156,12 @@ def _is_sm100_or_newer() -> bool:
     return torch.cuda.get_device_capability()[0] >= 10
 
 
+def _use_deepgemm_fp4_indexer() -> bool:
+    # PPU implements the V4 DeepGEMM FP4 logits APIs independently of NVIDIA
+    # compute capability. Keep this separate from SM100-only packing/fusions.
+    return is_ppu() or _is_sm100_or_newer()
+
+
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     # IDLE is a real per-DP-rank mode. Do not let a stale _original_forward_mode
     # from a reused/padded ForwardBatch turn an empty rank into TARGET_VERIFY.
@@ -330,6 +336,39 @@ def _dense_fp4_mqa_logits(
 ) -> torch.Tensor:
     from deep_gemm import fp8_fp4_mqa_logits as fn
 
+    if is_ppu():
+        from sglang.kernels.ops.attention.dsv4.compact_logits import compact_logits_into
+
+        # PPU returns BF16 columns addressing the concatenated K tensor.
+        # Bound that temporary and compact directly into the final FP32 output;
+        # full-size INT64 gather indices can cost more than the logits themselves.
+        max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+        if max_logits_mb <= 0:
+            raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+        max_logits_bytes = max_logits_mb * 1024 * 1024
+        num_rows = q_fp4[0].shape[0]
+        output = torch.empty(
+            (num_rows, max_seqlen_k), dtype=torch.float32, device=weights.device
+        )
+        # This budget covers the BF16 temporary, not the final FP32 output.
+        # At least one query row is necessary even if it exceeds the budget.
+        rows_per_chunk = max(1, max_logits_bytes // max(1, kv_fp4[0].shape[0] * 2))
+        for start in range(0, num_rows, rows_per_chunk):
+            stop = min(start + rows_per_chunk, num_rows)
+            chunk_ks, chunk_ke = ks[start:stop], ke[start:stop]
+            logits = fn(
+                (q_fp4[0][start:stop], q_fp4[1][start:stop]),
+                kv_fp4,
+                weights[start:stop],
+                chunk_ks,
+                chunk_ke,
+                clean_logits=False,
+                logits_dtype=torch.bfloat16,
+            )
+            compact_logits_into(logits, output[start:stop], chunk_ks, chunk_ke)
+            del logits
+        return output
+
     # q (int8 [T, H, 64], int32 [T, H]) x kv (int8 [L, 64], int32 [L]) -> fp32
     # [T, max_seqlen_k]; row t column j is k[ks_t + j], garbage past ke_t - ks_t.
     return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
@@ -340,9 +379,7 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
         get_tc_piecewise_forward_context,
     )
 
-    real = (
-        get_tc_piecewise_forward_context().forward_batch.global_num_token_non_padded_cpu
-    )
+    real = get_tc_piecewise_forward_context().forward_batch.num_token_non_padded_cpu
     if real is None:
         real = x.shape[0]
 
@@ -1373,7 +1410,8 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and _is_sm120
+                (self.enable_deepseek_v4_fp4_indexer and _is_sm120)
+                or (compress_ratio in (1, 2) and is_ppu())
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -3307,14 +3345,16 @@ class DeepseekV4AttnBackend(
             or forward_batch.forward_mode.is_target_verify()
         )
         if is_decode_or_verify:
-            if _is_sm100_or_newer():
-                # DeepGEMM pairs verify rows by request id; decode has one row each.
+            if _use_deepgemm_fp4_indexer():
+                # verify rows of one request share a request id (DeepGEMM pairs
+                # them); decode has one row per request, nothing to pair
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
                 self._low_ratio_index_topk_decode(layer, x, q_lora, pos, req_ids)
             else:
                 self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         elif (
-            self._use_dense_fp4_prefill_indexer(forward_batch) and _is_sm100_or_newer()
+            self._use_dense_fp4_prefill_indexer(forward_batch)
+            and _use_deepgemm_fp4_indexer()
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
         else:
@@ -3571,6 +3611,7 @@ class DeepseekV4AttnBackend(
         assert indexer.n_local_heads == indexer.n_heads
         if (
             x.is_cuda
+            and not is_ppu()
             and torch.version.cuda is not None
             and x.dtype == torch.bfloat16
             and indexer.index_head_dim == 128

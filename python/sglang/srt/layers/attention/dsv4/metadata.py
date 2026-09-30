@@ -159,10 +159,7 @@ class PagedIndexerMetadata:
                 _c4 = _c4.unsqueeze(-1)
 
             metadata_extra = None
-            if (
-                self.q_fp8_shape is not None
-                and not envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-            ):
+            if self.q_fp8_shape is not None and not use_jit_indexer:
                 metadata_extra = (
                     1,  # next_n
                     self.q_fp8_shape[2],  # num_heads
