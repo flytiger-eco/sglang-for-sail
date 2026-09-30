@@ -1,0 +1,148 @@
+---
+title: "Install SGLang from Source"
+mode: wide
+metatags:
+    description: "SGLang-for-Sail install-from-source guide: PPU Docker runtime image and building sglang-kernel, sglang-router, and sglang from source."
+---
+
+This guide shows how to install **SGLang-for-Sail**. Start from the SAIL release Docker image, which ships **sglang 0.5.13**, and then install the `sglang` and `sglang-kernel` packages from source on top of it. The flow follows the upstream [sgl-project/sglang](https://github.com/sgl-project/sglang) installation guide and adds the PPU-specific build steps described in the SAIL SGLang release note.
+
+Two paths are covered, from least to most effort:
+
+1. [Use the sglang preinstalled in the Docker image](#option-a-run-inside-the-official-docker-image) — the base image already ships sglang 0.5.13; nothing to install.
+2. [Build and install from source](#option-b-build-and-install-from-source) — clone the SGLang-for-Sail fork from GitHub and build the `sglang-kernel`, `sglang-router`, and `sglang` packages yourself.
+
+## Prerequisites
+
+Start from the SAIL release Docker image, which provides the base runtime: **sglang 0.5.13** on the **v2.1.1 SDK + PyTorch 2.11.0** stack.
+
+| Component | Version in base image |
+|-----------|---------|
+| sglang | 0.5.13 |
+| PyTorch | 2.11.0 |
+| CUDA | 13.0 |
+| Ubuntu | 24.04 |
+| Python | 3.12 |
+| PPU SDK | v2.1.1 |
+| Hardware | PPU ZW-810E / ZW-890P |
+
+The full image reference is:
+
+```
+pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+```
+
+Because the image is built against SDK 2.1.1, keep all `sglang` / `sglang-kernel` installs and builds inside this image so the runtime, CUDA, and PPU driver versions stay consistent.
+
+## Option A: Run inside the official Docker image
+
+The base image already ships sglang 0.5.13, so if that version meets your needs there is nothing to install — just enter the container and run.
+
+```bash
+IMAGE=pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
+
+# Enter a container (example command)
+sudo docker run --privileged -it -e HOST_HOSTNAME=$(hostname) \
+    --network=host --device=/dev/infiniband --ipc=host --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    --shm-size=16g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --init --pid=host \
+    -v <path to your workspace> \
+    -w <path to your workspace> \
+    --name <your docker_name> \
+    ${IMAGE} bash
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+```
+
+<Note>
+The `--device=/dev/alixpu_ctl` and `--device=/dev/alixpu` flags expose the PPU devices to the container. Adjust `--shm-size`, `--ulimit`, and the volume mount to match your host.
+</Note>
+
+## Option B: Build and install from source
+
+To install the `sglang` and `sglang-kernel` packages from source, clone the SGLang-for-Sail fork and build the packages inside the base image. The general install flow follows the upstream [sgl-project/sglang](https://github.com/sgl-project/sglang) guide; the fork adds the PPU-specific build files (such as `setup_ppu.py`) that the steps below rely on.
+
+### Fork and clone the repository
+
+Fork the SGLang-for-Sail repository under your GitHub account, then clone your fork and check out the release tag that matches your base image:
+
+```bash
+git clone https://github.com/<your_user_name>/sglang-for-sail.git
+cd sglang-for-sail
+git checkout v0.5.13  # match the base image, or your target release tag/branch
+```
+
+### 1. Build and install sglang-kernel
+
+```bash
+cd python/sglang/kernels/aot
+rm -rf build
+pip install scikit-build-core cmake==3.31.2 uv
+python3 setup_ppu.py bdist_wheel &> build.log
+# After a successful build, install the sgl_kernel*.whl under ./dist/
+pip install dist/sgl_kernel*.whl
+```
+
+### 2. Build and install sglang-router
+
+Set up the Rust build environment, then build the router wheel:
+
+```bash
+# Set up the build environment
+pip install setuptools_rust "maturin[patchelf]"
+apt update && apt install -y libssl-dev protobuf-compiler
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+# Build the package
+cd sgl-model-gateway/bindings/python
+maturin build --release --out dist --features vendored-openssl
+# After a successful build, install the sglang_router*.whl under ./dist/
+pip install dist/sglang_router*.whl
+```
+
+### 3. Build and install sglang
+
+```bash
+cd python
+rm -rf build dist *.egg-info
+python -m uv build --no-build-isolation --wheel -Cbuild-dir=build --color=always .
+# After a successful build, install the sglang*.whl under ./dist/
+pip install dist/sglang*.whl
+
+# Upgrade related dependencies
+pip install -U einops
+```
+
+<Note>
+For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the in-tree JIT kernel path. See [How to update kernels in SGLang](./developer_guide.mdx#how-to-update-kernels-in-sglang) in the contribution guide.
+</Note>
+
+## Verify the installation
+
+```bash
+python3 -c "import sglang; print(sglang.__version__)"
+```
+
+Then launch a server to confirm the runtime works end to end:
+
+```bash
+python3 -m sglang.launch_server \
+  --host 0.0.0.0 \
+  --port 8999 \
+  --model-path <your_model_path> \
+  --tp-size 8 \
+  --mem-fraction-static 0.8 \
+  --disable-radix-cache \
+  --trust-remote-code
+```
+
+## Troubleshooting and known issues
+
+- **flashinfer version check fails.** The `pyproject.toml` pins a relatively high `flashinfer_python`. If a runtime version check fails, bypass it with:
+  ```bash
+  export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+  ```
+- **Long startup / warmup.** The server performs a warmup at startup that JIT-compiles the DeepGemm kernels it needs. Increase timeouts with `--watchdog-timeout 3600 --dist-timeout 3600`, or disable the precompile with `SGLANG_JIT_DEEPGEMM_PRECOMPILE`. When benchmarking, make sure no DeepGemm JIT compilation happens at request time, otherwise performance drops.
+- **AWQ / GPTQ quantization.** PPU SGLang has not yet optimized the Marlin kernel, so AWQ (w4a16) and GPTQ (w4a16, w8a16) may be functionally incorrect and slow. Prefer the PPU W8A8-INT8 path.
+- **Kernel build on PPU.** PPU `nvcc` handles `-gencode=arch=compute_80,code=sm_80` differently from GPU `nvcc`; this has been fixed in the PPU kernel build.
