@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -1341,7 +1342,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> DeepSeekV4IndexerPool:
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
-        dedicated-buffer NPU variant. ``force_fp4`` forces the fp4 low-ratio layout."""
+        dedicated-buffer NPU variant (int8 K + fp16 scale).
+
+        ``force_fp4`` selects the low-ratio layout, independently of the C4 flag.
+        Its default is FP4; the PPU INT8 opt-in uses 128 payload + 4 scale bytes."""
         if force_fp4:
             pool = DeepSeekV4IndexerPool(
                 size,
@@ -1351,7 +1355,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 layer_num,
                 device,
                 enable_memory_saver,
-                use_fp4_indexer=True,
+                use_fp4_indexer=not use_dsv41_int8_indexer(),
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).
             pool.index_k_rne = True

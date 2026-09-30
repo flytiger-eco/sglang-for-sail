@@ -1636,6 +1636,10 @@ class DeepseekV4AttnBackend(
             c4_seq_lens=c_seq_lens,
             use_topk_v2=False,
             use_prefill_cuda_graph=True,
+            force_deep_gemm_metadata=is_ppu(),
+            q_fp8_shape=torch.Size(
+                (c_seq_lens.shape[0], 1, self.index_n_heads, self.index_head_dim)
+            ),
             compress_ratio=compress_ratio,
             index_page_size=index_page_size,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
@@ -3068,7 +3072,8 @@ class DeepseekV4AttnBackend(
             local_q_lora = q_lora[:num_local]
             local_pos = positions[:num_local].to(torch.int64)
             if (
-                self._use_dense_fp4_prefill_indexer(forward_batch)
+                not layer.indexer.use_int8
+                and self._use_dense_fp4_prefill_indexer(forward_batch)
                 and _use_deepgemm_fp4_indexer()
             ):
                 self._low_ratio_index_topk_dense(
@@ -3336,10 +3341,22 @@ class DeepseekV4AttnBackend(
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first. Stored
-        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
+        # Index keys come from the pre-RoPE latent, so publish them first.
+        # Native FP4 uses per-32 E8M0; opt-in INT8 uses per-token FP32 scales.
+        # Neither path adds the V4 C4 indexer's Hadamard transform.
         if layer.indexer is not None and layer.indexer.owns_k:
-            if (
+            if layer.indexer.use_int8:
+                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                    store_int8_index_k,
+                )
+
+                store_int8_index_k(
+                    layer.indexer.index_keys(latent, freqs),
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    slots,
+                    pool.get_index_k_page_size(layer.compress_ratio),
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and torch.version.cuda is not None
@@ -3384,7 +3401,9 @@ class DeepseekV4AttnBackend(
             or forward_batch.forward_mode.is_target_verify()
         )
         if is_decode_or_verify:
-            if _use_deepgemm_fp4_indexer():
+            if layer.indexer.use_int8:
+                self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
+            elif _use_deepgemm_fp4_indexer() and self.candidate_indexer is not None:
                 # verify rows of one request share a request id (DeepGEMM pairs
                 # them); decode has one row per request, nothing to pair
                 req_ids = None if forward_batch.forward_mode.is_decode() else req
@@ -3392,7 +3411,8 @@ class DeepseekV4AttnBackend(
             else:
                 self._low_ratio_index_topk_sm90_decode(layer, x, q_lora, req, pos)
         elif (
-            self._use_dense_fp4_prefill_indexer(forward_batch)
+            not layer.indexer.use_int8
+            and self._use_dense_fp4_prefill_indexer(forward_batch)
             and _use_deepgemm_fp4_indexer()
         ):
             self._low_ratio_index_topk_extend(layer, x, q_lora, pos, forward_batch)
@@ -3583,15 +3603,17 @@ class DeepseekV4AttnBackend(
             ), f"prefill graph indexer width {width} exceeds the candidate window"
 
         num_tokens, num_heads = q.shape[0], q.shape[1]
-        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-        q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
-        q_sf = q_sf.view(num_tokens, 1, num_heads)
+        if not indexer.use_int8:
+            q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+            q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
+            q_sf = q_sf.view(num_tokens, 1, num_heads)
         weights = w.float()
 
         k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
         assert k_cache.dim() == 2
         page_size = metadata.c4_page_size
-        k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+        if not indexer.use_int8:
+            k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
         lens = metadata.c4_seq_lens
         page_table = metadata.page_table
@@ -3600,15 +3622,31 @@ class DeepseekV4AttnBackend(
         topk = min(indexer.index_topk, width)
         columns = torch.arange(width, device=lens.device)
         for rows, plan in metadata.row_chunks():
-            logits = deep_gemm_fp4_paged_mqa_logits(
-                (q_fp4[rows], q_sf[rows]),
-                k_cache,
-                weights[rows],
-                lens[rows],
-                page_table[rows],
-                plan,
-                width,
-            )
+            if indexer.use_int8:
+                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                    int8_paged_index_logits,
+                )
+
+                logits = int8_paged_index_logits(
+                    q[rows],
+                    weights[rows],
+                    k_cache,
+                    lens[rows],
+                    page_table[rows],
+                    plan,
+                    width,
+                    page_size,
+                )
+            else:
+                logits = deep_gemm_fp4_paged_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    k_cache,
+                    weights[rows],
+                    lens[rows],
+                    page_table[rows],
+                    plan,
+                    width,
+                )
             lens_c = lens[rows].unsqueeze(-1)
             # Columns past a row's length hold garbage.
             s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
@@ -3724,6 +3762,17 @@ class DeepseekV4AttnBackend(
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        """Dense paged decode/verify with candidate masks: Hopper FP4 Triton or
+        PPU FP4/INT8 DeepGEMM. Verify has one causal metadata row per query token;
+        selected slots are sorted with valid entries before -1 padding."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        if (
+            layer.indexer.use_int8 or _use_deepgemm_fp4_indexer()
+        ) and skip_low_ratio_indexer(layer.compress_ratio):
+            return
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3755,15 +3804,55 @@ class DeepseekV4AttnBackend(
         weights = indexer.head_weights(x)
         j = torch.arange(lmax, device=pos.device)
         valid = j[None, :] < lens[:, None]
-        slots = (
-            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
-            // ratio
-        )
-        slots = slots.masked_fill(~valid, 0)
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        s = fp4_index_logits_decode(
-            q, weights, slots, lens, table, table.shape[1] // 68
-        )
+        use_paged_logits = indexer.use_int8 or _use_deepgemm_fp4_indexer()
+        if indexer.use_int8:
+            from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                int8_paged_index_logits,
+            )
+
+            s = int8_paged_index_logits(
+                q,
+                weights,
+                table,
+                metadata.c4_seq_lens[:bs],
+                metadata.page_table[:bs],
+                metadata.deep_gemm_metadata,
+                metadata.max_c4_seq_len,
+                metadata.c4_page_size,
+            )[:, :lmax]
+            s.masked_fill_(~valid, -torch.inf)
+        elif use_paged_logits:
+            # PPU provides dense paged FP4 logits without the SM100 sparse
+            # candidate engine. Keep candidate selection in the mask path below.
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                quantize_fp4_indexer_tensor,
+            )
+
+            q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+            page_size = metadata.c4_page_size
+            s = deep_gemm_fp4_paged_mqa_logits(
+                (
+                    q_fp4.view(bs, 1, indexer.n_local_heads, 64),
+                    q_sf.view(bs, 1, indexer.n_local_heads),
+                ),
+                table.view(table.shape[0], page_size, 1, 68),
+                weights.float(),
+                metadata.c4_seq_lens[:bs],
+                metadata.page_table[:bs],
+                metadata.deep_gemm_metadata,
+                metadata.max_c4_seq_len,
+            )[:, :lmax]
+            s.masked_fill_(~valid, -torch.inf)
+        else:
+            slots = (
+                self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
+                // ratio
+            )
+            slots = slots.masked_fill(~valid, 0)
+            s = fp4_index_logits_decode(
+                q, weights, slots, lens, table, table.shape[1] // 68
+            )
         if indexer.is_candidate_source:
             mask = select_candidate_blocks(
                 s,
@@ -3786,9 +3875,16 @@ class DeepseekV4AttnBackend(
             idx = idx.masked_fill(idx < 0, lmax)
         idx = idx.sort(dim=-1).values
         reach = idx < lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
-        ).to(torch.int32)
+        if use_paged_logits:
+            # DeepGEMM reads the paged cache directly. Translate only selected
+            # positions, avoiding an INT64 [query rows, max context] slots tensor.
+            selected_slots = (
+                self.req_to_token[req[:, None], idx.clamp_max(lmax - 1) * ratio]
+                // ratio
+            )
+        else:
+            selected_slots = slots.gather(1, idx.clamp_max(lmax - 1))
+        page_indices[:bs, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
         if raw_indices is not None:
             raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
@@ -3829,21 +3925,44 @@ class DeepseekV4AttnBackend(
                 continue
             j = torch.arange(lc, device=pos.device)
             slots_j = self.req_to_token[r, j * ratio].to(torch.int64) // ratio
-            # Dequantize only this request's visible K rows; the table is pool-sized.
-            index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+            if indexer.use_int8:
+                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                    gather_int8_index_k,
+                    int8_index_logits,
+                    int8_logits_rows_per_chunk,
+                )
+
+                max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+                if max_logits_mb <= 0:
+                    raise ValueError(
+                        "SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive"
+                    )
+                # Gather each request once; DeepGEMM emits FP32 [rows, lc].
+                index_k = gather_int8_index_k(
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    slots_j,
+                    pool.get_index_k_page_size(ratio),
+                )
+                rows_per_chunk = int8_logits_rows_per_chunk(
+                    lc, max_logits_mb * 1024 * 1024
+                )
+            else:
+                index_k = pool.get_low_ratio_index_k_dequant(layer.layer_id, slots_j)
+                # Torch fallback materializes BF16 [rows, heads, lc] scores.
+                rows_per_chunk = max(
+                    1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2)
+                )
             k = min(topk, lc)
-            # Every step below is per query row; chunk rows so the [rows, heads, lc]
-            # bf16 scores stay under the budget (16 GiB at once for a 16k-token prompt).
-            rows_per_chunk = max(
-                1,
-                _TORCH_INDEXER_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2),
-            )
             masks = [] if publish is not None else None
             for start in range(0, tok.numel(), rows_per_chunk):
                 rows = slice(start, start + rows_per_chunk)
                 tok_c, lens_c = tok[rows], lens[rows]
-                s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-                s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+                if indexer.use_int8:
+                    s = int8_index_logits(q[tok_c], weights[tok_c], index_k, lens_c)
+                    s.masked_fill_(slots_j[None, :] <= 0, -torch.inf)
+                else:
+                    s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+                s.masked_fill_(j[None, :] >= lens_c[:, None], -torch.inf)
                 if masks is not None:
                     masks.append(
                         select_candidate_blocks(
@@ -3854,7 +3973,7 @@ class DeepseekV4AttnBackend(
                         )
                     )
                 elif consume is not None:
-                    s = s.masked_fill(~consume[b][rows], -torch.inf)
+                    s.masked_fill_(~consume[b][rows], -torch.inf)
                 idx = s.topk(k, dim=-1, sorted=False).indices
                 if consume is not None and masks is None:
                     idx = mask_topk_scores(s, idx)
@@ -3866,6 +3985,9 @@ class DeepseekV4AttnBackend(
                 ).to(torch.int32)
                 if raw_indices is not None:
                     raw_indices[tok_c, :k] = torch.where(reach, idx, -1).to(torch.int32)
+                # Do not keep the previous chunk's logits alive during the next GEMM.
+                del s
+            del index_k
             if masks is not None:
                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
         if publish is not None:

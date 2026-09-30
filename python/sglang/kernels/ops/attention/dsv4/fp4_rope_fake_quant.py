@@ -8,6 +8,16 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+from sglang.srt.utils import get_device_sm, is_ppu
+
+
+@triton.jit
+def _round_positive_e4m3_scale(scale):
+    # Input is clamped to [2**-9, 448]. Round to the E4M3FN grid without an
+    # FP8 cast: normal spacing is 2**(floor(log2(scale))-3), subnormal 2**-9.
+    exponent = (scale.to(tl.int32, bitcast=True) >> 23) & 255
+    step = (tl.maximum(exponent - 3, 118) << 23).to(tl.float32, bitcast=True)
+    return libdevice.rint(scale / step) * step
 
 
 @triton.jit
@@ -25,6 +35,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     AMAX_FLOOR: tl.constexpr,
     INVERSE: tl.constexpr,
     COMPRESSED_KV: tl.constexpr,
+    EMULATE_E4M3: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r // rows_per_token
@@ -59,7 +70,10 @@ def _rope_tail_fake_quant_fp4_kernel(
     amax = tl.max(tl.abs(vb), axis=1)
     if COMPRESSED_KV:
         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
-        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        if EMULATE_E4M3:
+            scale = _round_positive_e4m3_scale(scale)
+        else:
+            scale = scale.to(tl.float8e4nv).to(tl.float32)
         s = tl.div_rn(vb, scale[:, None])
     else:
         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
@@ -119,6 +133,7 @@ def rope_tail_fake_quant_fp4(
         AMAX_FLOOR=FP4_AMAX_FLOOR,
         INVERSE=inverse,
         COMPRESSED_KV=compressed_kv,
+        EMULATE_E4M3=is_ppu() and get_device_sm() < 89,
         num_warps=4,
     )
     return out

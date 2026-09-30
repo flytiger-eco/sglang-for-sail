@@ -831,11 +831,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
-        # Ratio 1/2 kv_source layers keep one FlashMLA-layout latent and one packed
-        # index key per compressed position. The low-ratio indexer pools are built
-        # with force_fp4=True (deepseek_v4_memory_pool._init_low_ratio_pools), so
-        # they are fp4 whatever dtype the c4 indexer runs at.
-        low_ratio_index_bytes = self.indexer_head_dim // 2 + 4
+        from sglang.srt.layers.attention.dsv4.indexer_quant import (
+            use_dsv41_int8_indexer,
+        )
+
+        # Match the low-ratio pool's actual payload and FP32/E8M0 scales.
+        low_ratio_index_bytes = (
+            self.indexer_head_dim
+            if use_dsv41_int8_indexer()
+            else self.indexer_head_dim // 2
+        ) + 4
         self.low_ratio_bytes_per_full_token = sum(
             (self.kv_bytes + low_ratio_index_bytes) / cfg.compress_ratios[l]
             for l in cfg.hf_config.kv_source_layer_ids

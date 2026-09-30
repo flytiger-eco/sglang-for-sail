@@ -248,6 +248,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    from sglang.srt.layers.attention.dsv4.indexer_quant import (
+        dsv41_requires_int8_indexer,
+    )
+
+    if dsv41_requires_int8_indexer():
+        if server_args.enable_deepseek_v4_fp4_indexer:
+            raise ValueError(
+                "DeepSeek-V4.1 on PPU below SM89 requires the INT8 indexer; "
+                "remove --enable-deepseek-v4-fp4-indexer."
+            )
+        logger.info("DeepSeek-V4.1 on PPU below SM89: using INT8 low-ratio indexer")
     if cfg.enable_prefill_cp:
         # This release does not default V4 models to CP-v2. V4.1 needs its
         # canonical token order for Engram and low-ratio KV sharing.

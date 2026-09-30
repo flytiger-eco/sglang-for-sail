@@ -173,6 +173,11 @@ class PagedIndexerMetadata:
                             _c4[i : i + self.row_chunk],
                             self.c4_page_size,
                             deep_gemm.get_num_sms(),
+                            **(
+                                dict(metadata_extra=metadata_extra)
+                                if is_ppu() and metadata_extra is not None
+                                else {}
+                            ),
                         )
                         for i in range(0, _c4.shape[0], self.row_chunk)
                     ]
