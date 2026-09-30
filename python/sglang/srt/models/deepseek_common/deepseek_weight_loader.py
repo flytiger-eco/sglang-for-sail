@@ -114,6 +114,19 @@ def _resolve_layer_weight_block_size(
     return getattr(selected_quant_config, "weight_block_size", None)
 
 
+def _dequant_indexer_shard(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    quant_config: Optional[QuantizationConfig],
+) -> torch.Tensor:
+    """Dequantize one indexer shard to bf16, per the scale's granularity."""
+    if scale.numel() == weight.shape[0]:
+        # per-output-channel scale (w8a8 int8 / channelwise fp8)
+        return (weight.float() * scale.float()).to(torch.bfloat16)
+    block_size = _get_indexer_weight_block_size(quant_config)
+    return block_quant_dequant(weight, scale, block_size, torch.bfloat16)
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -136,7 +149,10 @@ def _load_fused_indexer_wk(
 
     if ".indexer.weights_proj." in name:
         is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        if not is_scale and loaded_weight.dtype not in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        ):
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
             return True
@@ -147,16 +163,19 @@ def _load_fused_indexer_wk(
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            weights_bf16 = _dequant_indexer_shard(
+                entry["weight"], entry["scale"], quant_config
             )
             fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
 
-    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    # wk: a bf16 checkpoint copies straight in; quantized checkpoints (block-fp8
+    # with weight_scale_inv, channelwise int8/fp8 with weight_scale) need dequant.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+    if not is_scale and loaded_weight.dtype not in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ):
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
         return True
@@ -167,10 +186,7 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
-        )
+        wk_bf16 = _dequant_indexer_shard(entry["weight"], entry["scale"], quant_config)
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return True
 
