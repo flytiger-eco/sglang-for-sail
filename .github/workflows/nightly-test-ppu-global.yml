@@ -2,8 +2,8 @@ name: Nightly Test (PPU Global)
 
 on:
   schedule:
-    # 北京时间每天 00:00；四类 nightly 只保留此定时入口。
-    - cron: '0 16 * * *'
+    # 北京时间每天 21:12；四类 nightly 只保留此定时入口。
+    - cron: '12 13 * * *'
   workflow_dispatch:
     inputs:
       ref:
