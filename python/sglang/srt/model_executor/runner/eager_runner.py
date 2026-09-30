@@ -360,10 +360,13 @@ class EagerRunner(BaseRunner):
         rank-local slice, then gather hidden states before the logits step.
         """
         model = self.model_runner.model
-
+        input_ids = forward_batch.input_ids
         input_embeds = kwargs.get("input_embeds")
+        prepare_cp_inputs = getattr(model, "prepare_cp_inputs", None)
+        if prepare_cp_inputs is not None:
+            input_ids, input_embeds = prepare_cp_inputs(forward_batch, input_embeds)
         if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            input_embeds = model.get_input_embeddings()(input_ids)
         with cp_shard_model_inputs(
             input_embeds, forward_batch.positions, forward_batch
         ) as (sharded_input_embeds, sharded_positions):
@@ -371,7 +374,7 @@ class EagerRunner(BaseRunner):
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
             hidden_states = model.model(
-                forward_batch.input_ids,
+                input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,
@@ -388,19 +391,38 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        tail = None
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+        if (
+            isinstance(model, DeepseekV4ForCausalLM)
+            and model.model.late_layer_start is not None
+            and self.model_runner.attn_backend.tail_forward_metadata is not None
+        ):
+            tail = self.model_runner.attn_backend.tail_forward_metadata.late_layer_tail
+
         stream = torch.cuda.current_stream()
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
-        # DSpark aux tensors ride the same CP token split; gather them the same way.
-        if aux_hidden_states is not None:
-            if isinstance(aux_hidden_states, torch.Tensor):
-                aux_hidden_states = cp_gather_after_forward(
-                    aux_hidden_states, forward_batch, stream
-                )
-            else:
-                aux_hidden_states = [
-                    cp_gather_after_forward(aux, forward_batch, stream)
-                    for aux in aux_hidden_states
-                ]
+        full_cp_metadata = forward_batch.attn_cp_metadata
+        if tail is not None:
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+        try:
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            # DSpark aux tensors ride the same CP token split; gather them the same way.
+            if aux_hidden_states is not None:
+                if isinstance(aux_hidden_states, torch.Tensor):
+                    aux_hidden_states = cp_gather_after_forward(
+                        aux_hidden_states, forward_batch, stream
+                    )
+                else:
+                    aux_hidden_states = [
+                        cp_gather_after_forward(aux, forward_batch, stream)
+                        for aux in aux_hidden_states
+                    ]
+        finally:
+            forward_batch.attn_cp_metadata = full_cp_metadata
+
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
@@ -409,14 +431,27 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
-            forward_batch.input_ids,
+        logits_input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        if tail is not None:
+            from sglang.srt.layers.logits_processor import LogitsMetadata
+
+            logits_input_ids = forward_batch.input_ids[tail.output_token_indices]
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        output = model.logits_processor(
+            logits_input_ids,
             hidden_states,
             model.lm_head,
-            forward_batch,
+            logits_metadata,
             aux_hidden_states,
             **logits_kwargs,
         )
+        if tail is not None:
+            output.hidden_states_token_indices = tail.output_token_indices
+        return output
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
