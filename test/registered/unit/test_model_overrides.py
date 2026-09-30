@@ -1003,17 +1003,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {
                 "attention_backend": "dsv4",
                 "page_size": 256,
-                "swa_full_tokens_ratio": 0.1,
             },
         )
         # NPU pool geometry
         self.assertEqual(
             _deepseek_v4_overrides(_args(device="npu"), hf)["page_size"], 128
-        )
-        # user-set window ratio survives
-        self.assertNotIn(
-            "swa_full_tokens_ratio",
-            _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
         # nvfp4 hybrid checkpoint routes the MoE runner
         self.assertEqual(

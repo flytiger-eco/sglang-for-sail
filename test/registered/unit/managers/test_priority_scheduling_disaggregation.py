@@ -35,6 +35,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.ngram_embedding_manager = MagicMock()
+        scheduler.chunked_req = None
         return scheduler
 
     def _new_req(self, priority=None):

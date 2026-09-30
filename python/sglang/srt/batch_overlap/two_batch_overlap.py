@@ -789,6 +789,7 @@ class TboForwardBatchPreparer:
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
                 num_token_non_padded_cpu=None,
+                encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,

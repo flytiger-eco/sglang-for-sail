@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch_npu
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -90,6 +91,7 @@ class NPUCompressStatePool(CompressStatePool):
         enable_memory_saver: bool,
         ratio: int,
         ring_size: int,
+        request_scoped: bool,
         swa_page_size: int,
     ):
         assert ratio in (
@@ -111,6 +113,7 @@ class NPUCompressStatePool(CompressStatePool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             online=False,
+            request_scoped=request_scoped,
             swa_page_size=swa_page_size,
             state_cache_page_size=ring_size,
         )
@@ -257,6 +260,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         enable_memory_saver: bool,
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
+        kv_layout: KVLayout = KVLayout.V4,
     ) -> NPUDeepSeekV4SingleKVPool:
         # NPU does not use the HiSparse c4 device pool; fail loud if someone
         # enables it so the silent layout mismatch surfaces at init.
@@ -264,6 +268,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             "enable_hisparse is not supported on the NPU DSV4 KV pool "
             f"(got c4 pool class {cls.__name__})."
         )
+        # The V4.1 fp8 / fp4 page layouts are CUDA FlashMLA formats.
+        assert kv_layout is KVLayout.V4, f"NPU pools do not support {kv_layout}"
         # Full/SWA use the global page size, C4 uses its native compressed page,
         # and C128 has an independent physical page size.
         is_c4_pool = page_size * 4 == global_page_size
@@ -312,6 +318,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             device=self.device,
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
+            request_scoped=ratio == 128,
             swa_page_size=self.swa_page_size,
         )
 

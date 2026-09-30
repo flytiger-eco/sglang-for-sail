@@ -112,10 +112,20 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
-    q_fp8_shape: torch.Size
+    q_fp8_shape: Optional[torch.Size] = None
+    use_topk_v2: bool = False
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     build_paged_mqa_logits_metadata: bool = True
+    # Compression ratio of the indexer source: 4 for c4, 1/2 for the dsv41
+    # low-ratio sources. Drives the compressed-domain page size and seq lens.
+    compress_ratio: int = 4
+    # Compressed-domain page size; 0 derives page_size // compress_ratio (the c4
+    # rule). The low-ratio indexer-K pool pages at 64 and passes it explicitly.
+    index_page_size: int = 0
+    # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
+    # all rows at once.
+    row_chunk: int = 0
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -159,33 +169,47 @@ class PagedIndexerMetadata:
                     self.q_fp8_shape[3],  # head_dim
                     1,  # element size
                 )
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-                **(
-                    dict(
-                        metadata_extra=metadata_extra,
-                    )
-                    if is_ppu() and metadata_extra is not None
-                    else {}
-                ),
-            )
-
+            if self.row_chunk > 0:
+                self.deep_gemm_metadata = torch.stack(
+                    [
+                        get_paged_mqa_logits_metadata(
+                            _c4[i : i + self.row_chunk],
+                            self.c4_page_size,
+                            deep_gemm.get_num_sms(),
+                        )
+                        for i in range(0, _c4.shape[0], self.row_chunk)
+                    ]
+                )
+            else:
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                    **(
+                        dict(
+                            metadata_extra=metadata_extra,
+                        )
+                        if is_ppu() and metadata_extra is not None
+                        else {}
+                    ),
+                )
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
         from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if self.use_topk_v2:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+        assert (
+            self.page_size % self.compress_ratio == 0
+        ), f"compress_ratio {self.compress_ratio} must divide page_size {self.page_size}"
 
     @property
     def c4_page_size(self) -> int:
-        return self.page_size // 4
+        return self.index_page_size or self.page_size // self.compress_ratio
 
     @property
     def max_seq_len(self) -> int:
@@ -194,6 +218,17 @@ class PagedIndexerMetadata:
     @property
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
+
+    def row_chunks(self):
+        num_rows = self.c4_seq_lens.shape[0]
+        if self.row_chunk <= 0:
+            return [(slice(0, num_rows), self.deep_gemm_metadata)]
+        return [
+            (slice(start, min(start + self.row_chunk, num_rows)), plan)
+            for start, plan in zip(
+                range(0, num_rows, self.row_chunk), self.deep_gemm_metadata
+            )
+        ]
 
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
@@ -208,6 +243,9 @@ class PagedIndexerMetadata:
             dst=self,
             check_eq_fields=[
                 "page_size",
+                "compress_ratio",
+                "index_page_size",
+                "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "build_paged_mqa_logits_metadata",

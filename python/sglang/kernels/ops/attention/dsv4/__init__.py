@@ -43,8 +43,13 @@ from .topk import (
     topk_transform_512,
     topk_transform_512_bf16,
     topk_transform_512_v2,
+    topk_transform_paged_v2,
+    topk_transform_ragged_v2,
 )
 from .utils import make_name
+
+# Upstream renamed the v1 entry point; retain the release's public name too.
+topk_transform_paged = topk_transform_512
 
 __all__ = [
     "CompressorDecodePlan",
@@ -72,8 +77,11 @@ __all__ = [
     "topk_transform_512",
     "topk_transform_512_bf16",
     "topk_transform_512_v2",
+    "topk_transform_paged",
+    "topk_transform_paged_v2",
     "top_k_per_row_prefill",
     "top_k_per_row_prefill_bf16",
+    "topk_transform_ragged_v2",
     "plan_topk_v2",
     "hash_topk",
     "mega_moe_pre_dispatch",

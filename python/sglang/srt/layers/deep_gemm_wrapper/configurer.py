@@ -43,3 +43,20 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_ppu)
+
+
+def _supports_sparse_indexer() -> bool:
+    if _is_ppu or not DEEPGEMM_BLACKWELL:
+        return False
+    import deep_gemm
+
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "get_paged_sparse_mqa_logits_metadata",
+            "fp8_fp4_paged_sparse_mqa_logits",
+        )
+    )
+
+
+DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_sparse_indexer()

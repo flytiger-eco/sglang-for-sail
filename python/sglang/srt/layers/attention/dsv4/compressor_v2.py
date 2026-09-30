@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -156,6 +157,7 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        kv_layout: KVLayout = KVLayout.V4,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -197,6 +199,7 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            layout=kv_layout,
         )
 
     def forward_unified(
@@ -223,6 +226,7 @@ class CompressorBackendMixin:
             compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
         )
         bf16_store = False
+        kv_layout = KVLayout.V4
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -239,6 +243,8 @@ class CompressorBackendMixin:
             assert compress_kv_pool is not None
             kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            # The pool's page format (V4, or the V4.1 fp8 / fp4 layouts).
+            kv_layout = token_to_kv_pool.get_extra_key_layout(layer_id)
             if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                 out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
         self._forward_compress_all_in_one(
@@ -256,6 +262,7 @@ class CompressorBackendMixin:
             out_loc=out_loc,
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
+            kv_layout=kv_layout,
         )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

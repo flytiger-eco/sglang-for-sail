@@ -30,7 +30,7 @@ if _SGLANG_PROFILE_NVTX:
     try:
         from model_prof import prof_iter as _prof_iter
 
-        from sglang.srt.model_executor.cuda_graph_runner import (
+        from sglang.srt.model_executor.runner import (
             get_is_capture_mode as _get_is_capture_mode,
         )
 

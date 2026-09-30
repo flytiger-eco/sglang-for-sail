@@ -34,6 +34,7 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -216,7 +217,11 @@ def build_kv_cache(
     )
 
     # Hybrid memory pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa
+    token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
+    is_hybrid_swa = tp_worker.is_hybrid_swa and (
+        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        or token_to_kv_pool.needs_paged_swa_allocator
+    )
     _spec = linear_attn_model_spec(tp_worker.model_runner.model_config)
     _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
     is_hybrid_ssm = (

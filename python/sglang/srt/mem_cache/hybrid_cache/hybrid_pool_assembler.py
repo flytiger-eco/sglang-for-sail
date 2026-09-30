@@ -419,6 +419,89 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+def _dsv4_low_ratio_entries(
+    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_num: int
+):
+    """Mirror each shared source once, in FULL-page units, before its first use.
+
+    Prefixes end at an even page boundary. Ratio-2 compression starts a new
+    pair there, so its request-scoped ring is rebuilt rather than cached.
+    """
+    import torch
+
+    entries = []
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
+        if not sources:
+            continue
+        kv_pool = kvcache.kv_pools[ratio]
+        index_pool = kvcache.index_pools[ratio]
+        assert page_size % ratio == 0
+        slots_per_page = page_size // ratio
+        assert slots_per_page % index_pool.page_size == 0
+        index_pages_per_full_page = slots_per_page // index_pool.page_size
+        layer_mapping = {
+            source - kvcache.start_layer: index for index, source in enumerate(sources)
+        }
+        regions = [(names[0], kv_pool, kv_pool.kv_buffer)]
+        if index_pool.index_k_with_scale_buffer is not None:
+            index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
+        else:
+            index_regions = [
+                (names[1], index_pool.index_k_payload_buffer),
+                (names[2], index_pool.index_k_scale_buffer),
+            ]
+        for name, buffers in index_regions:
+            # A FULL page contains several contiguous 64-slot FP4 index pages.
+            # Drop only the extra partial padding row beyond the FULL address space.
+            rows = []
+            for buffer in buffers:
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                rows.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .reshape(full_pages, -1)
+                )
+            regions.append((name, index_pool, rows))
+        for name, device_pool, buffers in regions:
+            entries.append(
+                build_pool_entry(
+                    name=name,
+                    host_pool=DeepSeekV4PagedHostPool(
+                        pool_name=str(name),
+                        device_buffers=buffers,
+                        item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                        num_host_pages=num_host_pages,
+                        slot_page_size=page_size,
+                        layout=get_memory().hicache_mem_layout,
+                        allocator_type=_get_allocator_type(),
+                        page_aligned_only=True,
+                    ),
+                    device_pool=device_pool,
+                    layer_mapping=layer_mapping,
+                    transfer_layer_num=transfer_layer_num,
+                )
+            )
+    return entries
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -438,8 +521,9 @@ def build_deepseek_v4_hicache_stack(
     full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
+    has_paged_swa = not is_unified_kv and kvcache.swa_kv_pool is not None
     mtp_swa_device_buffers = []
-    if is_unified_kv:
+    if not has_paged_swa:
         # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
         # so there is no separate SWA host pool to map.
         swa_layer_mapping = {}
@@ -507,7 +591,7 @@ def build_deepseek_v4_hicache_stack(
         ),
     ]
 
-    if not is_unified_kv:
+    if has_paged_swa:
         swa_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.SWA),
             device_buffers=[
@@ -519,6 +603,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
         entries.append(
@@ -545,6 +630,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
@@ -631,6 +717,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=server_args.hicache_mem_layout,
             allocator_type=_get_allocator_type(server_args),
+            page_aligned_only=_dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -645,6 +732,10 @@ def build_deepseek_v4_hicache_stack(
                 ),
             ]
         )
+
+    entries.extend(
+        _dsv4_low_ratio_entries(kvcache, page_size, num_host_pages, transfer_layer_num)
+    )
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
@@ -1185,10 +1276,11 @@ class _DeepSeekV4Strategy(StackStrategy):
             DeepSeekV4TokenToKVPool,
         )
 
-        return isinstance(kvcache, DeepSeekV4TokenToKVPool) and components == {
-            ComponentType.FULL,
-            ComponentType.SWA,
-        }
+        if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+            return False
+        if kvcache.swa_kv_pool is None and not getattr(kvcache, "_unified_kv", False):
+            return components == {ComponentType.FULL}
+        return components == {ComponentType.FULL, ComponentType.SWA}
 
     def build(
         self,
@@ -1230,6 +1322,12 @@ class _DeepSeekV4Strategy(StackStrategy):
                 ),
             )
             for name, src in (
+                (PoolName.DEEPSEEK_V4_C1, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C1_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
@@ -1952,3 +2050,14 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
     except Exception:
         logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
         raise
+
+
+def _dsv4_page_aligned_only(pool: Any) -> bool:
+    """
+    Whether a DeepSeek V4 paged pool may only move whole pages: the
+    token-granular copy (``transfer_cache_dsv4_mla``) splits a token into the
+    576-byte data row and 8-byte scale row of the V4 layout, so pools in the
+    V4.1 fp8 / fp4 layouts (512 + 16 and 256 + 32 bytes) must stay page aligned.
+    """
+    layout = getattr(pool, "kv_layout", None)
+    return layout is not None and layout.value != "v4"

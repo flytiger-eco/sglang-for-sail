@@ -506,6 +506,7 @@ class Envs:
     SGLANG_DSPARK_EMBED_IN_GRAPH = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     # Broadcast the compact ragged-verify token budget from TP rank0 so every
     # rank (incl. attention-CP ranks) picks the same cuda-graph tier.
@@ -1384,9 +1385,28 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
+    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
+    # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
+    # fp4 compressed caches) or "auto" (v41 on SM100 when FlashMLA supports it).
+    SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
+    # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
+    # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
+    SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
+
+    # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
+    # below) and gather rows from the GPU instead of sharding them over HBM.
+    SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # "shared" is one buffer for the whole TP group, mapped by every rank, with no
+    # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
+    # anonymous mapping per rank holding only its rows, gathered with the
+    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -1403,6 +1423,9 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
+    # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
+    SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

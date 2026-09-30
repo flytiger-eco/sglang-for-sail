@@ -526,6 +526,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 
+    # Fixed context extent for prefill body graphs; None preserves eager behavior.
+    max_seq_len_override: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
@@ -575,6 +578,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+    # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
+    # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
+    encoder_swa_replay: bool = False
+
+    ngram_history: Optional[torch.Tensor] = None
 
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
@@ -774,6 +782,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_cpu=seq_lens_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
+            ngram_history=batch.ne_history,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

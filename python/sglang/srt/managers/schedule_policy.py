@@ -5,7 +5,7 @@ from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -550,6 +550,7 @@ class PrefillAdder:
         self.log_storage_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
+        self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
         if running_batch is not None:
@@ -863,6 +864,7 @@ class PrefillAdder:
         mamba_gap_reserve: int = 0,
         host_hit_len: int = 0,
         storage_hit_len: int = 0,
+        req: Optional[Req] = None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -884,6 +886,16 @@ class PrefillAdder:
         if mamba_gap_reserve and self.rem_mamba_slots is not None:
             self.rem_mamba_slots -= 1
         self.rem_input_tokens -= extend_input_len
+        if (
+            req is not None
+            and get_exec().features.enable_encoder_swa_bounded_replay
+            and (req.req_pool_idx is None or req.is_retracted)
+        ):
+            replay_tokens = min(prefix_len, 128)
+            self.log_replay_tokens += replay_tokens
+            self.rem_input_tokens -= replay_tokens
+            if self.rem_chunk_tokens is not None:
+                self.rem_chunk_tokens -= replay_tokens
 
         if self.is_hybrid_swa:
             self.rem_swa_token_offset += self._swa_budget_for_req(
@@ -945,6 +957,7 @@ class PrefillAdder:
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             host_hit_len=req.host_hit_length,
             storage_hit_len=req.storage_hit_length,
+            req=req,
         )
 
     def _req_inc_lock_ref(self, req: Req):
@@ -1375,6 +1388,7 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
+                    req=req,
                 )
             else:
                 # Make sure at least one page is available
@@ -1423,6 +1437,7 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                     host_hit_len=req.host_hit_length,
                     storage_hit_len=req.storage_hit_length,
+                    req=req,
                 )
 
         return self.budget_state()

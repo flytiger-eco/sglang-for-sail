@@ -27,6 +27,10 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_512,
     topk_transform_512_v2,
 )
+from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_paged,
+    topk_transform_paged_v2,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -75,41 +79,6 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 _arange_cache = {}
 # Determine which quant dtype to use based on hardware capability
 _USE_INT8 = not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get()
-
-
-def split_indexer_prefill_chunks(
-    seq_lens_cpu: List[int],
-    query_lens_cpu: List[int],
-    workspace_size: int,
-    max_logits_bytes: int,
-) -> List[Tuple[slice, slice]]:
-    chunks: List[Tuple[slice, slice]] = []
-    n = len(seq_lens_cpu)
-    max_logits_elems = max(1, max_logits_bytes // 4)
-    end = 0
-
-    while end < n:
-        start, chunk_m, chunk_n = end, 0, 0
-
-        while end < n:
-            q, s = query_lens_cpu[end], seq_lens_cpu[end]
-            new_m, new_n = chunk_m + q, chunk_n + s
-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
-                chunk_m, chunk_n = new_m, new_n
-                end += 1
-            else:
-                break
-
-        if end == start:
-            chunk_m, chunk_n = query_lens_cpu[end], seq_lens_cpu[end]
-            end += 1
-
-        req_slice = slice(start, end)
-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
-        for q_off in range(0, chunk_m, max_q):
-            chunks.append((req_slice, slice(q_off, min(q_off + max_q, chunk_m))))
-
-    return chunks
 
 
 def split_indexer_prefill_chunks(
@@ -583,6 +552,90 @@ def topk_transform_512_flashinfer_unfused(
         },
         contiguous_topk_input=True,
     )
+
+
+def topk_transform_flashinfer_fused(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    import flashinfer
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        _flashinfer_tie_break_value,
+    )
+
+    flashinfer.top_k_page_table_transform(
+        scores,
+        page_tables.contiguous(),
+        seq_lens.contiguous(),
+        out_page_indices.shape[1],
+        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+        tie_break=_flashinfer_tie_break_value(),
+        dsa_graph_safe=True,
+        page_size=page_size,
+        out=out_page_indices,
+        out_raw_indices=out_raw_indices,
+    )
+
+
+def deep_gemm_fp4_paged_mqa_logits(
+    q_fp4: Tuple[torch.Tensor, torch.Tensor],
+    k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
+    from deep_gemm import fp8_fp4_paged_mqa_logits
+
+    sl = seq_lens.to(torch.int32)
+    if sl.dim() == 1:
+        sl = sl.unsqueeze(-1)
+    return fp8_fp4_paged_mqa_logits(
+        q_fp4,
+        k_cache,
+        weights,
+        sl,
+        page_table,
+        deep_gemm_metadata,
+        max_seq_len,
+        False,
+    )
+
+
+def topk_transform_paged_from_metadata(
+    logits: torch.Tensor,
+    metadata,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
+    positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
+    if metadata.use_topk_v2:
+        topk_transform_paged_v2(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            metadata.topk_metadata,
+            raw_indices,
+        )
+    else:
+        topk_transform_paged(
+            logits,
+            metadata.c4_seq_lens,
+            metadata.page_table,
+            page_indices,
+            metadata.c4_page_size,
+            raw_indices,
+        )
 
 
 class C4IndexerBackendMixin:
@@ -1247,14 +1300,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
+        if hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
 
         if use_prefill_logits:
             self._forward_prefill_c4_topk_chunked(
@@ -1286,7 +1339,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
             assert logits is not None
             topk_transform_512_v2(
                 logits,
@@ -1295,6 +1348,7 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                raw_indices,
             )
         else:
             assert logits is not None

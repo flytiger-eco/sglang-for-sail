@@ -1159,7 +1159,6 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     arg_groups/deepseek_v4_hook.py). The kv-cache dtype and NPU split-backend
     writes, the max_running_requests fill and the validations stay in the
     hook at its legacy slot."""
-    from sglang.srt.server_args import ServerArgs
 
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
@@ -1179,7 +1178,10 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
         f"Use dsv4 attention backend for {model_arch}, setting page_size to {page_size}."
     )
 
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if (
+        getattr(hf_config, "model_type", None) != "deepseek_v41"
+        and not server_args._swa_full_tokens_ratio_explicitly_set
+    ):
         overrides["swa_full_tokens_ratio"] = 0.1
         logger.info(f"Setting swa_full_tokens_ratio to 0.1 for {model_arch}.")
 
@@ -1193,6 +1195,19 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+    quant = getattr(hf_config, "quantization_config", None) or {}
+    if (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and server_args.device == "cuda"
+        and is_sm100_supported()
+        and server_args.fp8_gemm_runner_backend == "auto"
+        and quant.get("quant_method") == "fp8"
+        and quant.get("weight_block_size") == [32, 32]
+        and quant.get("scale_fmt") == "ue8m0"
+        and is_flashinfer_available()
+    ):
+        overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
+
     return overrides
 
 
@@ -1220,7 +1235,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # cuda_graph_backend_prefill declared here lands too late (the breakable
     # default would already have been auto-disabled for this multimodal arch).
     # It is set inline before _handle_cuda_graph_config instead.
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if not server_args._swa_full_tokens_ratio_explicitly_set:
         overrides["swa_full_tokens_ratio"] = 0.1
     if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
         overrides["mamba_full_memory_ratio"] = 0.1
@@ -2071,10 +2086,20 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = view.get_model_config().hf_config.architectures[0]
+    hf_config = view.get_model_config().hf_config
+    model_arch = hf_config.architectures[0]
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and is_sm100_supported()
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (is_sm90_supported() or is_sm100_supported())
         and view.tp_size > 1
         and not view.enable_dp_attention

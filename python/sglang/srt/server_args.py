@@ -905,7 +905,7 @@ class ServerArgs:
         NS("schedule"),
     ] = 16
     swa_full_tokens_ratio: A[
-        float,
+        Optional[float],
         Arg(
             help=(
                 "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
@@ -916,7 +916,25 @@ class ServerArgs:
             resolvable=True,
         ),
         NS("schedule"),
-    ] = 0.8
+    ] = None
+    _swa_full_tokens_ratio_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+        NS("schedule"),
+    ] = None
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
+        ),
+        NS("schedule"),
+    ] = None
     disable_hybrid_swa_memory: A[
         bool,
         Arg(help="Disable the hybrid SWA memory pool.", resolvable=True),
@@ -1892,6 +1910,12 @@ class ServerArgs:
         "Maximum batch size captured for the prefill cuda graph.",
         NS("exec.graph"),
     ] = None
+    cuda_graph_max_seq_len_prefill: A[
+        Optional[int],
+        "Longest sequence a prefill cuda graph replay admits; longer batches "
+        "run eager prefill. Folds into cuda_graph_config[prefill].max_seq_len.",
+        NS("exec.graph"),
+    ] = None
     cuda_graph_bs_decode: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the decode cuda graph.",
@@ -1900,6 +1924,15 @@ class ServerArgs:
     cuda_graph_bs_prefill: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the prefill cuda graph.",
+        NS("exec.graph"),
+    ] = None
+    cuda_graph_prefill_max_context: A[
+        Optional[int],
+        Arg(
+            help="Fixed maximum context length for DeepSeek-V4 prefill graphs; larger contexts run eagerly.",
+            type_parser=human_readable_int,
+            aliases=["--context-bucket"],
+        ),
         NS("exec.graph"),
     ] = None
     cuda_graph_tc_compiler: A[
@@ -3547,6 +3580,17 @@ class ServerArgs:
         "Enable returning indexer topk indices of layers with indexer with responses.",
         NS("exec.features"),
     ] = False
+    enable_encoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+        NS("exec.features"),
+    ] = False
+    enable_decoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
+        NS("exec.features"),
+    ] = False
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
@@ -3609,6 +3653,12 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        if self._swa_full_tokens_ratio_explicitly_set is None:
+            self._swa_full_tokens_ratio_explicitly_set = (
+                self.swa_full_tokens_ratio is not None
+            )
+        if self.swa_full_tokens_ratio is None:
+            self.swa_full_tokens_ratio = 0.8
         self._run_resolution_pipeline()
 
     def _run_resolution_pipeline(self):
@@ -4648,6 +4698,8 @@ class ServerArgs:
             _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs_decode)
         if self.cuda_graph_max_bs_prefill is not None:
             _set(Phase.PREFILL, "max_bs", self.cuda_graph_max_bs_prefill)
+        if self.cuda_graph_max_seq_len_prefill is not None:
+            _set(Phase.PREFILL, "max_seq_len", self.cuda_graph_max_seq_len_prefill)
         if self.cuda_graph_bs_decode is not None:
             _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
         if self.cuda_graph_bs_prefill is not None:
@@ -4657,6 +4709,9 @@ class ServerArgs:
             # decode is implemented; today decode ignores it.
             _set(Phase.DECODE, "tc_compiler", self.cuda_graph_tc_compiler)
             _set(Phase.PREFILL, "tc_compiler", self.cuda_graph_tc_compiler)
+
+        if self.cuda_graph_prefill_max_context is not None:
+            _set(Phase.PREFILL, "max_context_size", self.cuda_graph_prefill_max_context)
 
         # ---- Explicit JSON config (highest precedence) ----
         for phase, phase_config in explicit_input.items():
@@ -5635,9 +5690,14 @@ class ServerArgs:
             from sglang.srt.arg_groups.deepseek_v4_hook import (
                 validate_deepseek_v4_cp,
                 validate_deepseek_v4_mega_moe_token_budget,
+                validate_deepseek_v41_features,
             )
 
+            # Derive CP topology before V4.1 validates PD and replay features.
+            # --enable-prefill-cp supplies attn_cp_size from tp_size / dp_size;
+            # callers need not explicitly repeat these derived dimensions.
             validate_deepseek_v4_cp(self)
+            validate_deepseek_v41_features(self)
             validate_deepseek_v4_mega_moe_token_budget(self)
 
             # The SM120 marlin fallback moved to the resolution pipeline
@@ -8413,6 +8473,8 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+        if self.swa_prefix_tails is not None and self.swa_prefix_tails < 0:
+            raise ValueError("--swa-prefix-tails must be nonnegative.")
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

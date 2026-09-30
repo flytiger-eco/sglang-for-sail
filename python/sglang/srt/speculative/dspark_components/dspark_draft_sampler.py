@@ -96,29 +96,37 @@ class DsparkDraftSampler:
         base_logits = base_logits.view(bs, self.gamma, -1)
         anchor = input_ids.view(bs, self.gamma)[:, 0]
 
-        if self.folded_sampling:
+        draft_tokens = None
+        if not self.folded_sampling and getattr(
+            self.markov_head, "supports_sharded_greedy", False
+        ):
+            draft_tokens = self.markov_head.sample_block_greedy_fused(
+                base_logits, first_prev_tokens=anchor
+            )
+        if draft_tokens is None:
+            if self.folded_sampling:
 
-            def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                del step_idx
-                # In-graph philox noise: each replay advances the generator
-                # and redraws.
-                noise = self.exp_noise[:bs].exponential_()
-                return SampleStepTokens.execute(
-                    step_logits=step_logits,
-                    temperatures=self.temperatures[:bs],
-                    greedy_mask=self.greedy_mask[:bs],
-                    exp_noise=noise,
-                )
+                def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                    del step_idx
+                    # In-graph philox noise: each replay advances the generator
+                    # and redraws.
+                    noise = self.exp_noise[:bs].exponential_()
+                    return SampleStepTokens.execute(
+                        step_logits=step_logits,
+                        temperatures=self.temperatures[:bs],
+                        greedy_mask=self.greedy_mask[:bs],
+                        exp_noise=noise,
+                    )
 
-        else:
-            sampler = greedy_step_sampler
+            else:
+                sampler = greedy_step_sampler
 
-        draft_tokens, corrected_logits = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=sampler,
-        )
+            draft_tokens, corrected_logits = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=sampler,
+            )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.folded_sampling:
             self.corrected_out[: bs * self.gamma].copy_(
@@ -142,6 +150,9 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
+    # The V4.1 TP head reduces compact argmax summaries in the greedy graph.
+    if getattr(model.markov_head, "supports_sharded_greedy", False):
+        return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize

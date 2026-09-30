@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
-from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -138,6 +138,18 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
+def dsv41_dspark_needs_rebootstrap(
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> bool:
+    """V4.1's request-scoped pair ring and draft KV cannot use CPU tensor backup."""
+    if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return False
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = token_to_kv_pool_allocator.get_kvcache()
+    return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
+
 
 def retraction_backup(
     req: Req,
@@ -146,6 +158,11 @@ def retraction_backup(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     backend: str,
 ) -> None:
+    if dsv41_dspark_needs_rebootstrap(token_to_kv_pool_allocator):
+        # Drain the in-flight verify before its slots can receive recomputed KV.
+        device = token_to_kv_pool_allocator.get_kvcache().device
+        torch.get_device_module(device).synchronize(device)
+        return True
     if backend == "cpu_tensor":
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return

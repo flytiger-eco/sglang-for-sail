@@ -3,7 +3,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import (
+    ResolvedView,
+    _declaration_overlay,
+    run_post_process_pass,
+)
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -195,3 +201,136 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
         f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
     )
+
+
+def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_triton,
+    )
+
+    cfg = ResolvedView(server_args, _declaration_overlay(server_args))
+    if (
+        getattr(server_args.get_model_config().hf_config, "model_type", None)
+        != "deepseek_v41"
+    ):
+        if cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError(
+                "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
+            )
+        return
+    if cfg.enable_encoder_swa_bounded_replay:
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        incompatible = (
+            ("non-CUDA hardware", not get_platform().is_cuda),
+            (
+                "prefill CUDA graphs",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+            ("DP attention", cfg.enable_dp_attention),
+            (
+                "context parallelism",
+                cfg.enable_prefill_context_parallel or cfg.attn_cp_size > 1,
+            ),
+            (
+                "external cache linker",
+                getattr(cfg, "enable_unified_cache_external_linker", False),
+            ),
+            ("unified memory", cfg.enable_unified_memory),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("LoRA", cfg.enable_lora),
+            ("radix sessions", cfg.enable_session_radix_cache),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
+                )
+        if (
+            cfg.max_running_requests is None
+            or cfg.max_running_requests <= 0
+            or not cfg.chunked_prefill_size
+            or cfg.chunked_prefill_size < 128
+        ):
+            raise ValueError(
+                "encoder SWA replay requires explicit --max-running-requests and --chunked-prefill-size >= 128"
+            )
+
+    unsupported = (
+        (
+            "speculative decoding other than DSpark",
+            cfg.speculative_algorithm is not None
+            and str(cfg.speculative_algorithm).upper() != "DSPARK",
+        ),
+        ("HiSparse", cfg.enable_hisparse),
+        ("the unified KV layout", is_unified_kv_triton()),
+        ("two-batch overlap", cfg.enable_two_batch_overlap),
+        ("pipeline parallelism", cfg.pp_size > 1),
+    )
+    for feature, enabled in unsupported:
+        if enabled:
+            raise ValueError(
+                f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
+                "serve this model."
+            )
+
+    if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if (
+            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            or cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.dp_size != 1
+            or cfg.enable_dp_attention
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.enable_prefill_context_parallel
+        ):
+            raise ValueError(
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
+                "DP=1 and CP=1. Both servers must enable DSpark with the same "
+                "block size and TP size."
+            )
+
+    import dataclasses
+
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    prefill_graph = cfg.cuda_graph_config.prefill
+    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
+        # The captured low-ratio indexer scores a static context width; 16k
+        # keeps it inside the candidate window at under 1 ms per layer.
+        graph_config = dataclasses.replace(
+            cfg.cuda_graph_config,
+            prefill=dataclasses.replace(prefill_graph, max_seq_len=16 * 1024),
+        )
+        run_post_process_pass(
+            server_args, lambda _view: {"cuda_graph_config": graph_config}
+        )
+        logger.warning(
+            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
+            "DeepSeek-V4.1; longer contexts run eager prefill."
+        )
+
+    if cfg.enable_decoder_swa_bounded_replay:
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        # Late layers see a per-request tail slice, not the captured prefill shape.
+        incompatible = (
+            (
+                "the prefill CUDA graph",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            ),
+            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
+            ("DP attention", cfg.enable_dp_attention),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    "--enable-decoder-swa-bounded-replay cannot be combined with "
+                    f"{feature} yet; disable one of them."
+                )

@@ -194,7 +194,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         pin_memory: bool = True,
         allocator_type: str = "default",
+        page_aligned_only: bool = False,
     ):
+        self.page_aligned_only = page_aligned_only
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
@@ -379,6 +381,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
+            if self.page_aligned_only:
+                raise ValueError(f"{self.pool_name} requires whole-page transfers")
             # Whole C4 pages can use the normal HiCache page-row copy below.
             # Token-granular DSV4 C4 copy needs this helper because a token is
             # not one contiguous byte range in the paged row:
@@ -459,6 +463,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             host_indices.numel() % self.slot_page_size != 0
             or device_indices.numel() % self.slot_page_size != 0
         ):
+            if self.page_aligned_only:
+                raise ValueError(f"{self.pool_name} requires whole-page transfers")
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
             transfer_cache_dsv4_mla(

@@ -244,7 +244,10 @@ struct AllReducePushImpl {
 
   static SGL_DEVICE void push_impl(uint32_t num_vecs, void* (&data)[kWorldSize], const void* src) {
     const auto num_threads = blockDim.x * gridDim.x;
-    const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Round-robin warps across blocks so small tails use every CTA.
+    const auto warp_in_block = threadIdx.x / device::kWarpThreads;
+    const auto lane_id = threadIdx.x % device::kWarpThreads;
+    const auto global_tid = (blockIdx.x + gridDim.x * warp_in_block) * device::kWarpThreads + lane_id;
 #pragma unroll
     for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
       vec_t vec;
@@ -264,7 +267,10 @@ struct AllReducePushImpl {
   static SGL_DEVICE void poll_impl(uint32_t num_vecs, void* (&data)[kWorldSize], void* out) {
     // need polling to ensure data is ready
     const auto num_threads = blockDim.x * gridDim.x;
-    const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    // Round-robin warps across blocks so small tails use every CTA.
+    const auto warp_in_block = threadIdx.x / device::kWarpThreads;
+    const auto lane_id = threadIdx.x % device::kWarpThreads;
+    const auto global_tid = (blockIdx.x + gridDim.x * warp_in_block) * device::kWarpThreads + lane_id;
     // pos_zero-filled vec we write back after consuming each slot, so the
     // double-buffered phase comes back around with the "slot empty" marker
     // re-established.

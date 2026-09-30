@@ -1628,3 +1628,39 @@ def is_ep_joiner() -> bool:
 def is_ep_scale_joiner() -> bool:
     """True in a process launched as an elastic-EP scale-up joiner."""
     return get_exec().moe.ep_join_mode == "scale"
+
+
+@dataclasses.dataclass(frozen=True)
+class PlatformInfo:
+    """Hardware facts for backported kernels, using the release's detectors."""
+
+    device_sm: int
+    is_cuda: bool
+    is_hip: bool
+    is_sm90: bool
+    is_sm100: bool
+    is_sm120: bool
+    is_blackwell: bool
+
+
+@functools.lru_cache(maxsize=1)
+def get_platform() -> PlatformInfo:
+    from sglang.srt.utils import (
+        get_device_sm,
+        is_blackwell_supported,
+        is_cuda,
+        is_hip,
+        is_sm90_supported,
+        is_sm100_supported,
+        is_sm120_supported,
+    )
+
+    return PlatformInfo(
+        device_sm=get_device_sm(),
+        is_cuda=is_cuda(),
+        is_hip=is_hip(),
+        is_sm90=is_sm90_supported(),
+        is_sm100=is_sm100_supported(),
+        is_sm120=is_sm120_supported(),
+        is_blackwell=is_blackwell_supported(),
+    )

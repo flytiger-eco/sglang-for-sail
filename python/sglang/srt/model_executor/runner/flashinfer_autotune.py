@@ -171,11 +171,12 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer.autotuner import autotune
+    from flashinfer.autotuner import AutoTuner, autotune
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
+    reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
+    if reuse_cache:
         autotune_cache = cache_path
         logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
     else:
@@ -196,12 +197,19 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
+        # autotune(cache=...) clears all file-loaded tactics on entry, which would drop
+        # the target's tactics when the draft worker loads; load and save them by hand.
+        tuner = AutoTuner.get()
+        if reuse_cache and autotune_cache.is_file():
+            tuner.load_configs(str(autotune_cache))
         with autotune(
             True,
-            cache=str(autotune_cache),
+            cache=None if reuse_cache else str(autotune_cache),
             skip_ops=skip_ops,
         ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
             yield
+        if reuse_cache:
+            tuner.save_configs(str(autotune_cache))
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
@@ -249,7 +257,7 @@ def maybe_flashinfer_autotune_speculative_draft(
 def maybe_flashinfer_autotune_extend(
     runner: BaseRunner, *, decode_num_tokens: int
 ) -> None:
-    """Also autotune one EXTEND-shaped dummy forward.
+    """Also autotune kernels at the prefill token ceiling.
 
     The decode-shaped autotune only covers token counts up to the decode
     batch size, so larger prefill/extend batches fall outside the tuned
@@ -258,8 +266,6 @@ def maybe_flashinfer_autotune_extend(
     untuned at >=8k tokens on sm100). One extra forward at the largest
     per-rank extend token count tunes all buckets up to it.
     """
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
-        return
     mr = runner.model_runner
     # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
     # runs on all dp ranks at once, so the gathered dummy already reaches the
@@ -267,6 +273,15 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = mr.server_args.max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
+    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
+    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
+    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
+        with flashinfer_autotune_context(mr, run_lm_head=False):
+            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
+        if tuned:
+            return
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+        return
     if not mr.is_generation or mr.spec_algorithm.is_speculative():
         # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
         # extend-bucket autotune for spec configs is a follow-up.

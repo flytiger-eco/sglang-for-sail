@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from typing import TYPE_CHECKING, Generator, Optional, cast
 
 import torch
@@ -74,6 +75,10 @@ def flashinfer_trtllm_deferred_finalize_context(
         yield
     finally:
         _deferred_finalize_enabled.reset(token)
+
+
+def is_deferred_finalize_enabled() -> bool:
+    return _deferred_finalize_enabled.get()
 
 
 def finalize_flashinfer_trtllm_deferred_output(
@@ -1394,3 +1399,53 @@ def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
 # build time even for LoRA); gated by the master switch so the upstream path is untouched.
 if _SGLANG_EXPERIMENTAL_LORA_OPTI:
     from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
+
+
+@cache
+def _flashinfer_has_typed_deferred_weights() -> bool:
+    from importlib.metadata import version
+
+    from packaging.version import Version
+
+    return Version(version("flashinfer-python")) >= Version("0.6.18")
+
+
+def _make_deferred_finalize_output(
+    result,
+    *,
+    top_k: int,
+) -> FlashInferTrtllmDeferredFinalizeOutput:
+    """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
+    gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
+    # The release pins FlashInfer 0.6.17. Its packed-routing result uses an
+    # FP32 allocation containing BF16 payload; 0.6.18 fixes the output dtype.
+    if (
+        expert_weights.dtype == torch.float32
+        and not _flashinfer_has_typed_deferred_weights()
+    ):
+        n, k = expert_weights.shape
+        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+    # FlashInfer >= 0.6.18 types this buffer by what it holds: bf16 for packed
+    # routing (flashinfer #3595) and the caller's dtype for unpacked routing,
+    # so fp32 here is genuine fp32 and must not be reinterpreted as bf16 bits.
+    if expert_weights.dtype not in (torch.bfloat16, torch.float32):
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return BF16 or FP32 expert weights, got "
+            f"{expert_weights.dtype}"
+        )
+    if gemm2_out.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return BF16 GEMM2 output, got "
+            f"{gemm2_out.dtype}"
+        )
+    if expanded_idx_to_permuted_idx.dtype != torch.int32:
+        raise RuntimeError(
+            "FlashInfer deferred finalize must return Int32 permuted indices, got "
+            f"{expanded_idx_to_permuted_idx.dtype}"
+        )
+    return FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=expert_weights,
+        expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+        top_k=top_k,
+    )

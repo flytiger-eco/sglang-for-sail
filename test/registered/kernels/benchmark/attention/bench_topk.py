@@ -77,6 +77,8 @@ def _build_fn(provider: str, batch_size: int, seq_len: int, k: int):
 @marker.parametrize("batch_size", [2**x for x in range(13)], [1, 128, 1024])
 @marker.benchmark("provider", ["jit_v1", "jit_v2", "flashinfer", "torch"])
 def benchmark(seq_len: int, batch_size: int, k: int, provider: str):
+    seed = seq_len ^ (batch_size << 16) ^ (k << 32)
+    torch.random.manual_seed(seed)
     if k > seq_len:
         marker.skip("k cannot be larger than seq_len")
     if k == 2048 and provider == "jit_v1":
