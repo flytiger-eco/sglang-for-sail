@@ -1,0 +1,300 @@
+name: Release PyPI Nightly Wheels
+
+on:
+  # Run daily at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+  # Triggered by nightly Docker workflow to use same commit
+  repository_dispatch:
+    types: [nightly-release]
+  # Manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Specific commit SHA to build (leave empty for latest)'
+        required: false
+        type: string
+
+concurrency:
+  group: release-ppu-pypi-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-nightly-wheel-v0_5_18:
+    if: github.repository == 'flytiger-eco/sglang-for-sail'
+    runs-on: ubuntu-latest
+    outputs:
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      commit_sha: ${{ steps.build.outputs.commit_sha }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Use commit from: 1) Docker workflow, 2) manual input, 3) latest main
+          # ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+          ref: refs/heads/v0.5.18
+          fetch-depth: 0  # Need full history for setuptools-scm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools setuptools-scm
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          BRANCH="v0.5.18"
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+
+          VERSION=${BRANCH#v}  # Remove 'v' prefix
+
+          # Use date-based dev number for correct chronological sorting
+          # e.g., 0.5.9.dev20260215+g4cf4f0859 > 0.5.9.dev20260214+g45a4697d4
+          FORCE_VERSION="${VERSION}.dev${BUILD_DATE}+${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+
+          # Build wheel
+          python3 -m build --wheel
+
+          WHEEL_FILE=$(ls dist/*.whl)
+          # FORCE_VERSION is authoritative — don't re-derive it from the wheel
+          # name. The wheel is platform-tagged (cp3XX-cp3XX-linux_x86_64) because
+          # of the bundled Rust extension, so it carries no `py3` component.
+          NIGHTLY_VERSION="$FORCE_VERSION"
+
+          # Guard against setuptools-scm ignoring the pretend version. Wheel
+          # name layout is {name}-{version}-{python}-{abi}-{platform}.whl and a
+          # PEP 440 version never contains '-', so field 2 is the version.
+          WHEEL_VERSION=$(basename "$WHEEL_FILE" | cut -d- -f2)
+          if [ "$WHEEL_VERSION" != "$NIGHTLY_VERSION" ]; then
+            echo "::error::Built wheel version '$WHEEL_VERSION' does not match forced version '$NIGHTLY_VERSION'"
+            exit 1
+          fi
+
+          # Get commit info
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          COMMIT_SHA=$(git rev-parse HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+
+          echo "Built wheel: $WHEEL_FILE"
+          echo "Nightly version: ${NIGHTLY_VERSION}"
+          echo "Commit: ${COMMIT_HASH}"
+          echo "Build date: ${BUILD_DATE}"
+
+          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+      # The -v0_5_18 suffix keeps this distinct from the v0.5.13 job below:
+      # artifact names are unique per run, and a collision fails with a 409.
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheel-v0_5_18
+          path: python/dist/*.whl
+          retention-days: 7
+
+  release-nightly-v0_5_18:
+    permissions:
+      contents: write
+    needs: build-nightly-wheel-v0_5_18
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    # Only one wheel is published while the cu129/cu130 index updates below are
+    # disabled, so there is nothing left to fan out over.
+    # strategy:
+    #   fail-fast: false
+    #   # The wheel is CUDA-agnostic and built once — we just register the same
+    #   # artifact under cu129/sglang/ and cu130/sglang/ wheel indexes so users
+    #   # can install via either --extra-index-url. Serialize because both matrix
+    #   # runs clone and push to the same sgl-whl branch.
+    #   max-parallel: 1
+    #   matrix:
+    #     cuda_version: ['129', '130']
+    steps:
+      # No checkout: this job only republishes the artifact built above.
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-wheel-v0_5_18
+          path: dist/
+
+      - name: List downloaded wheels
+        run: |
+          echo "Downloaded wheel:"
+          ls -lh dist/
+
+      - name: Create GitHub Release for nightly wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          # Branch is part of the tag: the two maintenance branches release on the
+          # same schedule, so without it the tags are indistinguishable at a glance.
+          tag_name: nightly-v0.5.18-${{ needs.build-nightly-wheel-v0_5_18.outputs.build_date }}-${{ needs.build-nightly-wheel-v0_5_18.outputs.commit_hash }}
+          # Tag the commit that was actually built. Without this the tag lands on
+          # the default branch head, which is a different maintenance branch and
+          # would make the v0.5.18 and v0.5.13 releases point at the same commit.
+          target_commitish: ${{ needs.build-nightly-wheel-v0_5_18.outputs.commit_sha }}
+          name: Nightly Build v0.5.18 ${{ needs.build-nightly-wheel-v0_5_18.outputs.build_date }} (${{ needs.build-nightly-wheel-v0_5_18.outputs.commit_hash }})
+          prerelease: true
+          # Fail loudly instead of publishing an empty release when the glob misses.
+          fail_on_unmatched_files: true
+          body: |
+            Nightly build from branch v0.5.18, commit ${{ needs.build-nightly-wheel-v0_5_18.outputs.commit_hash }}
+            Build date: ${{ needs.build-nightly-wheel-v0_5_18.outputs.build_date }}
+            Version: ${{ needs.build-nightly-wheel-v0_5_18.outputs.nightly_version }}
+          files: |
+            dist/*.whl
+
+  build-nightly-wheel-v0_5_13:
+    if: github.repository == 'flytiger-eco/sglang-for-sail'
+    runs-on: ubuntu-latest
+    outputs:
+      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      commit_hash: ${{ steps.build.outputs.commit_hash }}
+      commit_sha: ${{ steps.build.outputs.commit_sha }}
+      build_date: ${{ steps.build.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/heads/v0.5.13
+          fetch-depth: 0  # Need full history for setuptools-scm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools setuptools-scm
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Build wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          BRANCH="v0.5.13"
+          HASH="g$(git rev-parse --short HEAD)"
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          VERSION=${BRANCH#v}  # Remove 'v' prefix
+
+          # Use date-based dev number for correct chronological sorting
+          # e.g., 0.5.13.dev20260215+g4cf4f0859 > 0.5.13.dev20260214+g45a4697d4
+          FORCE_VERSION="${VERSION}.dev${BUILD_DATE}+${HASH}"
+          echo "Forcing nightly version to: $FORCE_VERSION"
+
+          # Unlike v0.5.18, this branch declares a STATIC `version` in [project]
+          # instead of `dynamic = ["version"]`, so setuptools never asks
+          # setuptools-scm for the version and SETUPTOOLS_SCM_PRETEND_VERSION is
+          # silently ignored (verified: the wheel comes out as plain 0.5.13).
+          # Rewriting the literal is the only lever on the wheel version. There is
+          # exactly one line-anchored `version =` in the file, so this is safe.
+          sed -i -E "s/^version = \".*\"/version = \"${FORCE_VERSION}\"/" pyproject.toml
+          grep -Fq "version = \"${FORCE_VERSION}\"" pyproject.toml
+
+          # [tool.setuptools_scm] still generates sglang/_version.py, which is what
+          # sglang.__version__ reads at runtime. Set the pretend version too so the
+          # runtime version matches the wheel metadata.
+          export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+
+          # Build wheel
+          python3 -m build --wheel
+
+          WHEEL_FILE=$(ls dist/*.whl)
+          # FORCE_VERSION is authoritative — don't re-derive it from the wheel
+          # name. The wheel is platform-tagged (cp3XX-cp3XX-linux_x86_64) because
+          # of the bundled Rust extension, so it carries no `py3` component.
+          NIGHTLY_VERSION="$FORCE_VERSION"
+
+          # Guard against the version rewrite above not taking effect. Wheel name
+          # layout is {name}-{version}-{python}-{abi}-{platform}.whl and a PEP 440
+          # version never contains '-', so field 2 is the version.
+          WHEEL_VERSION=$(basename "$WHEEL_FILE" | cut -d- -f2)
+          if [ "$WHEEL_VERSION" != "$NIGHTLY_VERSION" ]; then
+            echo "::error::Built wheel version '$WHEEL_VERSION' does not match forced version '$NIGHTLY_VERSION'"
+            exit 1
+          fi
+
+          # Get commit info
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          COMMIT_SHA=$(git rev-parse HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+
+          echo "Built wheel: $WHEEL_FILE"
+          echo "Nightly version: ${NIGHTLY_VERSION}"
+          echo "Commit: ${COMMIT_HASH}"
+          echo "Build date: ${BUILD_DATE}"
+
+          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "commit_sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheel-v0_5_13
+          path: python/dist/*.whl
+          retention-days: 7
+
+  release-nightly-v0_5_13:
+    permissions:
+      contents: write
+    needs: build-nightly-wheel-v0_5_13
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    steps:
+      # No checkout: this job only republishes the artifact built above.
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-wheel-v0_5_13
+          path: dist/
+
+      - name: List downloaded wheels
+        run: |
+          echo "Downloaded wheel:"
+          ls -lh dist/
+
+      - name: Create GitHub Release for nightly wheel
+        uses: softprops/action-gh-release@v2
+        with:
+          # Branch is part of the tag: the two maintenance branches release on the
+          # same schedule, so without it the tags are indistinguishable at a glance.
+          tag_name: nightly-v0.5.13-${{ needs.build-nightly-wheel-v0_5_13.outputs.build_date }}-${{ needs.build-nightly-wheel-v0_5_13.outputs.commit_hash }}
+          # Tag the commit that was actually built, not the default branch head.
+          target_commitish: ${{ needs.build-nightly-wheel-v0_5_13.outputs.commit_sha }}
+          name: Nightly Build v0.5.13 ${{ needs.build-nightly-wheel-v0_5_13.outputs.build_date }} (${{ needs.build-nightly-wheel-v0_5_13.outputs.commit_hash }})
+          prerelease: true
+          # Fail loudly instead of publishing an empty release when the glob misses.
+          fail_on_unmatched_files: true
+          body: |
+            Nightly build from branch v0.5.13, commit ${{ needs.build-nightly-wheel-v0_5_13.outputs.commit_hash }}
+            Build date: ${{ needs.build-nightly-wheel-v0_5_13.outputs.build_date }}
+            Version: ${{ needs.build-nightly-wheel-v0_5_13.outputs.nightly_version }}
+          files: |
+            dist/*.whl
