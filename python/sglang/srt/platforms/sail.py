@@ -3,13 +3,27 @@
 T-HEAD SAIL exposes a CUDA-compatible API through its torch backend, so
 ``SailDeviceMixin`` inherits all device ops from ``CudaDeviceMixin`` and
 only overrides identity (``_enum``, ``device_name``).
+
+SAIL presence is detected by matching the ``ZW`` tag in the CUDA device name,
+keeping the check consistent with ``sglang.srt.utils.is_sail``.
 """
+
+from functools import lru_cache
+
+import torch
 
 from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
+_ZW_TAG = "ZW"
 _ZW810E_NAME = "ZW810E"
+
+
+@lru_cache(maxsize=1)
+def is_sail_available() -> bool:
+    """Return True when the local device is a T-HEAD SAIL (device name holds "ZW")."""
+    return bool(torch.cuda.is_available() and _ZW_TAG in torch.cuda.get_device_name())
 
 
 class SailDeviceMixin(CudaDeviceMixin):
@@ -40,3 +54,10 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
 
     def is_zw810e(self) -> bool:
         return _ZW810E_NAME in self.get_device_name()
+
+
+# Load SAIL FA3 ops hook when running on SAIL hardware.
+# The module-level @plugin_hook decorator registers an AROUND hook on
+# FlashAttentionBackend.__init__ so SAIL-specific FA3 ops are used transparently.
+if is_sail_available():
+    import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
