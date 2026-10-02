@@ -14,8 +14,24 @@ from typing import Optional, Tuple, Union
 
 import flash_mla
 import torch
-from flash_mla import fused_norm_rope_attn_rope_cast as _mega
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+# MegaAttention only exists from FlashMLA's 2026.09.30 release on; a fork that
+# tracks the pre-Mega interface (e.g. the PPU wheel) exports everything else.
+# Keep it optional so this module stays importable there, and fail only when a
+# ``flash_mla_mega_*`` entry point is actually used.
+try:
+    from flash_mla import fused_norm_rope_attn_rope_cast as _mega
+
+    _mega_import_error = None
+except ImportError as e:
+    _mega = None
+    _mega_import_error = e
+
+_MEGA_IMPORT_ERROR = ImportError(
+    "This flash_mla has no MegaAttention (fused_norm_rope_attn_rope_cast); "
+    "the MegaAttention entry points need the FlashMLA 2026.09.30 or newer wheel."
+)
 
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
@@ -183,6 +199,8 @@ def flash_mla_mega_prefill(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, ...]:
     """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    if _mega_import_error is not None:
+        raise _MEGA_IMPORT_ERROR from _mega_import_error
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
@@ -218,6 +236,8 @@ def flash_mla_mega_decode(
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MegaAttention decode over a paged cache: (out_fp8, out_sf, lse)."""
+    if _mega_import_error is not None:
+        raise _MEGA_IMPORT_ERROR from _mega_import_error
     return _mega.decode(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,
