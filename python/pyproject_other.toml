@@ -146,6 +146,12 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/hardware-platforms/sail
 srt_sail = [
+  "acext>=1.1.0",
+  "cuda-python>=13.0",
+  "deep_ep",
+  "deep_gemm",
+  "flash_attn_3",
+  "flash_mla",
   "sailify",
   "sglang[runtime_common]",
   "torch-for-sail",
