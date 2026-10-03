@@ -2809,7 +2809,10 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
         # Initialize token_to_kv_pool_allocator
-        need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
+        need_sort = (
+            get_disagg().disaggregation_mode in ("decode", "prefill")
+            or envs.SGLANG_SORT_PAGE.get()
+        )
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
