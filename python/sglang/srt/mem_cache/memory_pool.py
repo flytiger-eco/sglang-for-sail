@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     next_power_of_2,
 )
@@ -5150,7 +5151,12 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
-    index_k_with_scale_buffer_dtype = torch.uint8
+    # MXFP4 quant block — must match downcast_to_mxfp4_indexer / fused store mxfp4.
+    mxfp4_block_size = 32
+    use_bf16_indexer = envs.SGLANG_SAIL_BF16_INDEXER.get() and is_sail()
+    index_k_with_scale_buffer_dtype = (
+        torch.uint8 if not use_bf16_indexer else torch.bfloat16
+    )
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
     def __init__(
@@ -5174,6 +5180,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5206,6 +5213,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_page_size = self.page_size // index_kpool
         if dcp_replicated:
             self.index_page_size //= get_parallel().attn_dcp_size
+        self.use_fp4_indexer = use_fp4_indexer
         if index_buf_size is None:
             dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
@@ -5223,6 +5231,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             else [False] * layer_num
         )
         assert len(self.skip_topk_layers) == layer_num
+        if self.use_fp4_indexer:
+            assert not self.use_bf16_indexer, (
+                "FP4 indexer cache is incompatible with SGLANG_SAIL_BF16_INDEXER"
+            )
+            assert index_head_dim % self.mxfp4_block_size == 0, (
+                f"index_head_dim={index_head_dim} must be divisible by MXFP4 block {self.mxfp4_block_size}"
+            )
+            assert is_sail(), "FP4 indexer cache is supported on PPU platforms"
 
         physical_page_size = self.index_page_size
         if _is_hip:
@@ -5416,6 +5432,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
             self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
 
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
+    @property
+    def scale_bytes_per_token(self) -> int:
+        """Per-token scale bytes. FP8: head_dim/quant_block * 4. FP4: head_dim/32 ue8m0 bytes."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // self.mxfp4_block_size
+        return (self.index_head_dim // self.quant_block_size) * 4
+
     def _clear_buffers(self):
         super()._clear_buffers()
         self.index_key_cache.clear()
@@ -5450,6 +5480,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        assert not self.use_fp4_indexer, (
+            "Unfused FP4 cache insert is not supported. The FP4 path requires "
+            "the fused store kernel (fused_store_index_k_mxfp4_cache); the "
+            "scalar (k_fp8, k_scale) tensors here have no FP4 analog."
+        )
         self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):

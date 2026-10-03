@@ -98,7 +98,9 @@ from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,
     is_hip,
+    is_sail,
     is_xpu,
+    print_info_once,
     print_warning_once,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -139,7 +141,7 @@ def prepare_kv_for_attention(
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
-
+_is_sail = is_sail()
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
@@ -513,7 +515,9 @@ class DeepseekSparseAttnBackend(
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
-            1 if get_exec().deterministic.enable_deterministic_inference else 0
+            1
+            if get_exec().deterministic.enable_deterministic_inference and not _is_sail
+            else 0
         )
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
@@ -546,6 +550,7 @@ class DeepseekSparseAttnBackend(
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
+        self.indexer_head_dim = model_runner.model_config.index_head_dim
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -642,6 +647,7 @@ class DeepseekSparseAttnBackend(
                     kv_dtype=fp8_dtype,
                 )
 
+        self.flashmla_padding = 64
         # Speculative decoding
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -946,18 +952,59 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
+    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+        return (
+            1,  # next_n
+            self.num_q_heads,  # num_heads
+            self.indexer_head_dim,  # head_dim
+            (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+        )
+
+    def _build_paged_mqa_schedule_metadata(
+        self,
+        seqlens_32_2d: torch.Tensor,
+    ) -> torch.Tensor:
+        return resolve_paged_mqa_logits_metadata_fn()(
+            seqlens_32_2d,
+            64,
+            resolve_num_sms(),
+            **(
+                dict(metadata_extra=self._paged_mqa_schedule_metadata_extra())
+                if _is_sail and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                else {}
+            ),
+        )
+
     def _refresh_paged_mqa_schedule_metadata(
         self,
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
-        new_schedule = resolve_paged_mqa_logits_metadata_fn()(
-            seqlens_32_2d, 64, resolve_num_sms()
-        )
-        if metadata.paged_mqa_schedule_metadata is None:
+        new_schedule = self._build_paged_mqa_schedule_metadata(seqlens_32_2d)
+        current_schedule = metadata.paged_mqa_schedule_metadata
+        if current_schedule is None:
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
-        else:
-            metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            return
+
+        if current_schedule.shape == new_schedule.shape:
+            current_schedule.copy_(new_schedule)
+            return
+
+        if (
+            current_schedule.dim() == new_schedule.dim()
+            and current_schedule.shape[1:] == new_schedule.shape[1:]
+            and current_schedule.shape[0] >= new_schedule.shape[0]
+        ):
+            current_schedule.zero_()
+            current_schedule[: new_schedule.shape[0]].copy_(new_schedule)
+            return
+
+        raise RuntimeError(
+            "DSA paged MQA schedule metadata buffer is too small for CUDA graph "
+            f"replay: buffer_shape={tuple(current_schedule.shape)}, "
+            f"new_shape={tuple(new_schedule.shape)}. This usually means the graph "
+            "was captured with insufficient max context length."
+        )
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -1314,8 +1361,8 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
-                paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1703,8 +1750,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
-                paged_mqa_ctx_lens_2d, 64, resolve_num_sms()
+            # CUDA graph captures the schedule tensor's shape and data pointer.
+            # Reserve schedule capacity for the largest context this graph can
+            # replay; per-replay code refreshes the valid prefix in-place.
+            paged_mqa_ctx_lens_2d = torch.full_like(
+                paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+            )
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1994,6 +2047,7 @@ class DeepseekSparseAttnBackend(
                     schedule_seqlens_expanded,
                     bs,
                 )
+
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
             self._refresh_topk_v2_plan(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
@@ -2318,6 +2372,23 @@ class DeepseekSparseAttnBackend(
             "flashmla_sparse_q8",
             "triton_sparse_mla",
         ):
+            if q_rope is not None:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+
+            # The PPU sparse FlashMLA kernel requires 64 query heads. Preserve
+            # its padding contract independently of the community helper's
+            # architecture-specific padding.
+            if _is_sail and layer.tp_q_head_num % self.flashmla_padding != 0:
+                assert self.flashmla_padding % layer.tp_q_head_num == 0
+                print_info_once(
+                    f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
+                )
+                q_padded = q_all.new_empty(
+                    (q_all.shape[0], self.flashmla_padding, q_all.shape[2])
+                )
+                q_padded[:, : layer.tp_q_head_num, :] = q_all
+                q_all = q_padded
+
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
                 page_table_1 = topk_indices
@@ -2386,8 +2457,6 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
-            if q_rope is not None:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if dsa_impl == "triton_sparse_mla":
                 return self._forward_triton_sparse_mla(
                     q_all=q_all,
@@ -2397,6 +2466,16 @@ class DeepseekSparseAttnBackend(
                     v_head_dim=layer.v_head_dim,
                     topk_length=metadata.dsa_cache_seqlens_int32,
                 )
+            if _is_sail:
+                return self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                    attn_sink=attn_sink,
+                )[:, : layer.tp_q_head_num, :]
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -3271,7 +3350,10 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.physical_page_size, 1, self.kv_cache_dim)
         assert self.physical_page_size == 64, "only page size 64 is supported"
 
-        if not self.dsa_kv_cache_store_fp8:
+        if (
+            envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get()
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -3293,7 +3375,7 @@ class DeepseekSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             kv_format=self.flashmla_kv_format,
         )
 
@@ -4060,7 +4142,7 @@ class DeepseekSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
             topk=self.dsa_index_topk,
         )
 

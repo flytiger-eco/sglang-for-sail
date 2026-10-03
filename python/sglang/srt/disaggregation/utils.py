@@ -40,6 +40,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -125,6 +126,32 @@ def poll_and_all_reduce_prefill_pp(
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
     return polls
+
+
+def _resolve_speculative_backend_type(server_args: ServerArgs, backend_name: str):
+    backend_type = (
+        server_args.speculative_draft_attention_backend
+        if server_args.speculative_draft_attention_backend
+        else getattr(server_args, backend_name)
+    )
+    if backend_type is None:
+        backend_type = server_args.attention_backend
+    return backend_type
+
+
+def dsa_seed_backend_enabled(server_args: ServerArgs) -> bool:
+    decode_backend = _resolve_speculative_backend_type(
+        server_args, "decode_attention_backend"
+    )
+    draft_extend_backend_name = (
+        "decode_attention_backend"
+        if server_args.speculative_attention_mode == "decode"
+        else "prefill_attention_backend"
+    )
+    draft_extend_backend = _resolve_speculative_backend_type(
+        server_args, draft_extend_backend_name
+    )
+    return decode_backend in ("dsa", "nsa") and draft_extend_backend in ("dsa", "nsa")
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
