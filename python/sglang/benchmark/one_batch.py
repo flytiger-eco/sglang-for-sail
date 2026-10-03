@@ -798,11 +798,23 @@ def latency_test_run_once(
             trace_filename=trace_filename_prefill,  # pass it in here for the MLX path only
         )
 
+    use_cuda_events = get_device().device == "cuda"
+    if use_cuda_events:
+        prefill_start_event = torch.cuda.Event(enable_timing=True)
+        prefill_end_event = torch.cuda.Event(enable_timing=True)
     model_runner.synchronize()
-    tic = time.perf_counter()
+    if use_cuda_events:
+        prefill_start_event.record()
+    else:
+        tic = time.perf_counter()
     next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
-    prefill_latency = time.perf_counter() - tic
+    if use_cuda_events:
+        prefill_end_event.record()
+        prefill_end_event.synchronize()
+        prefill_latency = prefill_start_event.elapsed_time(prefill_end_event) / 1000.0
+    else:
+        prefill_latency = time.perf_counter() - tic
 
     if enable_profile_prefill:
         stop_profile(
@@ -823,6 +835,9 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     decode_latencies = []
+    if use_cuda_events:
+        decode_start_event = torch.cuda.Event(enable_timing=True)
+        decode_end_event = torch.cuda.Event(enable_timing=True)
     # Determine profiling start step and end step
     profile_start = (
         profile_start_step if profile_start_step is not None else (output_len // 2)
@@ -831,6 +846,7 @@ def latency_test_run_once(
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     trace_filename_decode = None
     profiler = None
+    profiler_stopped = False
     for i in range(output_len - 1):
         model_runner.synchronize()
         # Start profiler at the specified step
@@ -845,13 +861,22 @@ def latency_test_run_once(
                 trace_filename=trace_filename_decode,
             )
 
-        tic = time.perf_counter()
+        if use_cuda_events:
+            decode_start_event.record()
+        else:
+            tic = time.perf_counter()
         next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
-        latency = time.perf_counter() - tic
+        if use_cuda_events:
+            decode_end_event.record()
+            decode_end_event.synchronize()
+            latency = decode_start_event.elapsed_time(decode_end_event) / 1000.0
+        else:
+            latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+        # For CUDA_PROFILER, profiler is None but stop_profile still calls cudaProfilerStop
+        if enable_profile_decode and not profiler_stopped and i >= profile_end - 1:
             stop_profile(
                 profiler,
                 profile_activities,
@@ -861,6 +886,7 @@ def latency_test_run_once(
                 stage="decode",
             )
             profiler = None
+            profiler_stopped = True
 
         tot_latency += latency
         throughput = batch_size / latency
