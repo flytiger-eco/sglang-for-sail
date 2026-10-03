@@ -55,11 +55,17 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
     def is_zw810e(self) -> bool:
         return _ZW810E_NAME in self.get_device_name()
 
+    def get_device_num_tensorcores(self, device_id: int = 0) -> int:
+        if self.is_zw810e():
+            return 20
+        return super().get_device_num_tensorcores(device_id)
 
-# Load SAIL attention hooks when running on SAIL hardware.
+
+# Load SAIL hooks when running on SAIL hardware.
 # Each module registers @plugin_hook decorators that inject SAIL-native ops
-# into the respective attention backends transparently.
+# into the respective backends transparently.
 if is_sail_available():
     import sglang.srt.hardware_backend.ppu.attention.ppu_dsa_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_fa3_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.ppu.moe.ppu_deepep_hooks  # noqa: F401
