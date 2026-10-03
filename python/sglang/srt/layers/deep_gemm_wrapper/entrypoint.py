@@ -55,6 +55,9 @@ _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 _is_sail = is_sail()
 
+if _is_sail:
+    from sglang.srt.layers import deep_gemm_tuner as tuner
+
 
 # TODO maybe rename these functions
 def grouped_gemm_nt_f8f8bf16_masked(
@@ -67,6 +70,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     max_block_n: int = 256,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    configs: Tuple = None,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -74,6 +78,15 @@ def grouped_gemm_nt_f8f8bf16_masked(
     if lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
         kernel_type = (
             compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
+        )
+
+    if _is_sail:
+        best_config = (
+            configs
+            if configs is not None
+            else tuner.get_deep_gemm_config(
+                expected_m, n, k, num_groups=num_groups, dtype="fp8"
+            )
         )
 
     _sanity_check_input(lhs)
@@ -118,6 +131,13 @@ def grouped_gemm_nt_f8f8bf16_masked(
                     if overlap_args is not None
                     else {}
                 ),
+                **(
+                    dict(
+                        configs=best_config,
+                    )
+                    if _is_sail
+                    else {}
+                ),
             )
 
 
@@ -138,10 +158,20 @@ def grouped_gemm_nt_bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    configs=None,
 ):
     num_groups, _, k = a.shape
     _, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
+
+    if _is_sail:
+        best_config = (
+            configs
+            if configs is not None
+            else tuner.get_deep_gemm_config(
+                expected_m, n, k, num_groups=num_groups, dtype="bf16"
+            )
+        )
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -161,6 +191,13 @@ def grouped_gemm_nt_bf16_masked(
                 if overlap_args is not None
                 else {}
             ),
+            **(
+                dict(
+                    configs=best_config,
+                )
+                if _is_sail
+                else {}
+            ),
         )
 
 
@@ -171,6 +208,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m_indices: torch.Tensor,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    configs: Tuple = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -192,6 +230,28 @@ def grouped_gemm_nt_f8f8bf16_contig(
     if recipe_b is not None:
         fp4_kwargs["recipe_b"] = recipe_b
 
+    if _is_sail:
+        best_config = (
+            configs
+            if configs is not None
+            else tuner.get_deep_gemm_config(m, n, k, num_groups=num_groups, dtype="fp8")
+        )
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs,
+            rhs,
+            out,
+            m_indices,
+            **(
+                dict(
+                    configs=best_config,
+                )
+                if _is_sail
+                else {}
+            ),
+        )
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
@@ -203,13 +263,35 @@ def grouped_gemm_nt_bf16_contig(
     b: torch.Tensor,
     d: torch.Tensor,
     m_indices: torch.Tensor,
+    configs=None,
 ):
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
 
+    if _is_sail:
+        best_config = (
+            configs
+            if configs is not None
+            else tuner.get_deep_gemm_config(
+                m, n, k, num_groups=num_groups, dtype="bf16"
+            )
+        )
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(a, b, d, m_indices)
+        deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_contiguous(
+            a,
+            b,
+            d,
+            m_indices,
+            **(
+                dict(
+                    configs=best_config,
+                )
+                if _is_sail
+                else {}
+            ),
+        )
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
@@ -263,6 +345,7 @@ def gemm_nt_f8f8bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     recipe: Optional[Tuple[int, int, int]] = None,
+    configs: Tuple = None,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
@@ -274,6 +357,13 @@ def gemm_nt_f8f8bf16(
     else:
         kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
 
+    if _is_sail:
+        best_config = (
+            configs
+            if configs is not None
+            else tuner.get_deep_gemm_config(m, n, k, num_groups=num_groups, dtype="fp8")
+        )
+
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
@@ -283,6 +373,7 @@ def gemm_nt_f8f8bf16(
             rhs,
             out,
             **({"recipe": recipe} if recipe is not None else {}),
+            **({"configs": best_config} if _is_sail else {}),
         )
 
 
@@ -344,6 +435,7 @@ def grouped_gemm_nt_f8f8bf16_nopad(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f8f8bf16_nopad"
 
@@ -355,16 +447,20 @@ def grouped_gemm_nt_f8f8bf16_nopad(
             compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL
         )
 
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="fp8"
+        )
+    )
+
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(
-            lhs,
-            rhs,
-            out,
-            m_indices,
-            m_rows,
+            lhs, rhs, out, m_indices, m_rows, best_config
         )
 
 
@@ -373,16 +469,22 @@ def gemm_nt_i8i8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support gemm_nt_i8i8bf16"
 
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(m, n, k, num_groups=num_groups, dtype="int8")
+    )
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_I8I8BF16
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out)
+        deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out, best_config)
 
 
 def grouped_gemm_nt_i8i8bf16_contig(
@@ -390,15 +492,23 @@ def grouped_gemm_nt_i8i8bf16_contig(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     m_indices: torch.Tensor,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_i8i8bf16_contig"
 
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(m, n, k, num_groups=num_groups, dtype="int8")
+    )
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
+        deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(
+            lhs, rhs, out, m_indices, best_config
+        )
 
 
 def grouped_gemm_nt_i8i8bf16_masked(
@@ -409,11 +519,19 @@ def grouped_gemm_nt_i8i8bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_i8i8bf16_masked"
 
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            expected_m, n, k, num_groups=num_groups, dtype="int8"
+        )
+    )
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED
 
     with compile_utils.deep_gemm_execution_hook(
@@ -425,6 +543,7 @@ def grouped_gemm_nt_i8i8bf16_masked(
             out,
             masked_m,
             expected_m,
+            best_config,
             **(
                 dict(
                     enable_sbo_overlap=True,
@@ -443,16 +562,24 @@ def grouped_gemm_nt_i8i8bf16_nopad(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_i8i8bf16_nopad"
 
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="int8"
+        )
+    )
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(
-            lhs, rhs, out, m_indices, m_rows
+            lhs, rhs, out, m_indices, m_rows, best_config
         )
 
 
@@ -462,16 +589,24 @@ def grouped_gemm_nt_bf16_nopad(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_bf16_nopad"
 
     m, k = lhs.shape
     num_groups, n, _ = rhs.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="bf16"
+        )
+    )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
-            lhs, rhs, out, m_indices, m_rows
+            lhs, rhs, out, m_indices, m_rows, best_config
         )
 
 
@@ -481,6 +616,7 @@ def gemm_nt_f4f4bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     bias: Optional[torch.Tensor],
     out: torch.Tensor,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support gemm_nt_f4f4bf16"
 
@@ -493,9 +629,14 @@ def gemm_nt_f4f4bf16(
         if bias is None
         else compile_utils.DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS
     )
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(m, n, k, num_groups=num_groups, dtype="fp4")
+    )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, bias, out)
+        deep_gemm.gemm_fp4_fp4_bf16_nt(lhs, rhs, bias, out, best_config)
 
 
 def grouped_gemm_nt_f4f4bf16_masked(
@@ -507,6 +648,7 @@ def grouped_gemm_nt_f4f4bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f4f4bf16_masked"
 
@@ -516,6 +658,14 @@ def grouped_gemm_nt_f4f4bf16_masked(
         compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED
         if bias is None
         else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS
+    )
+
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            expected_m, n, k, num_groups=num_groups, dtype="fp4"
+        )
     )
 
     with compile_utils.deep_gemm_execution_hook(
@@ -531,6 +681,7 @@ def grouped_gemm_nt_f4f4bf16_masked(
                 out,
                 masked_m,
                 expected_m,
+                best_config,
                 **(
                     dict(
                         enable_sbo_overlap=True,
@@ -550,6 +701,7 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     m_rows: torch.Tensor = None,
+    configs=None,
 ):
     assert _is_sail, f"only ppu deepgemm support grouped_gemm_nt_f4f4bf16_nopad"
 
@@ -561,10 +713,17 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         if bias is None
         else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS
     )
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="fp4"
+        )
+    )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
-            lhs, rhs, bias, out, m_indices, m_rows
+            lhs, rhs, bias, out, m_indices, m_rows, best_config
         )
 
 
@@ -576,6 +735,7 @@ def grouped_gemm_nt_bf16i4bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    configs=None,
 ):
     # lhs: shape [e, m, k], dtype bf16
     # rhs[0]: shape [e, k//16, n*2], dtype int32 (packed int4 weights)
@@ -586,6 +746,14 @@ def grouped_gemm_nt_bf16i4bf16_masked(
 
     num_groups, _, k = lhs.shape
     n = rhs[0].shape[2] // 2
+
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            expected_m, n, k, num_groups=num_groups, dtype="int4"
+        )
+    )
 
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
 
@@ -598,6 +766,7 @@ def grouped_gemm_nt_bf16i4bf16_masked(
             out,
             masked_m,
             expected_m,
+            best_config,
             **(
                 dict(
                     enable_sbo_overlap=True,
@@ -616,6 +785,7 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     out: torch.Tensor,
     m_indices: torch.Tensor,
     m_rows: Optional[torch.Tensor] = None,
+    configs=None,
 ):
     # lhs: shape [m, k], dtype bf16
     # rhs[0]: shape [e, k//16, n*2], dtype int32 (packed int4 weights)
@@ -629,6 +799,14 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
 
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
 
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="int4"
+        )
+    )
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_w4a16_nopad(
             lhs,
@@ -636,6 +814,7 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
             out,
             m_indices,
             m_rows,
+            best_config,
         )
 
 
