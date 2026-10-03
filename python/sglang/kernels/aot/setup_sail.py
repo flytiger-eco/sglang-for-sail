@@ -237,7 +237,7 @@ extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib"]
 # ======================= Extension Modules ======================= #
 def _make_common_ops():
     """common_ops for SM80/SM89."""
-    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math"]
+    nvcc_flags = sgl_kernel_cuda_flags + ["-use_fast_math", "-DSGL_KERNEL_SAIL"]
     return CUDAExtension(
         name="sgl_kernel.common_ops",
         sources=staged_common_sources,
