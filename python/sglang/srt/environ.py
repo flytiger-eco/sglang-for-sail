@@ -2196,6 +2196,7 @@ class Envs:
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    SGLANG_SAIL_FLA_CUDA = EnvBool(False)
 
 
 envs = Envs()
