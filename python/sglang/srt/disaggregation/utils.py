@@ -27,6 +27,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_disagg,
     get_spec,
 )
@@ -126,6 +127,20 @@ def poll_and_all_reduce_prefill_pp(
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
     return polls
+
+
+def dsa_seed_backend_enabled() -> bool:
+    prefill_backend, decode_backend = attention_backends()
+    spec = get_spec()
+    draft_backend = spec.speculative_draft_attention_backend
+    draft_extend_backend = (
+        decode_backend
+        if spec.speculative_attention_mode == "decode"
+        else prefill_backend
+    )
+    return (draft_backend or decode_backend) in ("dsa", "nsa") and (
+        draft_backend or draft_extend_backend
+    ) in ("dsa", "nsa")
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
