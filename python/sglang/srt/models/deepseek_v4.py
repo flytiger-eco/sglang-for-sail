@@ -342,12 +342,15 @@ def _flashinfer_hc_pre(
     num_tokens, hc_mult, hidden_size = x.shape
     hc_hidden_size = hc_mult * hidden_size
     mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
-    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+    n_splits = (
+        1 if _is_sail else _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+    )
 
-    dot_mix = torch.empty(
+    alloc_buffer = torch.zeros if _is_sail else torch.empty
+    dot_mix = alloc_buffer(
         (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
     )
-    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    sqrsum = alloc_buffer((n_splits, num_tokens), dtype=torch.float32, device=x.device)
     tf32_hc_prenorm_gemm(
         x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
     )
@@ -3479,11 +3482,22 @@ class DeepseekV4DecoderLayerBase(nn.Module):
 
             m, k = x_flat.shape
             mix_hc = hc_fn.size(0)
-            d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
-            s_out = torch.empty((m,), dtype=torch.float, device=x.device)
+            if _is_sail:
+                d_out = torch.zeros((1, m, mix_hc), dtype=torch.float, device=x.device)
+                s_out = torch.zeros((1, m), dtype=torch.float, device=x.device)
+            else:
+                d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
+                s_out = torch.empty((m,), dtype=torch.float, device=x.device)
             tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+                x_flat,
+                hc_fn.float().contiguous(),
+                d_out,
+                s_out,
+                num_splits=1 if _is_sail else None,
             )
+            if _is_sail:
+                d_out = d_out.squeeze(0)
+                s_out = s_out.squeeze(0)
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:

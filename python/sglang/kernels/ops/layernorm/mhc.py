@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sail
 from sglang.srt.utils.common import is_gfx1250_supported
 
 _is_hip = is_hip()
@@ -1168,12 +1168,18 @@ def mhc_pre(
         )
 
     if _use_deep_gemm_hc_prenorm():
-        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        if is_sail():
+            assert n_splits == 1, (
+                "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+            )
+        else:
+            n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-        gemm_out_mul = torch.empty(
+        alloc_buffer = torch.zeros if is_sail() else torch.empty
+        gemm_out_mul = alloc_buffer(
             n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
         )
-        gemm_out_sqrsum = torch.empty(
+        gemm_out_sqrsum = alloc_buffer(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
@@ -1772,17 +1778,20 @@ def mhc_fused_post_pre(
     if num_tokens <= fma_token_threshold:
         tile_n = 2 if num_tokens < 8 else 3
         n_splits = 8 if (num_tokens < 8 and hidden_size <= 4096) else 4
+    elif is_sail() and _use_deep_gemm_hc_prenorm():
+        n_splits = 1
     else:
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-    gemm_out_mul = torch.empty(
+    alloc_buffer = torch.zeros if is_sail() else torch.empty
+    gemm_out_mul = alloc_buffer(
         n_splits,
         num_tokens,
         hc_mult3,
         dtype=torch.float32,
         device=residual.device,
     )
-    gemm_out_sqrsum = torch.empty(
+    gemm_out_sqrsum = alloc_buffer(
         n_splits,
         num_tokens,
         dtype=torch.float32,
@@ -2779,7 +2788,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
+    slices = 1 if is_sail() else _HC_MIX_COMPENSATED_SLICES
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
@@ -2789,12 +2798,15 @@ def hc_mix_stats_sinkhorn_deepgemm(
     if m == 0:
         return pre, post, comb
 
-    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
-    mix_lo = torch.empty_like(mix_hi)
-    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
+    alloc_buffer = torch.zeros if is_sail() else torch.empty
+    mix_hi = alloc_buffer((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_lo = alloc_buffer((slices, m, mix), dtype=torch.float32, device=dev)
+    sq = alloc_buffer((slices, m), dtype=torch.float32, device=dev)
     tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
     # sq depends only on x_flat, so the second projection recomputes the same
     # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
+    if is_sail():
+        sq.zero_()
     tf32_hc_prenorm_gemm(x_flat, low, mix_lo, sq, slices)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix_hi,
