@@ -48,6 +48,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -120,7 +124,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sail, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -3638,6 +3642,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+
+        assert attn_sink is not None
+        if is_sail():
+            # Slice attn_sink to current TP rank's heads to match q's head dim
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            if attn_tp_size > 1:
+                attn_tp_rank = get_attn_tensor_model_parallel_rank()
+                n_local_heads = attn_sink.shape[0] // attn_tp_size
+                attn_sink = attn_sink[
+                    attn_tp_rank * n_local_heads : (attn_tp_rank + 1) * n_local_heads
+                ]
+
+        assert attn_sink.shape[0] == q.shape[1], (
+            f"attn_sink head count ({attn_sink.shape[0]}) must match "
+            f"q head count ({q.shape[1]})"
+        )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
