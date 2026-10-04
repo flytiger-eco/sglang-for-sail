@@ -75,6 +75,15 @@ from sglang.srt.utils.common import (
     use_intel_amx_backend,
 )
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -995,6 +1004,17 @@ class LogitsProcessor(nn.Module):
             if use_logits_buffer and not self.do_tensor_parallel_all_gather
             else None
         )
+        if SGLANG_PROFILE_NVTX:
+            lm_head_weight_shape = getattr(lm_head.weight, "shape", None)
+            logit_scale_shape = getattr(self.logit_scale, "shape", None)
+            if torch.cuda.is_current_stream_capturing():
+                th_nvtx_range_push(
+                    f"[FW:GEMM] op:compute_logits,type:D,hidden_states:{hidden_states.shape},lm_head_weight:{lm_head_weight_shape},logit_scale:{logit_scale_shape}"
+                )
+            else:
+                th_nvtx_range_push(
+                    f"[FW:GEMM] op:compute_logits,type:P,hidden_states:{hidden_states.shape},lm_head_weight:{lm_head_weight_shape},logit_scale:{logit_scale_shape}"
+                )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
             logits = self._compute_lm_head(
                 hidden_states, lm_head, embedding_bias, out=logits_buffer
@@ -1007,6 +1027,8 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
 
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
