@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
-from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+from sglang.srt.utils import is_hip, is_sail, is_sm120_supported, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -181,12 +181,14 @@ class PagedIndexerMetadata:
     page_table: torch.Tensor
     compressed_seq_lens: torch.Tensor
     use_topk_v2: bool
+    q_fp8_shape: Optional[torch.Size] = None
     force_deep_gemm_metadata: bool = False
     use_prefill_cuda_graph: bool = False
     # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
     compress_ratio: int = 4
     rows_per_request: int = 1
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
+    build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -203,7 +205,10 @@ class PagedIndexerMetadata:
 
     def __post_init__(self):
         if (
-            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or is_xpu()
+            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            or not self.build_paged_mqa_logits_metadata
         ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
@@ -251,6 +256,14 @@ class PagedIndexerMetadata:
                     self.rows_per_chunk,
                     self.mqa_logits_budget_bytes,
                 )
+            extra_kwargs = {}
+            if is_sail() and self.q_fp8_shape is not None and not use_jit_indexer:
+                extra_kwargs["metadata_extra"] = (
+                    self.rows_per_request,
+                    self.q_fp8_shape[2],
+                    self.q_fp8_shape[3],
+                    1,
+                )
             if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
@@ -258,6 +271,7 @@ class PagedIndexerMetadata:
                         compressed_seq_lens[rows].view(-1, group),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
+                        **extra_kwargs,
                     )
                     for rows in iter_row_chunks(
                         num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
@@ -268,6 +282,7 @@ class PagedIndexerMetadata:
                     compressed_seq_lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
+                    **extra_kwargs,
                 )
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
@@ -373,6 +388,8 @@ class PagedIndexerMetadata:
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
                 "rows_per_request",
+                "build_paged_mqa_logits_metadata",
+                "q_fp8_shape",
             ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,

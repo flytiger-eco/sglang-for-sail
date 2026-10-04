@@ -15,12 +15,14 @@ from .norm_rope import (
     fused_k_norm_rope_flashmla,
     fused_norm_rope_inplace,
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_int8_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
 )
 from .topk import (
     plan_topk_v2,
+    top_k_per_row_prefill,
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
@@ -38,6 +40,7 @@ __all__ = [
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
+    "fused_q_indexer_rope_hadamard_int8_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
@@ -48,5 +51,6 @@ __all__ = [
     "topk_transform_kpool_ragged_v2",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
+    "top_k_per_row_prefill",
     "plan_topk_v2",
 ]

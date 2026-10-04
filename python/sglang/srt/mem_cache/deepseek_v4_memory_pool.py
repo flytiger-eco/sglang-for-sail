@@ -591,6 +591,13 @@ class DeepSeekV4IndexerPool(KVCache):
             self.index_head_dim, self.use_fp4_indexer
         )
 
+    @property
+    def packed_bytes_per_token(self) -> int:
+        """K-side bytes per token in the cache buffer (excludes scales)."""
+        if self.use_fp4_indexer:
+            return self.index_head_dim // 2
+        return self.index_head_dim
+
     def _create_buffer(self):
         page_bytes = self.page_size * self.get_bytes_per_token()
         # Same page count as the KV pool of this ratio: PD registers both by page.
