@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
     top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -1074,6 +1075,7 @@ class C4IndexerBackendMixin:
                 ks,
                 ke,
                 clean_logits=False,
+                logits_dtype=torch.bfloat16,
             )
         else:
             q_fp8 = q_fp8[global_token_start:global_token_end]
@@ -1153,15 +1155,26 @@ class C4IndexerBackendMixin:
                 request_slice=req_slice,
                 query_slice=query_slice,
             )
-            top_k_per_row_prefill(
-                logits,
-                row_starts,
-                row_ends,
-                core_metadata.page_table[token_start:token_end],
-                core_metadata.c4_sparse_page_indices[token_start:token_end],
-                indexer_metadata.c4_page_size,
-                None if raw_indices is None else raw_indices[token_start:token_end],
-            )
+            if logits.dtype == torch.bfloat16:
+                top_k_per_row_prefill_bf16(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    core_metadata.page_table[token_start:token_end],
+                    core_metadata.c4_sparse_page_indices[token_start:token_end],
+                    indexer_metadata.compressed_page_size,
+                    None if raw_indices is None else raw_indices[token_start:token_end],
+                )
+            else:
+                top_k_per_row_prefill(
+                    logits,
+                    row_starts,
+                    row_ends,
+                    core_metadata.page_table[token_start:token_end],
+                    core_metadata.c4_sparse_page_indices[token_start:token_end],
+                    indexer_metadata.compressed_page_size,
+                    None if raw_indices is None else raw_indices[token_start:token_end],
+                )
 
     def forward_c4_indexer(
         self,
@@ -1358,7 +1371,17 @@ class C4IndexerBackendMixin:
             topk_plan: Optional[torch.Tensor] = None,
         ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-            if self.dsa_topk_backend.is_torch():
+            if is_sail() and logits.dtype == torch.bfloat16:
+                top_k_per_row_prefill_bf16(
+                    logits,
+                    torch.zeros_like(c4_seq_lens[rows]),
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    c4_sparse_page_indices[rows],
+                    indexer_metadata.compressed_page_size,
+                    row_raw_indices,
+                )
+            elif self.dsa_topk_backend.is_torch():
                 topk_transform_pytorch_vectorized(
                     logits,
                     c4_seq_lens[rows],
@@ -1515,6 +1538,11 @@ class C4IndexerBackendMixin:
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
+                    **(
+                        {"logits_dtype": torch.bfloat16}
+                        if _USE_INT8 and not use_fp4_indexer
+                        else {}
+                    ),
                 )
                 run_topk_transform(rows, logits, topk_plan)
 

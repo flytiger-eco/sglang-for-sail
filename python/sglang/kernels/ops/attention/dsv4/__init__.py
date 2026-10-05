@@ -23,6 +23,8 @@ from .norm_rope import (
 from .topk import (
     plan_topk_v2,
     top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
+    topk_transform_512_bf16,
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
@@ -49,8 +51,10 @@ __all__ = [
     "topk_transform_paged",
     "topk_transform_kpool_v2",
     "topk_transform_kpool_ragged_v2",
+    "topk_transform_512_bf16",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
     "top_k_per_row_prefill",
+    "top_k_per_row_prefill_bf16",
     "plan_topk_v2",
 ]
