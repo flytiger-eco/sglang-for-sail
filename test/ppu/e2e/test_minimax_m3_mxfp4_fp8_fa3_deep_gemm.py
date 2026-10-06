@@ -10,7 +10,7 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
-    "T-HEAD/MiniMax-M3-MXFP4-FP8",
+    "modelscope.cn/organization/T-HEAD/MiniMax-M3-MXFP4-FP8",
 )
 BASE_URL = "http://127.0.0.1:9985"
 SERVER_LAUNCH_TIMEOUT = 24000
