@@ -749,21 +749,10 @@ class TestPpuFa3Int8FailFast(unittest.TestCase):
                     f"(must stay commented out): {stripped_line!r}"
                 )
 
-    # 6e. Old copy code is preserved as comments (change traceability)
-    def test_old_code_commented(self):
-        commented = [
-            line.strip()
-            for line in self.src.splitlines()
-            if line.strip().startswith("#")
-        ]
-        joined = "\n".join(commented)
-        self.assertIn("k_cache = k_cache.to(torch.bfloat16)", joined)
-        self.assertIn("v_cache = v_cache.to(torch.bfloat16)", joined)
-        self.assertIn(
-            "CR Finding W5",
-            self.src,
-            "Fail-fast must reference CR Finding W5",
-        )
+    # 6e. The obsolete copy path is removed completely.
+    def test_old_upcast_code_removed(self):
+        self.assertNotIn("k_cache = k_cache.to(torch.bfloat16)", self.src)
+        self.assertNotIn("v_cache = v_cache.to(torch.bfloat16)", self.src)
 
 
 if __name__ == "__main__":
