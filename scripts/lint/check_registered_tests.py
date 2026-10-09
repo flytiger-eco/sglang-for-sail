@@ -16,13 +16,12 @@ Pre-commit hook: validate CI registry calls under test/registered/.
         suite at all.
    The modern form resolves to the identical suite (CIRegistry.effective_suite
    is f"{stage}-test-{runner_config}") and is /rerun-test-able.
-3. Every file with an enabled registry must contain an executable
-   `if __name__ == "__main__":` block so direct CI execution runs its tests.
 
 Reuses ut_parse_one_file() from ci_register.py (AST-based parsing)
 to match the same logic used by run_suite.py's collect_tests().
 """
 
+import ast
 import glob
 import importlib.util
 import os
@@ -38,6 +37,37 @@ _MODERN_SHAPE = re.compile(r"^(.+)-test-(.+)$")
 # form. Anything else needs stage=/runner_config=, or its effective_suite matches
 # no suite any workflow invokes and the test silently never runs.
 _LEGACY_CUDA_PREFIXES = ("stress",)
+
+
+def _defines_testcase(tree: ast.AST) -> bool:
+    """True if the file defines unittest classes, statically or via type()."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            if any("TestCase" in ast.unparse(b) for b in node.bases):
+                return True
+        elif isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "type"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Tuple)
+                and any("TestCase" in ast.unparse(e) for e in node.args[1].elts)
+            ):
+                return True
+    return False
+
+
+def _main_runs_tests(tree: ast.Module) -> bool:
+    for stmt in tree.body:
+        if not (
+            isinstance(stmt, ast.If)
+            and ast.unparse(stmt.test).replace("'", '"') == '__name__ == "__main__"'
+        ):
+            continue
+        body = ast.unparse(ast.Module(body=stmt.body, type_ignores=[]))
+        if "unittest.main" in body or "pytest.main" in body:
+            return True
+    return False
 
 
 def main() -> int:
@@ -62,18 +92,22 @@ def main() -> int:
     missing = []
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
-    missing_main_entries = []
+    dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     for f in files:
         try:
-            registries, has_main_entry = ci_register.ut_parse_one_file(f)
+            registries, _has_main_entry = ci_register.ut_parse_one_file(f)
         except Exception:
             # Skip files that can't be parsed (syntax errors, etc.)
             continue
         if len(registries) == 0:
             missing.append(f)
             continue
-        if any(r.disabled is None for r in registries) and not has_main_entry:
-            missing_main_entries.append(f)
+        # TestCase classes are dead unless __main__ runs them (CI does
+        # `python3 file.py`); the ERROR text below explains the fix.
+        with open(f, "r", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=f)
+        if _defines_testcase(tree) and not _main_runs_tests(tree):
+            dead_tests.append(f)
         for r in registries:
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.
             if not (
@@ -129,15 +163,16 @@ def main() -> int:
             )
         print()
         exit_code = 1
-    if missing_main_entries:
+    if dead_tests:
         print(
-            "ERROR: Registered test file(s) missing an executable `if __name__ "
-            '== "__main__":` entry. CI executes each file as `python3 file.py -f`, '
-            "so pytest functions and unittest.TestCase classes would otherwise "
-            "be silently skipped. Add `unittest.main()` or propagate "
-            '`pytest.main([__file__, "-v"])` with sys.exit()/SystemExit:\n'
+            "ERROR: Test file(s) define TestCase classes that CI never runs: "
+            "the registered file is executed as `python3 file.py`, but its "
+            '`if __name__ == "__main__"` block does not call unittest.main() '
+            "or pytest.main(), so the classes are silently skipped while the "
+            "file reports success. Make __main__ run the tests (put any CLI "
+            "entry point behind an explicit flag):\n"
         )
-        for f in missing_main_entries:
+        for f in dead_tests:
             print(f"  {f}")
         print()
         exit_code = 1
