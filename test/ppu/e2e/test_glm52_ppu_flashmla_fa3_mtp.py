@@ -18,7 +18,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 # The fix gates _create_flashmla_prefill_backend to return None on PPU,
 # preserving HybridAttnBackend (fa3 for EXTEND, flashmla for DRAFT_EXTEND_V2).
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/GLM-5.2-W8A8-INT8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/GLM-5.2-W8A8-INT8"
+)
 SERVED_MODEL_NAME = "GLM-5.2"
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 24000  # match --dist-timeout

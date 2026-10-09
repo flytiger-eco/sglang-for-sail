@@ -16,10 +16,6 @@ Strategy:
 2. Otherwise, find the highest version tag across all branches
    and describe relative to it. This handles local dev installs
    from main where release tags only exist on release branches.
-3. If no version tags exist at all, synthesize a describe string
-   (0.0.0-0-g<short_hash>) so that setuptools_scm can still produce
-   a version with branch+commit metadata via the custom local_scheme
-   (e.g. 0.0.0+main.0041a12).
 """
 
 import re
@@ -30,27 +26,35 @@ import sys
 def parse_version_tuple(tag: str) -> tuple:
     """Parse a version tag into a sortable tuple using PEP 440 ordering.
 
+    Supports the SAIL fork tag format with a local version suffix:
+      0.5.13+v0.1.0 -> upstream 0.5.13, sail 0.1.0
+
     Returns a tuple where:
     - Base version parts are integers: (major, minor, patch)
     - Pre-release suffix gets a lower sort key than bare version:
-      v0.5.10rc0  -> (0, 5, 10, 0, 0)   # pre-release
-      v0.5.10     -> (0, 5, 10, 1, 0)   # stable (sorts higher)
-      v0.5.10.post1 -> (0, 5, 10, 2, 1)  # post-release (sorts highest)
+      v0.5.10rc0  -> (0, 5, 10, 0, 0, 0, 0, 0)   # pre-release
+      v0.5.10     -> (0, 5, 10, 1, 0, 0, 0, 0)   # stable (sorts higher)
+      v0.5.10.post1 -> (0, 5, 10, 2, 1, 0, 0, 0)  # post-release (sorts highest)
+    - The trailing sail version parts break ties for the same upstream base:
+      0.5.13+v0.2.0 -> (0, 5, 13, 1, 0, 0, 2, 0)  # sorts above 0.5.13+v0.1.0
     """
     v = tag.lstrip("v")
-    # Split base version from suffix
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:\.?(rc|post)(\d+))?$", v)
+    # Split base version from suffix and optional +vX.Y.Z local version
+    m = re.match(
+        r"^(\d+)\.(\d+)\.(\d+)(?:\.?(rc|post)(\d+))?(?:\+v(\d+)\.(\d+)\.(\d+))?$", v
+    )
     if not m:
-        return (0, 0, 0, 0, 0)
+        return (0, 0, 0, 0, 0, 0, 0, 0)
     major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
     suffix_type = m.group(4)
     suffix_num = int(m.group(5)) if m.group(5) else 0
+    sail = tuple(int(m.group(i)) if m.group(i) else 0 for i in (6, 7, 8))
     if suffix_type == "rc":
-        return (major, minor, patch, 0, suffix_num)
+        return (major, minor, patch, 0, suffix_num) + sail
     elif suffix_type == "post":
-        return (major, minor, patch, 2, suffix_num)
+        return (major, minor, patch, 2, suffix_num) + sail
     else:
-        return (major, minor, patch, 1, 0)
+        return (major, minor, patch, 1, 0) + sail
 
 
 def run_git(*args: str, allow_failure: bool = False) -> str:
@@ -87,7 +91,13 @@ def run_git(*args: str, allow_failure: bool = False) -> str:
 def get_exact_version_tag() -> str:
     """Return the version tag name if HEAD has an exact version tag, or empty string."""
     return run_git(
-        "describe", "--tags", "--exact-match", "--match", "v*", allow_failure=True
+        # "describe", "--tags", "--exact-match", "--match", "v*", allow_failure=True
+        "describe",
+        "--tags",
+        "--exact-match",
+        "--match",
+        "*",
+        allow_failure=True,
     )
 
 
@@ -137,23 +147,14 @@ def get_version_describe() -> str:
         return exact
 
     # Fallback for untagged commits (e.g., dev install from main)
-    describe = get_latest_version_tag_describe()
-    if describe:
-        return describe
-
-    # No version tags found: synthesize a describe string so that
-    # setuptools_scm can still produce a version with branch+commit metadata
-    # via the custom local_scheme (e.g. 0.0.0+main.0041a12).
-    short_hash = run_git("rev-parse", "--short=7", "HEAD")
-    if short_hash:
-        return f"0.0.0-0-g{short_hash}"
-
-    return ""
+    return get_latest_version_tag_describe()
 
 
 def get_latest_version_tag() -> str:
     """Return just the highest version tag (PEP 440 ordered), or empty string."""
-    tags_raw = run_git("tag", "--list", "v*.*.*")
+    # Match both upstream tags (v0.5.13) and SAIL fork tags (0.5.13+v0.1.0)
+    tags_raw = run_git("tag", "--list", "v*.*.*", "[0-9]*.*.*")
+    tags_raw = run_git("tag", "--list")
     if not tags_raw:
         return ""
     tag_list = sorted(tags_raw.splitlines(), key=parse_version_tuple, reverse=True)
@@ -169,11 +170,12 @@ def main() -> None:
         result = get_version_describe()
     if not result:
         print(
-            "ERROR: Could not determine version from git.\n"
+            "ERROR: Could not determine version from git tags.\n"
             "Possible causes:\n"
+            "  - No version tags (v*.*.*) exist: run 'git fetch --tags'\n"
+            "  - Shallow clone without tags: run 'git fetch --unshallow --tags'\n"
             "  - Git safe.directory issue: run 'git config --global --add safe.directory <repo>'\n"
             "  - Not inside a git repository\n"
-            "  - git command not available\n"
             "setuptools-scm will fall back to version 0.0.0.dev0",
             file=sys.stderr,
         )
