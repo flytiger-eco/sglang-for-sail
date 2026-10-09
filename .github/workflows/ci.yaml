@@ -3,31 +3,40 @@ name: CI Pipeline
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  # Ignored review events use a per-run suffix so they cannot cancel active PR CI.
+  group: >-
+    ci-${{ github.event.pull_request.number }}-${{
+    github.event_name == 'pull_request_review' &&
+    (github.event.review.state != 'approved' || github.event.review.user.type == 'Bot') &&
+    github.run_id || 'active' }}
   cancel-in-progress: true
 
 jobs:
   # Stage 1: 密钥扫描预检（组织级 reusable workflow）
   precheck:
     name: Pre-check
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      (github.event.review.state == 'approved' && github.event.review.user.type != 'Bot')
     uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
 
-  # Stage 2: 冒烟测试 与 AI 评审 并行
-  smoke-test:
-    name: Smoke Test
+  # Stage 2: 注册完整性校验与 AI 评审并行
+  registration-validation:
+    name: Registration Validation
     needs: precheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run smoke tests
-        run: |
-          echo "在此替换为你的冒烟测试命令"
+      - name: Validate registered tests
+        run: python3 scripts/lint/check_registered_tests.py
 
   ai-code-review:
     name: AI Code Review (Copilot Gate)
@@ -38,7 +47,7 @@ jobs:
   # Stage 3: 人工审批门禁
   human-review:
     name: Human Review Gate
-    needs: [smoke-test, ai-code-review]
+    needs: [registration-validation, ai-code-review]
     uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
     secrets: inherit
 

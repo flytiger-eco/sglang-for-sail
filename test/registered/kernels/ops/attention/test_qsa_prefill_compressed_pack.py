@@ -195,3 +195,7 @@ def test_qsa_prefill_indices_scratch_is_reused():
     large = backend._get_qsa_prefill_indices_scratch(1024, 2051, device)
     small = backend._get_qsa_prefill_indices_scratch(52, 2051, device)
     assert small.data_ptr() == large.data_ptr()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
