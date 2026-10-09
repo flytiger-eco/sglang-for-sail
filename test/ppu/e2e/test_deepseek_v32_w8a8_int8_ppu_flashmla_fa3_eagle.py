@@ -8,7 +8,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 # E2E test for DeepSeek-V3.2 W8A8-INT8 on PPU with EAGLE speculative decoding,
 # flashmla decode + fa3 prefill, and DP attention.
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-V3.2-W8A8-INT8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-V3.2-W8A8-INT8"
+)
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 24000
 
