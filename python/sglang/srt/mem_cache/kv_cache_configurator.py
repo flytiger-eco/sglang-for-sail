@@ -2059,7 +2059,9 @@ class KVCacheConfigurator:
             )
 
             pool_kwargs["use_fp4_indexer"] = (
-                current_platform.is_sail() and is_fp4_indexer_cache_enabled()
+                current_platform.is_sail()
+                and get_dsa_index_kpool(self.model_config.hf_config) == 1
+                and is_fp4_indexer_cache_enabled()
             )
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
