@@ -8,7 +8,9 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import CustomTestCase, popen_launch_server
 
 # 1. 从环境变量获取模型路径（优先读取 MODEL，兼容 MODEL_PATH）
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-V4-Flash-0731-W8A8-INT8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-V4-Flash-0731-W8A8-INT8"
+)
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 60000  # 增大超时时间，防止 8 卡加载慢导致超时
 
