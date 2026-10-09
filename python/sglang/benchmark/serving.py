@@ -1506,6 +1506,7 @@ async def benchmark(
                 limited_request_func(
                     request_func_input=test_input,
                     pbar=None,
+                    task_id=-1,
                 )
             )
         )
