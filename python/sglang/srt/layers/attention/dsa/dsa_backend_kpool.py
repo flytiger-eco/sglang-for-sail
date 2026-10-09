@@ -5,10 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils import is_sail
-
-_is_sail = is_sail()
-
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_extend_metadata,
     init_kpool_write_plan,
@@ -18,6 +14,9 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_pooled_paged_mqa_metadata,
 )
 from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
+from sglang.srt.utils import is_sail
+
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
