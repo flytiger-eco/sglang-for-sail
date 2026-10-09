@@ -25,6 +25,10 @@ concurrency:
 permissions:
   contents: read
 
+# Every test container passes PIP_INDEX_URL=https://pypi.org/simple: the
+# sdk2.2.0 base image ships a pip index pointing at the Artifactory PyPI repo,
+# which returns 401 for the CI credentials. The env var outranks every pip
+# config file and restores the pip default these jobs used before the upgrade.
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
 
@@ -85,6 +89,7 @@ jobs:
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
             -e PPU_SUPPORTS_FP8=0 \
+            -e PIP_INDEX_URL=https://pypi.org/simple \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -171,6 +176,7 @@ jobs:
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
             -e PPU_SUPPORTS_FP8=0 \
+            -e PIP_INDEX_URL=https://pypi.org/simple \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -240,6 +246,7 @@ jobs:
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
             -e PPU_SUPPORTS_FP8=0 \
+            -e PIP_INDEX_URL=https://pypi.org/simple \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -302,6 +309,7 @@ jobs:
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
             -e PPU_SUPPORTS_FP8=0 \
+            -e PIP_INDEX_URL=https://pypi.org/simple \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
@@ -364,6 +372,7 @@ jobs:
             -e PPU_ARTIFACTORY_USER \
             -e PPU_ARTIFACTORY_PASSWORD \
             -e PPU_SUPPORTS_FP8=0 \
+            -e PIP_INDEX_URL=https://pypi.org/simple \
             ${{ env.PPU_BASE_IMAGE }} \
             bash -c "
               cd /workspace && \
