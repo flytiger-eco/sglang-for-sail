@@ -171,12 +171,22 @@ def flash_attn_with_kvcache(
         if softmax_scale is None:
             softmax_scale = qv.shape[-1] ** -0.5
 
-    # PPU int8: PPU FA3 only supports BF16 KV; an int8 KV cache (quantized
-    # models such as GLM-5.3-Flash INT8) must be up-cast before the kernel.
+    # Fail fast on an int8 KV cache: up-casting with .to(bfloat16) would copy
+    # and lose FA3's in-place cache updates, so require bf16 or the DSA backend.
     if k_cache is not None and k_cache.dtype == torch.int8:
-        k_cache = k_cache.to(torch.bfloat16)
+        raise ValueError(
+            "PPU FA3 received k_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
+        )
     if v_cache is not None and v_cache.dtype == torch.int8:
-        v_cache = v_cache.to(torch.bfloat16)
+        raise ValueError(
+            "PPU FA3 received v_cache with dtype=int8. PPU flash_attn_with_kvcache "
+            "only supports bf16 KV cache. Using .to(bfloat16) would create a copy "
+            "that loses FA3's in-place cache updates. Please use bf16 KV cache or "
+            "route int8 models through the DSA backend instead."
+        )
 
     attention_chunk = 0 if attention_chunk is None else int(attention_chunk)
 
