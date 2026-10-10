@@ -1,0 +1,45 @@
+name: Probe SDK 2.2.0 Answer and Accuracy
+
+on:
+  push:
+    branches:
+      - probe/sdk220-answer-acc
+    paths:
+      - .github/workflows/probe-sdk220-answer-accuracy.yml
+
+concurrency:
+  group: ppu-nightly-btv15
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  answer-8:
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@ci/ppu-nightly-sdk220-image
+    with:
+      ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
+    secrets: inherit
+
+  answer-16:
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@ci/ppu-nightly-sdk220-image
+    with:
+      ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
+    secrets: inherit
+
+  answer-32:
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@ci/ppu-nightly-sdk220-image
+    with:
+      ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
+    secrets: inherit
+
+  accuracy:
+    needs: [answer-8, answer-16, answer-32]
+    if: ${{ !cancelled() }}
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@ci/ppu-nightly-sdk220-image
+    with:
+      ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
+      mode: full
+      entries: glm52-fp8chan-gsm8k,glm52-fp8chan-ceval,glm52-fp8chan-ifeval,glm52-mxfp4-gsm8k,glm52-mxfp4-ceval,glm52-mxfp4-ifeval
+    secrets: inherit
