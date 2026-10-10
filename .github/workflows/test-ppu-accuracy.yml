@@ -147,7 +147,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-8872321ed266
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -230,7 +230,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-15587706392b
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -313,7 +313,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-dc882a184251
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -396,7 +396,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-fp8-channelwise-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-fp8-channelwise ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-415f7752e6ef
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -484,7 +484,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8 gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-73eed23f40cb
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -567,7 +567,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8 gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-4d5482842dd7
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -650,7 +650,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8 ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-f6422830253f
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -733,7 +733,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/glm5.2-mxfp4-fp8-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run glm5.2-mxfp4-fp8 ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-07e58bc68627
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -821,7 +821,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-mxfp4-fp8 gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-65b63b4534be
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -904,7 +904,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-mxfp4-fp8 gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-c4ec844aad6c
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -987,7 +987,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-mxfp4-fp8 ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-c937c4c4bce0
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1070,7 +1070,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/kimi2.6-mxfp4-fp8-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run kimi2.6-mxfp4-fp8 ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-7ef324ea4a3f
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1158,7 +1158,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-fp8-channelwise gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-71a80a9a2d69
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1241,7 +1241,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-fp8-channelwise gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-9e318e062498
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1324,7 +1324,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-fp8-channelwise ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-729cdc825e84
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1407,7 +1407,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-fp8-channelwise-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-fp8-channelwise ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-511b15ba7bd1
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1495,7 +1495,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-mxfp4-fp8 gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-928712d51bcd
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1578,7 +1578,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-mxfp4-fp8 gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-7bbb71429541
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1661,7 +1661,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-mxfp4-fp8 ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-05b33a2fc31a
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1744,7 +1744,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/minimax2.7-mxfp4-fp8-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run minimax2.7-mxfp4-fp8 ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-0f4d0f14fccb
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1832,7 +1832,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-b255622a47b5
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1915,7 +1915,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-fp8-channelwise gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-0ab82f0dac05
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -1998,7 +1998,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-fp8-channelwise ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-41409cf70850
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -2081,7 +2081,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-fp8-channelwise-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-fp8-channelwise ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-ac0babd5796c
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -2169,7 +2169,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k-smoke/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k smoke via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-e464bde07220
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -2252,7 +2252,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-gsm8k/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 gsm8k via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-7abed6f8d2fa
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -2335,7 +2335,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ceval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ceval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-53370551e350
           image: ${{ env.PPU_BASE_IMAGE }}
@@ -2418,7 +2418,7 @@ jobs:
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/qwen3.5-397b-a17b-mxfp4-fp8-ifeval/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run qwen3.5-397b-a17b-mxfp4-fp8 ifeval via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: acc-fadbf39d4149
           image: ${{ env.PPU_BASE_IMAGE }}
