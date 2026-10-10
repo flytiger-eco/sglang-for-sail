@@ -142,5 +142,49 @@ class TestKernelCacheIdentity(unittest.TestCase):
         )
 
 
+class TestWorkflowCacheIdentity(unittest.TestCase):
+    WORKFLOW_SDK_VERSIONS = {
+        "pr-test-ppu.yml": "2.2.0",
+        "nightly-test-ppu.yml": "2.2.0",
+        "test-ppu-answer.yml": "2.1.1",
+        "test-ppu-answer-16.yml": "2.1.1",
+        "test-ppu-answer-32.yml": "2.1.1",
+        "test-ppu-accuracy.yml": "2.1.1",
+        "test-ppu-perf.yml": "2.1.1",
+        "test-ppu-perf-16.yml": "2.1.1",
+        "test-ppu-perf-32.yml": "2.1.1",
+        "test-ppu-pd-perf-glm52.yml": "2.1.1",
+        "test-ppu-pd-perf-qwen35.yml": "2.1.1",
+    }
+
+    def test_workflows_declare_expected_sdk_version(self):
+        workflow_dir = REPO_ROOT / ".github/workflows"
+        for filename, sdk_version in self.WORKFLOW_SDK_VERSIONS.items():
+            with self.subTest(filename=filename):
+                text = (workflow_dir / filename).read_text()
+                self.assertIn(f"  PPU_SDK_VERSION: {sdk_version}\n", text)
+
+    def test_k8s_extra_env_forwards_image_and_sdk_identity(self):
+        workflow_dir = REPO_ROOT / ".github/workflows"
+        for filename in self.WORKFLOW_SDK_VERSIONS:
+            if filename == "nightly-test-ppu.yml":
+                continue
+            text = (workflow_dir / filename).read_text()
+            extra_env_lines = [
+                line for line in text.splitlines() if "extra_env:" in line
+            ]
+            self.assertTrue(extra_env_lines, filename)
+            for line in extra_env_lines:
+                with self.subTest(filename=filename):
+                    self.assertIn("PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }}", line)
+                    self.assertIn("PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }}", line)
+
+    def test_bare_metal_jobs_forward_image_and_sdk_identity(self):
+        text = (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text()
+        install_count = text.count("bash scripts/ci/ppu/ppu_install_dependency.sh")
+        self.assertEqual(text.count("-e PPU_BASE_IMAGE \\\n"), install_count)
+        self.assertEqual(text.count("-e PPU_SDK_VERSION \\\n"), install_count)
+
+
 if __name__ == "__main__":
     unittest.main()

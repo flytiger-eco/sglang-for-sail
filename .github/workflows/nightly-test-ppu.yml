@@ -31,6 +31,7 @@ permissions:
 # config file and restores the pip default these jobs used before the upgrade.
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
 
 jobs:
   nightly-1a-ppu:
@@ -80,6 +81,8 @@ jobs:
             -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
+            -e PPU_BASE_IMAGE \
+            -e PPU_SDK_VERSION \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
             -e SGLANG_SAIL_PLA_CUDA=0 \
             -e CUDA_VISIBLE_DEVICES=0 \
@@ -167,6 +170,8 @@ jobs:
             -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
+            -e PPU_BASE_IMAGE \
+            -e PPU_SDK_VERSION \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
             -e SGLANG_SAIL_PLA_CUDA=0 \
             -e CUDA_VISIBLE_DEVICES=0 \
@@ -237,6 +242,8 @@ jobs:
             -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
+            -e PPU_BASE_IMAGE \
+            -e PPU_SDK_VERSION \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
             -e SGLANG_SAIL_PLA_CUDA=0 \
             -e CUDA_VISIBLE_DEVICES=0,1 \
@@ -301,6 +308,8 @@ jobs:
             -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
+            -e PPU_BASE_IMAGE \
+            -e PPU_SDK_VERSION \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
             -e SGLANG_SAIL_PLA_CUDA=0 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
@@ -364,6 +373,8 @@ jobs:
             -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
             -e SGLANG_IS_IN_CI=true \
             -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
+            -e PPU_BASE_IMAGE \
+            -e PPU_SDK_VERSION \
             -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
             -e SGLANG_SAIL_PLA_CUDA=0 \
             -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
