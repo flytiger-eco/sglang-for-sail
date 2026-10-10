@@ -116,7 +116,7 @@ jobs:
           PPU_ENV_OUTPUT: ${{ env.PERF_RESULTS_ON_RUNNER }}/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run nightly-pd-perf-16-glm52-ppu (fp8-channelwise) via K8s
-        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
+        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into a
@@ -261,7 +261,7 @@ jobs:
           PPU_ENV_OUTPUT: ${{ env.PERF_RESULTS_ON_RUNNER }}/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run nightly-pd-perf-16-glm52-ppu (mxfp4-fp8) via K8s
-        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
+        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 2
