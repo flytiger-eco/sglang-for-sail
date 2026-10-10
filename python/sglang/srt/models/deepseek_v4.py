@@ -931,7 +931,7 @@ class MqaAttentionBase(nn.Module):
             or (
                 wo_a_fp8 is None
                 and _FP8_WO_A_GEMM
-                and _is_ppu
+                and _is_sail
                 and quant_config is not None
             )
         )
@@ -4627,8 +4627,8 @@ class DeepseekV4Model(nn.Module):
             forward_batch
         )
         if use_prefill_cp and not run_tbo and not is_cp_active(forward_batch):
-            # Legacy V1 prefill CP (PPU): the CP-v2 runner shards at the model
-            # boundary, but V1 keeps the strategy dormant, so this model must
+            # Legacy V1 prefill CP: the CP-v2 runner shards at the model
+            # boundary, while V1 has no live strategy, so this model must
             # split activations itself. is_cp_active() gates the V2 runner
             # path, which arrives here already sharded -- never re-split.
             if self.pp_group.is_first_rank:
@@ -5104,10 +5104,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        input_ids, input_embeds = self.prepare_language_model_inputs(
-            input_ids, forward_batch, input_embeds
-        )
-        if self.dsa_enable_prefill_cp:
+        # V1 legacy prefill CP metadata path; skipped when a live V2 strategy
+        # owns the batch (the V2 runner shards inputs at the model boundary
+        # and bypasses this forward entirely).
+        if self.dsa_enable_prefill_cp and not is_cp_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -5451,7 +5451,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not (
             self.wo_a_fp8
             or use_npu_arch35_mxfp8_wo_a(self.quant_config)
-            or (_FP8_WO_A_GEMM and _is_ppu and self.quant_config is not None)
+            or (_FP8_WO_A_GEMM and _is_sail and self.quant_config is not None)
         ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
