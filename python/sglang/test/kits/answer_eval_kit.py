@@ -190,13 +190,19 @@ SERVER_PARAMETER_CLI_ORDER = (
 # ones: an entry here is a name this tree actually reads, checked when it was
 # added.  `SGLANG_WARMUP_TIMEOUT` is declared in `sglang.srt.environ`, and
 # `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` is read through
-# `get_bool_env_var` in `sglang.srt.layers.attention.dsa.utils`.  The internal
+# `get_bool_env_var` in `sglang.srt.layers.attention.dsa.utils`.  The two
+# DeepSeek-V4 names are likewise declared in `sglang.srt.environ` and read on
+# the dsv4 path -- `SGLANG_OPT_USE_TOPK_V2` by the dsv4 attention layers and
+# `SGLANG_DSV4_FP4_EXPERTS` by `model_config.py` -- and the internal btv1.1
+# P0_daily case exports both for every serving of this checkpoint.  The internal
 # GLM cases also export `SGLANG_NSA_DUAL_STREAM=0`, which is deliberately not
 # here: nothing in this tree reads that name, so accepting it would let a config
 # state a setting no run honours.
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
+    "SGLANG_OPT_USE_TOPK_V2",
+    "SGLANG_DSV4_FP4_EXPERTS",
 }
 
 
