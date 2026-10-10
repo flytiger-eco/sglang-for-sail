@@ -17,19 +17,19 @@ permissions:
 
 jobs:
   answer-8:
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@ci/ppu-nightly-sdk220-image
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@19515151f4bebc7aae77d1d90295f60415b97a4f
     with:
       ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
     secrets: inherit
 
   answer-16:
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@ci/ppu-nightly-sdk220-image
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@19515151f4bebc7aae77d1d90295f60415b97a4f
     with:
       ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
     secrets: inherit
 
   answer-32:
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@ci/ppu-nightly-sdk220-image
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@19515151f4bebc7aae77d1d90295f60415b97a4f
     with:
       ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
     secrets: inherit
@@ -37,7 +37,7 @@ jobs:
   accuracy:
     needs: [answer-8, answer-16, answer-32]
     if: ${{ !cancelled() }}
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@ci/ppu-nightly-sdk220-image
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@19515151f4bebc7aae77d1d90295f60415b97a4f
     with:
       ref: 19515151f4bebc7aae77d1d90295f60415b97a4f
       mode: full
