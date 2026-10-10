@@ -82,14 +82,14 @@ permissions:
 # because `suite` does not: the eight configs of a model share one registered
 # file and differ only in the config SGLANG_PPU_ACCURACY_TEST_CONFIG selects.
 #
-# Twenty-eight jobs, and the `entries` input is why that is safe. A job here holds
-# a whole board for most of a night, so a dispatch that started all twenty-one
-# full entries would ask the farm for twenty-one boards until morning. `entries`
+# Thirty jobs, and the `entries` input is why that is safe. A job here holds
+# a whole board for most of a night, so a dispatch that started all twenty-two
+# full entries would ask the farm for twenty-two boards until morning. `entries`
 # is therefore a selection rather than a filter with a permissive default: empty
 # runs `glm52-fp8chan-gsm8k` alone -- the one entry that has run green -- and
 # `all` is the word a caller has to write to mean all of them.
-# 全部 full 先等待七个 smoke；失败或未选中不阻止后续，取消则停止。
-# 前十六项各占一条执行链，末五项接在不同前驱之后，最多同时请求 128 卡。
+# 全部 full 先等待八个 smoke；失败或未选中不阻止后续，取消则停止。
+# 前十六项各占一条执行链，末七项接在不同前驱之后，最多同时请求 128 卡。
 # 这是计划请求量上限；异常残留的 worker 仍需在切换前单独确认已清理。
 #
 # C-Eval and IFEval entries are dispatchable but not yet stageable: only GSM8K is
@@ -2466,9 +2466,174 @@ jobs:
           overwrite: true
           retention-days: 30
 
+  dsv4flash-w8a8-gsm8k-smoke:
+    name: deepseek-v4-flash w8a8 gsm8k smoke (btv1.1)
+    if: ${{ (inputs.mode == 'smoke' || inputs.mode == 'both') && (inputs.entries == '' || inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',dsv4flash-w8a8-gsm8k-smoke,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: acc-2b8f4e6a9c31
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k-smoke/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
+      - name: Run deepseek-v4-flash w8a8 gsm8k smoke via K8s
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
+        with:
+          job_suffix: acc-2b8f4e6a9c31
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k-smoke/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-dsv4flash-ppu,ACCURACY_TIMEOUT_PER_FILE=7200,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k-smoke.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k-smoke,SGLANG_DSV4_FP4_EXPERTS=0,SGLANG_OPT_USE_TOPK_V2=0,SGLANG_DEFAULT_THINKING=1,SGLANG_DSV4_REASONING_EFFORT=high${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: dsv4-flash-w8a8-gsm8k-smoke
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k-smoke
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-dsv4-flash-w8a8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-dsv4-flash-w8a8-gsm8k-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
+  dsv4flash-w8a8-gsm8k:
+    name: deepseek-v4-flash w8a8 gsm8k (btv1.1)
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k-smoke, minimax27-fp8chan-gsm8k-smoke, minimax27-mxfp4-gsm8k-smoke, qwen35-fp8chan-gsm8k-smoke, qwen35-mxfp4-gsm8k-smoke, dsv4flash-w8a8-gsm8k-smoke]
+    if: ${{ !cancelled() && (inputs.mode == 'full' || inputs.mode == 'both' || inputs.mode == '') && (inputs.entries == 'all' || contains(format(',{0},', inputs.entries), ',dsv4flash-w8a8-gsm8k,')) }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 600
+    steps:
+      - name: Checkout code
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Wait out the git egress congestion
+        if: steps.checkout.outcome == 'failure'
+        shell: bash
+        run: sleep 90
+      - name: Checkout code (second attempt)
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 2
+      - name: Observe compute Pod environment
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_ENV_JOB: acc-7d1c9f3a5b62
+          PPU_ENV_EXPECTED_PODS: "1"
+          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k/environment-pods.tsv
+        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
+      - name: Run deepseek-v4-flash w8a8 gsm8k via K8s
+        uses: flytiger-eco/ppu-distributed-action@caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9
+        with:
+          job_suffix: acc-7d1c9f3a5b62
+          image: ${{ env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: "board-type=ZW-M890P"
+          command: bash /workspace/source/scripts/ci/ppu/run_accuracy_suite_board.sh
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k/environment-pods.tsv,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},ACCURACY_SUITE=nightly-accuracy-8-dsv4flash-ppu,ACCURACY_TIMEOUT_PER_FILE=30600,SGLANG_PPU_ACCURACY_TEST_CONFIG=/workspace/source/test/registered/ppu/accuracy_eval/configs/dsv4-flash/w8a8-int8-144g-gsm8k.json,SGLANG_PPU_ACCURACY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k,SGLANG_DSV4_FP4_EXPERTS=0,SGLANG_OPT_USE_TOPK_V2=0,SGLANG_DEFAULT_THINKING=1,SGLANG_DSV4_REASONING_EFFORT=high${{ inputs.dataset_dir && format(',SGLANG_PPU_ACCURACY_DATASET_DIR={0}', inputs.dataset_dir) || '' }}"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 570
+      - name: Collect Accuracy evidence
+        if: always()
+        shell: bash
+        env:
+          ENTRY: dsv4-flash-w8a8-gsm8k
+          ACCURACY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/accuracy-results/dsv4-flash-w8a8-gsm8k
+        run: bash scripts/ci/ppu/collect_accuracy_evidence.sh
+      - name: Upload Accuracy evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-dsv4-flash-w8a8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Wait out the artifact egress congestion
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        shell: bash
+        run: sleep 30
+      - name: Upload Accuracy evidence (second attempt)
+        if: always() && steps.upload_evidence.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-accuracy-k8s-dsv4-flash-w8a8-gsm8k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-accuracy-artifacts/
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+
   publish-trend-rows:
     name: 归档趋势原始行（CPU）
-    needs: [glm52-fp8chan-gsm8k-smoke, glm52-fp8chan-gsm8k, glm52-fp8chan-ceval, glm52-fp8chan-ifeval, glm52-mxfp4-gsm8k-smoke, glm52-mxfp4-gsm8k, glm52-mxfp4-ceval, glm52-mxfp4-ifeval, kimi26-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k, kimi26-mxfp4-ceval, kimi26-mxfp4-ifeval, minimax27-fp8chan-gsm8k-smoke, minimax27-fp8chan-gsm8k, minimax27-fp8chan-ceval, minimax27-fp8chan-ifeval, minimax27-mxfp4-gsm8k-smoke, minimax27-mxfp4-gsm8k, minimax27-mxfp4-ceval, minimax27-mxfp4-ifeval, qwen35-fp8chan-gsm8k-smoke, qwen35-fp8chan-gsm8k, qwen35-fp8chan-ceval, qwen35-fp8chan-ifeval, qwen35-mxfp4-gsm8k-smoke, qwen35-mxfp4-gsm8k, qwen35-mxfp4-ceval, qwen35-mxfp4-ifeval]
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-fp8chan-gsm8k, glm52-fp8chan-ceval, glm52-fp8chan-ifeval, glm52-mxfp4-gsm8k-smoke, glm52-mxfp4-gsm8k, glm52-mxfp4-ceval, glm52-mxfp4-ifeval, kimi26-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k, kimi26-mxfp4-ceval, kimi26-mxfp4-ifeval, minimax27-fp8chan-gsm8k-smoke, minimax27-fp8chan-gsm8k, minimax27-fp8chan-ceval, minimax27-fp8chan-ifeval, minimax27-mxfp4-gsm8k-smoke, minimax27-mxfp4-gsm8k, minimax27-mxfp4-ceval, minimax27-mxfp4-ifeval, qwen35-fp8chan-gsm8k-smoke, qwen35-fp8chan-gsm8k, qwen35-fp8chan-ceval, qwen35-fp8chan-ifeval, qwen35-mxfp4-gsm8k-smoke, qwen35-mxfp4-gsm8k, qwen35-mxfp4-ceval, qwen35-mxfp4-ifeval, dsv4flash-w8a8-gsm8k-smoke, dsv4flash-w8a8-gsm8k]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
