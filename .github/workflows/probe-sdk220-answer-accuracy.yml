@@ -10,7 +10,6 @@ on:
 concurrency:
   group: ppu-nightly-btv15
   cancel-in-progress: false
-  queue: max
 
 permissions:
   contents: read
