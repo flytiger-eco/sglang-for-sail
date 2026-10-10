@@ -57,6 +57,9 @@
 #                                  the installed version string).
 #   SGL_KERNEL_WHEEL_CACHE       — set to 0 to disable the NAS wheel cache
 #   SGL_KERNEL_WHEEL_CACHE_DIR   — cache root (default /mnt/wl_nas/cache/sgl-kernel-wheels)
+#   PPU_BASE_IMAGE               — declared base-image tag used by the run
+#   PPU_BASE_IMAGE_DIGEST        — immutable image digest, preferred when available
+#   PPU_SDK_VERSION              — explicit PPU SDK release (for example, 2.2.0)
 
 set -euo pipefail
 
@@ -88,26 +91,57 @@ install_and_verify() {
 }
 
 # ==================== Wheel cache key ==================== #
-# Key = sha256( aot-subtree git object | torch version | cuda version | py X.Y ).
-# The kernel source (including the third-party pins that live under aot/) is
-# captured exactly by the git tree object of the aot subdir, so the key changes
-# iff a file under aot/ changes -- giving cross-commit HITs whenever the kernel
-# is untouched. The toolchain is added explicitly because it comes from the base
-# image, not from git. If the tree object is unavailable (non-git checkout) the
-# cache is disabled and we build plainly.
+# Key = sha256( aot-subtree git object | toolchain | image identity | PPU SDK ).
+# Prefer the immutable image digest, while retaining the declared tag as a
+# fallback for workflows that do not resolve a digest. Image and SDK identity
+# are mandatory for cache use: an incomplete key must compile from source
+# rather than risk installing a wheel built against another SDK generation.
 CACHE_KEY=""
+_CACHE_UNAVAILABLE_REASON=""
+_IMAGE_IDENTITY=""
+_IMAGE_IDENTITY_SOURCE=""
+_SDK_VERSION="${PPU_SDK_VERSION:-}"
+
+if [ -n "${PPU_BASE_IMAGE_DIGEST:-}" ]; then
+    _IMAGE_IDENTITY="${PPU_BASE_IMAGE_DIGEST}"
+    _IMAGE_IDENTITY_SOURCE="digest"
+elif [ -n "${PPU_BASE_IMAGE:-}" ]; then
+    _IMAGE_IDENTITY="${PPU_BASE_IMAGE}"
+    _IMAGE_IDENTITY_SOURCE="tag"
+fi
+
+if [ -n "${_IMAGE_IDENTITY}" ]; then
+    echo "Cache image identity (${_IMAGE_IDENTITY_SOURCE}): ${_IMAGE_IDENTITY}"
+else
+    echo "Cache image identity: <missing>"
+fi
+echo "PPU SDK version: ${_SDK_VERSION:-<missing>}"
+
 if [ "${SGL_KERNEL_WHEEL_CACHE:-1}" != "0" ]; then
-    _AOT_TREE=$(git -C "${REPO_ROOT}" rev-parse "HEAD:python/sglang/kernels/aot" 2>/dev/null || echo "")
-    if [ -n "${_AOT_TREE}" ]; then
-        _TOOLCHAIN=$(python3 -c 'import sys
+    if [ -z "${_IMAGE_IDENTITY}" ]; then
+        _CACHE_UNAVAILABLE_REASON="missing image identity"
+    elif [ -z "${_SDK_VERSION}" ]; then
+        _CACHE_UNAVAILABLE_REASON="missing PPU_SDK_VERSION"
+    else
+        _AOT_TREE=$(git -C "${REPO_ROOT}" rev-parse "HEAD:python/sglang/kernels/aot" 2>/dev/null || echo "")
+        if [ -z "${_AOT_TREE}" ]; then
+            _CACHE_UNAVAILABLE_REASON="missing AOT git tree"
+        else
+            _TOOLCHAIN=$(python3 -c 'import sys
 try:
     import torch
     tv, cu = torch.__version__, torch.version.cuda
 except Exception:
     tv = cu = "none"
 print(f"{tv}|{cu}|cp{sys.version_info.major}{sys.version_info.minor}")' 2>/dev/null || echo "")
-        if [ -n "${_TOOLCHAIN}" ]; then
-            CACHE_KEY=$(printf '%s|%s' "${_AOT_TREE}" "${_TOOLCHAIN}" | sha256sum | cut -c1-16)
+            if [ -z "${_TOOLCHAIN}" ]; then
+                _CACHE_UNAVAILABLE_REASON="missing toolchain fingerprint"
+            else
+                CACHE_KEY=$(printf '%s|%s|%s|%s' \
+                    "${_AOT_TREE}" "${_TOOLCHAIN}" \
+                    "${_IMAGE_IDENTITY}" "${_SDK_VERSION}" | sha256sum | cut -c1-16)
+                echo "Wheel cache key: ${CACHE_KEY}"
+            fi
         fi
     fi
 fi
@@ -117,6 +151,25 @@ KEY_DIR=""
 if [ -n "${CACHE_KEY}" ]; then
     KEY_DIR="${WHEEL_CACHE_DIR}/${CACHE_KEY}"
 fi
+
+# Stamp a PEP 440 local version segment so the resulting wheel is identifiable
+# as a PPU source-build and satisfies the runtime PPU kernel-version guard. The
+# cache key keeps HIT and MISS versions identical; unavailable cache identity
+# falls back to the tested commit.
+if [ -z "${SGL_KERNEL_LOCAL_VERSION:-}" ]; then
+    if [ -n "${CACHE_KEY}" ]; then
+        SGL_KERNEL_LOCAL_VERSION="ppu.src.${CACHE_KEY}"
+    else
+        _SHA=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "")
+        if [ -n "${_SHA}" ]; then
+            SGL_KERNEL_LOCAL_VERSION="ppu.src.g${_SHA}"
+        else
+            SGL_KERNEL_LOCAL_VERSION="ppu.src"
+        fi
+    fi
+fi
+export SGL_KERNEL_LOCAL_VERSION
+echo "SGL_KERNEL_LOCAL_VERSION: ${SGL_KERNEL_LOCAL_VERSION}"
 
 # ==================== Fast path: cache HIT ==================== #
 if [ -n "${KEY_DIR}" ]; then
@@ -138,7 +191,7 @@ if [ -n "${KEY_DIR}" ]; then
 elif [ "${SGL_KERNEL_WHEEL_CACHE:-1}" = "0" ]; then
     echo "Wheel cache disabled (SGL_KERNEL_WHEEL_CACHE=0); building from source."
 else
-    echo "Wheel cache unavailable (no git tree/toolchain); building from source."
+    echo "Wheel cache unavailable (${_CACHE_UNAVAILABLE_REASON:-incomplete identity}); building from source."
 fi
 
 # ==================== Slow path: build from source ==================== #
@@ -147,27 +200,6 @@ if [ -z "${MAX_JOBS:-}" ]; then
     MAX_JOBS=$(python3 -c "import os; print(min(os.cpu_count() * 2 // 3, 32))")
 fi
 export MAX_JOBS
-
-# Stamp a PEP 440 local version segment so the resulting wheel is identifiable
-# as a PPU source-build and satisfies the runtime PPU kernel-version guard
-# (sglang/srt/hardware_backend/ppu/kernel_version_check.py), which keys on a
-# 'ppu' marker in the installed version string. Derive it from the cache key so
-# a HIT and a fresh MISS yield the same, content-addressed version string; fall
-# back to the commit short-sha when the cache is unavailable.
-if [ -z "${SGL_KERNEL_LOCAL_VERSION:-}" ]; then
-    if [ -n "${CACHE_KEY}" ]; then
-        SGL_KERNEL_LOCAL_VERSION="ppu.src.${CACHE_KEY}"
-    else
-        _SHA=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "")
-        if [ -n "${_SHA}" ]; then
-            SGL_KERNEL_LOCAL_VERSION="ppu.src.g${_SHA}"
-        else
-            SGL_KERNEL_LOCAL_VERSION="ppu.src"
-        fi
-    fi
-fi
-export SGL_KERNEL_LOCAL_VERSION
-echo "SGL_KERNEL_LOCAL_VERSION: ${SGL_KERNEL_LOCAL_VERSION}"
 
 # setuptools reads [project].version from pyproject.toml; a value passed to
 # setup() is ignored when that field is static. So stamp the local segment
