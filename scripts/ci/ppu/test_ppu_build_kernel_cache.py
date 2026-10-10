@@ -10,6 +10,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILD_SCRIPT = REPO_ROOT / "scripts/ci/ppu/ppu_build_kernel.sh"
 AOT_TREE = "aot-tree-object"
 TOOLCHAIN = "2.11.0|13.0|cp312"
+SDK_2_2_IMAGE = (
+    "pkg.flytiger-eco.com/docker_release/llm:"
+    "sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001"
+)
 
 
 class KernelCacheHarness:
@@ -146,22 +150,23 @@ class TestWorkflowCacheIdentity(unittest.TestCase):
     WORKFLOW_SDK_VERSIONS = {
         "pr-test-ppu.yml": "2.2.0",
         "nightly-test-ppu.yml": "2.2.0",
-        "test-ppu-answer.yml": "2.1.1",
-        "test-ppu-answer-16.yml": "2.1.1",
-        "test-ppu-answer-32.yml": "2.1.1",
-        "test-ppu-accuracy.yml": "2.1.1",
-        "test-ppu-perf.yml": "2.1.1",
-        "test-ppu-perf-16.yml": "2.1.1",
-        "test-ppu-perf-32.yml": "2.1.1",
-        "test-ppu-pd-perf-glm52.yml": "2.1.1",
-        "test-ppu-pd-perf-qwen35.yml": "2.1.1",
+        "test-ppu-answer.yml": "2.2.0",
+        "test-ppu-answer-16.yml": "2.2.0",
+        "test-ppu-answer-32.yml": "2.2.0",
+        "test-ppu-accuracy.yml": "2.2.0",
+        "test-ppu-perf.yml": "2.2.0",
+        "test-ppu-perf-16.yml": "2.2.0",
+        "test-ppu-perf-32.yml": "2.2.0",
+        "test-ppu-pd-perf-glm52.yml": "2.2.0",
+        "test-ppu-pd-perf-qwen35.yml": "2.2.0",
     }
 
-    def test_workflows_declare_expected_sdk_version(self):
+    def test_workflows_declare_expected_image_and_sdk_version(self):
         workflow_dir = REPO_ROOT / ".github/workflows"
         for filename, sdk_version in self.WORKFLOW_SDK_VERSIONS.items():
             with self.subTest(filename=filename):
                 text = (workflow_dir / filename).read_text()
+                self.assertIn(f"  PPU_BASE_IMAGE: {SDK_2_2_IMAGE}\n", text)
                 self.assertIn(f"  PPU_SDK_VERSION: {sdk_version}\n", text)
 
     def test_k8s_extra_env_forwards_image_and_sdk_identity(self):
@@ -178,6 +183,10 @@ class TestWorkflowCacheIdentity(unittest.TestCase):
                 with self.subTest(filename=filename):
                     self.assertIn("PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }}", line)
                     self.assertIn("PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }}", line)
+                    self.assertIn(
+                        "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/", line
+                    )
+                    self.assertIn("PIP_TRUSTED_HOST=mirrors.aliyun.com", line)
 
     def test_bare_metal_jobs_forward_image_and_sdk_identity(self):
         text = (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text()

@@ -30,8 +30,8 @@ permissions:
   contents: read
 
 env:
-  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:v2.1.1-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.13-py312
-  PPU_SDK_VERSION: 2.1.1
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
   PERF_SUITE: nightly-perf-16-ppu
   PERF_CONFIG: test/registered/ppu/perf_eval/configs/qwen3.8/2.4t-a95b-mxfp4-fp8-144g-prefill-2n.json
 
@@ -205,7 +205,7 @@ jobs:
             bash ../scripts/ci/ppu/run_perf_suite_node.sh \
               ${{ env.PERF_SUITE }} 12000 "$SGLANG_PPU_PERF_RESULTS_DIR/ranks"
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=${{ env.PERF_RESULTS_IN_POD }}/environment-pods.tsv,SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/${{ env.PERF_CONFIG }},SGLANG_PPU_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=${{ env.PERF_RESULTS_IN_POD }}/environment-pods.tsv,SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com,GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_PERF_TEST_CONFIG=/workspace/source/${{ env.PERF_CONFIG }},SGLANG_PPU_PERF_RESULTS_DIR=${{ env.PERF_RESULTS_IN_POD }}"
           container_options: |
             privileged: true
             host_ipc: true
