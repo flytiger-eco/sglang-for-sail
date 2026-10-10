@@ -114,7 +114,7 @@ jobs:
           PPU_ENV_OUTPUT: ${{ env.ANSWER_RESULTS_ON_RUNNER }}/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
       - name: Run ${{ matrix.suite }} via K8s
-        uses: flytiger-eco/ppu-distributed-action@972c2d9e0418b8a4782deb438eab012e276b3e31
+        uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: ans16-${{ strategy.job-index }}
           image: ${{ env.PPU_BASE_IMAGE }}
