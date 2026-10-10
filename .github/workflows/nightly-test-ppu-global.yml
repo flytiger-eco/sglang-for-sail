@@ -158,7 +158,7 @@ jobs:
   answer-8:
     needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@v0.5.18
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer.yml@ci/ppu-nightly-sdk220-image
     with:
       ref: ${{ needs.prepare.outputs.source_sha }}
     secrets: inherit
@@ -166,7 +166,7 @@ jobs:
   answer-16:
     needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@v0.5.18
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-16.yml@ci/ppu-nightly-sdk220-image
     with:
       ref: ${{ needs.prepare.outputs.source_sha }}
     secrets: inherit
@@ -174,7 +174,7 @@ jobs:
   answer-32:
     needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'answer' || inputs.suite == 'all' || inputs.suite == '') }}
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@v0.5.18
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-answer-32.yml@ci/ppu-nightly-sdk220-image
     with:
       ref: ${{ needs.prepare.outputs.source_sha }}
     secrets: inherit
@@ -184,7 +184,7 @@ jobs:
   accuracy:
     needs: [prepare, pd-glm52, pd-qwen35, perf-8, perf-16, perf-32, answer-8, answer-16, answer-32]
     if: ${{ !cancelled() && needs.prepare.result == 'success' && (inputs.suite == 'accuracy' || inputs.suite == 'all' || inputs.suite == '') }}
-    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@v0.5.18
+    uses: flytiger-eco/sglang-for-sail/.github/workflows/test-ppu-accuracy.yml@ci/ppu-nightly-sdk220-image
     with:
       ref: ${{ needs.prepare.outputs.source_sha }}
       mode: ${{ inputs.mode || 'full' }}
