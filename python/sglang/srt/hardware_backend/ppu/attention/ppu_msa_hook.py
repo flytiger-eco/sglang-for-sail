@@ -329,6 +329,12 @@ def _ppu_msa_sparse_prefill(
             _ppu_prefill_capture_warned = True
         return _triton_prefill()
 
+    # The SAIL planner neither produces nor consumes the cross-layer top-k
+    # index cache, and does not implement the hisparse loc remapping; a batch
+    # needing either stays on the community Triton path.
+    if return_topk_idx or cached_topk_idx is not None or loc_mapping is not None:
+        return _triton_prefill()
+
     # msa_ppu_forward_extend needs the live ForwardBatch (req_pool_indices
     # for the packed page table, plus a stable per-forward identity so the
     # ~57 sparse layers reuse one forward's plans). The stash set by the
