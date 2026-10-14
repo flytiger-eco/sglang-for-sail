@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "ppu": HWBackend.PPU,
 }
 
 # Per-commit test suites (run on every PR).
@@ -115,6 +116,13 @@ PER_COMMIT_SUITES = {
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
     ],
+    HWBackend.PPU: [
+        # pr-test-ppu.yml serializes these K8s jobs via needs. Stage C is
+        # declared for 2-GPU tests but currently has no registered coverage.
+        "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu",
+        "stage-c-test-2-gpu-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -204,6 +212,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.PPU,
 }
 
 
