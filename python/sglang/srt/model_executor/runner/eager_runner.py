@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -61,7 +62,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu, is_sail
 from sglang.srt.utils.common import (
     ceil_align,
     get_eager_max_batch_size,
@@ -72,6 +73,7 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -249,6 +251,12 @@ class EagerRunner(BaseRunner):
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            if (
+                _is_sail
+                and model_runner.is_draft_worker
+                and forward_batch.forward_metadata_replan_equivalent
+            ):
+                attn_backend = get_attn_backend()
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,

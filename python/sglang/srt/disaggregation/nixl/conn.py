@@ -3162,6 +3162,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_gpu_id=dst_gpu_id,
                     state_type=st,
                     force_flat=True,
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                 )
             elif (
                 st == StateType.SWA
