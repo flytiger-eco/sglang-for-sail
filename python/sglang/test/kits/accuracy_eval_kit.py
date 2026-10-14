@@ -261,6 +261,10 @@ SERVER_PARAMETER_CLI_ORDER = (
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
+    # Declared in `sglang.srt.environ` (EnvBool, default on) and read by
+    # `sglang.srt.layers.attention.deepseek_v4_backend`; the internal btv1.5
+    # P0_daily cases export it as 1 for every DeepSeek-V4 mxfp4 serving.
+    "SGLANG_OPT_FLASHMLA_SPARSE_PREFILL",
 }
 
 # The generation keys a config may pin, matching what the internal cases state
