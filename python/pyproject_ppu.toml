@@ -87,7 +87,7 @@ dependencies = [
   "deep_gemm==1.1.0",
   "fast-hadamard-transform==1.0.4.post1",
   "flash-attn==2.8.2",
-  "flash_attn_3",
+  "flash_attn_3==2.8.2",
   "flash_mla==2.0.0",
   "flashinfer_python[cu13]==0.6.17",
   "mooncake==0.3.12.post1",
