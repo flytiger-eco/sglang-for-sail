@@ -201,6 +201,12 @@ NIGHTLY_SUITES = {
         "nightly-answer-8-glm52-ppu",
         "nightly-answer-8-kimi26-ppu",
         "nightly-answer-8-minimax27-ppu",
+        # DeepSeek-V4-Flash W8A8, the first DeepSeek case on this board.
+        "nightly-answer-8-dsv4flash-ppu",
+        # The btv1.5 DeepSeek additions: the dated V4-Pro MXFP4-FP8 checkpoint
+        # and V3.2 FP8, both single-board tp 8 serves.
+        "nightly-answer-8-dsv4pro-ppu",
+        "nightly-answer-8-dsv32-ppu",
         # Whole boards, one suite each: every node runs the same registered file
         # and the launcher tells each which rank it is.
         "nightly-answer-16-ppu",
@@ -259,6 +265,14 @@ NIGHTLY_SUITES = {
         "nightly-accuracy-8-kimi26-ppu",
         "nightly-accuracy-8-minimax27-ppu",
         "nightly-accuracy-8-qwen35-ppu",
+        # DeepSeek-V4-Flash W8A8, the first DeepSeek case on this board.
+        "nightly-accuracy-8-dsv4flash-ppu",
+        # The btv1.5 additions: V4-Pro MXFP4-FP8, V3.2 FP8 and GLM-5.1's two
+        # formats.  dsv4flash's suite name covers its second config too (the
+        # MXFP4-FP8 pair lives under the same name as the W8A8 pair).
+        "nightly-accuracy-8-dsv4pro-ppu",
+        "nightly-accuracy-8-dsv32-ppu",
+        "nightly-accuracy-8-glm51-ppu",
     ],
 }
 
