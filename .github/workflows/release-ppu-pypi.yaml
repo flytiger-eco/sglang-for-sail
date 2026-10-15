@@ -131,6 +131,7 @@ jobs:
         source scripts/ci/utils/install_protoc.sh
         source scripts/ci/utils/install_rustup.sh
         cd python
+        cp pyproject_other.toml pyproject.toml
         cp ../README.md ../LICENSE .
         pip install build wheel setuptools setuptools-scm setuptools-rust
         git config --global --add safe.directory ''*''
