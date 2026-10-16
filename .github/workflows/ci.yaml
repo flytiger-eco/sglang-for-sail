@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The GITHUB_TOKEN's scopes narrow down the workflow_call chain, so the
+  # pr-gate job inside pr-test-ppu.yml needs this declared here to list
+  # workflow runs for its cooldown check.
+  actions: read
 
 concurrency:
   # Ignored review and unrelated-label events use a per-run suffix so they
@@ -39,6 +43,19 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate registered tests
         run: python3 scripts/lint/check_registered_tests.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install CI filter test dependencies
+        run: |
+          python3 -m pip install PyYAML==6.0.3 pytest==8.3.5
+          npm install --prefix "$RUNNER_TEMP/ppu-ci-filter-tests" \
+            --ignore-scripts --no-save --no-package-lock --no-audit --no-fund \
+            picomatch@2.3.1 minimatch@9.0.5
+      - name: Validate CI path filters and authorization contracts
+        env:
+          NODE_PATH: ${{ runner.temp }}/ppu-ci-filter-tests/node_modules
+        run: python3 -m unittest discover -s scripts/ci/utils/tests -p 'test_run_ci_*.py' -v
 
   ai-code-review:
     name: AI Code Review (Copilot Gate)

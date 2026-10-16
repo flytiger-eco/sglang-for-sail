@@ -1,0 +1,86 @@
+name: PPU PR Suite
+description: Isolated PR worker, bounded tests, and mandatory evidence
+inputs:
+  lane:
+    required: true
+    description: smoke, body, or multi
+  cards:
+    required: true
+    description: PPU devices per pod
+  worker-minutes:
+    required: true
+    description: Worker deadline, leaving cleanup time inside the job deadline
+  kernel:
+    default: 'false'
+    description: Include kernel probes in the body pod
+outputs:
+  evidence_ok:
+    description: All selected files executed and produced valid results
+    value: ${{ steps.evidence.outputs.evidence_ok }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Resolve immutable image
+      shell: bash
+      run: bash scripts/ci/ppu/resolve_image_digest.sh
+    - name: Require image identity
+      shell: bash
+      run: |
+        [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+        [[ "$PPU_BASE_IMAGE_REF" == *@sha256:* ]]
+    - name: Checkout pinned worker action
+      uses: actions/checkout@v4
+      with:
+        repository: flytiger-eco/ppu-distributed-action
+        ref: 67ef781e31924dc04b31cc01b7c537a797add97e
+        path: .ppu-pr-action
+        persist-credentials: false
+    - name: Isolate PR mounts
+      shell: bash
+      run: |
+        python3 scripts/ci/ppu/prepare_pr_action.py .ppu-pr-action
+        mkdir -p "/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+    - name: Execute worker
+      id: worker
+      uses: ./.ppu-pr-action
+      with:
+        image: ${{ env.PPU_BASE_IMAGE_REF }}
+        nnodes: 0
+        nproc_per_node: ${{ inputs.cards }}
+        node_selector: board-type=OAM-810E
+        job_suffix: ${{ github.job }}
+        command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh ${{ inputs.lane }}
+        host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.event.pull_request.number || github.run_id }}/${{ inputs.lane }}:/ppu-pr-cache
+        extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_RUN_KERNEL=${{ inputs.kernel }},PPU_SMALL_MODEL_PATH=${{ env.PPU_SMALL_MODEL_PATH }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ env.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ env.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+        container_options: |
+          host_ipc: true
+          shm_size: 8Gi
+        timeout_minutes: ${{ inputs.worker-minutes }}
+    - name: Validate evidence
+      id: evidence
+      if: always()
+      shell: bash
+      env:
+        LANE: ${{ inputs.lane }}
+        KERNEL: ${{ inputs.kernel }}
+        WORKER_OUTCOME: ${{ steps.worker.outcome }}
+      run: |
+        directory="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_JOB"
+        python3 scripts/ci/ppu/pr_report.py sanitize --directory "$directory"
+        python3 scripts/ci/ppu/pr_report.py summarize --directory "$directory" --lane "$LANE"
+        args=()
+        [[ "$KERNEL" != true ]] || args+=(--kernel)
+        python3 scripts/ci/ppu/pr_report.py verify --directory "$directory" --lane "$LANE" "${args[@]}"
+        [[ "$WORKER_OUTCOME" == success ]]
+        echo 'evidence_ok=true' >> "$GITHUB_OUTPUT"
+    - name: Upload evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ppu-pr-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+        path: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/${{ github.job }}
+        if-no-files-found: error
+        retention-days: 14
