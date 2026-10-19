@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_sail
 from sglang.srt.utils.common import async_h2d
@@ -31,9 +32,20 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+
 # TODO: use a per-forward mqa_logits_budget_bytes() budget that also
 # leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+
+
+def _deep_gemm_score_budget_bytes() -> int:
+    # The env override is SAIL-only; NVIDIA keeps the fixed budget.
+    if not is_sail():
+        return _DEEP_GEMM_SCORE_BUDGET_BYTES
+    max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+    if max_logits_mb <= 0:
+        raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+    return max_logits_mb * 1024 * 1024
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -122,6 +134,10 @@ def _index_q_and_weights(
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
     ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
     rows, heads = x.shape[0], indexer.n_local_heads
+    if is_sail():
+        q = indexer.queries(q_lora, freqs_cis[positions])
+        q_fp4, q_sf = quantize_index_q(q)
+        return q_fp4, q_sf, indexer.head_weights(x).float()
     q, _ = indexer.wq_b(q_lora)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
@@ -221,7 +237,7 @@ def score_tiles(
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=_deep_gemm_score_budget_bytes(),
         width_align=width_align,
     )
 
@@ -279,6 +295,7 @@ class DecodeScores(msgspec.Struct, frozen=True):
     scores: torch.Tensor  # [bs, lmax]
     page_table: Optional[torch.Tensor] = None
     page_size: int = 0
+    row_start: int = 0  # first batch row of a paged plan chunk
 
 
 def prefill_requests(
@@ -403,14 +420,14 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     has_candidate_mask: bool
 
 
-def decode_scores(
+def decode_score_chunks(
     *,
     inputs: DecodeInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
-) -> Optional[DecodeScores | PagedDecodeScores]:
-    """None when there is no row, or nothing visible yet."""
+) -> Iterator[DecodeScores | PagedDecodeScores]:
+    """Score one metadata row chunk at a time; yield nothing when no row is visible."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -420,17 +437,16 @@ def decode_scores(
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
     )
+    inputs.reset_outputs()
     if bs == 0:
-        inputs.reset_outputs()
-        return None
+        return
     lens = (pos + 1) // ratio
     metadata = inputs.paged_metadata
     # V4 reserves the replay bound in metadata; visibility stays on device.
     # A capture-time length read would both synchronize and truncate replay.
     lmax = min(metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio)
     if lmax == 0:
-        inputs.reset_outputs()
-        return None
+        return
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
@@ -450,7 +466,7 @@ def decode_scores(
             ratio,
             candidate_mask,
         )
-        return PagedDecodeScores(
+        yield PagedDecodeScores(
             bs=bs,
             lmax=lmax,
             lens=lens,
@@ -461,56 +477,11 @@ def decode_scores(
             plan=plan,
             has_candidate_mask=candidate_mask is not None,
         )
-    inputs.reset_outputs()
+        return
+
     j = torch.arange(lmax, device=pos.device)
-    valid = j[None, :] < lens[:, None]
-    use_paged = is_sail()
-    slots = None
-    if use_paged:
-        score_chunks = []
-        if indexer.use_int8:
-            from sglang.kernels.ops.attention.dsv4.int8_indexer import (
-                int8_paged_index_logits,
-            )
-
-            for rows, plan in metadata.row_chunks():
-                score_chunks.append(
-                    int8_paged_index_logits(
-                        q[rows],
-                        weights[rows],
-                        table,
-                        metadata.compressed_seq_lens[rows],
-                        metadata.page_table[rows],
-                        plan,
-                        metadata.max_compressed_seq_len,
-                        metadata.compressed_page_size,
-                    )[:, :lmax]
-                )
-        else:
-            from sglang.kernels.ops.attention.dsv4.index_logits import (
-                deep_gemm_fp4_paged_mqa_logits,
-            )
-
-            q_fp4, q_sf = quantize_index_q(q)
-            k_cache = get_index_k_cache(
-                token_to_kv_pool=pool,
-                layer_id=inputs.layer_id,
-                page_size=metadata.compressed_page_size,
-            )
-            for rows, plan in metadata.row_chunks():
-                score_chunks.append(
-                    deep_gemm_fp4_paged_mqa_logits(
-                        (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
-                        k_cache,
-                        weights[rows].float(),
-                        metadata.compressed_seq_lens[rows],
-                        metadata.page_table[rows],
-                        plan,
-                        metadata.max_compressed_seq_len,
-                    )[:, :lmax]
-                )
-        scores = torch.cat(score_chunks)
-    else:
+    if not is_sail():
+        valid = j[None, :] < lens[:, None]
         slots = (
             req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
         )
@@ -518,16 +489,67 @@ def decode_scores(
         scores = fp4_index_logits_decode(
             q, weights, slots, lens, table, table.shape[1] // 68
         )
-    scores.masked_fill_(~valid, -torch.inf)
-    return DecodeScores(
-        bs=bs,
-        lmax=lmax,
-        lens=lens,
-        slots=slots,
-        scores=scores,
-        page_table=metadata.page_table[:bs] if use_paged else None,
-        page_size=metadata.compressed_page_size if use_paged else 0,
+        scores.masked_fill_(~valid, -torch.inf)
+        yield DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+        return
+
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        deep_gemm_fp4_paged_mqa_logits,
     )
+    from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+        int8_paged_index_logits,
+    )
+
+    if not indexer.use_int8:
+        q_fp4, q_sf = quantize_index_q(q)
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=pool,
+            layer_id=inputs.layer_id,
+            page_size=metadata.compressed_page_size,
+        )
+
+    def score_rows(rows, plan):
+        if indexer.use_int8:
+            return int8_paged_index_logits(
+                q[rows],
+                weights[rows],
+                table,
+                metadata.compressed_seq_lens[rows],
+                metadata.page_table[rows],
+                plan,
+                metadata.max_compressed_seq_len,
+                metadata.compressed_page_size,
+            )[:, :lmax]
+        return deep_gemm_fp4_paged_mqa_logits(
+            (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
+            k_cache,
+            weights[rows].float(),
+            metadata.compressed_seq_lens[rows],
+            metadata.page_table[rows],
+            plan,
+            metadata.max_compressed_seq_len,
+        )[:, :lmax]
+
+    for rows, plan in metadata.row_chunks():
+        rows = slice(rows.start, min(rows.stop, bs))
+        if rows.start >= bs:
+            break
+        scores = score_rows(rows, plan)
+        chunk_lens = lens[rows]
+        scores.masked_fill_(j[None, :] >= chunk_lens[:, None], -torch.inf)
+        yield DecodeScores(
+            bs=rows.stop - rows.start,
+            lmax=lmax,
+            lens=chunk_lens,
+            slots=None,
+            scores=scores,
+            page_table=metadata.page_table[rows],
+            page_size=metadata.compressed_page_size,
+            row_start=rows.start,
+        )
+        # The consumer drops its reference first; release this chunk's logits
+        # before the next chunk is scored.
+        del scores
 
 
 def select_decode(
@@ -563,6 +585,7 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
     else:
         assert d.slots is not None
         selected_slots = d.slots.gather(1, clamped)
-    inputs.out_page_indices[: d.bs, :k] = torch.where(reach, selected_slots, -1).to(
+    rows = slice(d.row_start, d.row_start + d.bs)
+    inputs.out_page_indices[rows, :k] = torch.where(reach, selected_slots, -1).to(
         torch.int32
     )

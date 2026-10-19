@@ -18,7 +18,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
-    decode_scores,
+    decode_score_chunks,
     get_deep_gemm_prefill_data,
     prefill_requests,
     score_tiles,
@@ -88,57 +88,77 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
-        d = decode_scores(
+        picked = []  # (first row, its block ids) per scored chunk
+        for d in decode_score_chunks(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-        )
-        if d is None:
-            return None
-        if isinstance(d, PagedDecodeScores):
-            assert self.block_size == 8
-            blocks = amax_topk_blocks(
-                d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
-            )
-            published = BlockIds(
-                blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
-            )
-        else:
-            published = BlockIds(
-                blocks=select_candidate_block_ids(
-                    d.scores,
-                    d.lens[:, None],
-                    topk_blocks=self.topk_blocks,
-                    block_size=self.block_size,
+        ):
+            if isinstance(d, PagedDecodeScores):
+                assert not picked
+                assert self.block_size == 8
+                blocks = amax_topk_blocks(
+                    d.scores, d.lens, (d.lens + 7) // 8, self.topk_blocks
+                )
+                published = BlockIds(
+                    blocks=blocks,
+                    decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
+                )
+                select_decode(inputs, d, inputs.indexer.index_topk)
+                return published
+            picked.append(
+                (
+                    d.row_start,
+                    select_candidate_block_ids(
+                        d.scores,
+                        d.lens[:, None],
+                        topk_blocks=self.topk_blocks,
+                        block_size=self.block_size,
+                    ),
                 )
             )
-        select_decode(inputs, d, inputs.indexer.index_topk)
-        return published
+            select_decode(inputs, d, inputs.indexer.index_topk)
+            del d  # release this chunk's logits before the next chunk is scored
+        if not picked:
+            return None
+        width = max(ids.shape[1] for _, ids in picked)
+        blocks = torch.full(
+            (inputs.positions.shape[0], width),
+            -1,
+            dtype=torch.int32,
+            device=inputs.positions.device,
+        )
+        for start, ids in picked:
+            blocks[start : start + ids.shape[0], : ids.shape[1]] = ids
+        return BlockIds(blocks=blocks)
 
     def consume_decode(
         self,
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
-        d = decode_scores(
+        assert published is not None
+        assert published.blocks.shape[0] == inputs.positions.shape[0]
+        for d in decode_score_chunks(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            candidate_mask=published.decode_mask if published is not None else None,
-        )
-        if d is None:
-            return
-        assert published is not None and published.blocks.shape[0] == d.bs
-        if isinstance(d, PagedDecodeScores):
-            assert published.decode_mask is not None
-            select_decode(inputs, d, inputs.indexer.index_topk)
-            return
-        k = min(inputs.indexer.index_topk, d.lmax)
-        idx = topk_among_blocks(
-            d.scores, d.lens, published.blocks, k, block_size=self.block_size
-        )
-        write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
+            candidate_mask=published.decode_mask,
+        ):
+            if isinstance(d, PagedDecodeScores):
+                assert published.decode_mask is not None
+                select_decode(inputs, d, inputs.indexer.index_topk)
+                return
+            k = min(inputs.indexer.index_topk, d.lmax)
+            idx = topk_among_blocks(
+                d.scores,
+                d.lens,
+                published.blocks[d.row_start : d.row_start + d.bs],
+                k,
+                block_size=self.block_size,
+            )
+            write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
+            del d  # release this chunk's logits before the next chunk is scored
 
     # ---------- DeepGEMM: flattened-K scores ----------
 
