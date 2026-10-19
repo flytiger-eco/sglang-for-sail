@@ -484,7 +484,7 @@ def handle_model_specific_adjustments(server_args: Any):
             validate_deepseek_v41_features,
         )
 
-        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        # Validate V4.1 features before resolving the CP topology.
         validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
 
