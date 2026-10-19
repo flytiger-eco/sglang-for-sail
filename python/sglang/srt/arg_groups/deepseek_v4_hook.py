@@ -20,6 +20,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    if cfg.dcp_size != 1:
+        return False
+    if cfg.disaggregation_mode == "decode":
+        # Each DP worker owns a complete MQA cache. Initially support pure
+        # attention DP (attention TP=1), in addition to the existing DP=1 TP
+        # layout; mixed attention DP/TP needs separate end-to-end validation.
+        decode_dp_supported = (cfg.dp_size == 1 and not cfg.enable_dp_attention) or (
+            cfg.dp_size > 1 and cfg.enable_dp_attention and cfg.tp_size == cfg.dp_size
+        )
+        return decode_dp_supported and cfg.attn_cp_size == 1
+
+    if cfg.dp_size != 1:
+        return False
+    prefill_cp = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.attn_cp_size > 1
+    )
+    return (not cfg.enable_dp_attention or prefill_cp) and (
+        cfg.attn_cp_size == 1 or prefill_cp
+    )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -260,15 +284,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
-            or cfg.attn_cp_size != 1
-            or cfg.dcp_size != 1
+            or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "DCP=1, Prefill DP=1, and Decode CP=1. Prefill may use canonical "
+                "interleave CP. Decode supports DP=1 or attention DP with "
+                "--enable-dp-attention and --tp equal to --dp-size. Both servers "
+                "must enable DSpark with the same block size and KV layout. "
+                "Prefill CP and Decode DP sizes are independent when both "
+                "servers use attention TP=1; otherwise Prefill TP*CP and "
+                "Decode attention TP*DP widths must match."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -298,8 +324,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, so the tail slice cannot apply.
-            ("DP attention", cfg.enable_dp_attention),
+            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
+            # so the tail slice does not apply to it.
+            ("DP attention", cfg.enable_dp_attention and cfg.dp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:
