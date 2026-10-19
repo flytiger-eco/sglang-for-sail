@@ -68,9 +68,15 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa or _is_
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
+    if _is_sail:
+        if not ENABLE_JIT_DEEPGEMM or get_device_sm() < 89:
+            return False
+    elif not DEEPGEMM_BLACKWELL:
         return False
-    import deep_gemm
+    try:
+        import deep_gemm
+    except (ImportError, OSError, RuntimeError):
+        return False
 
     return all(
         callable(getattr(deep_gemm, name, None))

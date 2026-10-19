@@ -1185,10 +1185,12 @@ class TestCandidateIndexerGating(CustomTestCase):
                     prefill, decode = make(topk_blocks, block_size)
                 self.assertIsInstance(prefill, DenseBlocksBackend)
                 self.assertIsInstance(decode, DenseBlocksBackend)
-        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
+        # Blackwell without DeepGEMM's sparse logits warns and serves dense blocks
+        # instead of failing startup.
         with sm100(True), patch(flag, False):
-            with self.assertRaises(RuntimeError):
-                make(2048, 8)
+            prefill, decode = make(2048, 8)
+        self.assertIsInstance(prefill, DenseBlocksBackend)
+        self.assertIsInstance(decode, DenseBlocksBackend)
 
 
 if __name__ == "__main__":
