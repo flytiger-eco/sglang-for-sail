@@ -5,7 +5,12 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
-#ifndef USE_ROCM
+// SAIL (hgcc) has no e2m1 intrinsics either, so it shares ROCm's software path.
+#if defined(USE_ROCM) || defined(__HGGCCC__)
+#define SGL_SOFTWARE_E2M1
+#endif
+
+#ifndef SGL_SOFTWARE_E2M1
 #include <cuda_fp4.h>
 #endif
 
@@ -23,7 +28,7 @@ constexpr float kAmaxFloor = 6.0f * 1.1754943508222875e-38f;
 constexpr uint32_t kBlockSize = 32;
 /// Compressed-KV elements sharing one E4M3 scale.
 constexpr uint32_t kCompressedKVBlockSize = 16;
-#ifdef USE_ROCM
+#ifdef SGL_SOFTWARE_E2M1
 /// \brief `cvt.rn.satfinite.e2m1x2.f32` for one value, in software: RNE onto the
 /// e2m1 grid {0, .5, 1, 1.5, 2, 3, 4, 6}, saturated at 6, sign kept (also for -0).
 SGL_DEVICE uint32_t e2m1_code(float x) {
@@ -49,7 +54,9 @@ SGL_DEVICE float e2m1_value(uint32_t code) {
 SGL_DEVICE uint32_t e2m1x2_code(fp32x2_t x) {
   return e2m1_code(x.x) | (e2m1_code(x.y) << 4);
 }
+#endif
 
+#ifdef USE_ROCM
 /// \brief `float(__nv_fp8_e4m3(raw))` for `raw` in `[2^-9, 448]`: RNE onto the E4M3FN
 /// grid, gfx950's `v_cvt_pk_fp8_f32` in hardware, software elsewhere (gfx942's fp8 is FNUZ).
 SGL_DEVICE float e4m3_round_rn(float raw) {
@@ -77,7 +84,7 @@ SGL_DEVICE float compressed_kv_scale(float amax) {
 /// \brief Quantize compressed KV with its E4M3 scale and return dequantized values.
 SGL_DEVICE fp32x2_t fake_quant_compressed_kv_x2(fp32x2_t x, float scale) {
   const fp32x2_t scaled{__fdiv_rn(x.x, scale) + 0.0f, __fdiv_rn(x.y, scale) + 0.0f};
-#ifdef USE_ROCM
+#ifdef SGL_SOFTWARE_E2M1
   const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
 #else
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
@@ -98,7 +105,7 @@ SGL_DEVICE fp32x2_t block_scale(float amax) {
 /// scaling clears negative zero to match `torch.sign(0) == 0` in `torch_quant.round_fp4`.
 SGL_DEVICE fp32x2_t fake_quant_x2(fp32x2_t x, float scale, float inv_scale) {
   const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
-#ifdef USE_ROCM
+#ifdef SGL_SOFTWARE_E2M1
   const fp32x2_t grid{e2m1_value(e2m1_code(scaled.x)), e2m1_value(e2m1_code(scaled.y))};
 #else
   const auto code = __nv_cvt_float2_to_fp4x2(scaled, __NV_E2M1, cudaRoundNearest);
