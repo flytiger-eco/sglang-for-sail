@@ -33,10 +33,14 @@ def _warp_dispatch_num_tokens() -> int:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
-@pytest.mark.parametrize("hidden_dim", [1076, 1368])
+@pytest.mark.parametrize("hidden_dim", [1076, 1368, 1536, 2048])
 def test_per_token_quant_fp8_is_bit_exact(dtype, dispatch, hidden_dim):
     """The JIT migration must preserve every output and scale bit from AOT."""
     num_tokens = 39 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    if dispatch == "warp" and hidden_dim % 16 == 0:
+        # Exceed the resident token capacity and leave a partial final CTA.
+        # 1536 uses cp.async; 2048 also covers the PPU AIU specialization.
+        num_tokens = _warp_dispatch_num_tokens() * 4 + 3
     input = torch.rand((num_tokens, hidden_dim), dtype=dtype, device="cuda")
 
     actual_output, actual_scale = _run_impl(input, use_jit=True)
