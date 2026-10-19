@@ -1,5 +1,5 @@
 """The full top-k of the ratio-1/2 index layers outside the candidate scheme:
-DeepGEMM on SM100, torch elsewhere."""
+DeepGEMM on SAIL and SM100, torch elsewhere."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
-    decode_scores,
+    decode_score_chunks,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
@@ -111,6 +111,7 @@ class FullTopKIndexer:
                         topk_plans[chunk_idx] if topk_plans is not None else None
                     ),
                 )
+                del logits  # release this chunk's logits before the next is scored
             return
         logits = deep_gemm_fp4_paged_mqa_logits(
             (data.q_fp4, data.q_sf),
@@ -127,14 +128,13 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
-        d = decode_scores(
+        for d in decode_score_chunks(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-        )
-        if d is None:
-            return
-        select_decode(inputs, d, inputs.indexer.index_topk)
+        ):
+            select_decode(inputs, d, inputs.indexer.index_topk)
+            del d  # release this chunk's logits before the next chunk is scored
 
     def _deep_gemm_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
         indexer = inputs.indexer
@@ -174,3 +174,4 @@ class FullTopKIndexer:
                 page_size,
                 inputs.out_raw_indices[rows, :topk],
             )
+            del logits  # release this chunk's logits before the next is scored
