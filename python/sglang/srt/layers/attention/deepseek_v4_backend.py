@@ -1549,6 +1549,7 @@ class DeepseekV4AttnBackend(
             bool(self.low_ratios)
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
+            and get_parallel().attn_cp_size == 1
             and not use_dsv41_int8_indexer()
         )
 

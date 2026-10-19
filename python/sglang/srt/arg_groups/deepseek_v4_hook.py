@@ -30,14 +30,17 @@ def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
         decode_dp_supported = (cfg.dp_size == 1 and not cfg.enable_dp_attention) or (
             cfg.dp_size > 1 and cfg.enable_dp_attention and cfg.tp_size == cfg.dp_size
         )
-        return decode_dp_supported and cfg.attn_cp_size == 1
+        return (
+            decode_dp_supported and cfg.attn_cp_size == 1 and not cfg.enable_prefill_cp
+        )
 
     if cfg.dp_size != 1:
         return False
+    # V4.1 validation runs before validate_deepseek_v4_cp resolves CP size.
     prefill_cp = (
-        cfg.enable_prefill_cp
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_prefill_cp
         and cfg.cp_strategy == "interleave"
-        and cfg.attn_cp_size > 1
     )
     return (not cfg.enable_dp_attention or prefill_cp) and (
         cfg.attn_cp_size == 1 or prefill_cp
@@ -300,7 +303,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
+    ):
         # The captured low-ratio indexer scores a static context width; 16k
         # keeps it inside the candidate window at under 1 ms per layer.
         declare_resolution(

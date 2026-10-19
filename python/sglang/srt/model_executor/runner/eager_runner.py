@@ -385,9 +385,11 @@ class EagerRunner(BaseRunner):
         model = self.model_runner.model
         input_ids = forward_batch.input_ids
         input_embeds = kwargs.get("input_embeds")
-        prepare_cp_inputs = getattr(model, "prepare_cp_inputs", None)
-        if prepare_cp_inputs is not None:
-            input_ids, input_embeds = prepare_cp_inputs(forward_batch, input_embeds)
+        prepare_inputs = getattr(model, "prepare_language_model_inputs", None)
+        if prepare_inputs is not None:
+            input_ids, input_embeds = prepare_inputs(
+                input_ids, forward_batch, input_embeds
+            )
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(input_ids)
         with cp_shard_model_inputs(
@@ -458,12 +460,12 @@ class EagerRunner(BaseRunner):
             # DSpark aux capture is on, else it overrides the packed aux.
             if aux_hidden_states is None:
                 logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        logits_input_ids = forward_batch.input_ids
+        logits_input_ids = input_ids
         logits_metadata = forward_batch
         if tail is not None:
             from sglang.srt.layers.logits_processor import LogitsMetadata
 
-            logits_input_ids = forward_batch.input_ids[tail.output_token_indices]
+            logits_input_ids = input_ids[tail.output_token_indices]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu

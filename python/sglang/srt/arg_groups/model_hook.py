@@ -452,7 +452,7 @@ def handle_model_specific_adjustments(server_args: Any):
             validate_deepseek_v41_features,
         )
 
-        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        # Validate V4.1 features before resolving the CP topology.
         validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
 
@@ -995,12 +995,13 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
+    hf_config = model_config_of(server_args).hf_config
+    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = model_config_of(server_args).hf_config.architectures
+    architectures = hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):

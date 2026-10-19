@@ -2830,7 +2830,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4490,6 +4491,7 @@ class DeepseekV4Model(nn.Module):
                     config.image_token_id
                     if config.model_type == "deepseek_v41"
                     and config.vision_n_layers > 0
+                    and not getattr(config, "language_model_only", False)
                     else None
                 ),
             )
@@ -4675,6 +4677,7 @@ class DeepseekV4Model(nn.Module):
                 if (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0
+                    and not getattr(self.config, "language_model_only", False)
                 ):
                     hidden_states = torch.where(
                         (local_input_ids == self.config.image_token_id)[:, None, None],
@@ -4895,7 +4898,11 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         complete_input_ids = forward_batch.input_ids
-        if self.config.model_type == "deepseek_v41" and self.config.vision_n_layers > 0:
+        if (
+            self.config.model_type == "deepseek_v41"
+            and self.config.vision_n_layers > 0
+            and not getattr(self.config, "language_model_only", False)
+        ):
             complete_input_ids = complete_input_ids.masked_fill(
                 complete_input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
@@ -5144,7 +5151,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if get_parallel().pp_group.world_size != 1:
                 raise ValueError("V4.1 vision currently does not support PP")
             if not (
@@ -5315,15 +5326,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
-    def prepare_cp_inputs(self, forward_batch, input_embeds=None):
-        """Build full-sequence vision embeddings before CP shards language tokens."""
-        input_ids = forward_batch.input_ids
-        if self.vision is not None:
+    def prepare_language_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare image embeddings and model IDs before CP shards language tokens.
+
+        Keep scheduler hash IDs intact for multimodal cache keys; Engram and
+        visual routing consume vocabulary image IDs.
+        """
+        if (
+            self.vision is not None
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             if forward_batch.contains_mm_inputs():
                 if input_embeds is not None:
                     raise ValueError("Cannot combine input_embeds and image inputs")
-                # The embedder clones IDs before replacing image placeholders;
-                # retain scheduler IDs and image offsets for caching/chunking.
                 input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
             input_ids = input_ids.masked_fill(
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
@@ -5359,6 +5380,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if (
             hf_config.model_type == "deepseek_v41"
             and hf_config.vision_n_layers > 0
+            and not getattr(hf_config, "language_model_only", False)
             and get_moe_a2a_backend().is_deepep()
         ):
             return (
@@ -5418,24 +5440,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
-        if (
-            self.vision is not None
-            and not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
-            if input_embeds is not None:
-                raise ValueError("Cannot combine input_embeds and image inputs")
-            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            # Decode/verify IDs are already vocabulary IDs; remap prompt image
-            # hashes for Engram and routing.
-            input_ids = input_ids.masked_fill(
-                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
-            )
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
