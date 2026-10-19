@@ -18,7 +18,7 @@ from sglang.kernels.jit.utils import (
 )
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
-from .topk import plan_topk_v2, topk_transform_paged_v2
+from .topk import topk_transform_paged
 from .utils import make_name
 
 
@@ -132,14 +132,12 @@ def amax_topk_blocks(
     block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
         max_seq_len = logits.shape[1]
-    # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
-    plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
-    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
+    # only, so nothing past a row's keys is initialised (pad for vectorized loads)
     keys = logits.new_empty(rows, -(-max_seq_len // (4 * block)) * 4)
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
-    topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
+    topk_transform_paged(keys, nblocks, None, blocks, 1)
     return blocks
 
 

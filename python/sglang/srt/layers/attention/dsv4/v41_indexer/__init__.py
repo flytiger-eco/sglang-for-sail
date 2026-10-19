@@ -5,11 +5,13 @@ DeepGEMM sparse table (``sparse_table``) or dense block ids (``dense_blocks``)."
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_ppu
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+from sglang.srt.utils import get_device_sm, is_ppu
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -24,6 +26,8 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "CandidateMetadata",
@@ -116,8 +120,13 @@ def make_candidate_indexer(
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
+    # The sparse table path packs FP4 index-K; an INT8 pool stores 132-byte
+    # slots, and the dense backend dispatches on indexer.use_int8 itself.
+    if use_dsv41_int8_indexer():
+        return dense_blocks, dense_blocks
     # Without candidate blocks no layer is a candidate source or consumer.
-    if is_ppu() or not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    supports_sparse = get_device_sm() >= 89 if is_ppu() else is_sm100_or_newer()
+    if not supports_sparse or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -125,10 +134,12 @@ def make_candidate_indexer(
     )
 
     if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
-        raise RuntimeError(
-            "the candidate indexer needs DeepGEMM's paged sparse MQA logits "
-            "(sgl-deep-gemm >= 0.2.0 with SGLANG_ENABLE_JIT_DEEPGEMM on)"
+        logger.warning(
+            "Candidate indexer requested but DeepGEMM has no paged sparse MQA "
+            "logits API (sgl-deep-gemm >= 0.2.0 with "
+            "SGLANG_ENABLE_JIT_DEEPGEMM on); falling back to dense blocks."
         )
+        return dense_blocks, dense_blocks
     from .sparse_table import SparseTableBackend
 
     sparse_table = SparseTableBackend(
