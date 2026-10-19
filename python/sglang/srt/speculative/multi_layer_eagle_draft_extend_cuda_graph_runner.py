@@ -468,6 +468,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 capture_inputs=None,
                 post_warmup_hook=post_warmup_hook,
             )
+            self.deepep_adapter.capture_complete()
 
     def replay(
         self,
@@ -1065,6 +1066,8 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                 first.attn_backend, "on_after_cuda_graph_warmup", None
             ),
         )
+        for r in runners:
+            r.deepep_adapter.capture_complete()
 
         buffers.input_ids.copy_(input_ids_orig)
         buffers.hidden_states.copy_(hidden_states_orig)
