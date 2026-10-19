@@ -1,8 +1,21 @@
 """DeepSeek-V4 attention kernels (RFC #29630, Phase 2.5)."""
 
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+register_kernel(
+    KernelSpec(
+        op="attention.dequantize_k_cache_paged_v2_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.attn:dequantize_k_cache_paged_v2_cuda",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
 # --- merged from sglang.kernels.ops.attention.dsv4 (RFC #29630 Phase 4) ---
 from .attn import (
     dequantize_k_cache_paged_cuda,
+    dequantize_k_cache_paged_v2_cuda,
     fused_store_cache,
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
@@ -45,6 +58,7 @@ __all__ = [
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
     "dequantize_k_cache_paged_cuda",
+    "dequantize_k_cache_paged_v2_cuda",
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",
