@@ -996,7 +996,11 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 def _engram_image_token_id(config) -> Optional[int]:
     """The image token Engram hashes as blocked and leaves ungated (V4.1 vision)."""
-    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+    if (
+        config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+        and not getattr(config, "language_model_only", False)
+    ):
         return config.image_token_id
     return None
 
@@ -4628,7 +4632,11 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         complete_input_ids = forward_batch.input_ids
-        if self.config.model_type == "deepseek_v41" and self.config.vision_n_layers > 0:
+        if (
+            self.config.model_type == "deepseek_v41"
+            and self.config.vision_n_layers > 0
+            and not getattr(self.config, "language_model_only", False)
+        ):
             complete_input_ids = complete_input_ids.masked_fill(
                 complete_input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
@@ -5119,6 +5127,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if (
             hf_config.model_type == "deepseek_v41"
             and hf_config.vision_n_layers > 0
+            and not getattr(hf_config, "language_model_only", False)
             and get_moe_a2a_backend().is_deepep()
         ):
             return (
@@ -5159,17 +5168,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         """
         if (
             getattr(self, "vision", None) is not None
-            and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
         ):
-            if input_embeds is not None:
-                raise ValueError("Cannot combine input_embeds and image inputs")
-            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
+            if forward_batch.contains_mm_inputs():
+                if input_embeds is not None:
+                    raise ValueError("Cannot combine input_embeds and image inputs")
+                input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
             # Decode/verify IDs are already vocabulary IDs; remap prompt image
             # hashes for Engram and routing.
             input_ids = input_ids.masked_fill(
