@@ -3978,6 +3978,7 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+    from sglang.srt.runtime_context import process_model_config
 
     if moe_a2a_backend is None:
         moe_a2a_backend = get_moe_a2a_backend()
@@ -3987,6 +3988,18 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
         assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        # Engram tables are sharded over the full TP group even with DeepEP.
+        # Their lookup gathers IDs across attention-DP ranks, so graph capture
+        # needs DP-sized token metadata and replay must pick a common DP bucket.
+        # Reuse the gathered-buffer bookkeeping without changing MoE dispatch.
+        # A shared host table owns all rows and bypasses this collective.
+        if getattr(process_model_config().hf_config, "engram_layer_ids", ()):
+            shared_engram = (
+                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+                and envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
+            )
+            if not shared_engram:
+                return True
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,

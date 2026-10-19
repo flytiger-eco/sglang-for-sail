@@ -5145,11 +5145,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.determine_num_fused_shared_experts()
         self.vision = None
         if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
-            if (
-                get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+            if get_parallel().pp_group.world_size != 1:
+                raise ValueError("V4.1 vision currently does not support PP")
+            if not (
+                get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_deepep()
             ):
-                raise ValueError("V4.1 vision currently does not support PP or MoE A2A")
+                raise ValueError(
+                    "V4.1 vision supports MoE A2A backends none and deepep"
+                )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
             self.vision = ViT(args)
@@ -5352,6 +5355,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
+            )
+        if (
+            hf_config.model_type == "deepseek_v41"
+            and hf_config.vision_n_layers > 0
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            return (
+                "V4.1 vision routing with DeepEP requires separate shared experts; "
+                "per-rank fused shared slots are not supported."
             )
         if get_parallel().moe_ep_size > 1 and not uses_per_rank_fused_shared_slots():
             return (
