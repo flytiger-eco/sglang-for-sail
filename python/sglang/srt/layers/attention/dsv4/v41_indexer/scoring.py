@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_sail
 from sglang.srt.utils.common import async_h2d
 
 from .types import DecodeInputs, PrefillInputs
@@ -274,8 +275,10 @@ class DecodeScores(msgspec.Struct, frozen=True):
     bs: int
     lmax: int
     lens: torch.Tensor  # [bs]
-    slots: torch.Tensor  # [bs, lmax]
+    slots: Optional[torch.Tensor]  # fallback [bs, lmax]
     scores: torch.Tensor  # [bs, lmax]
+    page_table: Optional[torch.Tensor] = None
+    page_size: int = 0
 
 
 def prefill_requests(
@@ -305,7 +308,18 @@ def prefill_requests(
         j = torch.arange(lc, device=pos.device)
         slots = req_to_token[r, j * ratio].to(torch.int64) // ratio
         # Dequantize only this request's visible K rows; the table is pool-sized.
-        index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
+        if indexer.use_int8:
+            from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                gather_int8_index_k,
+            )
+
+            index_k = gather_int8_index_k(
+                pool.get_index_k_with_scale_buffer(inputs.layer_id),
+                slots,
+                pool.get_index_k_page_size(ratio),
+            )
+        else:
+            index_k = pool.get_low_ratio_index_k_dequant(inputs.layer_id, slots)
         request = RequestScores(
             lc=lc, k=min(topk, lc), columns=j, tok=tok, lens=lens, slots=slots
         )
@@ -328,10 +342,28 @@ def _score_chunks(
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    if indexer.use_int8:
+        from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+            int8_index_logits,
+            int8_logits_rows_per_chunk,
+        )
+        from sglang.srt.environ import envs
+
+        max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+        if max_logits_mb <= 0:
+            raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+        rows_per_chunk = int8_logits_rows_per_chunk(lc, max_logits_mb * 1024 * 1024)
+        # FIXME: the generator's `s`, the consumer's previous ChunkScores and
+        # the out-of-place mask can hold ~3x this budget at once. INT8 sparse
+        # indexer support removes it only for candidate layers; full-top-k and
+        # the torch fallback still need mask-in-place + release-before-next.
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+        if indexer.use_int8:
+            s = int8_index_logits(q[tok_c], weights[tok_c], index_k, lens_c)[:, :lc]
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
         s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
 
@@ -432,12 +464,70 @@ def decode_scores(
     inputs.reset_outputs()
     j = torch.arange(lmax, device=pos.device)
     valid = j[None, :] < lens[:, None]
-    slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
-    slots = slots.masked_fill(~valid, 0)
-    scores = fp4_index_logits_decode(
-        q, weights, slots, lens, table, table.shape[1] // 68
+    use_paged = is_sail()
+    slots = None
+    if use_paged:
+        score_chunks = []
+        if indexer.use_int8:
+            from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                int8_paged_index_logits,
+            )
+
+            for rows, plan in metadata.row_chunks():
+                score_chunks.append(
+                    int8_paged_index_logits(
+                        q[rows],
+                        weights[rows],
+                        table,
+                        metadata.compressed_seq_lens[rows],
+                        metadata.page_table[rows],
+                        plan,
+                        metadata.max_compressed_seq_len,
+                        metadata.compressed_page_size,
+                    )[:, :lmax]
+                )
+        else:
+            from sglang.kernels.ops.attention.dsv4.index_logits import (
+                deep_gemm_fp4_paged_mqa_logits,
+            )
+
+            q_fp4, q_sf = quantize_index_q(q)
+            k_cache = get_index_k_cache(
+                token_to_kv_pool=pool,
+                layer_id=inputs.layer_id,
+                page_size=metadata.compressed_page_size,
+            )
+            for rows, plan in metadata.row_chunks():
+                score_chunks.append(
+                    deep_gemm_fp4_paged_mqa_logits(
+                        (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
+                        k_cache,
+                        weights[rows].float(),
+                        metadata.compressed_seq_lens[rows],
+                        metadata.page_table[rows],
+                        plan,
+                        metadata.max_compressed_seq_len,
+                    )[:, :lmax]
+                )
+        scores = torch.cat(score_chunks)
+    else:
+        slots = (
+            req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
+        )
+        slots = slots.masked_fill(~valid, 0)
+        scores = fp4_index_logits_decode(
+            q, weights, slots, lens, table, table.shape[1] // 68
+        )
+    scores.masked_fill_(~valid, -torch.inf)
+    return DecodeScores(
+        bs=bs,
+        lmax=lmax,
+        lens=lens,
+        slots=slots,
+        scores=scores,
+        page_table=metadata.page_table[:bs] if use_paged else None,
+        page_size=metadata.compressed_page_size if use_paged else 0,
     )
-    return DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
 
 
 def select_decode(
@@ -466,6 +556,13 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
     k = idx.shape[1]
     idx = idx.sort(dim=-1).values
     reach = idx < d.lens[:, None]
-    inputs.out_page_indices[: d.bs, :k] = torch.where(
-        reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
-    ).to(torch.int32)
+    clamped = idx.clamp_max(d.lmax - 1)
+    if d.page_table is not None:
+        selected_slots = d.page_table.gather(1, clamped // d.page_size).to(torch.int64)
+        selected_slots = selected_slots * d.page_size + clamped % d.page_size
+    else:
+        assert d.slots is not None
+        selected_slots = d.slots.gather(1, clamped)
+    inputs.out_page_indices[: d.bs, :k] = torch.where(reach, selected_slots, -1).to(
+        torch.int32
+    )
