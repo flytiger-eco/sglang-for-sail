@@ -141,11 +141,18 @@ def _jit_topk_bf16_module():
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
+    """V1 float32 top-k (k <= 2048), with optional page-table transform.
+
+    On the CUDA/PPU JIT path, ``page_tables=None`` writes raw positions into
+    ``out_page_indices`` without allocating an identity page table or a v2 plan.
+    """
+    if page_tables is None and (is_hip_runtime() or is_xpu()):
+        raise NotImplementedError("V1 raw-index output requires the CUDA/PPU JIT path")
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
