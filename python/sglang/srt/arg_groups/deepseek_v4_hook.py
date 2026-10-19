@@ -45,7 +45,11 @@ def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
 
     # CP size may still be implicit at this validation slot; the CP hook declares
     # it later from tp_size. Prefill attention DP is not part of this layout.
-    prefill_cp = cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
+    prefill_cp = (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+    )
     has_cp = cfg.enable_prefill_cp or cfg.attn_cp_size != 1
     return cfg.attn_dp_size == 1 and (not has_cp or prefill_cp)
 
