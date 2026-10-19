@@ -178,7 +178,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
-    is_ppu,
+    is_sail,
     is_xpu,
     log_info_on_rank0,
 )
@@ -188,7 +188,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
-_is_ppu = is_ppu()
+_is_sail = is_sail()
 _is_xpu = is_xpu()
 
 
@@ -755,7 +755,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         # Skip attention backend init for 1-step draft,
                         # `draft_forward` only does sample in this case.
                         self.draft_attn_backend.init_forward_metadata(forward_batch)
-                        if _is_ppu:
+                        if _is_sail:
                             # MLP sync may pad DSA eager draft after this plan.
                             from sglang.srt.layers.attention.dsa_backend import (
                                 DeepseekSparseAttnMultiStepBackend,
