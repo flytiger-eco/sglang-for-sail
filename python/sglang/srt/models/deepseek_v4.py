@@ -77,11 +77,13 @@ from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    attn_cp_all_gather_into_tensor,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
@@ -4084,6 +4086,21 @@ def _scatter_tail_rows(
     return full
 
 
+def _tail_cp_routing_ids(
+    *, local_input_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Routing IDs for a CP tail; ``local_input_ids`` already follows its rows."""
+    if get_moe_a2a_backend().is_none():
+        # The MoE path all-gathers hidden rows rank-major; all-gather the IDs too.
+        cp_size = get_parallel().attn_cp_size
+        gathered = local_input_ids.new_empty(
+            (local_input_ids.shape[0] * cp_size, *local_input_ids.shape[1:])
+        )
+        attn_cp_all_gather_into_tensor(gathered, local_input_ids)
+        return local_input_ids, gathered
+    return local_input_ids, local_input_ids
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -4298,19 +4315,27 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        complete_input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        # CP routing uses a rank-major order, but image masks and Engram need
+        # the original sequence order with model IDs, not scheduler hash IDs.
+        if complete_input_ids is None:
+            complete_input_ids = forward_batch.input_ids
+        local_input_ids = (
+            cp_shard_hidden_states(complete_input_ids, forward_batch)
+            if cp_extend
+            else input_ids
+        )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                hash_ids = self.engram_hasher(complete_input_ids[:total], forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4373,11 +4398,21 @@ class DeepseekV4Model(nn.Module):
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                local_input_ids = tail.rows(local_input_ids)
+                if tail.cp_metadata is not None:
+                    # These IDs already follow the tail's rank-local hidden rows.
+                    # Re-sharding the compact tail would change CP ownership.
+                    input_ids, input_ids_global = _tail_cp_routing_ids(
+                        local_input_ids=local_input_ids
+                    )
+                else:
+                    input_ids = tail.rows(input_ids)
+                    local_input_ids = input_ids
+                    if not (
+                        get_parallel().attn_dp_size > 1
+                        and get_moe_a2a_backend().is_none()
+                    ):
+                        input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4407,7 +4442,7 @@ class DeepseekV4Model(nn.Module):
                     and forward_batch.contains_mm_inputs()
                 ):
                     hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
+                        (local_input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
                         hidden_states,
                     )
@@ -4579,6 +4614,11 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        complete_input_ids = forward_batch.input_ids
+        if self.config.model_type == "deepseek_v41" and self.config.vision_n_layers > 0:
+            complete_input_ids = complete_input_ids.masked_fill(
+                complete_input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4671,6 +4711,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                complete_input_ids=complete_input_ids,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4850,16 +4891,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+            if get_parallel().pp_group.world_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP/CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -5024,6 +5061,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        """Pass full-sequence language inputs to the runner's CP boundary."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        return input_embeds, forward_batch.positions, kwargs
+
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
 
@@ -5087,8 +5129,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
+            and forward_batch.contains_mm_inputs()
         ):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
@@ -5136,6 +5177,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -5181,11 +5225,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
-            )
+            output.hidden_states_token_indices = tail.output_token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

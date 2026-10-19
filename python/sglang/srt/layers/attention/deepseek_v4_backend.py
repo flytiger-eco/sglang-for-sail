@@ -929,6 +929,22 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    # Under CP, token_indices address this rank's sharded rows; logits and output
+    # metadata use the corresponding rows in the original full sequence.
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        indices = (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
+        return (
+            indices[: self.real_rows_count]
+            if self.real_rows_count is not None
+            else indices
+        )
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1821,6 +1837,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
