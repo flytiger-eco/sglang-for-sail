@@ -39,6 +39,11 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
+from sglang.kernels.ops.layernorm.mhc_mega import (
+    MegaMHCInput,
+    can_use_mega_mhc_prefill,
+    try_mhc_mega_boundary,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -3696,6 +3701,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         combined_attn: Optional[torch.Tensor] = None,
         normalized_attn: Optional[torch.Tensor] = None,
         next_combined: Optional[list] = None,
+        mega_mhc_next_layer=None,
+        mega_mhc_seam_open: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Layer forward where each sublayer consumes the previous sublayer's
         pre-mix. Returns (hidden_states, ffn_pre)."""
@@ -3712,6 +3719,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         attn_quantized: Optional[list] = (
             [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
         )
+        carried = (
+            precomputed_attn if isinstance(precomputed_attn, MegaMHCInput) else None
+        )
         attn_stats = partial(
             self._hc_mix_stats,
             hidden_states,
@@ -3720,16 +3730,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_attn_base,
             stats_stream,
         )
-        x = self._hc_combine(
-            hidden_states,
-            apply_pre=prev_pre,
-            norm=self.input_layernorm,
-            stats_stream=stats_stream,
-            quantized=attn_quantized,
-            precomputed=precomputed_attn,
-            combined=combined_attn,
-            normalized=normalized_attn,
-        )
+        if carried is not None:
+            x = carried.normalized
+            attn_stats = lambda: carried.stats
+        else:
+            x = self._hc_combine(
+                hidden_states,
+                apply_pre=prev_pre,
+                norm=self.input_layernorm,
+                stats_stream=stats_stream,
+                quantized=attn_quantized,
+                precomputed=precomputed_attn,
+                combined=combined_attn,
+                normalized=normalized_attn,
+            )
+        mega_ffn = None
         prefill_overlap = (
             stats_stream is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -3822,15 +3837,31 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
-            hidden_states, ffn_combined, ffn_normalized = self._hc_post_with_combine(
-                x,
-                residual,
-                attn_post,
-                attn_comb,
-                attn_pre,
-                forward_batch,
-                norm=self.post_attention_layernorm,
-            )
+            if mega_mhc_seam_open:
+                mega_ffn = self._try_mega_mhc_boundary(
+                    x,
+                    residual,
+                    attn_pre,
+                    attn_post,
+                    attn_comb,
+                    self,
+                    forward_batch,
+                    for_ffn=True,
+                )
+            if mega_ffn is not None:
+                hidden_states = mega_ffn[0]
+            else:
+                hidden_states, ffn_combined, ffn_normalized = (
+                    self._hc_post_with_combine(
+                        x,
+                        residual,
+                        attn_post,
+                        attn_comb,
+                        attn_pre,
+                        forward_batch,
+                        norm=self.post_attention_layernorm,
+                    )
+                )
 
         residual = hidden_states
         ffn_stats = partial(
@@ -3841,14 +3872,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_base,
             stats_stream,
         )
-        x = self._hc_combine(
-            hidden_states,
-            apply_pre=attn_pre,
-            norm=self.post_attention_layernorm,
-            stats_stream=stats_stream,
-            normalized=ffn_normalized,
-            combined=ffn_combined,
-        )
+        if mega_ffn is not None:
+            ffn_stats = lambda: mega_ffn[1].stats
+            x = mega_ffn[1].normalized
+        else:
+            x = self._hc_combine(
+                hidden_states,
+                apply_pre=attn_pre,
+                norm=self.post_attention_layernorm,
+                stats_stream=stats_stream,
+                normalized=ffn_normalized,
+                combined=ffn_combined,
+            )
         mhc = None
         if (
             self.config.model_type == "deepseek_v41"
@@ -3910,7 +3945,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             if stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(stats_stream)
-            if next_combined is not None:
+            mega_attn = None
+            if (
+                mega_mhc_seam_open
+                and mega_mhc_next_layer is not None
+                and next_input is not None
+            ):
+                mega_attn = self._try_mega_mhc_boundary(
+                    x,
+                    residual,
+                    ffn_pre,
+                    ffn_post,
+                    ffn_comb,
+                    mega_mhc_next_layer,
+                    forward_batch,
+                    for_ffn=False,
+                )
+            if mega_attn is not None:
+                hidden_states, carried = mega_attn
+                next_input.append(carried)
+            elif next_combined is not None:
                 hidden_states, combined, normalized = self._hc_post_with_combine(
                     x,
                     residual,
@@ -3925,6 +3979,40 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
+
+    def _try_mega_mhc_boundary(
+        self, x, residual, pre, post, comb, next_layer, forward_batch, *, for_ffn
+    ):
+        if (
+            self.config.model_type != "deepseek_v41"
+            or not self.hc_pre_from_prev_sublayer
+            or not can_use_mega_mhc_prefill(forward_batch)
+            or get_forward().sp_active
+        ):
+            return None
+        # Boundaries run after attention/MoE communication restores local rows.
+        norm = (
+            next_layer.post_attention_layernorm
+            if for_ffn
+            else next_layer.input_layernorm
+        )
+        if norm.cast_x_before_out_mul or norm.variance_size_override is not None:
+            return None
+        return try_mhc_mega_boundary(
+            x,
+            residual,
+            pre,
+            post,
+            comb,
+            next_layer.hc_ffn_fn if for_ffn else next_layer.hc_attn_fn,
+            next_layer.hc_ffn_scale if for_ffn else next_layer.hc_attn_scale,
+            next_layer.hc_ffn_base if for_ffn else next_layer.hc_attn_base,
+            norm.weight,
+            next_layer.rms_norm_eps,
+            next_layer.hc_eps,
+            norm.variance_epsilon,
+            next_layer.hc_sinkhorn_iters,
+        )
 
     def _run_moe_ffn_dp_sync(
         self,
@@ -4648,6 +4736,8 @@ class DeepseekV4Model(nn.Module):
                 saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 hidden_states = tail.rows(hidden_states)
                 prev_pre = tail.rows(prev_pre)
+                # A cached norm/stats pair describes the full row set, not this tail.
+                precomputed_attn = None
                 local_input_ids = tail.rows(local_input_ids)
                 if tail.cp_metadata is not None:
                     # `local_input_ids` already follows the tail's hidden rows; a
@@ -4697,6 +4787,15 @@ class DeepseekV4Model(nn.Module):
             )
             next_norm = None
             next_input = []
+            mega_mhc_seam_open = i + 1 != self.late_layer_start
+            mega_mhc_next_layer = None
+            if (
+                mega_mhc_seam_open
+                and i + 1 < self.end_layer
+                and self.layers[i + 1].engram is None
+                and can_use_mega_mhc_prefill(forward_batch)
+            ):
+                mega_mhc_next_layer = self.layers[i + 1]
             # The next layer can consume a collapsed input only if no Engram
             # or row selection changes the residual between the two layers.
             next_combined = (
@@ -4761,6 +4860,8 @@ class DeepseekV4Model(nn.Module):
                     combined_attn=combined_attn,
                     normalized_attn=normalized_attn,
                     next_combined=next_combined,
+                    mega_mhc_next_layer=mega_mhc_next_layer,
+                    mega_mhc_seam_open=mega_mhc_seam_open,
                 )
             precomputed_attn = next_input[0] if next_input else None
             combined_attn, normalized_attn = (

@@ -1667,6 +1667,8 @@ class Envs:
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    # MegaMHC prefill; PPU requires a compatible DeepGEMM mega_mhc implementation.
+    SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
