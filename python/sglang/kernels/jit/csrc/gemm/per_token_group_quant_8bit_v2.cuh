@@ -138,7 +138,7 @@ struct NaiveScheduler {
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
-  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
+  template <bool FUSE_SILU_AND_MUL, bool IS_COLUMN_MAJOR, int THREADS_PER_SUBWARP, typename FUNC>
   SGL_DEVICE static void execute(
       const int subwarps_per_block,
       const int hidden_dim_num_groups,
@@ -146,20 +146,18 @@ struct NaiveScheduler {
       const int num_tokens_per_expert,
       FUNC fn) {
     constexpr int expert_idx = 0;
-    const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
+    const uint32_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
-    const int64_t group_id = static_cast<int64_t>(blockIdx.x) * subwarps_per_block + subwarp_id;
+    const uint32_t group_id = blockIdx.x * subwarps_per_block + subwarp_id;
 
-    int64_t input_group_start_offset;
-    if constexpr (!FUSE_SILU_AND_MUL) input_group_start_offset = group_id * GROUP_SIZE;
-    const int token_idx = group_id / hidden_dim_num_groups;
-    const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
-    if constexpr (FUSE_SILU_AND_MUL) {
-      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-      input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
+    // Contiguous row-major quantization only needs the flattened group index.
+    int token_idx = 0;
+    int hidden_dim_group_idx = 0;
+    if constexpr (IS_COLUMN_MAJOR || FUSE_SILU_AND_MUL) {
+      token_idx = group_id / hidden_dim_num_groups;
+      hidden_dim_group_idx = group_id % hidden_dim_num_groups;
     }
-    fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+    fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, group_id);
   }
 };
 
@@ -181,7 +179,7 @@ struct MaskedLayoutScheduler {
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
-  template <bool FUSE_SILU_AND_MUL, int GROUP_SIZE, int THREADS_PER_SUBWARP, typename FUNC>
+  template <bool FUSE_SILU_AND_MUL, bool IS_COLUMN_MAJOR, int THREADS_PER_SUBWARP, typename FUNC>
   SGL_DEVICE static void execute(
       const int subwarps_per_block,
       const int hidden_dim_num_groups,
@@ -196,10 +194,9 @@ struct MaskedLayoutScheduler {
     const int curr_expert_token_num = masked_m[expert_idx];
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
-      const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
-      const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
-      fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+      const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
+                                    token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+      fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, offset_num_groups);
     }
   }
 };
@@ -231,7 +228,7 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
 
   device::PDLWaitPrimary<kUsePDL>();
 
-  SCHEDULER::template execute<FUSE_SILU_AND_MUL, GROUP_SIZE, THREADS_PER_SUBWARP>(
+  SCHEDULER::template execute<FUSE_SILU_AND_MUL, IS_COLUMN_MAJOR, THREADS_PER_SUBWARP>(
       subwarps_per_block,
       hidden_dim_num_groups,
       masked_m,
@@ -240,12 +237,18 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
           const int token_idx,
           const int hidden_dim_group_idx,
           const int lane_id,
-          const int input_group_start_offset) {
+          const int offset_num_groups) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
-                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+        int input_group_start_offset;
+        if constexpr (FUSE_SILU_AND_MUL) {
+          const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
+          input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
+              expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
+        } else {
+          input_group_start_offset = static_cast<int64_t>(offset_num_groups) * GROUP_SIZE;
+        }
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
