@@ -60,10 +60,12 @@ def has_dense_fp4_indexer() -> bool:
 def _use_deep_gemm_prefill() -> bool:
     # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
     from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
     from sglang.srt.runtime_context import get_parallel
 
     return (
-        is_sm100_or_newer()
+        not use_dsv41_int8_indexer()
+        and is_sm100_or_newer()
         and has_dense_fp4_indexer()
         and (
             get_parallel().attn_cp_size > 1
@@ -77,11 +79,13 @@ def make_full_topk_indexer(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
 ) -> FullTopKIndexer:
+    from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
+
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=is_sm100_or_newer() and not use_dsv41_int8_indexer(),
     )
 
 

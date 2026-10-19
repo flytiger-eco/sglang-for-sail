@@ -1051,10 +1051,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        from sglang.srt.layers.attention.dsv4.indexer_quant import (
+            use_dsv41_int8_indexer,
+        )
+
+        # Match the low-ratio pool format independently of C4.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim, use_fp4_indexer=not use_dsv41_int8_indexer()
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.

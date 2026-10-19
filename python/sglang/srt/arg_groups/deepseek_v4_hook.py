@@ -187,6 +187,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    from sglang.srt.layers.attention.dsv4.indexer_quant import (
+        dsv41_requires_int8_indexer,
+    )
+
+    if dsv41_requires_int8_indexer():
+        if server_args.enable_deepseek_v4_fp4_indexer:
+            raise ValueError(
+                "DeepSeek-V4.1 on PPU below SM89 requires the INT8 indexer; "
+                "remove --enable-deepseek-v4-fp4-indexer."
+            )
+        logger.info("DeepSeek-V4.1 on PPU below SM89: using INT8 low-ratio indexer")
     if cfg.enable_encoder_swa_bounded_replay:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
