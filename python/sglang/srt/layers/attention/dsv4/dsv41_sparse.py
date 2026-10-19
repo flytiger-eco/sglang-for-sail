@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -132,6 +133,7 @@ class DeepseekV41Compressor(nn.Module):
             if fused_compress is None
             else bool(fused_compress)
         )
+        self.use_fused_compress &= not use_dsv41_int8_indexer()
         self.use_fused_gate = compress_ratio > 1 and self.use_fused_compress
         if self.use_fused_gate:
             self.wkv_gate = nn.Linear(
@@ -182,9 +184,12 @@ def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
 
 
 class DeepseekV41Indexer(nn.Module):
-    """Scores compressed positions with a small fp4 side attention; only a
-    kv_source layer owns index keys. Projections are replicated across TP: every
-    rank scores with all heads, so the top-k needs no cross-rank reduction."""
+    """Scores compressed positions with FP4 or opt-in PPU INT8 side attention.
+    Only a kv_source layer owns index keys; other index sources read its cache.
+
+    The projections are replicated across TP, as in the c4 indexer: every rank
+    scores with all heads, so the decode kernel path needs no cross-rank
+    reduction and every rank selects the same top-k."""
 
     def __init__(
         self,
@@ -195,6 +200,7 @@ class DeepseekV41Indexer(nn.Module):
         prefix: str,
     ):
         super().__init__()
+        self.use_int8 = use_dsv41_int8_indexer()
         self.n_heads = config.index_n_heads
         self.n_local_heads = self.n_heads
         self.index_head_dim = config.index_head_dim
@@ -252,6 +258,8 @@ class DeepseekV41Indexer(nn.Module):
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Pre-RoPE latents [n, D] -> fp4-rounded index keys [n, index_head_dim]."""
         k = self.k_norm(self.forward_wk(latent))
+        if self.use_int8:
+            return rope_tail(k, freqs, self.rope_head_dim)
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
     def queries(
@@ -264,6 +272,12 @@ class DeepseekV41Indexer(nn.Module):
         fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
+        if self.use_int8:
+            return rope_tail(
+                q,
+                freqs[positions] if positions is not None else freqs,
+                self.rope_head_dim,
+            )
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:

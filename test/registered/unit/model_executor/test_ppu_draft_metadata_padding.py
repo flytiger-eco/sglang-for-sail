@@ -47,7 +47,7 @@ class TestPPUDraftMetadataPadding(unittest.TestCase):
             _resolve_decode_pdmux=lambda: (default, contextlib.nullcontext()),
         )
         with (
-            patch.object(er, "_is_ppu", ppu, create=True),
+            patch.object(er, "_is_sail", ppu, create=True),
             patch.object(er, "device_timer_ctx", lambda *_: contextlib.nullcontext()),
             forward_context(ForwardContext(attn_backend=active)),
         ):

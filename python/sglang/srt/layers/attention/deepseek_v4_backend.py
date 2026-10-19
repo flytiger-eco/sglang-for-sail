@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -1574,18 +1575,23 @@ class DeepseekV4AttnBackend(
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=False,
             use_prefill_cuda_graph=True,
+            force_deep_gemm_metadata=is_sail(),
+            q_fp8_shape=torch.Size(
+                (c_seq_lens.shape[0], 1, self.index_n_heads, self.index_head_dim)
+            ),
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
         )
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        """Whether ratio-1/2 sources use captured projections and indexer metadata."""
+        """Whether ratio-1/2 sources use captured FP4 projections and metadata."""
         return (
             bool(self.low_ratios)
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
+            and not use_dsv41_int8_indexer()
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -3446,10 +3452,22 @@ class DeepseekV4AttnBackend(
         pool = self.token_to_kv_pool
         latent = layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
-        # Index keys come from the pre-RoPE latent, so publish them first. Stored
-        # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
+        # Index keys come from the pre-RoPE latent, so publish them first.
+        # Native FP4 uses per-32 E8M0; opt-in INT8 uses per-token FP32 scales.
+        # Neither path adds the V4 C4 indexer's Hadamard transform.
         if layer.indexer is not None and layer.indexer.owns_k:
-            if (
+            if layer.indexer.use_int8:
+                from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+                    store_int8_index_k,
+                )
+
+                store_int8_index_k(
+                    layer.indexer.index_keys(latent, freqs),
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    slots,
+                    pool.get_index_k_page_size(layer.compress_ratio),
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and torch.version.cuda is not None
@@ -3610,6 +3628,12 @@ class DeepseekV4AttnBackend(
         else:
             rows_per_request = _as_int_list(forward_batch.extend_seq_lens_cpu)
             rows_per_request_device = forward_batch.extend_seq_lens
+        if req is None and layer.indexer.use_int8:
+            req = torch.repeat_interleave(
+                forward_batch.req_pool_indices.to(torch.int64),
+                rows_per_request_device.to(torch.int64),
+                output_size=x.shape[0],
+            )
         return PrefillInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,

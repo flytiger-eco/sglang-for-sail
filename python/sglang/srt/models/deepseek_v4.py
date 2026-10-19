@@ -128,7 +128,10 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    W8A8Int8Config,
+    W8A8Int8LinearMethod,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -298,13 +301,19 @@ _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
-    """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
-    return (
-        _FP8_WO_A_GEMM
-        and isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size == [128, 128]
-    )
+    """Select quantized wo_a einsum; PPU also supports channelwise INT8.
+
+    Keep the historical FP8 switch for the release's INT8 DeepGEMM path.
+    Other devices still require the upstream 128x128 block-FP8 layout.
+    """
+    if not _FP8_WO_A_GEMM:
+        return False
+    if _is_sail and isinstance(quant_config, W8A8Int8Config):
+        return True
+    return isinstance(quant_config, Fp8Config) and quant_config.weight_block_size == [
+        128,
+        128,
+    ]
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -5862,9 +5871,10 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert weight.dtype == torch.float8_e4m3fn, (
-        f"expected fp8_e4m3fn, got {weight.dtype}"
-    )
+    assert weight.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ), f"expected fp8_e4m3fn or int8, got {weight.dtype}"
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,
@@ -5893,7 +5903,6 @@ def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
-    saw_wo_a_scale = False
     emitted = False
 
     for name, tensor in weights:
@@ -5904,20 +5913,27 @@ def _dequant_fp8_wo_a_streaming(
             if scale is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield name, _dequant(tensor, scale)
+                yield name, _dequant_fp8(tensor, scale)
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
-            saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+        scale_suffix = next(
+            (
+                suffix
+                for suffix in (".scale", ".weight_scale", ".weight_scale_inv")
+                if name.endswith(".wo_a" + suffix)
+            ),
+            None,
+        )
+        if scale_suffix is not None:
+            prefix = name[: -len(scale_suffix)]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield prefix + ".weight", _dequant(weight, tensor)
+                yield prefix + ".weight", _dequant_fp8(weight, tensor)
             else:
                 bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -5925,37 +5941,16 @@ def _dequant_fp8_wo_a_streaming(
         yield name, tensor
 
     if emitted:
-        logger.info("Finished streaming dequant fp8 wo_a")
+        logger.info("Finished streaming dequant FP8/INT8 wo_a to BF16")
     for prefix, bucket in pending.items():
         if "weight" in bucket:
-            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            if bucket["weight"].dtype in (torch.int8, torch.float8_e4m3fn):
+                raise ValueError(
+                    f"{prefix}: quantized wo_a weight is missing its scale"
+                )
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
-            yield prefix + ".scale", bucket["scale"]
-
-
-def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    from einops import rearrange
-
-    assert weight.dtype in (
-        torch.float8_e4m3fn,
-        torch.int8,
-    ), f"expected fp8_e4m3f or int8, got {weight.dtype}"
-    assert scale.dtype in (
-        torch.float8_e8m0fnu,
-        torch.float32,
-    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
-
-    bn = weight.shape[0] // scale.shape[0]
-    bk = weight.shape[1] // scale.shape[1]
-    weight_f32 = rearrange(
-        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=bn, bk=bk
-    )
-    result = rearrange(
-        weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
-    )
-
-    return result.to(torch.bfloat16)
+            raise ValueError(f"{prefix}: wo_a scale is missing its weight")
 
 
 def _dequant_fp8_wo_a(
@@ -5972,7 +5967,7 @@ def _dequant_fp8_wo_a(
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
-        yield name, _dequant(weight, scale)
+        yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
 
