@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
-    decode_scores,
+    decode_score_chunks,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
@@ -114,6 +114,7 @@ class FullTopKIndexer:
                         topk_plans[chunk_idx] if topk_plans is not None else None
                     ),
                 )
+                del logits  # release this chunk's logits before the next is scored
             return
         logits = deep_gemm_fp4_paged_mqa_logits(
             (data.q_fp4, data.q_sf),
@@ -130,17 +131,16 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs, out: Selection) -> None:
-        d = decode_scores(
+        for d in decode_score_chunks(
             inputs=inputs,
             out=out,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-        )
-        if d is None:
-            return
-        k = min(inputs.indexer.index_topk, d.lmax)
-        idx = d.scores.topk(k, dim=-1, sorted=False).indices
-        write_decode(out, d, idx)
+        ):
+            k = min(inputs.indexer.index_topk, d.lmax)
+            idx = d.scores.topk(k, dim=-1, sorted=False).indices
+            write_decode(out, d, idx)
+            del d  # release this chunk's logits before the next chunk is scored
 
     def _deep_gemm_prefill_captured(
         self, inputs: CapturedPrefillInputs, out: Selection
@@ -182,3 +182,4 @@ class FullTopKIndexer:
                 page_size,
                 out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
             )
+            del logits  # release this chunk's logits before the next is scored

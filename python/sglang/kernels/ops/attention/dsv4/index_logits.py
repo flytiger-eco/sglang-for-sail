@@ -8,11 +8,12 @@ from typing import Iterator, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_ppu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
@@ -54,20 +55,27 @@ def flat_index_logits_tiles(
     width = ceil_align(max(context_lengths, default=0), width_align)
     if rows == 0 or width == 0:
         return
+    if is_ppu():
+        max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+        if max_logits_mb <= 0:
+            raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+        # PPU obeys the same MB knob as the INT8 indexer in place of the
+        # caller's generic budget; the sliced FP32 tile is its only live
+        # logits tensor, so the planner's row accounting applies as-is.
+        budget_bytes = max_logits_mb * 1024 * 1024
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
-        tile_starts = starts[tile]
         yield (
             tile,
             fp8_fp4_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
-                tile_starts,
-                tile_starts + lengths[tile],
+                starts[tile],
+                starts[tile] + lengths[tile],
                 False,
                 width,
             ),

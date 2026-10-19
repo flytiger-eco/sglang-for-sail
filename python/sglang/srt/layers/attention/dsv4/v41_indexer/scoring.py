@@ -11,6 +11,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_ppu
 
 from .types import (
@@ -23,9 +24,20 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+
 # TODO: use a per-forward mqa_logits_budget_bytes() budget that also
 # leaves room for candidate block ids and block-selection scratch.
 _DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+
+
+def _deep_gemm_score_budget_bytes() -> int:
+    # The env override is PPU-only; NVIDIA keeps the fixed budget.
+    if not is_ppu():
+        return _DEEP_GEMM_SCORE_BUDGET_BYTES
+    max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+    if max_logits_mb <= 0:
+        raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+    return max_logits_mb * 1024 * 1024
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -103,6 +115,7 @@ def get_deep_gemm_decode_data(
     assert indexer.n_local_heads == indexer.n_heads
     if (
         x.is_cuda
+        and not is_ppu()
         and torch.version.cuda is not None
         and x.dtype == torch.bfloat16
         and indexer.index_head_dim == 128
@@ -203,7 +216,7 @@ def score_tiles(
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=_deep_gemm_score_budget_bytes(),
         width_align=width_align,
     )
 
@@ -261,6 +274,7 @@ class DecodeScores(msgspec.Struct, frozen=True):
     scores: torch.Tensor  # [bs, lmax]
     page_table: Optional[torch.Tensor] = None
     page_size: int = 0
+    row_start: int = 0  # first batch row of a paged plan chunk
 
 
 def prefill_requests(
@@ -364,14 +378,15 @@ def write_prefill(
         out.raw_indices[chunk.tok, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
 
-def decode_scores(
+def decode_score_chunks(
     *,
     inputs: DecodeInputs,
     out: Selection,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
-) -> Optional[DecodeScores]:
-    """None when there is no row, or nothing visible yet."""
+) -> Iterator[DecodeScores]:
+    """Scores one plan row chunk at a time so a chunk's logits are released
+    before the next chunk is scored; yields nothing when no row is visible."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -382,56 +397,20 @@ def decode_scores(
         f"decode expects one token per request, {pos.shape=} {bs=}"
     )
     if bs == 0:
-        return None
+        return
     lens = (pos + 1) // ratio
     metadata = inputs.paged_metadata
     # V4 reserves the replay bound in metadata; visibility stays on device.
     # A capture-time length read would both synchronize and truncate replay.
     lmax = min(metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio)
     if lmax == 0:
-        return None
+        return
     q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
     weights = indexer.head_weights(inputs.x)
     j = torch.arange(lmax, device=pos.device)
-    valid = j[None, :] < lens[:, None]
     table = pool.get_index_k_with_scale_buffer(inputs.layer_id)
-    use_paged = is_ppu()
-    slots = None
-    if indexer.use_int8:
-        from sglang.kernels.ops.attention.dsv4.int8_indexer import (
-            int8_paged_index_logits,
-        )
-
-        scores = int8_paged_index_logits(
-            q,
-            weights,
-            table,
-            metadata.compressed_seq_lens[:bs],
-            metadata.page_table[:bs],
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-            metadata.compressed_page_size,
-        )[:, :lmax]
-    elif use_paged:
-        from sglang.kernels.ops.attention.dsv4.index_logits import (
-            deep_gemm_fp4_paged_mqa_logits,
-        )
-
-        q_fp4, q_sf = quantize_index_q(q)
-        scores = deep_gemm_fp4_paged_mqa_logits(
-            (q_fp4.unsqueeze(1), q_sf.unsqueeze(1)),
-            get_index_k_cache(
-                token_to_kv_pool=pool,
-                layer_id=inputs.layer_id,
-                page_size=metadata.compressed_page_size,
-            ),
-            weights.float(),
-            metadata.compressed_seq_lens[:bs],
-            metadata.page_table[:bs],
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )[:, :lmax]
-    else:
+    if not is_ppu():
+        valid = j[None, :] < lens[:, None]
         slots = (
             req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
         )
@@ -439,16 +418,67 @@ def decode_scores(
         scores = fp4_index_logits_decode(
             q, weights, slots, lens, table, table.shape[1] // 68
         )
-    scores.masked_fill_(~valid, -torch.inf)
-    return DecodeScores(
-        bs=bs,
-        lmax=lmax,
-        lens=lens,
-        slots=slots,
-        scores=scores,
-        page_table=metadata.page_table[:bs] if use_paged else None,
-        page_size=metadata.compressed_page_size if use_paged else 0,
+        scores.masked_fill_(~valid, -torch.inf)
+        yield DecodeScores(bs=bs, lmax=lmax, lens=lens, slots=slots, scores=scores)
+        return
+
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        deep_gemm_fp4_paged_mqa_logits,
     )
+    from sglang.kernels.ops.attention.dsv4.int8_indexer import (
+        int8_paged_index_logits,
+    )
+
+    if not indexer.use_int8:
+        q_fp4, q_sf = quantize_index_q(q)
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=pool,
+            layer_id=inputs.layer_id,
+            page_size=metadata.compressed_page_size,
+        )
+
+    def score_rows(rows, plan):
+        if indexer.use_int8:
+            return int8_paged_index_logits(
+                q[rows],
+                weights[rows],
+                table,
+                metadata.compressed_seq_lens[rows],
+                metadata.page_table[rows],
+                plan,
+                metadata.max_compressed_seq_len,
+                metadata.compressed_page_size,
+            )[:, :lmax]
+        return deep_gemm_fp4_paged_mqa_logits(
+            (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
+            k_cache,
+            weights[rows].float(),
+            metadata.compressed_seq_lens[rows],
+            metadata.page_table[rows],
+            plan,
+            metadata.max_compressed_seq_len,
+        )[:, :lmax]
+
+    for rows, plan in metadata.row_chunks():
+        rows = slice(rows.start, min(rows.stop, bs))
+        if rows.start >= bs:
+            break
+        scores = score_rows(rows, plan)
+        chunk_lens = lens[rows]
+        scores.masked_fill_(j[None, :] >= chunk_lens[:, None], -torch.inf)
+        yield DecodeScores(
+            bs=rows.stop - rows.start,
+            lmax=lmax,
+            lens=chunk_lens,
+            slots=None,
+            scores=scores,
+            page_table=metadata.page_table[rows],
+            page_size=metadata.compressed_page_size,
+            row_start=rows.start,
+        )
+        # The consumer drops its reference first; release this chunk's logits
+        # before the next chunk is scored.
+        del scores
 
 
 def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
@@ -461,8 +491,7 @@ def write_decode(out: Selection, d: DecodeScores, idx: torch.Tensor) -> None:
         selected_slots = selected_slots * d.page_size + clamped % d.page_size
     else:
         selected_slots = d.slots.gather(1, clamped)
-    out.page_indices[: d.bs, :k] = torch.where(reach, selected_slots, -1).to(
-        torch.int32
-    )
+    rows = slice(d.row_start, d.row_start + d.bs)
+    out.page_indices[rows, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
     if out.raw_indices is not None:
-        out.raw_indices[: d.bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
+        out.raw_indices[rows, :k] = torch.where(reach, idx, -1).to(torch.int32)
