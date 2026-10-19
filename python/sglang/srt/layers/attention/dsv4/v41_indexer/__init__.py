@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_sail
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -46,6 +46,10 @@ def is_sm100_or_newer() -> bool:
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
 
 
+def use_deep_gemm_fp4_indexer() -> bool:
+    return is_sail() or is_sm100_or_newer()
+
+
 @functools.cache
 def has_dense_fp4_indexer() -> bool:
     if not torch.cuda.is_available() or torch.version.cuda is None:
@@ -62,7 +66,9 @@ def _use_deep_gemm_prefill() -> bool:
     from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 
     return (
-        not use_dsv41_int8_indexer() and is_sm100_or_newer() and has_dense_fp4_indexer()
+        not use_dsv41_int8_indexer()
+        and use_deep_gemm_fp4_indexer()
+        and has_dense_fp4_indexer()
     )
 
 
@@ -77,7 +83,8 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer() and not use_dsv41_int8_indexer(),
+        use_deep_gemm_decode=use_deep_gemm_fp4_indexer()
+        and not use_dsv41_int8_indexer(),
     )
 
 
@@ -106,7 +113,8 @@ def make_candidate_indexer(
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     if (
-        not is_sm100_or_newer()
+        is_sail()
+        or not is_sm100_or_newer()
         or use_dsv41_int8_indexer()
         or candidate_topk_blocks <= 0
     ):
