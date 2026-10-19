@@ -17,13 +17,37 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    attn_tp_size_of,
+    get_platform,
+)
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    if cfg.dcp_size != 1 or cfg.dp_size != 1:
+        return False
+
+    if cfg.disaggregation_mode == "decode":
+        # A decode attention-DP worker owns a complete MQA cache. Mixed
+        # attention TP/DP remains outside the validated transfer layout.
+        return (
+            not cfg.enable_prefill_cp
+            and cfg.attn_cp_size == 1
+            and (cfg.attn_dp_size == 1 or attn_tp_size_of(cfg) == 1)
+        )
+
+    # CP size may still be implicit at this validation slot; the CP hook declares
+    # it later from tp_size. Prefill attention DP is not part of this layout.
+    prefill_cp = cfg.enable_prefill_cp and cfg.cp_strategy == "interleave"
+    has_cp = cfg.enable_prefill_cp or cfg.attn_cp_size != 1
+    return cfg.attn_dp_size == 1 and (not has_cp or prefill_cp)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -310,27 +334,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
-        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
-        supported_prefill_cp = (
-            cfg.disaggregation_mode == "prefill"
-            and cfg.enable_prefill_cp
-            and cfg.cp_strategy == "interleave"
-        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
-            or (
-                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
-                and not supported_prefill_cp
-            )
-            or cfg.dcp_size != 1
+            or not _dsv41_dspark_pd_parallelism_supported(cfg)
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
-                "--enable-prefill-cp with the interleave strategy. "
-                "DP attention is supported when "
-                "both servers use the same block size and target/draft KV layout."
+                "DCP=1, system DP=1, Prefill attention DP=1, and Decode CP=1. "
+                "Prefill may use canonical interleave CP. Decode may use pure "
+                "attention DP (--attn-dp-size equal to --tp). Both servers must "
+                "enable DSpark with the same block size and KV layout. Prefill CP "
+                "and Decode attention-DP sizes are independent when attention "
+                "TP=1 on both servers; otherwise their attention widths must match."
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
