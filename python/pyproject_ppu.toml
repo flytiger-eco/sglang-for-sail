@@ -1,0 +1,303 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.11", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang"
+dynamic = ["version"]
+description = "SGLang is a fast serving framework for large language models and vision language models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+
+# Please keep dependency lists in this file sorted alphabetically by package name.
+dependencies = [
+  "aiohttp",
+  "anthropic>=0.20.0",
+  "apache-tvm-ffi==0.1.11",
+  "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "blobfile==3.0.0",
+  "build",
+  "compressed-tensors",
+  "datasets",
+  "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
+  "distro",
+  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
+  "einops",
+  "fastapi",
+  "gguf",
+  "humming-kernels[cu13]==0.1.10",
+  "interegular",
+  "IPython",
+  "kernels>=0.14.1,<0.15",
+  "llguidance>=1.7.6,<2.0.0",
+  "mistral_common>=1.11.5",
+  "modelscope",
+  "msgspec",
+  "ninja",
+  "numba==0.65.1",
+  "numpy",
+  "nvidia-mathdx==25.6.0",
+  "nvidia-ml-py",
+  "openai==2.6.1",
+  "openai-harmony==0.0.4",
+  "orjson",
+  "outlines==0.1.11",
+  "packaging",
+  "partial_json_parser",
+  "pillow",
+  "prometheus-client>=0.20.0",
+  "psutil",
+  "py-spy",
+  "pybase64",
+  "pydantic",
+  "python-multipart",
+  "pyzmq>=25.1.2",
+  "quack-kernels==0.6.4",
+  "requests",
+  "scipy",
+  "sentencepiece",
+  "setproctitle",
+  "smg-grpc-servicer>=0.5.0",
+  "soundfile==0.13.1",
+  "tiktoken",
+  "timm==1.0.16",
+  "tokenspeed_mla==0.1.8",
+  "tomli ; python_version < '3.11'",
+  "tqdm",
+  "transformers==5.12.1",
+  "uvicorn",
+  "uvloop",
+  "watchfiles",
+  "xgrammar==0.2.1",
+  "xxhash",
+  "zstandard",
+  # PPU-specific dependencies. Public versions intentionally omit the local
+  # +v*.ppu2.2.0 suffix so package metadata remains portable; uv resolves each
+  # package from the flytiger index configured below. docker/ppu.Dockerfile
+  # fetches sglang-kernel from flytiger when available and otherwise builds it
+  # from the AOT sources in sglang/kernels/aot with setup_ppu.py.
+  "acext==1.1.0",
+  "cpm-kernels==1.0.11",
+  "cuda-bindings==13.0.0",
+  "cuda-python==13.0.0",
+  "deep_ep==2.2.0",
+  "deep_gemm==1.1.0",
+  "fast-hadamard-transform==1.0.4.post1",
+  "flash-attn==2.8.2",
+  "flash_attn_3==2.8.2",
+  "flash_mla==2.0.0",
+  "flashinfer_python[cu13]==0.6.15.post1",
+  "mooncake-transfer-engine==0.3.12.post1",
+  "nvidia-dali-cuda130==1.53.0",
+  "pla==1.0.0",
+  "sglang-kernel==0.4.5",
+  "sglang-router==0.3.2",
+  "tilelang==0.1.11",
+  "torch==2.11.0",
+  "torch_memory_saver==0.0.9",
+  "torchao==0.17.0",
+  "torchaudio==2.11.0",
+  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
+  "torchvision",
+  "transformer-engine==2.5",
+  "triton==3.7.0",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "flytiger"
+url = "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+
+[tool.uv.sources]
+# PPU-specific packages resolved from the flytiger index
+acext = { index = "flytiger" }
+cpm-kernels = { index = "flytiger" }
+cuda-bindings = { index = "flytiger" }
+cuda-python = { index = "flytiger" }
+deep_ep = { index = "flytiger" }
+deep_gemm = { index = "flytiger" }
+fast-hadamard-transform = { index = "flytiger" }
+flash-attn = { index = "flytiger" }
+flash_attn_3 = { index = "flytiger" }
+flash_mla = { index = "flytiger" }
+flashinfer-python = { index = "flytiger" }
+mooncake-transfer-engine = { index = "flytiger" }
+nvidia-dali-cuda130 = { index = "flytiger" }
+pla = { index = "flytiger" }
+sglang-kernel = { index = "flytiger" }
+sglang-router = { index = "flytiger" }
+tilelang = { index = "flytiger" }
+torch = { index = "flytiger" }
+torch_memory_saver = { index = "flytiger" }
+torchao = { index = "flytiger" }
+torchaudio = { index = "flytiger" }
+torchcodec = { index = "flytiger" }
+torchvision = { index = "flytiger" }
+transformer-engine = { index = "flytiger" }
+triton = { index = "flytiger" }
+
+[project.optional-dependencies]
+checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+diffusion = [
+  "addict==2.4.0",
+  "av==16.1.0",
+  "cache-dit==1.3.0",
+  "cloudpickle==3.1.2",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "msgpack",
+  "nvidia-modelopt",
+  "opencv-python-headless==4.10.0.84",
+  "PyYAML==6.0.1",
+  "remote-pdb==2.1.0",
+  "runai_model_streamer>=0.15.7",
+  "scikit-image==0.25.2",
+  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "trimesh>=4.0.0",
+  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "websockets",
+  "xatlas",
+]
+
+diffusion-qvg = [
+  # quant-videogen 0.1.0 pins an incompatible Torch version, so it is
+  # installed separately with --no-deps; this extra provides its missing
+  # import-time dependencies.
+  "loguru>=0.7",
+  "termcolor>=2.3",
+]
+
+ray = [
+  "ray[default]>=2.55.1",
+]
+
+tracing = [
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+  "opentelemetry-sdk",
+]
+
+http2 = [
+  "granian>=2.6.0",
+]
+
+fastokens = [
+  "fastokens>=0.1.1,<0.2.0",
+]
+
+test = [
+  "accelerate",
+  "addict",
+  "auto-round>=0.13.1",
+  "av==16.1.0",
+  "bitsandbytes",
+  "pymupdf",
+  "diff-cover",
+  "expecttest",
+  "granian>=2.6.0",
+  "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
+  "matplotlib",
+  # 4.9.3 is what sgl-eval's math_verify grader needs (latex2sympy2_extended
+  # raises ImportError on 4.7.x); pinned here so other test deps cannot pull
+  # it down.
+  "antlr4-python3-runtime==4.9.3",
+  "pandas",
+  "parameterized",
+  "peft>=0.18.0",
+  "polars",
+  "pytest",
+  "pytest-cov",
+  "sentence_transformers",
+  "sglang[fastokens]",
+  "tabulate",
+]
+
+dev = ["sglang[test]"]
+
+all = [
+  "sglang[diffusion]",
+  "sglang[http2]",
+  "sglang[tracing]",
+]
+
+[tool.uv.extra-build-dependencies]
+st-attn = ["setuptools", "torch"]
+vsa = ["setuptools", "torch"]
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
+killall_sglang = "sglang.cli.killall:main"
+
+[tool.setuptools.package-data]
+"sglang" = [
+  "srt/**/*",
+  "kernels/**/*",
+  "multimodal_gen/apps/realtime_webui/**/*"
+]
+
+[tool.setuptools.exclude-package-data]
+"sglang" = [
+  "kernels/aot/*",
+  "kernels/aot/**/*",
+  "srt/mem_cache/rust_tree_core/mem_cache_inspection*.so",
+]
+
+[tool.setuptools.packages.find]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "sglang.kernels.aot*",
+  "tests*",
+]
+
+[tool.wheel]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "sglang/kernels/aot*",
+  "tests*",
+]
+
+[tool.setuptools_scm]
+root = ".."
+version_file = "sglang/_version.py"
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"
+
+# Rust extension modules are auto-discovered by setup.py from the Cargo
+# workspace in ../rust and its declared extension manifests
+# ([package.metadata.sglang] python-module in each crate).
+# This CUDA pyproject builds all of them; platform variants restrict the set
+# via [tool.sglang] rust-extensions (see pyproject_other.toml).
+
+[tool.kernels.dependencies]
+"kernels-community/sgl-flash-attn3" = 1
