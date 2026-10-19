@@ -61,6 +61,7 @@ def _jit_dequantize_k_cache_module():
         cuda_files=["deepseek_v4/dequantize_k_cache.cuh"],
         cuda_wrappers=[
             ("dequantize_k_cache_paged", "DequantizeKCacheKernel::run"),
+            ("dequantize_k_cache_paged_v2", "DequantizeKCacheV2Kernel::run"),
         ],
     )
 
@@ -93,6 +94,31 @@ def dequantize_k_cache_paged_cuda(
         page_table,
         page_size,
         int(use_fp8_native),
+    )
+
+
+def dequantize_k_cache_paged_v2_cuda(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    use_fp8_native: bool = True,
+    threads_per_token: int = 8,
+) -> None:
+    """Vectorized :func:`dequantize_k_cache_paged_cuda`.
+
+    Splits each token across ``threads_per_token`` threads (8, 16 or 32) so
+    every access is a 16-byte vector instead of a single byte. Produces
+    bit-identical output; requires 16-byte aligned buffers.
+    """
+    module = _jit_dequantize_k_cache_module()
+    module.dequantize_k_cache_paged_v2(
+        out,
+        k_cache,
+        page_table,
+        page_size,
+        int(use_fp8_native),
+        int(threads_per_token),
     )
 
 
