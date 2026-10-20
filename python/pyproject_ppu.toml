@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-rust>=1.10", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-rust>=1.11", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,7 +22,7 @@ dependencies = [
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
-  "compressed-tensors",
+  "compressed-tensors==0.18.0",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",
@@ -30,7 +30,7 @@ dependencies = [
   "einops",
   "fastapi",
   "gguf",
-  "humming-kernels[cu13]==0.1.10",
+  "humming-kernels[cu13]==0.1.12",
   "interegular",
   "IPython",
   "kernels>=0.14.1,<0.15",
@@ -66,6 +66,7 @@ dependencies = [
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
+  "tokenizers==0.22.2", # 0.23.0rc0 is incompatible with transformers' CLIPTokenizer.
   "tokenspeed_mla==0.1.8",
   "tomli ; python_version < '3.11'",
   "tqdm",
@@ -78,7 +79,9 @@ dependencies = [
   "zstandard",
   # PPU-specific dependencies. Public versions intentionally omit the local
   # +v*.ppu2.2.0 suffix so package metadata remains portable; uv resolves each
-  # package from the flytiger index configured below.
+  # package from the flytiger index configured below. docker/ppu.Dockerfile
+  # fetches sglang-kernel from flytiger when available and otherwise builds it
+  # from the AOT sources in sglang/kernels/aot with setup_ppu.py.
   "acext==1.1.0",
   "cpm-kernels==1.0.11",
   "cuda-bindings==13.0.0",
@@ -90,7 +93,7 @@ dependencies = [
   "flash_attn_3==2.8.2",
   "flash_mla==2.0.0",
   "flashinfer_python[cu13]==0.6.17",
-  "mooncake==0.3.12.post1",
+  "mooncake-transfer-engine==0.3.12.post1",
   "nvidia-dali-cuda130==1.53.0",
   "pla==1.0.0",
   "sglang-kernel==0.4.6.post1",
@@ -128,7 +131,7 @@ flash-attn = { index = "flytiger" }
 flash_attn_3 = { index = "flytiger" }
 flash_mla = { index = "flytiger" }
 flashinfer-python = { index = "flytiger" }
-mooncake = { index = "flytiger" }
+mooncake-transfer-engine = { index = "flytiger" }
 nvidia-dali-cuda130 = { index = "flytiger" }
 pla = { index = "flytiger" }
 sglang-kernel = { index = "flytiger" }
@@ -210,11 +213,8 @@ test = [
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   # 4.9.3 is what sgl-eval's math_verify grader needs (latex2sympy2_extended
-  # raises ImportError on 4.7.x), so a `sglang[test]` environment is already
-  # compatible when sgl-eval is installed on top of it.
-  # Do NOT declare sgl-eval itself here: it is git-only, and PyPI rejects any
-  # uploaded distribution whose metadata carries a direct URL requirement.
-  # CUDA CI installs it in scripts/ci/cuda/ci_install_dependency.sh.
+  # raises ImportError on 4.7.x); pinned here so other test deps cannot pull
+  # it down.
   "antlr4-python3-runtime==4.9.3",
   "pandas",
   "parameterized",
@@ -241,6 +241,8 @@ vsa = ["setuptools", "torch"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
+"Documentation" = "https://docs.sglang.io"
+"Cookbook" = "https://docs.sglang.io/cookbook"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]
@@ -258,6 +260,7 @@ killall_sglang = "sglang.cli.killall:main"
 "sglang" = [
   "kernels/aot/*",
   "kernels/aot/**/*",
+  "srt/mem_cache/rust_tree_core/mem_cache_inspection*.so",
 ]
 
 [tool.setuptools.packages.find]
@@ -291,8 +294,9 @@ git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
 
-# Rust extension modules are auto-discovered by setup.py from the cargo
-# workspace in ../rust ([package.metadata.sglang] python-module in each crate).
+# Rust extension modules are auto-discovered by setup.py from the Cargo
+# workspace in ../rust and its declared extension manifests
+# ([package.metadata.sglang] python-module in each crate).
 # This CUDA pyproject builds all of them; platform variants restrict the set
 # via [tool.sglang] rust-extensions (see pyproject_other.toml).
 

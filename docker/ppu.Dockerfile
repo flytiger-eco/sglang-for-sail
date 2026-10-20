@@ -22,6 +22,8 @@ ARG MAX_JOBS=16
 # PPU packages from [tool.uv.sources] in python/pyproject_ppu.toml.
 # Use explicit local versions so pip cannot select the upstream CUDA packages.
 # sglang-router is built from this repository in gateway_builder instead.
+# sglang-kernel is fetched from flytiger when available, with an AOT source
+# build fallback in ppu_kernels_builder.
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
@@ -37,7 +39,6 @@ ARG PPU_PACKAGES="\
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     pla==1.0.0+v0.1.0.ppu2.2.0 \
-    sglang-kernel==0.4.6.post1+v0.1.0.ppu2.2.0 \
     tilelang==0.1.11+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
@@ -49,6 +50,9 @@ ARG PPU_PACKAGES="\
 # torchvision but not torchaudio. A full list would be e.g.
 #   "torchvision==0.28.0+v0.1.0.ppu2.2.0 torchaudio==2.11.0+v0.1.0.ppu2.2.0"
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
+# Must match version in python/sglang/kernels/aot/pyproject_ppu.toml and the
+# sglang-kernel pin in python/pyproject_ppu.toml.
+ARG SGL_KERNEL_VERSION=0.4.6.post1
 
 FROM ${PPU_BASE_IMAGE} AS base
 
@@ -123,7 +127,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip \
     && python3 -m pip install \
         "setuptools>=61" \
-        "setuptools-rust>=1.10" \
+        "setuptools-rust>=1.11" \
         "setuptools-scm>=8" \
         wheel \
         packaging \
@@ -163,6 +167,7 @@ ARG PPU_PIP_INDEX
 ARG MAX_JOBS
 ARG PPU_PACKAGES
 ARG PPU_TORCH_PACKAGES
+ARG SGL_KERNEL_VERSION
 
 WORKDIR /build
 
@@ -182,6 +187,37 @@ RUN mkdir -p /wheels \
             "${spec}" \
         || exit 1; \
     done \
+    && ls -l /wheels
+
+# Prefer the flytiger PPU package. If the requested version has not been
+# published yet, build it with setup_ppu.py (SM80/SM89 via the PPU CUDA SDK).
+# Keep the kernels/aot + kernels/jit/include layout because setup_ppu.py uses
+# ../jit/include; the fallback clones cutlass/flashinfer/triton at build time.
+COPY python/sglang/kernels/aot /build/sglang/kernels/aot
+COPY python/sglang/kernels/jit/include /build/sglang/kernels/jit/include
+RUN if MAX_JOBS=${MAX_JOBS} python3 -m pip wheel \
+        --no-cache-dir \
+        --no-deps \
+        --no-build-isolation \
+        --index-url ${PPU_PIP_INDEX} \
+        --wheel-dir /wheels \
+        "sglang-kernel==${SGL_KERNEL_VERSION}"; then \
+        echo "Using flytiger sglang-kernel ${SGL_KERNEL_VERSION}"; \
+    else \
+        echo "flytiger has no sglang-kernel ${SGL_KERNEL_VERSION}; building from AOT sources" \
+        && cd /build/sglang/kernels/aot \
+        && { grep -qx "version = \"${SGL_KERNEL_VERSION}\"" pyproject_ppu.toml \
+            || { echo "kernels/aot/pyproject_ppu.toml is not sglang-kernel ${SGL_KERNEL_VERSION}"; exit 1; }; } \
+        && cp pyproject_ppu.toml pyproject.toml \
+        && cp setup_ppu.py setup.py \
+        && MAX_JOBS=${MAX_JOBS} python3 -m pip wheel \
+            --no-cache-dir \
+            --no-deps \
+            --no-build-isolation \
+            --wheel-dir /wheels \
+            .; \
+    fi \
+    && rm -rf /build/sglang \
     && ls -l /wheels
 
 # Some PPU sdists are shims that rename a prebuilt wheel of a differently named
@@ -243,7 +279,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Pin torch from the base image and the PPU builds so the dependency solve
 # below can never replace them with CUDA wheels from PyPI.
 RUN python3 -m pip list --format=freeze \
-        | grep -iE '^(torch|torchvision|torchaudio|sglang-router)==' > /sgl-workspace/ppu_constraints.txt \
+        | grep -iE '^(torch|torchvision|torchaudio|sglang-router|sglang[-_]kernel)==' > /sgl-workspace/ppu_constraints.txt \
     && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES}; do echo "${spec}"; done \
         | sed 's/^mooncake==/mooncake-transfer-engine==/' \
         >> /sgl-workspace/ppu_constraints.txt \
@@ -270,7 +306,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         >> /sgl-workspace/ppu_constraints.txt \
     && echo "pyarrow<26" >> /sgl-workspace/ppu_constraints.txt \
     && cd /tmp/sglang_deps/python \
-    && sed -i 's/"mooncake==/"mooncake-transfer-engine==/' pyproject.toml \
     && mkdir -p sglang \
     && touch sglang/__init__.py \
     && touch README.md \
