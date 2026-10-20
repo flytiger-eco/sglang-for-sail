@@ -5469,7 +5469,12 @@ class MHATokenToKOnlyPool(KVCache):
 
 
 def get_minimax_sparse_index_dtype(
-    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+    *,
+    fp8_attn_gemm: bool,
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    model_config,
+    page_size: int,
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
     # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
@@ -5488,7 +5493,12 @@ def get_minimax_sparse_index_dtype(
             ppu_msa_indexer_fp8_available,
         )
 
-        if ppu_msa_indexer_fp8_available():
+        if ppu_msa_indexer_fp8_available(
+            model_config,
+            page_size=page_size,
+            main_dtype=kv_cache_dtype,
+            model_dtype=model_dtype,
+        ):
             return torch.float8_e4m3fn
     return model_dtype
 

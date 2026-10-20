@@ -378,6 +378,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,
+                    model_config=model_config,
+                    page_size=kvc.pool_page_size,
                 )
             )
 
