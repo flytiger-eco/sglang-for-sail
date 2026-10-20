@@ -11,11 +11,11 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -427,16 +427,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
-            kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
                 get_minimax_sparse_index_dtype(
                     fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                        resolving_view(kvc.server_args)
+                        SimpleNamespace(
+                            kv_cache_dtype=kvc.kv_cache_dtype_str,
+                            attention_backend=get_exec().kernel.attention_backend,
+                        )
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,
+                    model_config=model_config,
+                    page_size=kvc.pool_page_size,
                 )
             )
 

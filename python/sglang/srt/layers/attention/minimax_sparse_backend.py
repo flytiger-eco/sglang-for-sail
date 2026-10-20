@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
     get_minimax_sparse_score_type,
+    get_minimax_sparse_window_blocks,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
 )
@@ -126,7 +127,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
-            resolving_view(runner.server_args)
+            SimpleNamespace(
+                kv_cache_dtype=runner.kv_cache_dtype_str,
+                attention_backend=get_exec().kernel.attention_backend,
+            )
         )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
@@ -165,20 +169,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
-        if "sparse_init_block" in sparse_cfg:
-            self.init_blocks = sparse_cfg["sparse_init_block"]
-        else:
-            init_tokens = sparse_cfg["sparse_init_tokens"]
-            self.init_blocks = (
-                init_tokens + self.block_size_k - 1
-            ) // self.block_size_k
-        if "sparse_local_block" in sparse_cfg:
-            self.local_blocks = sparse_cfg["sparse_local_block"]
-        else:
-            local_tokens = sparse_cfg["sparse_local_tokens"]
-            self.local_blocks = (
-                local_tokens + self.block_size_k - 1
-            ) // self.block_size_k + 1
+        self.init_blocks, self.local_blocks = get_minimax_sparse_window_blocks(
+            sparse_cfg
+        )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         if self.hisparse_coordinator is not None:
             selected_tokens = self.topk_blocks * self.block_size_k
