@@ -334,17 +334,58 @@ def ppu_msa_available() -> bool:
     return True
 
 
-def ppu_msa_indexer_fp8_available() -> bool:
+def ppu_msa_indexer_fp8_available(
+    model_config, *, page_size: int, main_dtype: torch.dtype, model_dtype: torch.dtype
+) -> bool:
+    """Whether to allocate an fp8 index-K cache: indexer fp8 is on and the gate will pass."""
+    from sglang.srt.configs.model_config import (
+        get_minimax_sparse_attention_config,
+        get_minimax_sparse_disable_value_layer_ids,
+        get_minimax_sparse_layer_ids,
+        get_minimax_sparse_score_type,
+        get_minimax_sparse_window_blocks,
+    )
+    from sglang.srt.runtime_context import get_parallel, get_spec
     from sglang.srt.utils.common import get_device_sm
 
-    sm = get_device_sm()
-    is_sm89_plus = sm >= 89
-    indexer_fp8 = _sail_msa_bool_with_arch_default(
-        "SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8", is_sm89_plus
-    )
-    if not indexer_fp8:
+    if not _sail_msa_bool_with_arch_default(
+        "SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8", get_device_sm() >= 89
+    ):
         return False
-    return ppu_msa_available()
+
+    sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
+    _, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+    init_blocks, local_blocks = get_minimax_sparse_window_blocks(sparse_cfg)
+    parallel = get_parallel()
+    reason = _msa_ppu_config_reason(
+        page_size=page_size,
+        block_size_k=sparse_cfg["sparse_block_size"],
+        topk_blocks=sparse_cfg["sparse_topk_blocks"],
+        idx_head_dim=sparse_cfg["sparse_index_dim"],
+        head_dim=model_config.head_dim,
+        num_kv_heads=model_config.get_num_kv_heads(
+            parallel.attn_tp_size, parallel.attn_dcp_size
+        ),
+        num_idx_heads=_num_idx_heads_after_tp(sparse_cfg, parallel.attn_tp_size),
+        score_type=get_minimax_sparse_score_type(sparse_cfg),
+        sparse_layer_ids=sparse_layer_ids,
+        disable_value_layer_ids=get_minimax_sparse_disable_value_layer_ids(sparse_cfg),
+        main_dtype=main_dtype,
+        model_dtype=model_dtype,
+        max_context_len=int(model_config.context_len),
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        speculative_algorithm=get_spec().speculative_algorithm,
+    )
+    if reason is not None:
+        logger.info(
+            "[MiniMaxSparse][SAIL MSA] gate will not pass (%s); keeping a %s "
+            "index-K cache instead of fp8.",
+            reason,
+            model_dtype,
+        )
+        return False
+    return True
 
 
 # ============================================================================
@@ -1123,9 +1164,75 @@ def _sail_msa_bool_with_arch_default(name: str, sm_default: bool) -> bool:
     return getattr(envs, name).get()
 
 
+def _msa_ppu_config_reason(
+    *,
+    page_size: int,
+    block_size_k: int,
+    topk_blocks: int,
+    idx_head_dim: int,
+    head_dim: int,
+    num_kv_heads: int,
+    num_idx_heads: int,
+    score_type: str,
+    sparse_layer_ids,
+    disable_value_layer_ids,
+    main_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    max_context_len: int,
+    init_blocks: int,
+    local_blocks: int,
+    speculative_algorithm,
+) -> Optional[str]:
+    """First failing SAIL MSA gate condition that is fixed before the KV pool exists.
+
+    Shared by the backend gate and the index-K cache dtype decision so an fp8
+    index cache is only allocated when the gate is going to pass.
+    """
+    from sglang.srt.utils.common import get_device_sm
+
+    sm = get_device_sm()
+    if sm < 80:
+        return "SM<80"
+    if not envs.SGLANG_SAIL_MINIMAX_M3_MSA.get():
+        return "SGLANG_SAIL_MINIMAX_M3_MSA=0"
+    if not ppu_msa_available():
+        return "fmha_sm100 unavailable or API drifted"
+    if block_size_k != _PAGE_SIZE:
+        return "block_size_k!=128"
+    if page_size != _PAGE_SIZE:
+        return "page_size!=128"
+    if topk_blocks != 16:
+        return "topk_blocks!=16"
+    if idx_head_dim != 128:
+        return "idx_head_dim!=128"
+    if head_dim != 128:
+        return "main head_dim!=128"
+    if not _is_nhd_layout_unambiguous(num_kv_heads):
+        return "num_kv_heads==128 is layout-ambiguous"
+    if num_idx_heads != num_kv_heads:
+        return "num_idx_heads!=num_kv_heads"
+    if score_type != "max":
+        return "score_type!=max"
+    if not set(sparse_layer_ids) <= set(disable_value_layer_ids):
+        return "non-disable-value sparse layers exist (MSA produces no idx_o)"
+    if main_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        return "main KV dtype must be bf16 or fp8_e4m3"
+    use_fp8_kvcache = main_dtype == torch.float8_e4m3fn and sm >= 89
+    if use_fp8_kvcache and model_dtype != torch.bfloat16:
+        return "fp8 main KV requires bf16 model Q for fp8 attend staging"
+    if _aligned_max_k_tiles(max_context_len) >= _MAX_TOPK_SELECT_K_TILES:
+        return "aligned max_k_tiles >= 12288 (context too long)"
+    if max(init_blocks, local_blocks) > _MAX_FORCE_WINDOW_BLOCKS:
+        return "max(init_blocks, local_blocks) > 1024"
+    if speculative_algorithm is not None:
+        return "speculative decoding enabled"
+    return None
+
+
 def compute_msa_ppu_gate(backend, runner) -> Tuple[bool, bool, List[str]]:
     """Evaluate SAIL MSA routing gate. Returns (use_msa_ppu, use_attend, reasons)."""
     from sglang.srt.configs.model_config import get_minimax_sparse_attention_config
+    from sglang.srt.runtime_context import get_parallel, get_spec
     from sglang.srt.utils.common import get_device_sm
 
     reasons: List[str] = []
@@ -1172,8 +1279,6 @@ def compute_msa_ppu_gate(backend, runner) -> Tuple[bool, bool, List[str]]:
     )
     expected_index_dtype = torch.float8_e4m3fn if indexer_fp8 else torch.bfloat16
 
-    from sglang.srt.runtime_context import get_parallel
-
     attn_tp_size = get_parallel().attn_tp_size
     num_idx_heads = _num_idx_heads_after_tp(sparse_cfg, attn_tp_size)
     backend._ppu_msa_num_idx_heads = num_idx_heads
@@ -1181,52 +1286,30 @@ def compute_msa_ppu_gate(backend, runner) -> Tuple[bool, bool, List[str]]:
         runner.model_config.num_attention_heads // attn_tp_size
     )
 
-    ok = (
-        req(get_device_sm() >= 80, "SM<80")
-        and req(
-            envs.SGLANG_SAIL_MINIMAX_M3_MSA.get(),
-            "SGLANG_SAIL_MINIMAX_M3_MSA=0",
-        )
-        and req(ppu_msa_available(), "fmha_sm100 unavailable or API drifted")
-        and req(backend.block_size_k == _PAGE_SIZE, "block_size_k!=128")
-        and req(backend.page_size == _PAGE_SIZE, "page_size!=128")
-        and req(backend.topk_blocks == 16, "topk_blocks!=16")
-        and req(backend.idx_head_dim == 128, "idx_head_dim!=128")
-        and req(kv_pool.main_pool.head_dim == 128, "main head_dim!=128")
-        and req(
-            _is_nhd_layout_unambiguous(num_kv_heads),
-            "num_kv_heads==128 is layout-ambiguous",
-        )
-        and req(num_idx_heads == num_kv_heads, "num_idx_heads!=num_kv_heads")
-        and req(backend.score_type == "max", "score_type!=max")
-        and req(
-            set(backend.sparse_layer_ids) <= backend.disable_value_layer_ids,
-            "non-disable-value sparse layers exist (MSA produces no idx_o)",
-        )
-        and req(
-            main_dtype in (torch.bfloat16, torch.float8_e4m3fn),
-            "main KV dtype must be bf16 or fp8_e4m3",
-        )
-        and req(
-            not backend._ppu_msa_use_fp8_kvcache or runner.dtype == torch.bfloat16,
-            "fp8 main KV requires bf16 model Q for fp8 attend staging",
-        )
-        and req(
-            index_dtype == expected_index_dtype,
-            f"index KV dtype!={expected_index_dtype}",
-        )
-        and req(
-            _aligned_max_k_tiles(backend.max_context_len) < _MAX_TOPK_SELECT_K_TILES,
-            "aligned max_k_tiles >= 12288 (context too long)",
-        )
-        and req(
-            max(backend.init_blocks, backend.local_blocks) <= _MAX_FORCE_WINDOW_BLOCKS,
-            "max(init_blocks, local_blocks) > 1024",
-        )
-        and req(
-            getattr(runner.server_args, "speculative_algorithm", None) is None,
-            "speculative decoding enabled",
-        )
+    reason = _msa_ppu_config_reason(
+        page_size=backend.page_size,
+        block_size_k=backend.block_size_k,
+        topk_blocks=backend.topk_blocks,
+        idx_head_dim=backend.idx_head_dim,
+        head_dim=kv_pool.main_pool.head_dim,
+        num_kv_heads=num_kv_heads,
+        num_idx_heads=num_idx_heads,
+        score_type=backend.score_type,
+        sparse_layer_ids=backend.sparse_layer_ids,
+        disable_value_layer_ids=backend.disable_value_layer_ids,
+        main_dtype=main_dtype,
+        model_dtype=runner.dtype,
+        max_context_len=backend.max_context_len,
+        init_blocks=backend.init_blocks,
+        local_blocks=backend.local_blocks,
+        speculative_algorithm=get_spec().speculative_algorithm,
+    )
+    ok = req(
+        reason is None,
+        reason,
+    ) and req(
+        index_dtype == expected_index_dtype,
+        f"index KV dtype!={expected_index_dtype}",
     )
 
     use_attend = False

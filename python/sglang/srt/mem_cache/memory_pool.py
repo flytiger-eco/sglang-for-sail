@@ -5739,27 +5739,35 @@ class MHATokenToKOnlyPool(KVCache):
 
 
 def get_minimax_sparse_index_dtype(
-    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+    *,
+    fp8_attn_gemm: bool,
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    model_config,
+    page_size: int,
 ) -> torch.dtype:
     """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
-    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
-    if fp8_attn_gemm:
-        return kv_cache_dtype
-    if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
-        return torch.float8_e4m3fn
-    # On PPU the SAIL MSA fp8 OnlyScore indexer stores the index-K cache in fp8
-    # e4m3 too. Folded here (not inline at the pool-construction site) so this
-    # helper stays the single source of truth shared with the cell-size estimate
-    # caller in pool_configurator.py; the two must agree or the index-K pool is
-    # sized for the wrong element width. Local import: memory_pool is foundational
-    # and a module-level import of the attention-layer msa_ppu would be circular.
+    # SAIL must not bypass its MSA gate via another platform's fp8 fast path.
+    # Keep allocation and cell-size estimation on this single dtype decision.
+    # Local import avoids a foundational memory_pool -> attention import cycle.
     if current_platform.is_sail():
         from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
             ppu_msa_indexer_fp8_available,
         )
 
-        if ppu_msa_indexer_fp8_available():
+        if ppu_msa_indexer_fp8_available(
+            model_config,
+            page_size=page_size,
+            main_dtype=kv_cache_dtype,
+            model_dtype=model_dtype,
+        ):
             return torch.float8_e4m3fn
+        return model_dtype
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
+    if fp8_attn_gemm:
+        return kv_cache_dtype
+    if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
+        return torch.float8_e4m3fn
     return model_dtype
 
 

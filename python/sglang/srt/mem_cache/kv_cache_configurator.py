@@ -4,6 +4,7 @@ import gc
 import logging
 import math
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -2272,10 +2273,15 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             index_dtype=get_minimax_sparse_index_dtype(
                 fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                    resolving_view(self.server_args)
+                    SimpleNamespace(
+                        kv_cache_dtype=self.kv_cache_dtype_str,
+                        attention_backend=get_exec().kernel.attention_backend,
+                    )
                 ),
                 kv_cache_dtype=self.kv_cache_dtype,
                 model_dtype=self.model_dtype,
+                model_config=self.model_config,
+                page_size=self.pool_page_size,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size

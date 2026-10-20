@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -23,9 +24,6 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
-    ppu_msa_indexer_fp8_available,
-)
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -53,9 +51,12 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -937,19 +938,21 @@ class ModelRunnerKVCacheMixin:
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    # SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8=1 (PPU only)
-                    # quantizes the index-K cache to fp8 e4m3 for the SAIL MSA
-                    # fp8 OnlyScore indexer.
-                    index_dtype=(
-                        torch.float8_e4m3fn
-                        if (
-                            current_platform.is_sail()
-                            and ppu_msa_indexer_fp8_available()
-                        )
-                        else self.dtype
+                    # Share the dtype decision with the target pool configurator.
+                    index_dtype=get_minimax_sparse_index_dtype(
+                        fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                            SimpleNamespace(
+                                kv_cache_dtype=self.kv_cache_dtype_str,
+                                attention_backend=get_exec().kernel.attention_backend,
+                            )
+                        ),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        model_dtype=self.dtype,
+                        model_config=self.model_config,
+                        page_size=self.page_size,
                     ),
                     head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
+                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size
                     ),
                     head_dim=self.model_config.head_dim,
                     idx_head_dim=sparse_cfg["sparse_index_dim"],

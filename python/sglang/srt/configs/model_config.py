@@ -393,6 +393,24 @@ def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
     return [i for i, f in enumerate(flags) if f != 0]
 
 
+def get_minimax_sparse_window_blocks(sparse_cfg: dict) -> tuple[int, int]:
+    """Return (init_blocks, local_blocks) of the always-attended sparse window."""
+    block_size_k = sparse_cfg["sparse_block_size"]
+    if "sparse_init_block" in sparse_cfg:
+        init_blocks = sparse_cfg["sparse_init_block"]
+    else:
+        init_blocks = (
+            sparse_cfg["sparse_init_tokens"] + block_size_k - 1
+        ) // block_size_k
+    if "sparse_local_block" in sparse_cfg:
+        local_blocks = sparse_cfg["sparse_local_block"]
+    else:
+        local_blocks = (
+            sparse_cfg["sparse_local_tokens"] + block_size_k - 1
+        ) // block_size_k + 1
+    return init_blocks, local_blocks
+
+
 def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
     score_type = sparse_cfg.get("sparse_score_type", "max")
     assert score_type in (

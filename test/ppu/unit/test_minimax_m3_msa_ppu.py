@@ -27,6 +27,7 @@ try:
         compute_msa_ppu_gate,
         msa_ppu_forward_extend,
         ppu_msa_available,
+        ppu_msa_indexer_fp8_available,
     )
 
     _HAS_MODULE = True
@@ -37,10 +38,6 @@ except Exception as e:  # pragma: no cover
 
 HAS_GPU = torch.cuda.is_available()
 
-try:
-    from sglang.srt.utils.common import get_device_sm
-except Exception:  # pragma: no cover
-    get_device_sm = None
 PAGE = 128
 HEAD_DIM = 128
 
@@ -109,86 +106,332 @@ class TestLockedJITEntry(CustomTestCase):
         self.assertEqual(fn.call_count, 2)
 
 
-@unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")
-class TestPpuMsaGate(CustomTestCase):
-    def test_fp8_main_kv_accepts_only_e4m3(self):
-        if get_device_sm is None:
-            self.skipTest("Cannot import get_device_sm")
-        sm = get_device_sm()
-        if sm < 80:
-            self.skipTest(f"MSA PPU gate requires SM>=80, got SM{sm}")
-        is_sm89_plus = sm >= 89
-        expected_index_dtype = torch.float8_e4m3fn if is_sm89_plus else torch.bfloat16
-        expected_score_dtype = torch.bfloat16 if is_sm89_plus else torch.float32
+class _MsaGateFixture(CustomTestCase):
+    _SPARSE_CFG = {
+        "sparse_num_index_heads": 4,
+        "sparse_block_size": PAGE,
+        "sparse_topk_blocks": 16,
+        "sparse_index_dim": HEAD_DIM,
+        "sparse_attention_freq": [0, 1],
+        "sparse_disable_index_value": [0, 1],
+        "sparse_init_block": 1,
+        "sparse_local_block": 1,
+    }
 
-        main_pool = SimpleNamespace(
-            head_num=4,
-            head_dim=128,
-            dtype=torch.float8_e4m3fn,
+    def _evaluate(
+        self,
+        *,
+        page_size=PAGE,
+        sm=89,
+        msa_enabled=True,
+        api_available=True,
+        indexer_fp8="1",
+        attend=True,
+        speculative=None,
+        main_dtype=torch.bfloat16,
+        model_dtype=torch.bfloat16,
+        head_dim=HEAD_DIM,
+        kv_heads=4,
+        context_len=4096,
+        tp_size=1,
+        dcp_size=1,
+        sparse_overrides=None,
+        fp8_attn_gemm=False,
+        verify_pool=False,
+    ):
+        from sglang.srt.configs.model_config import (
+            get_minimax_sparse_window_blocks,
         )
-        backend = SimpleNamespace(
-            kv_pool=SimpleNamespace(
-                main_pool=main_pool,
-                index_kv_pool=None,
-                index_k_pool=SimpleNamespace(dtype=expected_index_dtype),
+        from sglang.srt.mem_cache.memory_pool import get_minimax_sparse_index_dtype
+        from sglang.srt.runtime_context import get_context, get_parallel, get_spec
+
+        sparse_cfg = {**self._SPARSE_CFG, **(sparse_overrides or {})}
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                sparse_attention_config=sparse_cfg,
+                architectures=["MiniMaxM3SparseForCausalLM"],
             ),
-            block_size_k=PAGE,
-            page_size=PAGE,
-            topk_blocks=16,
-            idx_head_dim=HEAD_DIM,
-            sparse_layer_ids={1},
-            disable_value_layer_ids={1},
-            score_type="max",
-            max_context_len=4096,
-            init_blocks=1,
-            local_blocks=1,
+            head_dim=head_dim,
+            context_len=context_len,
+            num_attention_heads=8,
+            get_num_kv_heads=lambda tp, dcp=1: max(1, kv_heads // (tp // dcp)),
         )
         runner = SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=object(), num_attention_heads=8),
-            dtype=torch.bfloat16,
+            model_config=model_config,
+            dtype=model_dtype,
             max_running_requests=16,
-            server_args=SimpleNamespace(speculative_algorithm=None),
         )
+        mod = "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu"
         with (
-            mock.patch(
-                "sglang.srt.configs.model_config.get_minimax_sparse_attention_config",
-                return_value={"sparse_num_index_heads": 4},
+            get_context().override_server_args(
+                tp_size=tp_size, dcp_size=dcp_size, page_size=page_size
             ),
-            mock.patch("sglang.srt.utils.common.is_sail", return_value=True),
+            # The raw seed still has no speculative algorithm: both gate readers
+            # must see this post-publish change, not a runner.server_args double.
+            get_spec().override(speculative_algorithm=speculative),
+            mock.patch("sglang.srt.utils.common.get_device_sm", return_value=sm),
+            mock.patch(f"{mod}.ppu_msa_available", return_value=api_available),
             mock.patch(
-                "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu._sail_msa_bool_with_arch_default",
-                side_effect=lambda _name, _sm_default: is_sm89_plus,
-            ),
-            mock.patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(attn_tp_size=1),
-            ),
-            mock.patch(
-                "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu.ppu_msa_available",
+                "sglang.srt.mem_cache.memory_pool.current_platform.is_sail",
                 return_value=True,
             ),
-            mock.patch(
-                "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu.envs.SGLANG_SAIL_MINIMAX_M3_MSA.get",
-                return_value=True,
-            ),
-            mock.patch(
-                "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu.envs.SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND.get",
-                return_value=True,
+            mock.patch.dict(
+                os.environ,
+                {
+                    "SGLANG_SAIL_MINIMAX_M3_MSA": str(int(msa_enabled)),
+                    "SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8": indexer_fp8,
+                    "SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_SCORE_BF16": "1",
+                    "SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND": str(int(attend)),
+                },
             ),
         ):
-            ok, use_attend, reasons = compute_msa_ppu_gate(backend, runner)
+            if indexer_fp8 == "":
+                os.environ.pop("SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8")
+                os.environ.pop("SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_SCORE_BF16")
+            fp8 = ppu_msa_indexer_fp8_available(
+                model_config,
+                page_size=page_size,
+                main_dtype=main_dtype,
+                model_dtype=model_dtype,
+            )
+            index_dtype = get_minimax_sparse_index_dtype(
+                fp8_attn_gemm=fp8_attn_gemm,
+                kv_cache_dtype=main_dtype,
+                model_dtype=model_dtype,
+                model_config=model_config,
+                page_size=page_size,
+            )
+            init_blocks, local_blocks = get_minimax_sparse_window_blocks(sparse_cfg)
+            backend = SimpleNamespace(
+                kv_pool=SimpleNamespace(
+                    main_pool=SimpleNamespace(
+                        head_num=model_config.get_num_kv_heads(
+                            get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+                        ),
+                        head_dim=head_dim,
+                        dtype=main_dtype,
+                    ),
+                    index_kv_pool=None,
+                    index_k_pool=SimpleNamespace(dtype=index_dtype),
+                ),
+                block_size_k=sparse_cfg["sparse_block_size"],
+                page_size=page_size,
+                topk_blocks=sparse_cfg["sparse_topk_blocks"],
+                idx_head_dim=sparse_cfg["sparse_index_dim"],
+                sparse_layer_ids={1},
+                disable_value_layer_ids={
+                    i
+                    for i, flag in enumerate(sparse_cfg["sparse_disable_index_value"])
+                    if flag
+                },
+                score_type=sparse_cfg.get("sparse_score_type", "max"),
+                max_context_len=context_len,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+            )
+            if verify_pool:
+                from functools import partial
 
-            self.assertTrue(ok, reasons)
-            self.assertTrue(use_attend)
-            self.assertEqual(backend._ppu_msa_use_fp8_kvcache, is_sm89_plus)
-            self.assertEqual(backend._ppu_msa_indexer_fp8, is_sm89_plus)
-            self.assertEqual(backend._ppu_msa_score_dtype, expected_score_dtype)
+                from sglang.srt.mem_cache.kv_cache_configurator import (
+                    KVCacheConfigurator,
+                )
+                from sglang.srt.mem_cache.memory_pool import (
+                    MHATokenToKVPool,
+                    MiniMaxSparseKVPool,
+                )
+                from sglang.srt.model_executor.pool_configurator import (
+                    DefaultPoolConfigurator,
+                )
+                from sglang.srt.runtime_context import get_schedule
 
-            main_pool.dtype = torch.float8_e5m2
-            ok, _, reasons = compute_msa_ppu_gate(backend, runner)
+                # Real CPU buffers, only the accelerator stream boundary is disabled.
+                kvc = SimpleNamespace(
+                    model_config=model_config,
+                    kv_cache_dtype=main_dtype,
+                    kv_cache_dtype_str="auto",
+                    model_dtype=model_dtype,
+                    pool_page_size=get_schedule().page_size,
+                    layer_info=SimpleNamespace(start_layer=0, end_layer=2),
+                    device="cpu",
+                    use_mla_backend=False,
+                    is_draft_worker=False,
+                )
+                pool_mod = "sglang.srt.mem_cache.kv_cache_configurator"
+                with (
+                    mock.patch(
+                        f"{pool_mod}.MiniMaxSparseKVPool",
+                        new=partial(
+                            MiniMaxSparseKVPool,
+                            main_pool_cls=partial(
+                                MHATokenToKVPool, enable_alt_stream=False
+                            ),
+                        ),
+                    ),
+                    mock.patch.dict(os.environ, {"SGLANG_USE_HND_KVCACHE": "0"}),
+                ):
+                    pool = KVCacheConfigurator._build_minimax_sparse_kv_pool(
+                        kvc, max_total_num_tokens=PAGE
+                    )
+                estimator = object.__new__(DefaultPoolConfigurator)
+                cell_bytes = estimator._compute_cell_size(kvc, num_layers=2)
+                self.assertEqual(
+                    sum(pool.get_kv_size_bytes()),
+                    (PAGE + pool.page_size) * cell_bytes,
+                )
+                self.assertEqual(pool.index_k_pool.dtype, index_dtype)
+                backend.kv_pool = pool
+            gate = compute_msa_ppu_gate(backend, runner)
+        return fp8, index_dtype, backend, gate
 
+
+@unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")
+class TestPpuMsaGate(_MsaGateFixture):
+    def test_arch_defaults_and_main_kv_dtype(self):
+        for sm in (80, 89):
+            with self.subTest(sm=sm):
+                fp8, dtype, backend, (ok, use_attend, reasons) = self._evaluate(
+                    sm=sm, indexer_fp8="", main_dtype=torch.float8_e4m3fn
+                )
+                self.assertTrue(ok, reasons)
+                self.assertTrue(use_attend)
+                self.assertEqual(fp8, sm >= 89)
+                self.assertEqual(
+                    dtype, torch.float8_e4m3fn if sm >= 89 else torch.bfloat16
+                )
+                self.assertEqual(backend._ppu_msa_use_fp8_kvcache, sm >= 89)
+                self.assertEqual(backend._ppu_msa_indexer_fp8, sm >= 89)
+                self.assertEqual(
+                    backend._ppu_msa_score_dtype,
+                    torch.bfloat16 if sm >= 89 else torch.float32,
+                )
+
+    def test_attend_disabled_still_allows_fp8_indexer(self):
+        fp8, _, _, (ok, use_attend, reasons) = self._evaluate(attend=False)
+        self.assertTrue(fp8)
+        self.assertTrue(ok)
+        self.assertFalse(use_attend)
+        self.assertIn("SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND=0", reasons)
+
+
+@unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")
+class TestPpuMsaIndexerFp8Allocation(_MsaGateFixture):
+    """Every fixed gate failure must keep the index cache readable by Triton."""
+
+    def test_allocation_and_backend_share_gate(self):
+        cases = [
+            ({}, None),
+            ({"page_size": 1}, "page_size!=128"),
+            ({"msa_enabled": False}, "SGLANG_SAIL_MINIMAX_M3_MSA=0"),
+            ({"sm": 79}, "SM<80"),
+            ({"api_available": False}, "fmha_sm100 unavailable or API drifted"),
+            ({"speculative": "EAGLE"}, "speculative decoding enabled"),
+            ({"head_dim": 64}, "main head_dim!=128"),
+            ({"kv_heads": 128}, "num_kv_heads==128 is layout-ambiguous"),
+            ({"kv_heads": 2}, "num_idx_heads!=num_kv_heads"),
+            ({"main_dtype": torch.float16}, "main KV dtype must be bf16 or fp8_e4m3"),
+            (
+                {"main_dtype": torch.float8_e5m2},
+                "main KV dtype must be bf16 or fp8_e4m3",
+            ),
+            (
+                {"main_dtype": torch.float8_e4m3fn, "model_dtype": torch.float16},
+                "fp8 main KV requires bf16 model Q for fp8 attend staging",
+            ),
+            (
+                {"context_len": 12288 * PAGE},
+                "aligned max_k_tiles >= 12288 (context too long)",
+            ),
+            ({"sparse_overrides": {"sparse_block_size": 64}}, "block_size_k!=128"),
+            ({"sparse_overrides": {"sparse_topk_blocks": 8}}, "topk_blocks!=16"),
+            ({"sparse_overrides": {"sparse_index_dim": 64}}, "idx_head_dim!=128"),
+            ({"sparse_overrides": {"sparse_score_type": "lse"}}, "score_type!=max"),
+            (
+                {"sparse_overrides": {"sparse_disable_index_value": [0, 0]}},
+                "non-disable-value sparse layers exist (MSA produces no idx_o)",
+            ),
+            (
+                {"sparse_overrides": {"sparse_local_block": 1025}},
+                "max(init_blocks, local_blocks) > 1024",
+            ),
+        ]
+        for options, reason in cases:
+            with self.subTest(options=options):
+                fp8, dtype, _, (ok, _, reasons) = self._evaluate(**options)
+                self.assertEqual(fp8, reason is None)
+                self.assertEqual(ok, reason is None, reasons)
+                self.assertEqual(
+                    dtype,
+                    torch.float8_e4m3fn
+                    if reason is None
+                    else options.get("model_dtype", torch.bfloat16),
+                )
+                if reason is not None:
+                    self.assertIn(reason, reasons)
+
+    def test_indexer_disabled_keeps_bf16_and_backend_usable(self):
+        fp8, dtype, _, (ok, _, reasons) = self._evaluate(indexer_fp8="0")
+        self.assertFalse(fp8)
+        self.assertEqual(dtype, torch.bfloat16)
+        self.assertTrue(ok, reasons)
+
+    def test_other_fp8_mode_cannot_bypass_sail_gate(self):
+        fp8, dtype, _, (ok, _, _) = self._evaluate(
+            page_size=1, main_dtype=torch.float8_e4m3fn, fp8_attn_gemm=True
+        )
+        self.assertFalse(fp8)
         self.assertFalse(ok)
-        self.assertIn("main KV dtype must be bf16 or fp8_e4m3", reasons)
+        self.assertEqual(dtype, torch.bfloat16)
+
+    def test_token_window_rounding_matches_backend(self):
+        from sglang.srt.configs.model_config import get_minimax_sparse_window_blocks
+
+        for init_tokens, local_tokens, expected in (
+            (0, 0, (0, 1)),
+            (1, PAGE, (1, 2)),
+            (PAGE + 1, PAGE + 1, (2, 3)),
+        ):
+            with self.subTest(init_tokens=init_tokens, local_tokens=local_tokens):
+                self.assertEqual(
+                    get_minimax_sparse_window_blocks(
+                        {
+                            "sparse_block_size": PAGE,
+                            "sparse_init_tokens": init_tokens,
+                            "sparse_local_tokens": local_tokens,
+                        }
+                    ),
+                    expected,
+                )
+
+    def test_estimate_matches_constructed_pool(self):
+        for options in (
+            {},
+            {"page_size": 1},
+            {"msa_enabled": False},
+            {"indexer_fp8": "0"},
+            {"main_dtype": torch.float8_e4m3fn},
+            {
+                "tp_size": 2,
+                "dcp_size": 2,
+                "sparse_overrides": {"sparse_num_index_heads": 8},
+            },
+        ):
+            with self.subTest(options=options):
+                fp8, _, _, (ok, _, reasons) = self._evaluate(
+                    verify_pool=True, **options
+                )
+                self.assertEqual(ok, fp8 or options.get("indexer_fp8") == "0", reasons)
+
+    def test_tp_dcp_head_counts_match_allocation(self):
+        for idx_heads, expected in ((4, False), (8, True)):
+            with self.subTest(idx_heads=idx_heads):
+                fp8, _, backend, (ok, _, reasons) = self._evaluate(
+                    tp_size=2,
+                    dcp_size=2,
+                    sparse_overrides={"sparse_num_index_heads": idx_heads},
+                )
+                self.assertEqual(backend.kv_pool.main_pool.head_num, 4)
+                self.assertEqual(fp8, expected)
+                self.assertEqual(ok, expected, reasons)
 
 
 @unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")
