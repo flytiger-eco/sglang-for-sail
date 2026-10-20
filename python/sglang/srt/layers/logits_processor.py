@@ -933,8 +933,6 @@ class LogitsProcessor(nn.Module):
             if self.do_tensor_parallel_all_gather_dp_attn
             else LoRABatchLayout.DP_LOCAL
         )
-        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         if SGLANG_PROFILE_NVTX:
             lm_head_weight_shape = getattr(lm_head.weight, "shape", None)
             logit_scale_shape = getattr(self.logit_scale, "shape", None)
@@ -946,7 +944,8 @@ class LogitsProcessor(nn.Module):
                 th_nvtx_range_push(
                     f"[FW:GEMM] op:compute_logits,type:P,hidden_states:{hidden_states.shape},lm_head_weight:{lm_head_weight_shape},logit_scale:{logit_scale_shape}"
                 )
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
+            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
