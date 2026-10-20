@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_ppu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -206,11 +207,11 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
+    # DFLASH + dp attention is validated on NPU and ppu.
+    if cfg.enable_dp_attention and cfg.device != "npu" and not is_ppu():
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
+            "attention outside NPU and PPU devices."
         )
 
     if cfg.pp_size != 1:
