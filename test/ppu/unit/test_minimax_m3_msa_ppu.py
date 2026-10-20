@@ -27,6 +27,7 @@ try:
         compute_msa_ppu_gate,
         msa_ppu_forward_extend,
         ppu_msa_available,
+        ppu_msa_indexer_fp8_available,
     )
 
     _HAS_MODULE = True
@@ -189,6 +190,76 @@ class TestPpuMsaGate(CustomTestCase):
 
         self.assertFalse(ok)
         self.assertIn("main KV dtype must be bf16 or fp8_e4m3", reasons)
+
+
+@unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")
+class TestPpuMsaIndexerFp8Allocation(CustomTestCase):
+    """The fp8 index-K cache is allocated only when the SAIL MSA gate will pass."""
+
+    _SPARSE_CFG = {
+        "sparse_num_index_heads": 4,
+        "sparse_block_size": PAGE,
+        "sparse_topk_blocks": 16,
+        "sparse_index_dim": HEAD_DIM,
+        "sparse_attention_freq": [0, 1],
+        "sparse_disable_index_value": [0, 1],
+        "sparse_init_block": 1,
+        "sparse_local_block": 1,
+    }
+
+    def _fp8_available(self, *, page_size, msa_enabled=True, speculative=None):
+        model_config = SimpleNamespace(
+            hf_config=object(),
+            head_dim=HEAD_DIM,
+            context_len=4096,
+            get_num_kv_heads=lambda tp, dcp=1: 4,
+        )
+        mod = "sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu"
+        with (
+            mock.patch(
+                "sglang.srt.configs.model_config.get_minimax_sparse_attention_config",
+                return_value=self._SPARSE_CFG,
+            ),
+            mock.patch(
+                f"{mod}._sail_msa_bool_with_arch_default",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=1, attn_dcp_size=1),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=speculative),
+            ),
+            mock.patch(f"{mod}.ppu_msa_available", return_value=True),
+            mock.patch(
+                f"{mod}.envs.SGLANG_SAIL_MINIMAX_M3_MSA.get",
+                return_value=msa_enabled,
+            ),
+        ):
+            return ppu_msa_indexer_fp8_available(
+                model_config,
+                page_size=page_size,
+                main_dtype=torch.bfloat16,
+                model_dtype=torch.bfloat16,
+            )
+
+    def setUp(self):
+        if get_device_sm is None or get_device_sm() < 80:
+            self.skipTest("MSA PPU gate requires SM>=80")
+
+    def test_fp8_when_gate_passes(self):
+        self.assertTrue(self._fp8_available(page_size=PAGE))
+
+    def test_bf16_when_page_size_is_not_128(self):
+        self.assertFalse(self._fp8_available(page_size=1))
+
+    def test_bf16_when_msa_disabled(self):
+        self.assertFalse(self._fp8_available(page_size=PAGE, msa_enabled=False))
+
+    def test_bf16_with_speculative_decoding(self):
+        self.assertFalse(self._fp8_available(page_size=PAGE, speculative="EAGLE"))
 
 
 @unittest.skipUnless(_HAS_MODULE, "msa_ppu not importable")

@@ -1849,6 +1849,8 @@ class KVCacheConfigurator:
                 ),
                 kv_cache_dtype=self.kv_cache_dtype,
                 model_dtype=self.model_dtype,
+                model_config=self.model_config,
+                page_size=self.pool_page_size,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
