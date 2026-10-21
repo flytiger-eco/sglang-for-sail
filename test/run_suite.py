@@ -201,6 +201,8 @@ NIGHTLY_SUITES = {
         "nightly-answer-8-glm52-ppu",
         "nightly-answer-8-kimi26-ppu",
         "nightly-answer-8-minimax27-ppu",
+        # DeepSeek-V4-Flash W8A8, the first DeepSeek case on this board.
+        "nightly-answer-8-dsv4flash-ppu",
         # Whole boards, one suite each: every node runs the same registered file
         # and the launcher tells each which rank it is.
         "nightly-answer-16-ppu",
@@ -259,6 +261,8 @@ NIGHTLY_SUITES = {
         "nightly-accuracy-8-kimi26-ppu",
         "nightly-accuracy-8-minimax27-ppu",
         "nightly-accuracy-8-qwen35-ppu",
+        # DeepSeek-V4-Flash W8A8, the first DeepSeek case on this board.
+        "nightly-accuracy-8-dsv4flash-ppu",
     ],
 }
 

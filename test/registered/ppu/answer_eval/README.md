@@ -18,7 +18,7 @@ reviewable unit. Nothing about discovery changes: `run_suite.py` and the
 `check-registered-tests` hook both walk `test/registered/**/*.py`, and a suite is
 owned by the `register_ppu_ci` call inside the file, not by its directory.
 
-Eight suites cover six models. A suite is a file, because `register_ppu_ci`
+Nine suites cover seven models. A suite is a file, because `register_ppu_ci`
 registers per file; a file holds only configs that agree on the checkpoint family
 and on the node count, because every test in a suite runs in one process off one
 `SGLANG_PPU_ANSWER_TEST_CONFIG` and a node count decides which workflow can run
@@ -35,6 +35,7 @@ other two formats need 1.
 | `nightly-answer-8-glm52-ppu` | `test_ppu_glm52_answer.py` | GLM-5.2 | 3 | 8 |
 | `nightly-answer-8-kimi26-ppu` | `test_ppu_kimi_k26_answer.py` | Kimi-K2.6 | 2 | 8 |
 | `nightly-answer-8-minimax27-ppu` | `test_ppu_minimax_m27_answer.py` | MiniMax-M2.7 | 3 | 8 |
+| `nightly-answer-8-dsv4flash-ppu` | `test_ppu_dsv4_flash_answer.py` | DeepSeek-V4-Flash | 1 | 8 |
 | `nightly-answer-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_answer.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 16, over 2 nodes |
 | `nightly-answer-16-kimi26-ppu` | `test_ppu_kimi_k26_w8a8_answer.py` | Kimi-K2.6-W8A8-INT8 | 1 | 16, over 2 nodes |
 | `nightly-answer-32-ppu` | `test_ppu_qwen38_a95b_answer.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 32, over 4 nodes |
@@ -53,7 +54,7 @@ read against — see [Measured baseline (ZW810E)](#measured-baseline-zw810e).
 
 | Line | Suites | Devices | Workflow |
 | --- | --- | --- | --- |
-| single board | the five 8-device suites, `nightly-answer-1-ppu` included | 1–8 | `test-ppu-answer.yml` |
+| single board | the six 8-device suites, `nightly-answer-1-ppu` included | 1–8 | `test-ppu-answer.yml` |
 | two nodes | `nightly-answer-16-ppu`, `nightly-answer-16-kimi26-ppu` | 16 | `test-ppu-answer-16.yml` |
 | four nodes | `nightly-answer-32-ppu` | 32 | `test-ppu-answer-32.yml` |
 
@@ -641,8 +642,10 @@ the executed set is what `register_ppu_ci` declares.
 
 ## The ported 144GiB entries
 
-Twelve configs were added from the internal btv1.5 `answer_144g` plan, against
-checkpoints already staged on this NAS. Each row names the internal
+Twelve configs were added from the internal btv1.5 `answer_144g` plan, and one
+DeepSeek-V4-Flash entry from the btv1.1 `P0_daily` plan (its `answer_144g` has
+no V4-Flash case), against checkpoints already staged on this NAS. Each row
+names the internal
 `llm_infer_sglang_evalscope` case its server parameters came from, and the
 checkpoint as measured on `na131t-ppu810e-test001`, which mounts the same NAS the
 cluster does. Every one of them holds exactly the number of shards its own
@@ -664,6 +667,7 @@ index, not from the `-of-NNNNN` suffix the filenames carry, which on
 | `qwen3.5-397b-fp8-channelwise` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-FP8-Channelwise` | 379.0 GiB, 94 |
 | `qwen3.5-397b-mxfp4-fp8` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-MXFP4-FP8` | 215.6 GiB, 94 |
 | `qwen3.8-2.4t-a95b-mxfp4-fp8` | `-16-` | `qwen3.7-mxfp4-fp8_3001` | `v3.8/Qwen3.8-2.4T-A95B-...-MXFP4-...` | 1272.1 GiB, 213 |
+| `dsv4-flash-w8a8-int8` | `-8-dsv4flash-` | `deepseek-v4-flash-a8w8_3001` | `deepseek/v4/DeepSeek-V4-Flash-W8A8-INT8` | not yet measured |
 
 Seven of the twelve entries name a source case that does not carry their
 checkpoint, in four groups. That is the plan's own situation rather than a
