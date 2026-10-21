@@ -82,6 +82,35 @@ def test_v1_top2048_ties(length):
     _check_row(scores[0], output[0], length, 2048)
 
 
+def test_v1_top2048_clustered_scores_are_exact():
+    # 4096 distinct FP32 scores inside one coarse FP16 bin overflow the tie
+    # buffer; the radix fallback must still select the exact top-k.
+    length, k = 4096, 2048
+    scores = (
+        1.0 + torch.arange(length, dtype=torch.float32, device="cuda") * 1e-6
+    ).unsqueeze(0)
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    output = torch.full((1, k), -99, dtype=torch.int32, device="cuda")
+    topk_transform_paged(scores, lengths, None, output, 1)
+    torch.cuda.synchronize()
+    _check_row(scores[0], output[0], length, k)
+
+
+def test_v1_top2048_clustered_scores_above_radix_capacity():
+    # 16384 distinct FP32 scores inside one coarse bin overflow both the tie
+    # buffer and radix's 8192-candidate refill; the exact fallback must still
+    # select the whole row's top-k.
+    length, k = 16384, 2048
+    scores = (
+        1.0 + torch.arange(length, dtype=torch.float32, device="cuda") * 2**-22
+    ).unsqueeze(0)
+    lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    output = torch.full((1, k), -99, dtype=torch.int32, device="cuda")
+    topk_transform_paged(scores, lengths, None, output, 1)
+    torch.cuda.synchronize()
+    _check_row(scores[0], output[0], length, k)
+
+
 def test_candidate_top2048_blocks():
     torch.manual_seed(0)
     width, k = 40000, 2048
