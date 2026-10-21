@@ -339,6 +339,7 @@ else:
         pass
 
 
+# Scheduler entry points dispatch batches; see event loops below.
 logger = logging.getLogger(__name__)
 
 
