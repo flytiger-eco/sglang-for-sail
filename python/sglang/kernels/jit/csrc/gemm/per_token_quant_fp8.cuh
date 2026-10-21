@@ -61,6 +61,36 @@ SGL_DEVICE float per_token_quant_block_max(float value) {
   return value;
 }
 
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+template <typename T, typename DST_DTYPE, int kVecSize>
+SGL_DEVICE void
+per_token_quant_store_fp32(const PerTokenQuantVector<T, kVecSize>& input_vec, float scale_inv, DST_DTYPE* output_arr) {
+  // bf16/fp32 input: use cvt.rn.satfinite.e4m3x2.f32
+  uint16_t* output_u16 = reinterpret_cast<uint16_t*>(output_arr);
+#pragma unroll
+  for (uint32_t j = 0; j < kVecSize / 2; ++j) {
+    float val_a = static_cast<float>(input_vec[j * 2]) * scale_inv;
+    float val_b = static_cast<float>(input_vec[j * 2 + 1]) * scale_inv;
+
+    // cvt.rn.satfinite.e4m3x2.f32: d[15:8]=cvt(first_arg), d[7:0]=cvt(second_arg)
+    // On little-endian: low byte (d[7:0]) stored first -> output_arr[j*2]
+    // So pass val_b as first arg (-> high byte = arr[j*2+1]),
+    //         val_a as second arg (-> low byte = arr[j*2])
+    uint16_t packed_fp8x2;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(packed_fp8x2) : "f"(val_b), "f"(val_a));
+
+    output_u16[j] = packed_fp8x2;
+  }
+
+  // Handle odd element (won't trigger for kVecSize = 4, 8, 16)
+  if constexpr (kVecSize % 2 != 0) {
+    float val = static_cast<float>(input_vec[kVecSize - 1]) * scale_inv;
+    val = fmaxf(fminf(val, device::math::FP8_E4M3_MAX), -device::math::FP8_E4M3_MAX);
+    output_arr[kVecSize - 1] = static_cast<DST_DTYPE>(val);
+  }
+}
+#endif
+
 template <typename T, typename DST_DTYPE, int kVecSize>
 SGL_DEVICE void per_token_quant_store(
     const PerTokenQuantVector<T, kVecSize>& input_vec, float scale_inv, DST_DTYPE* token_output, int i) {
@@ -69,68 +99,53 @@ SGL_DEVICE void per_token_quant_store(
   // SM89+ path: use cvt.rn.satfinite.e4m3x2 for packed 2-element conversion
   // satfinite automatically clamps, no manual fmaxf/fminf needed
   if constexpr (std::is_same_v<T, __nv_half>) {
-    // Full fp16 path: mul.rn.f16x2 + cvt.rn.satfinite.e4m3x2.f16x2
-    __half scale_inv_h = __float2half(scale_inv);
-    uint32_t scale_inv_f16x2;
-    asm("mov.b32 %0, {%1, %2};\n"
-        : "=r"(scale_inv_f16x2)
-        : "h"(*(reinterpret_cast<const uint16_t*>(&scale_inv_h))),
-          "h"(*(reinterpret_cast<const uint16_t*>(&scale_inv_h))));
-
-    uint16_t* output_u16 = reinterpret_cast<uint16_t*>(output_arr);
-#pragma unroll
-    for (uint32_t j = 0; j < kVecSize / 2; ++j) {
-      // Pack two fp16 inputs into a uint32
-      uint32_t input_f16x2;
+    // Tiny-magnitude rows (max < 448 / 65504) produce a scale_inv above the
+    // fp16 finite range; converting it to fp16 yields inf, so 0 * inf = NaN.
+    // Keep the packed fp16 fast path only when scale_inv is representable.
+    if (scale_inv <= 65504.0f) {
+      // Full fp16 path: mul.rn.f16x2 + cvt.rn.satfinite.e4m3x2.f16x2
+      __half scale_inv_h = __float2half(scale_inv);
+      uint32_t scale_inv_f16x2;
       asm("mov.b32 %0, {%1, %2};\n"
-          : "=r"(input_f16x2)
-          : "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2]),
-            "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2 + 1]));
+          : "=r"(scale_inv_f16x2)
+          : "h"(*(reinterpret_cast<const uint16_t*>(&scale_inv_h))),
+            "h"(*(reinterpret_cast<const uint16_t*>(&scale_inv_h))));
 
-      // fp16x2 multiply
-      uint32_t scaled_f16x2;
-      asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(scaled_f16x2) : "r"(input_f16x2), "r"(scale_inv_f16x2));
+      uint16_t* output_u16 = reinterpret_cast<uint16_t*>(output_arr);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize / 2; ++j) {
+        // Pack two fp16 inputs into a uint32
+        uint32_t input_f16x2;
+        asm("mov.b32 %0, {%1, %2};\n"
+            : "=r"(input_f16x2)
+            : "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2]),
+              "h"(reinterpret_cast<const uint16_t*>(&input_vec[0])[j * 2 + 1]));
 
-      // fp16x2 -> e4m3x2
-      // cvt.rn.satfinite.e4m3x2.f16x2: d[15:8]=cvt(a[31:16]), d[7:0]=cvt(a[15:0])
-      // On little-endian: a[15:0] is first element, a[31:16] is second
-      // So d[7:0]=cvt(first)=output_arr[j*2], d[15:8]=cvt(second)=output_arr[j*2+1] -> correct!
-      uint16_t packed_fp8x2;
-      asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed_fp8x2) : "r"(scaled_f16x2));
+        // fp16x2 multiply
+        uint32_t scaled_f16x2;
+        asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(scaled_f16x2) : "r"(input_f16x2), "r"(scale_inv_f16x2));
 
-      output_u16[j] = packed_fp8x2;
-    }
+        // fp16x2 -> e4m3x2
+        // cvt.rn.satfinite.e4m3x2.f16x2: d[15:8]=cvt(a[31:16]), d[7:0]=cvt(a[15:0])
+        // On little-endian: a[15:0] is first element, a[31:16] is second
+        // So d[7:0]=cvt(first)=output_arr[j*2], d[15:8]=cvt(second)=output_arr[j*2+1] -> correct!
+        uint16_t packed_fp8x2;
+        asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(packed_fp8x2) : "r"(scaled_f16x2));
 
-    // Handle odd element (won't trigger for kVecSize = 4, 8, 16)
-    if constexpr (kVecSize % 2 != 0) {
-      float val = static_cast<float>(input_vec[kVecSize - 1]) * scale_inv;
-      val = fmaxf(fminf(val, device::math::FP8_E4M3_MAX), -device::math::FP8_E4M3_MAX);
-      output_arr[kVecSize - 1] = static_cast<DST_DTYPE>(val);
+        output_u16[j] = packed_fp8x2;
+      }
+
+      // Handle odd element (won't trigger for kVecSize = 4, 8, 16)
+      if constexpr (kVecSize % 2 != 0) {
+        float val = static_cast<float>(input_vec[kVecSize - 1]) * scale_inv;
+        val = fmaxf(fminf(val, device::math::FP8_E4M3_MAX), -device::math::FP8_E4M3_MAX);
+        output_arr[kVecSize - 1] = static_cast<DST_DTYPE>(val);
+      }
+    } else {
+      per_token_quant_store_fp32(input_vec, scale_inv, output_arr);
     }
   } else {
-    // bf16/fp32 input: use cvt.rn.satfinite.e4m3x2.f32
-    uint16_t* output_u16 = reinterpret_cast<uint16_t*>(output_arr);
-#pragma unroll
-    for (uint32_t j = 0; j < kVecSize / 2; ++j) {
-      float val_a = static_cast<float>(input_vec[j * 2]) * scale_inv;
-      float val_b = static_cast<float>(input_vec[j * 2 + 1]) * scale_inv;
-
-      // cvt.rn.satfinite.e4m3x2.f32: d[15:8]=cvt(first_arg), d[7:0]=cvt(second_arg)
-      // On little-endian: low byte (d[7:0]) stored first -> output_arr[j*2]
-      // So pass val_b as first arg (-> high byte = arr[j*2+1]),
-      //         val_a as second arg (-> low byte = arr[j*2])
-      uint16_t packed_fp8x2;
-      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(packed_fp8x2) : "f"(val_b), "f"(val_a));
-
-      output_u16[j] = packed_fp8x2;
-    }
-
-    // Handle odd element (won't trigger for kVecSize = 4, 8, 16)
-    if constexpr (kVecSize % 2 != 0) {
-      float val = static_cast<float>(input_vec[kVecSize - 1]) * scale_inv;
-      val = fmaxf(fminf(val, device::math::FP8_E4M3_MAX), -device::math::FP8_E4M3_MAX);
-      output_arr[kVecSize - 1] = static_cast<DST_DTYPE>(val);
-    }
+    per_token_quant_store_fp32(input_vec, scale_inv, output_arr);
   }
 #else
   // Original path for SM < 89 and ROCm
