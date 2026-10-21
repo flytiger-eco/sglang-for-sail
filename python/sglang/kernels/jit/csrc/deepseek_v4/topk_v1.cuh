@@ -150,7 +150,7 @@ struct RegisterTopKSmem {
 
 template <bool kIs2Pass>
 [[maybe_unused]]
-SGL_DEVICE void register_topk(
+SGL_DEVICE bool register_topk(
     const float* __restrict__ scores,
     int32_t* __restrict__ indices,
     const uint32_t length,
@@ -256,6 +256,11 @@ SGL_DEVICE void register_topk(
 
   const auto [thr_bin, num_above, num_equal] = smem->match;
 
+  // The tie buffer ranks at most kMaxTies arrivals; a coarse bin with more
+  // members would rank an arbitrary subset, so let the caller run the radix
+  // selection over the whole row instead.
+  if (num_equal > v3::kMaxTies) return true;
+
   // Phase 3: Scatter
   constexpr uint32_t kMaxTolerance = 0;
   const bool need_tiebreak = (num_equal + num_above > topk + kMaxTolerance);
@@ -320,7 +325,7 @@ SGL_DEVICE void register_topk(
   }
 
 [[maybe_unused]] LABEL_SCATTER_DONE:
-  if (!need_tiebreak) return;
+  if (!need_tiebreak) return false;
 
   // Phase 4: Tie-breaking within the threshold bin
   __syncthreads();
@@ -336,7 +341,7 @@ SGL_DEVICE void register_topk(
   };
 
   if (num_ties <= 32u) {
-    if (lane_id >= num_ties || warp_id >= num_ties) return;
+    if (lane_id >= num_ties || warp_id >= num_ties) return false;
     const uint32_t mask = (1ull << num_ties) - 1u;
     const auto tie = tie_buffer[lane_id];
     const auto target_tie = tie_buffer[warp_id];
@@ -388,6 +393,7 @@ SGL_DEVICE void register_topk(
       }
     }
   }
+  return false;
 }
 
 [[maybe_unused]]
@@ -459,6 +465,91 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         s_chunk_buf[bi][tx * 4 + e] = (base + e < length) ? input[base + e] : 0.0f;
       }
     }
+  };
+
+  // Exact fallback for a coarse bin that exceeds the candidate buffer: refine
+  // with histogram-only passes over the whole row, then write the selection
+  // once. Only the pathological clustering case takes this path, so the extra
+  // row scans stay off the normal route.
+  const auto radix_topk_exact = [&] {
+    uint32_t prefix = 0;
+    uint32_t remain = topk;
+    for (uint32_t round = 0; round < 4; ++round) {
+      const uint32_t byte_shift = 24 - round * 8;
+      const uint32_t prefix_shift = 32 - round * 8;
+      if (tx < RADIX + 1) s_histogram[tx] = 0;
+      __syncthreads();
+      issue_chunk(0, 0);
+      cp_async_commit();
+      issue_chunk(1, 1);
+      cp_async_commit();
+      for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+        const uint32_t bi = ci & 1;
+        cp_async_wait_group<1>();
+        __syncthreads();
+        const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+        for (uint32_t e = 0; e < 4; ++e) {
+          const uint32_t idx = base + tx * 4 + e;
+          if (idx >= length) continue;
+          const uint32_t key = convert_to_uint32(s_chunk_buf[bi][tx * 4 + e]);
+          if (round == 0 || (key >> prefix_shift) == prefix) {
+            ::atomicAdd(&s_histogram[(key >> byte_shift) & 0xFF], 1);
+          }
+        }
+        __syncthreads();
+        issue_chunk(ci + 2, bi);
+        cp_async_commit();
+      }
+      cp_async_wait_all();
+      __syncthreads();
+      run_cumsum();
+      if (tx == 0) s_threshold_bin_id = 0;
+      __syncthreads();
+      if (tx < RADIX && s_histogram[tx] > remain && s_histogram[tx + 1] <= remain) {
+        s_threshold_bin_id = tx;
+      }
+      __syncthreads();
+      const uint32_t threshold = s_threshold_bin_id;
+      remain -= s_histogram[threshold + 1];
+      prefix = (prefix << 8) | threshold;
+    }
+
+    if (tx == 0) {
+      s_counter = 0;
+      s_last_remain = static_cast<int32_t>(remain);
+    }
+    __syncthreads();
+    issue_chunk(0, 0);
+    cp_async_commit();
+    issue_chunk(1, 1);
+    cp_async_commit();
+    for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+      const uint32_t bi = ci & 1;
+      cp_async_wait_group<1>();
+      __syncthreads();
+      const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        const uint32_t idx = base + tx * 4 + e;
+        if (idx >= length) continue;
+        const uint32_t key = convert_to_uint32(s_chunk_buf[bi][tx * 4 + e]);
+        if (key > prefix) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          output[pos] = static_cast<int32_t>(idx);
+        } else if (key == prefix) {
+          if (::atomicAdd(&s_last_remain, -1) > 0) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            output[pos] = static_cast<int32_t>(idx);
+          }
+        }
+      }
+      __syncthreads();
+      issue_chunk(ci + 2, bi);
+      cp_async_commit();
+    }
+    cp_async_wait_all();
+    __syncthreads();
   };
 
   // stage 1: 8bit coarse histogram, pipelined via the chunk loader above.
@@ -557,6 +648,11 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     __syncthreads();
   }
 
+  if (s_num_input[0] > SMEM_INPUT_SIZE) {
+    radix_topk_exact();
+    return;
+  }
+
   // stage 2: refine with 8bit radix passes
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
@@ -622,6 +718,10 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         }
       }
       __syncthreads();
+      if (s_num_input[r_idx ^ 1] > SMEM_INPUT_SIZE) {
+        radix_topk_exact();
+        return;
+      }
     }
   }
 }
@@ -646,8 +746,14 @@ __global__ __launch_bounds__(v3::kBlockSize, 2) void topk_512_transform_v3(const
     // Strided output is needed when topk exceeds the 1024 threads per block.
     naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits, topk);
   } else if (seq_len <= v3::kMax1PassLength) {
-    register_topk<false>(score_ptr, s_topk_indices, seq_len, topk, _smem);
+    const bool overflow = register_topk<false>(score_ptr, s_topk_indices, seq_len, topk, _smem);
     __syncthreads();
+    if (overflow) {
+      // A coarse threshold bin held more scores than the tie buffer ranks;
+      // select from the whole row instead.
+      radix_topk(score_ptr, s_topk_indices, seq_len, topk);
+      __syncthreads();
+    }
     const auto tx = threadIdx.x;
     for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
       indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
@@ -657,8 +763,12 @@ __global__ __launch_bounds__(v3::kBlockSize, 2) void topk_512_transform_v3(const
     }
   } else if (seq_len <= v3::kMax2PassLength) {  // Stall instruction fetch: consider tagged as likely?
     [[likely]];
-    register_topk<true>(score_ptr, s_topk_indices, seq_len, topk, _smem);
+    const bool overflow = register_topk<true>(score_ptr, s_topk_indices, seq_len, topk, _smem);
     __syncthreads();
+    if (overflow) {
+      radix_topk(score_ptr, s_topk_indices, seq_len, topk);
+      __syncthreads();
+    }
     const auto tx = threadIdx.x;
     for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
       indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
