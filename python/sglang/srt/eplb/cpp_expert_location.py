@@ -3,7 +3,7 @@ from pathlib import Path
 from torch.utils.cpp_extension import load
 
 _ABS_PATH = Path(__file__).resolve().parent
-_JIT_CSRC_PATH = _ABS_PATH.parents[1] / "jit_kernel" / "csrc" / "eplb"
+_JIT_CSRC_PATH = _ABS_PATH.parents[1] / "kernels" / "jit" / "csrc" / "eplb"
 _SOURCES = [(_JIT_CSRC_PATH / "eplb_expert_location.cpp").resolve()]
 
 _eplb_expert_location_cpp = None
