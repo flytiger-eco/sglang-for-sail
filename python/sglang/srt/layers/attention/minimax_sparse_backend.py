@@ -13,6 +13,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
     get_minimax_sparse_score_type,
+    get_minimax_sparse_window_blocks,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -162,20 +163,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
-        if "sparse_init_block" in sparse_cfg:
-            self.init_blocks = sparse_cfg["sparse_init_block"]
-        else:
-            init_tokens = sparse_cfg["sparse_init_tokens"]
-            self.init_blocks = (
-                init_tokens + self.block_size_k - 1
-            ) // self.block_size_k
-        if "sparse_local_block" in sparse_cfg:
-            self.local_blocks = sparse_cfg["sparse_local_block"]
-        else:
-            local_tokens = sparse_cfg["sparse_local_tokens"]
-            self.local_blocks = (
-                local_tokens + self.block_size_k - 1
-            ) // self.block_size_k + 1
+        self.init_blocks, self.local_blocks = get_minimax_sparse_window_blocks(
+            sparse_cfg
+        )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         if self.hisparse_coordinator is not None:
             selected_tokens = self.topk_blocks * self.block_size_k

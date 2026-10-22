@@ -956,14 +956,18 @@ class ModelRunnerKVCacheMixin:
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    # SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8=1 (PPU only)
-                    # quantizes the index-K cache to fp8 e4m3 for the SAIL MSA
-                    # fp8 OnlyScore indexer.
+                    # On PPU the index-K cache is fp8 e4m3 only when the SAIL
+                    # MSA fp8 OnlyScore indexer is on and its gate will pass.
                     index_dtype=(
                         torch.float8_e4m3fn
                         if (
                             current_platform.is_ppu()
-                            and ppu_msa_indexer_fp8_available()
+                            and ppu_msa_indexer_fp8_available(
+                                self.model_config,
+                                page_size=self.page_size,
+                                main_dtype=self.kv_cache_dtype,
+                                model_dtype=self.dtype,
+                            )
                         )
                         else self.dtype
                     ),

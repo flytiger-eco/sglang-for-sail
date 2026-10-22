@@ -106,9 +106,7 @@ class TestFusedIndexerWkLoader(unittest.TestCase):
             self._load(params, pending, PREFIX + ".weights_proj.weight", wp_int8)
         )
         self.assertTrue(
-            self._load(
-                params, pending, PREFIX + ".weights_proj.weight_scale", scale
-            )
+            self._load(params, pending, PREFIX + ".weights_proj.weight_scale", scale)
         )
         ref = (wp_int8.float() * scale.float()).to(torch.bfloat16)
         self.assertTrue(torch.equal(params[FUSED_NAME][-N_HEADS:], ref))
