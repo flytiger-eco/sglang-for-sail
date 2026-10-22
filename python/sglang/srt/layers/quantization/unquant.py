@@ -1055,7 +1055,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
-        if backend.is_deep_gemm():
+        if backend.is_deep_gemm() and is_sail():
             import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
         self.runner = MoeRunner(backend, moe_runner_config)
 
