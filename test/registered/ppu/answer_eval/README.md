@@ -18,7 +18,7 @@ reviewable unit. Nothing about discovery changes: `run_suite.py` and the
 `check-registered-tests` hook both walk `test/registered/**/*.py`, and a suite is
 owned by the `register_ppu_ci` call inside the file, not by its directory.
 
-Eight suites cover six models. A suite is a file, because `register_ppu_ci`
+Eleven suites cover nine models. A suite is a file, because `register_ppu_ci`
 registers per file; a file holds only configs that agree on the checkpoint family
 and on the node count, because every test in a suite runs in one process off one
 `SGLANG_PPU_ANSWER_TEST_CONFIG` and a node count decides which workflow can run
@@ -26,7 +26,9 @@ it at all. Configs that agree on both do share a suite — Qwen3.5's four, GLM-5
 three and MiniMax-M2.7's three do — and the caller picks which one by naming its
 config. Two models appear twice for the same reason: the 2.4T checkpoint's two
 quantisations need 2 nodes and 4, and Kimi-K2.6's W8A8-INT8 needs 2 where its
-other two formats need 1.
+other two formats need 1. The three DeepSeek entries keep one suite each for the
+opposite reason: V4-Flash, V4-Pro and V3.2 are different checkpoints, so each
+registers its own file.
 
 | Suite | Test file | Model | Configs | Devices |
 | --- | --- | --- | --- | --- |
@@ -35,12 +37,15 @@ other two formats need 1.
 | `nightly-answer-8-glm52-ppu` | `test_ppu_glm52_answer.py` | GLM-5.2 | 3 | 8 |
 | `nightly-answer-8-kimi26-ppu` | `test_ppu_kimi_k26_answer.py` | Kimi-K2.6 | 2 | 8 |
 | `nightly-answer-8-minimax27-ppu` | `test_ppu_minimax_m27_answer.py` | MiniMax-M2.7 | 3 | 8 |
+| `nightly-answer-8-dsv4flash-ppu` | `test_ppu_dsv4_flash_answer.py` | DeepSeek-V4-Flash | 1 | 8 |
+| `nightly-answer-8-dsv4pro-ppu` | `test_ppu_dsv4_pro_answer.py` | DeepSeek-V4-Pro | 1 | 8 |
+| `nightly-answer-8-dsv32-ppu` | `test_ppu_dsv32_answer.py` | DeepSeek-V3.2 | 1 | 8 |
 | `nightly-answer-16-ppu` | `test_ppu_qwen38_a95b_mxfp4_answer.py` | Qwen3.8-2.4T-A95B-MXFP4-FP8 | 1 | 16, over 2 nodes |
 | `nightly-answer-16-kimi26-ppu` | `test_ppu_kimi_k26_w8a8_answer.py` | Kimi-K2.6-W8A8-INT8 | 1 | 16, over 2 nodes |
 | `nightly-answer-32-ppu` | `test_ppu_qwen38_a95b_answer.py` | Qwen3.8-2.4T-A95B-FP8 | 1 | 32, over 4 nodes |
 
 The device count stays in the suite name even where the name also carries a model
-family: it is the scheduling fact a reader needs first, and the four 8-device
+family: it is the scheduling fact a reader needs first, and the six 8-device
 suites differ from each other only in which model they hold. Kimi-K2.6 is the one
 model whose name appears on two different device counts, which is why its
 two-node suite keeps the model in the name as well.
@@ -53,7 +58,7 @@ read against — see [Measured baseline (ZW810E)](#measured-baseline-zw810e).
 
 | Line | Suites | Devices | Workflow |
 | --- | --- | --- | --- |
-| single board | the five 8-device suites, `nightly-answer-1-ppu` included | 1–8 | `test-ppu-answer.yml` |
+| single board | the seven 8-device suites, `nightly-answer-1-ppu` included | 1–8 | `test-ppu-answer.yml` |
 | two nodes | `nightly-answer-16-ppu`, `nightly-answer-16-kimi26-ppu` | 16 | `test-ppu-answer-16.yml` |
 | four nodes | `nightly-answer-32-ppu` | 32 | `test-ppu-answer-32.yml` |
 
@@ -241,9 +246,10 @@ everything around the test differs, while the test itself does not:
   PPUs so that no second pod can land on the board and contend for a device with
   a server that has already claimed most of its memory. The internal btv1.5 plan
   schedules its answer cases as `1node8ppu` for the same reason.
-- **Lanes, not a matrix.** Twelve entries, one job id each, arranged into eight
-  lanes so at most eight boards are held at once: four lanes carry two entries,
-  the second declaring `needs` on the first, and four carry one. A matrix would
+- **Lanes, not a matrix.** Fifteen entries, one job id each, arranged into eight
+  lanes so at most eight boards are held at once: two lanes carry three entries,
+  two carry two, and four carry one, each later entry declaring `needs` on its
+  predecessor. A matrix would
   have been the obvious shape and was the first one tried, and it does not work
   above `max-parallel: 1`. `flytiger-eco/ppu-distributed-action` builds both the
   NAS directory it stages the source to and the name of the K8s job it submits
@@ -263,11 +269,11 @@ everything around the test differs, while the test itself does not:
   `nightly-answer-8-glm52-ppu`: the slug is what names the NAS results directory
   and the artifact, and `upload-artifact@v4` fails outright on a repeated name.
   `--suite` still receives the registered name.
-- **One body, twelve jobs.** The two long shell bodies each entry runs — the
+- **One body, fifteen jobs.** The two long shell bodies each entry runs — the
   board-side one that installs, warms and calls `run_suite.py`, and the
   orchestration-side one that carries the report off the NAS — are
   `scripts/ci/ppu/run_answer_suite_board.sh` and
-  `scripts/ci/ppu/collect_answer_evidence.sh`, so twelve jobs do not carry twelve
+  `scripts/ci/ppu/collect_answer_evidence.sh`, so fifteen jobs do not carry fifteen
   copies of them; what the workflow still states per entry is the K8s action's
   inputs. A local composite action would have been the tidier shape and does not
   work on this runner group: it drives the job through a container hook, so
@@ -279,7 +285,7 @@ everything around the test differs, while the test itself does not:
   because the runner downloads that itself, which is why the K8s action works at
   all — and it is the same split filesystem that silently drops
   `GITHUB_STEP_SUMMARY` here. Everything the pod needs that does not vary between
-  entries is exported by the board script rather than repeated in twelve
+  entries is exported by the board script rather than repeated in fifteen
   `extra_env` strings; the secrets, the provenance of the run and the four values
   that do vary are passed.
 - **Checkpoint path.** The 397B weights live under `T-HEAD/v3.5/` on this NAS
@@ -641,8 +647,11 @@ the executed set is what `register_ppu_ci` declares.
 
 ## The ported 144GiB entries
 
-Twelve configs were added from the internal btv1.5 `answer_144g` plan, against
-checkpoints already staged on this NAS. Each row names the internal
+Twelve configs were added from the internal btv1.5 `answer_144g` plan, one
+DeepSeek-V4-Flash entry from the btv1.1 `P0_daily` plan (its `answer_144g` has
+no V4-Flash case), and later the two DeepSeek entries the btv1.5 `answer_144g`
+carries, against checkpoints already staged on this NAS. Each row
+names the internal
 `llm_infer_sglang_evalscope` case its server parameters came from, and the
 checkpoint as measured on `na131t-ppu810e-test001`, which mounts the same NAS the
 cluster does. Every one of them holds exactly the number of shards its own
@@ -664,6 +673,9 @@ index, not from the `-of-NNNNN` suffix the filenames carry, which on
 | `qwen3.5-397b-fp8-channelwise` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-FP8-Channelwise` | 379.0 GiB, 94 |
 | `qwen3.5-397b-mxfp4-fp8` | `-8-` | this repository's own `-144g` entry | `v3.5/Qwen3.5-397B-A17B-MXFP4-FP8` | 215.6 GiB, 94 |
 | `qwen3.8-2.4t-a95b-mxfp4-fp8` | `-16-` | `qwen3.7-mxfp4-fp8_3001` | `v3.8/Qwen3.8-2.4T-A95B-...-MXFP4-...` | 1272.1 GiB, 213 |
+| `dsv4-flash-w8a8-int8` | `-8-dsv4flash-` | `deepseek-v4-flash-a8w8_3001` | `deepseek/v4/DeepSeek-V4-Flash-W8A8-INT8` | not yet measured |
+| `dsv4-pro-0813-mxfp4` | `-8-dsv4pro-` | `deepseek-v4-pro-0813-mxfp4-fp8_3001` | `T-HEAD/v4/DeepSeek-V4-Pro-0813-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken` | not yet measured |
+| `dsv3.2-fp8` | `-8-dsv32-` | `deepseek-v3.2-fp8_3001` | `deepseek/v3.2/DeepSeek-V3.2` | not yet measured |
 
 Seven of the twelve entries name a source case that does not carry their
 checkpoint, in four groups. That is the plan's own situation rather than a
@@ -695,6 +707,29 @@ substitution:
 checkpoint, which is why it is the only Kimi config that states a `quantization`
 at all. It departs from that case in topology instead, for a reason of
 arithmetic recorded under Capacity below.
+
+**The two DeepSeek ports.** `dsv4-pro-0813-mxfp4` and `dsv3.2-fp8` are the
+first two entries whose source cases carry their exact checkpoints —
+`deepseek-v4-pro-0813-mxfp4-fp8_3001` and `deepseek-v3.2-fp8_3001`, both from
+the btv1.5 `answer_144g` plan. Each serves with its case's own parameters: the
+`dsv4` attention backend for the Pro, the sparse-attention pair for V3.2,
+`cuda_graph_max_bs` 64, memory fraction 0.8, and the case's
+`dist_timeout`/`watchdog_timeout` pair — 6000/6000 for the Pro, and 600 for
+V3.2, whose case passes no `dist_timeout` at all. What does not come across, and
+why, is recorded in each test file's docstring: the Pro's `tool_call_parser`
+and `enable_deepseek_v4_fp4_indexer` are not in the schema; its
+`SGLANG_OPT_USE_TOPK_V2`/`SGLANG_DSV4_FP4_EXPERTS` pair stays unexported, as in
+its case — the W8A8 entry must pin both to 0, this one must not, because MXFP4
+wants the tree's defaults; V3.2's `nsa_*` spellings become
+`dsa_*`, its `enable_dp_attention`/`dp_size` pair is not in the schema, and its
+`USE_ACEXT_CUDA=0` export is dropped because the tree reads
+`SGLANG_SAIL_USE_ACEXT_CUDA`, whose default False is already the value the case
+asks for. Both serve non-thinking and grade `separate_reasoning`, like the rest
+of the line. Both checkpoints were among the five DeepSeek-V4 checkpoints
+recorded as unported below for lacking a chat template; that the internal plan
+lists a runnable case for each is the evidence their checkpoints have since
+gained one, and a first serve that fails the template check is the designed
+early signal.
 
 **Where these ports depart from their sources.** Eight departures beyond the
 deterministic generation line already described in
@@ -792,8 +827,9 @@ each node loads roughly its own half, so warming the whole tree on both nodes
 would read twice what the group needs and double the run's NAS traffic. Whether
 the halves are clean enough for that to matter is not measured.
 
-**What was not ported.** The NAS stages 25 checkpoints; 15 are covered, the twelve
-ported here plus the three that already had entries. The remaining ten fall into
+**What was not ported.** The NAS stages 25 checkpoints; 17 are covered, the
+fourteen ported here plus the three that already had entries. The remaining
+eight fall into
 two classes. Each architecture below was read from the checkpoint's own
 `config.json` on `na131t-ppu810e-test001`, and each claim of a missing registration
 is that the name appears nowhere under `python/sglang/`.
@@ -806,12 +842,15 @@ is that the name appears nowhere under `python/sglang/`.
   load rather than produce a verdict. Registering an architecture is its own change
   with its own evidence, not part of a config port — as the `Qwen3_5MoeForCausalLM`
   work in the four-node line shows.
-- **DeepSeek-V4, five checkpoints.** All five are `DeepseekV4ForCausalLM`, which
+- **DeepSeek-V4, three checkpoints.** All three are `DeepseekV4ForCausalLM`, which
   this tree does register, but none carries a chat template: no `chat_template*`
   file and no `chat_template` key in `tokenizer_config.json`. Every request in this
   corpus is a chat completion. A template is a decision about how the model is
   prompted, which belongs with whoever owns the checkpoint. Kimi-K3 is in the same
-  position on top of its missing registration.
+  position on top of its missing registration. The two DeepSeek ports above came
+  out of this class: the internal plan lists an `answer_144g` case for each,
+  which is the evidence their checkpoints have since gained templates, and the
+  first serve verifies it.
 
 `minimax2.7-w8a8-int8`, in the table above, was at one point in a third class here,
 and the reason was wrong. That checkpoint was first reported as an incomplete copy
@@ -1238,12 +1277,13 @@ with the checkpoints already in the node's page cache from the run above, the jo
 took 10m56s and 18m15s instead of 19m06s and 26m39s. The table above keeps the cold
 numbers, since a nightly on an otherwise idle board is the cold case.
 
-## The twelve-entry eight-wide line
+## The eight-wide line — measured
 
-The twelve ported entries run as one eight-wide dispatch. The reference grading is
+The ported entries run as one eight-wide dispatch. The reference grading is
 [run 34100574370](https://github.com/flytiger-eco/sglang-for-sail/actions/runs/34100574370),
 2026-09-07, at `265d498`, which is the first run to carry all three of the
-robustness fixes below. Eleven of the twelve reached a verdict; the results are:
+robustness fixes below; it ran the twelve entries that existed then and eleven
+of them reached a verdict. The results are:
 
 | Entry | Passed | Failing / error | Note |
 | --- | --- | --- | --- |

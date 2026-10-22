@@ -319,20 +319,25 @@ that week.
 The source set is `btv1.5/llm_infer_sglang_evalscope/P0_daily`: 39 cases, which
 are 13 (model, quantisation) pairs × 3 datasets, one case per pair per dataset.
 Seven of those 13 pairs are checkpoints this board has already served on the
-Answer or perf lines, giving **21 portable cases**; the other six pairs are
-models this repository has never stood up:
+Answer or perf lines, giving **21 portable cases**; the other six pairs were
+models this repository had never stood up. Five of those six have since been
+stood up too, one GSM8K entry at a time:
 
 | Portable (checkpoint already served here) | Not yet portable |
 | --- | --- |
-| GLM-5.2 FP8-Channelwise, GLM-5.2 MXFP4-FP8 | DeepSeek-V3.2-FP8 |
-| Kimi-K2.6 MXFP4-FP8 | DeepSeek-V4-Flash MXFP4-FP8 |
-| MiniMax-M2.7 FP8-Channelwise, MiniMax-M2.7 MXFP4-FP8 | DeepSeek-V4-Pro MXFP4-FP8 |
-| Qwen3.5-397B-A17B FP8-Channelwise, Qwen3.5-397B-A17B MXFP4-FP8 | GLM-5.1 FP8-Channelwise, GLM-5.1 MXFP4-FP8 |
-| | Qwen3.7 MXFP4-FP8 |
+| GLM-5.2 FP8-Channelwise, GLM-5.2 MXFP4-FP8 | Qwen3.7 MXFP4-FP8 |
+| Kimi-K2.6 MXFP4-FP8 | |
+| MiniMax-M2.7 FP8-Channelwise, MiniMax-M2.7 MXFP4-FP8 | |
+| Qwen3.5-397B-A17B FP8-Channelwise, Qwen3.5-397B-A17B MXFP4-FP8 | |
+| DeepSeek-V3.2-FP8, DeepSeek-V4-Flash MXFP4-FP8 | |
+| DeepSeek-V4-Pro MXFP4-FP8, GLM-5.1 FP8-Channelwise, GLM-5.1 MXFP4-FP8 | |
 
-All 21 are ported, across four suites — one per model family, because the
-configs of a family share one registered file and one process-wide
-`SGLANG_PPU_ACCURACY_TEST_CONFIG`:
+The original 21 run all three datasets. The five later ones run GSM8K only for
+now: their C-Eval and IFEval source cases exist, but a checkpoint earns the other
+two datasets only after its GSM8K entry has stood it up, and the smoke-plus-full
+pair is the cheapest way to do that. All 26 are ported, across eight suites — one
+per model family, because the configs of a family share one registered file and
+one process-wide `SGLANG_PPU_ACCURACY_TEST_CONFIG`:
 
 | Suite | Test file | Model family | Datasets | Configs | Devices |
 | --- | --- | --- | --- | --- | --- |
@@ -340,14 +345,17 @@ configs of a family share one registered file and one process-wide
 | `nightly-accuracy-8-kimi26-ppu` | `test_ppu_kimi_k26_accuracy.py` | Kimi-K2.6 (1 quantisation) | GSM8K, C-Eval, IFEval | 3 + 1 smoke | 8 |
 | `nightly-accuracy-8-minimax27-ppu` | `test_ppu_minimax_m27_accuracy.py` | MiniMax-M2.7 (2 quantisations) | GSM8K, C-Eval, IFEval | 6 + 1 smoke | 8 |
 | `nightly-accuracy-8-qwen35-ppu` | `test_ppu_qwen35_accuracy.py` | Qwen3.5-397B-A17B (2 quantisations) | GSM8K, C-Eval, IFEval | 6 + 1 smoke | 8 |
+| `nightly-accuracy-8-dsv4flash-ppu` | `test_ppu_dsv4_flash_accuracy.py` | DeepSeek-V4-Flash (2 quantisations) | GSM8K | 2 + 2 smoke | 8 |
+| `nightly-accuracy-8-glm51-ppu` | `test_ppu_glm51_accuracy.py` | GLM-5.1 (2 quantisations) | GSM8K | 2 + 2 smoke | 8 |
+| `nightly-accuracy-8-dsv32-ppu` | `test_ppu_dsv32_accuracy.py` | DeepSeek-V3.2 (1 quantisation) | GSM8K | 1 + 1 smoke | 8 |
+| `nightly-accuracy-8-dsv4pro-ppu` | `test_ppu_dsv4_pro_accuracy.py` | DeepSeek-V4-Pro (1 quantisation) | GSM8K | 1 + 1 smoke | 8 |
 
-Twenty-eight configs behind the four files: 21 full evaluations (7 checkpoints ×
-3 datasets) and one GSM8K smoke config per checkpoint. The full and smoke configs
-of a checkpoint differ only in `limit` — the smoke one evaluates 20 samples. The
-workflow selects which config runs by naming it in
-`SGLANG_PPU_ACCURACY_TEST_CONFIG`; a suite is a file, because `register_ppu_ci`
-registers per file, and the number in each suite name is 8 because every config
-declares eight devices.
+Forty configs behind the eight files: 27 full evaluations and one GSM8K smoke
+config per checkpoint. The full and smoke configs of a checkpoint differ only in
+`limit` — the smoke one evaluates 20 samples. The workflow selects which config
+runs by naming it in `SGLANG_PPU_ACCURACY_TEST_CONFIG`; a suite is a file, because
+`register_ppu_ci` registers per file, and the number in each suite name is 8
+because every config declares eight devices.
 
 GLM-5.2 GSM8K went first and alone, deliberately, because two facts about this
 line could only be established by running it and each would have been wrong
@@ -630,7 +638,7 @@ Two smaller ones, on every config:
 
 | Workflow | Suites | Jobs | Boards each | Trigger |
 | --- | --- | --- | --- | --- |
-| `test-ppu-accuracy.yml` | the four above | 28 (21 full + 7 smoke) | 1 | dispatch, `workflow_call` |
+| `test-ppu-accuracy.yml` | the eight above | 40 (27 full + 13 smoke) | 1 | dispatch, `workflow_call` |
 
 Not on a schedule: cron is honoured only from the default branch and this file
 lives on a version branch, so a cron here would never fire.
@@ -653,9 +661,12 @@ plus `if: ${{ !cancelled() }}` so they never hold two boards at once.
 `entries` picks which. A job here holds a whole board for most of a night, so it
 is a selection rather than a filter: empty runs `glm52-fp8chan-gsm8k` alone, a
 comma-separated list runs exactly those, and the literal `all` is what a caller
-writes to mean all twenty-one. That default is why a stray dispatch cannot ask the
-farm for twenty-one boards until morning. Run `34429388425` is what that gate
-looks like when it works: two named entries ran, twenty-six were skipped.
+writes to mean all twenty-seven. That default is why a stray dispatch cannot ask
+the farm for twenty-seven boards until morning — and even an `all` dispatch does
+not: `needs` chains the later full entries behind their predecessors, so the
+concurrent request peaks at sixteen lanes rather than twenty-seven boards.
+Run `34429388425` is what that gate looks like when it works: two named entries
+ran, twenty-six were skipped.
 
 Evidence is collected by `scripts/ci/ppu/collect_accuracy_evidence.sh`, which
 reads the report back off the NAS and prints the score as an annotation whether or
