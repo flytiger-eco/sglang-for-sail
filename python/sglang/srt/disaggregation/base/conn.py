@@ -65,6 +65,12 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Trailing head-sharded draft entries; independent of target MLA geometry.
+    draft_kv_entry_count: int = 0
+    draft_kv_head_num: int = 0
+    draft_total_kv_head_num: int = 0
+    # True only after inspecting the actual registered K/V tensors.
+    draft_kv_token_major: bool = False
     # for system dp
     system_dp_rank: int
     # for pp prefill
