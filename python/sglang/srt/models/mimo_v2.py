@@ -351,7 +351,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -361,7 +361,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -370,9 +370,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
@@ -429,6 +435,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -1663,6 +1670,18 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
                     param = params_dict[name]
+                    # Native MXFP4 backends keep packed uint8 weights and E8M0
+                    # scales; only convert for the destination's storage format.
+                    if loaded_weight.dtype == torch.uint8:
+                        if (
+                            name.endswith("weight_scale_inv")
+                            and param.dtype.is_floating_point
+                        ):
+                            loaded_weight = torch.exp2(
+                                loaded_weight.to(torch.float32) - 127.0
+                            )
+                        elif name.endswith("weight") and param.dtype == torch.int8:
+                            loaded_weight = loaded_weight.view(torch.int8)
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
