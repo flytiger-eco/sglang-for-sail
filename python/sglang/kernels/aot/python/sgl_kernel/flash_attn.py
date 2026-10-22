@@ -175,6 +175,79 @@ def flash_attn_with_kvcache(
             normalization factor).
     """
 
+    # PPU does not build the NVIDIA-only FA3 kernels (``flash_ops`` is imported
+    # under ``if not is_ppu()`` above), so ``torch.ops.sgl_kernel.fwd`` is not
+    # registered there. The PPU FA3 implementation is provided by
+    # ``flash_attn_interface`` and already wrapped with an identical call
+    # convention in ``sglang.srt.hardware_backend.ppu.attention.flash_attention``.
+    #
+    # sglang's own attention backend reaches that wrapper through the plugin-hook
+    # mechanism (``ppu_fa3_hooks.py``). External frameworks that import this module
+    # directly -- e.g. mini-sglang's ``attention/fa.py`` -- bypass the hooks, so we
+    # delegate to the same wrapper here to keep them working unmodified on PPU.
+    #
+    # NOTE: the PPU FA3 wrapper's ``flash_attn_with_kvcache`` does not accept
+    # ``only_qv``, does not forward a pre-allocated ``out`` buffer, and does not
+    # forward ``score_mod``, so we reject all three explicitly rather than
+    # silently returning wrong results.
+    if is_ppu():
+        if only_qv:
+            raise NotImplementedError(
+                "only_qv is not supported by the PPU FA3 wrapper "
+                "(flash_attn_with_kvcache)."
+            )
+        if out is not None:
+            raise NotImplementedError(
+                "A pre-allocated `out` buffer is not supported by the PPU FA3 "
+                "wrapper (flash_attn_with_kvcache); pass out=None."
+            )
+        if score_mod is not None:
+            raise NotImplementedError(
+                "score_mod is not supported by the PPU FA3 wrapper "
+                "(flash_attn_with_kvcache)."
+            )
+        from sglang.srt.hardware_backend.ppu.attention.flash_attention import (
+            flash_attn_with_kvcache as _ppu_flash_attn_with_kvcache,
+        )
+
+        return _ppu_flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=k,
+            v=v,
+            qv=qv,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            cache_leftpad=cache_leftpad,
+            page_table=page_table,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_q=max_seqlen_q,
+            rotary_seqlens=rotary_seqlens,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            rotary_interleaved=rotary_interleaved,
+            scheduler_metadata=scheduler_metadata,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
+            ver=ver,
+            out=out,
+        )
+
     if v_cache is None:
         raise ValueError("v_cache must be provided")
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
@@ -349,6 +422,73 @@ def flash_attn_varlen_func(
     out=None,
 ):
 
+    # PPU has no registered ``torch.ops.sgl_kernel.fwd`` (see the note in
+    # ``flash_attn_with_kvcache`` above), so delegate the varlen/prefill path to
+    # the same PPU FA3 wrapper. External callers that import this module directly
+    # -- e.g. mini-sglang -- bypass ``ppu_fa3_hooks`` and would otherwise hit the
+    # missing op. This must run before the ``is_fa3_supported`` gate below, which
+    # would raise on PPU.
+    #
+    # NOTE: the PPU FA3 varlen wrapper does not forward ``qv``, ``page_table`` or
+    # ``score_mod``, and does not accept ``only_qv`` or a pre-allocated ``out``
+    # buffer, so we reject all of these explicitly rather than silently dropping
+    # the QV term / page mapping / score modifier or returning stale data.
+    if is_ppu():
+        if only_qv or qv is not None:
+            raise NotImplementedError(
+                "only_qv / qv are not supported by the PPU FA3 varlen wrapper "
+                "(flash_attn_varlen_func)."
+            )
+        if out is not None:
+            raise NotImplementedError(
+                "A pre-allocated `out` buffer is not supported by the PPU FA3 "
+                "varlen wrapper (flash_attn_varlen_func); pass out=None."
+            )
+        if page_table is not None:
+            raise NotImplementedError(
+                "page_table is not supported by the PPU FA3 varlen wrapper "
+                "(flash_attn_varlen_func)."
+            )
+        if score_mod is not None:
+            raise NotImplementedError(
+                "score_mod is not supported by the PPU FA3 varlen wrapper "
+                "(flash_attn_varlen_func)."
+            )
+        from sglang.srt.hardware_backend.ppu.attention.flash_attention import (
+            flash_attn_varlen_func as _ppu_flash_attn_varlen_func,
+        )
+
+        return _ppu_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            qv=qv,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+            return_softmax_lse=return_softmax_lse,
+            sinks=sinks,
+            score_mod=score_mod,
+            aux_tensors=aux_tensors,
+            ver=ver,
+            out=out,
+        )
+
     if not is_fa3_supported():
         raise NotImplementedError(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
@@ -460,6 +600,38 @@ def get_scheduler_metadata(
     scheduler_metadata to flash_attn_with_kvcache / flash_attn_varlen_func.
     This avoids the prepare_varlen_num_blocks kernel running on every layer.
     """
+    # ``torch.ops.sgl_kernel.get_scheduler_metadata`` is not registered on PPU
+    # either, so delegate to the PPU FA3 wrapper. The PPU scheduler-metadata ABI
+    # has no ``cu_seqlens_k`` / ``seqused_q``; those two are not forwarded.
+    if is_ppu():
+        from sglang.srt.hardware_backend.ppu.attention.flash_attention import (
+            get_scheduler_metadata as _ppu_get_scheduler_metadata,
+        )
+
+        return _ppu_get_scheduler_metadata(
+            batch_size,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_heads,
+            num_heads_k,
+            headdim,
+            cache_seqlens,
+            qkv_dtype,
+            headdim_v=headdim_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            leftpad_k=leftpad_k,
+            page_size=page_size,
+            max_seqlen_k_new=max_seqlen_k_new,
+            causal=causal,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            has_softcap=has_softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            sm_margin=sm_margin,
+        )
+
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
