@@ -12,7 +12,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 #   - DP attention is enabled with DeepEP all-to-all
 #   - DeepGEMM dense and MoE paths are active on PPU
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/Qwen3.5-397B-A17B-W8A8-INT8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/Qwen3.5-397B-A17B-W8A8-INT8"
+)
 SERVED_MODEL_NAME = "Qwen3.5-397B-A17B"
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 24000

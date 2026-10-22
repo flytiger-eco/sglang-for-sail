@@ -11,7 +11,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 #   - decode attention backend is flashmla and prefill attention backend is fa3
 #   - speculative decoding uses EAGLE3
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/Kimi-K2.6-W4A8-INT8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/Kimi-K2.6-W4A8-INT8"
+)
 DRAFT_MODEL_PATH = os.environ.get(
     "DRAFT_MODEL_PATH",
     "kimi-k2.6-eagle3-mla",

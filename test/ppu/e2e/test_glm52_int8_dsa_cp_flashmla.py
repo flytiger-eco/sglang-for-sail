@@ -8,7 +8,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 # E2E test for GLM-5.2 INT8 on PPU with DSA attention + context parallelism
 # and flashmla_sparse/flashmla_kv DSA backends.
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/GLM-5.2-int8")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/GLM-5.2-int8"
+)
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 24000
 

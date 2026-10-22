@@ -9,7 +9,9 @@ from sglang.test.test_utils import CustomTestCase, popen_launch_server
 # Verifies the server boots and produces correct GSM8K accuracy for an
 # AWQ-quantized DeepSeek model on PPU.
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-R1-awq")
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "modelscope.cn/organization/T-HEAD/DeepSeek-R1-awq"
+)
 SERVED_MODEL_NAME = "DeepSeek-R1"
 BASE_URL = "http://127.0.0.1:8999"
 SERVER_LAUNCH_TIMEOUT = 24000
