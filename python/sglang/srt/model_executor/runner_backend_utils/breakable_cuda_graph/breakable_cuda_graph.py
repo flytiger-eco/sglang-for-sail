@@ -37,9 +37,10 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_ppu, is_xpu
 
 _is_xpu = is_xpu()
+_is_ppu = is_ppu()
 
 __all__ = [
     "eager_on_graph",
@@ -92,6 +93,17 @@ def _is_stream_capturing(stream: torch.Stream) -> bool:
     if is_hip() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
+    if _is_ppu:
+        # The PPU CUDA-compat runtime does not implement
+        # cudaStreamGetCaptureInfo (it returns cudaErrorNotSupported), and
+        # torch.cuda.is_current_stream_capturing() bottoms out in the same
+        # API, so neither query is available. Answer from the wait_stream
+        # hook's own bookkeeping instead: a stream is capturing exactly while
+        # it is forked off the capture stream and not yet re-joined. When the
+        # hook context is unavailable, answer True — a spurious extra join is
+        # harmless, whereas a skipped join breaks capture_end.
+        forked = _forked_streams_var.get()
+        return True if forked is None else stream in forked
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
