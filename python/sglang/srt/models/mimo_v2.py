@@ -1622,13 +1622,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     skipped_mtp_weights = True
                 continue
 
-            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
-                if name.endswith(".weight_scale"):
-                    name = name + "_inv"
-                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
-                elif name.endswith(".weight"):
-                    loaded_weight = loaded_weight.view(torch.int8)
-
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
@@ -1677,6 +1670,18 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if name.endswith("weight_scale") and (name + "_inv" in params_dict):
                         name = name + "_inv"
                     param = params_dict[name]
+                    # Native MXFP4 backends keep packed uint8 weights and E8M0
+                    # scales; only convert for the destination's storage format.
+                    if loaded_weight.dtype == torch.uint8:
+                        if (
+                            name.endswith("weight_scale_inv")
+                            and param.dtype.is_floating_point
+                        ):
+                            loaded_weight = torch.exp2(
+                                loaded_weight.to(torch.float32) - 127.0
+                            )
+                        elif name.endswith("weight") and param.dtype == torch.int8:
+                            loaded_weight = loaded_weight.view(torch.int8)
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
