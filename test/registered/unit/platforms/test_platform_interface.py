@@ -252,8 +252,8 @@ class TestSailDeviceMixin(CustomTestCase):
 
     def test_sail_srt_platform_capabilities(self):
         base = SailSRTPlatform()
-        self.assertTrue(base.support_cuda_graph())
-        self.assertTrue(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertTrue(base.capabilities.piecewise_graph)
 
     @patch("torch.cuda.get_device_capability", return_value=(8, 9))
     def test_sail_supports_fp8_at_sm89(self, mock_get_device_capability):
