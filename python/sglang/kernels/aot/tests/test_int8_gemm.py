@@ -36,7 +36,7 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     else:
         bias = None
     ### NOTE: int8_gemm with bias requires acext version >= 1.5.3 or higher.
-    use_acext_gemm = int(os.environ.get("USE_ACEXT_CUDA", 1)) and is_sail
+    use_acext_gemm = int(os.environ.get("USE_ACEXT_CUDA", 1)) and is_sail()
     if use_acext_gemm:
         o = acext_int8_gemm(a, b.t(), scale_b, scale_a, bias, out_dtype)
     else:
