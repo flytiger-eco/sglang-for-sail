@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.srt.utils import is_sail
+from sglang.test.ci.ci_register import register_ppu_ci
+
+register_ppu_ci(est_time=120, suite="stage-b-test-1-gpu-ppu")
 
 pytestmark = pytest.mark.skipif(not is_sail(), reason="PPU-only kernel")
 
@@ -398,6 +401,15 @@ def test_invalid_args() -> None:
     bad = torch.randn((E, T, 2049), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(AssertionError, match="last dim must be even"):
         silu_and_mul_masked_post_per_token_quant_fp8(bad, masked_m)
+    # masked_m must be contiguous (the kernel indexes it without a stride)
+    strided_m = torch.full((2 * E,), T, dtype=torch.int32, device="cuda")[::2]
+    with pytest.raises(AssertionError, match="masked_m must be contiguous"):
+        silu_and_mul_masked_post_per_token_quant_fp8(inp, strided_m)
+    # aligned strides with a 2-byte offset base pointer must be rejected
+    wide = torch.randn((E, T, two_N + 8), dtype=torch.bfloat16, device="cuda")
+    misaligned = wide[..., 1 : 1 + two_N]
+    with pytest.raises(RuntimeError, match="data pointer must be 16-byte aligned"):
+        silu_and_mul_masked_post_per_token_quant_fp8(misaligned, masked_m)
 
 
 if __name__ == "__main__":
