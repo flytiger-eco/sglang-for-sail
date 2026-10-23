@@ -193,6 +193,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_sail,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -384,6 +385,32 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+
+        # Only Support for PPU fp8 channelwise.
+        if (
+            _is_sail
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.float8_e4m3fn
+            and getattr(self.down_proj, "weight_scale", None) is not None
+            and self.down_proj.weight_scale.numel() == self.down_proj.weight.shape[1]
+        ):
+            from sglang.kernels.ops.elementwise.silu_mul_quant import (
+                silu_and_mul_post_per_token_quant_fp8,
+            )
+
+            M = gate_up.shape[0]
+            down_input_fp8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
+                gate_up, swiglu_limit=self.swiglu_limit
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (down_input_fp8, down_input_scale),
+                (self.down_proj.weight.t(), self.down_proj.weight_scale),
+                down_output,
+            )
+            return down_output
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -740,6 +767,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                is_nextn=is_nextn,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -757,6 +785,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                is_nextn=is_nextn,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
@@ -868,6 +897,8 @@ class DeepseekV2MoE(nn.Module):
                     "awq",
                     "awq_marlin",
                     "moe_wna16",
+                    "gptq",
+                    "gptq_marlin",
                 }
             )
             shared_gate_up_weight = getattr(
@@ -895,6 +926,10 @@ class DeepseekV2MoE(nn.Module):
                     == "compressed-tensors"
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                elif _is_sail:
+                    # The following code is specific to intel_amx_backend.
+                    # Can be safely skipped when running on PPU.
                     pass
                 else:
                     assert (
@@ -1940,10 +1975,13 @@ class DeepseekV2MoE(nn.Module):
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                self.experts.dispatcher.combine_a(
+                    combine_input=state.pop("combine_input"),
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
             state.pop("dispatch_output")
 
     def op_combine_b(self, state):
@@ -2207,7 +2245,7 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "gptq", "gptq_marlin"}
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
@@ -3192,8 +3230,9 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -3336,6 +3375,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if is_wint4afp8_or_wint4a16_config(quant_config):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        if quant_config and quant_config.get_name() == "mixed_precision_w4":
+            return (
+                "Deepseek V3/R1 mixed_precision_w4 model uses different quant "
+                "method for routed experts and shared experts."
+            )
         return None
 
     def determine_num_fused_shared_experts(self):

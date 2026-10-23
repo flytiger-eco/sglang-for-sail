@@ -105,6 +105,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             _mtp_quant_config(quant_config),
         )
 
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -227,7 +229,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
             hidden_states = forward_batch.spec_info.hidden_states
 
-            if not forward_batch.forward_mode.is_idle():
+            # Guard against empty (zero-token) batches under DP attention:
+            # a DP rank can receive a non-idle batch with 0 tokens. The
+            # GemmaRMSNorm kernels launch with grid=(num_tokens,) and fail on
+            # 0-row inputs (invalid configuration argument). Downstream paths
+            # (cat/fc/model forward/logits processor) all tolerate 0 rows.
+            if not forward_batch.forward_mode.is_idle() and input_embeds.shape[0] > 0:
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
             # Captured prefill gives padded embeddings but real-height target states;

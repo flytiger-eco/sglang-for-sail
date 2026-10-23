@@ -133,7 +133,7 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
     // `inv_scale_ue8m0` instead of the reference's division: the scale is a
     // power of two, so both are exact except at the unreachable exponent 254.
     const auto inv_scale = deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(out.exponent[half]));
-#ifndef USE_ROCM
+#ifndef SGL_SOFTWARE_E2M1
     const auto code = __nv_cvt_float2_to_fp4x2(
         fp32x2_t{data[half * 2] * inv_scale, data[half * 2 + 1] * inv_scale}, __NV_E2M1, cudaRoundNearest);
 #else

@@ -52,6 +52,14 @@ from sglang.srt.elastic_ep.elastic_ep import (
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
+from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.cpp_async_runtime import warmup_eplb_async_runtime_cpp
+from sglang.srt.eplb.cpp_deepseek import warmup_eplb_deepseek_cpp
+from sglang.srt.eplb.cpp_expert_location import warmup_eplb_expert_location_cpp
+from sglang.srt.eplb.eplb_async_host_mirror import (
+    EPLBAsyncHostMirrorManager,
+    set_global_eplb_async_host_mirror_manager,
+)
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionMetrics,
@@ -62,6 +70,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
@@ -69,7 +78,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.eplb.expert_location_updater import (
+    ExpertLocationUpdater,
+    set_global_expert_location_updater,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -181,6 +193,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner_utils import (
+    get_is_capture_mode,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -257,6 +272,48 @@ if _is_npu:
     init_npu_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
+
+MLA_ATTENTION_BACKENDS = [
+    "aiter",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+    "flashmla",
+    "cutedsl_mla",
+    "cutlass_mla",
+    "trtllm_mla",
+    "tokenspeed_mla",
+    "ascend",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
+    "intel_xpu",
+]
+
+
+def add_mla_attention_backend(backend_name):
+    if backend_name not in MLA_ATTENTION_BACKENDS:
+        MLA_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to MLA_ATTENTION_BACKENDS.")
+
+
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter
+
+        use_model_prof = True
+
+    except ImportError as e:
+        use_model_prof = False
+
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 
 # Detect stragger ranks in model loading
 
@@ -410,6 +467,8 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.init_spec_aux_hidden_state()
+        if SGLANG_PROFILE_NVTX:
+            self.iteration = 0
 
         # Apply the rank zero filter to logger
         if get_observability().show_time_cost:
@@ -692,15 +751,46 @@ class ModelRunner:
                 port=self.dist_port,
             )
 
+    def maybe_warmup_eplb_cpp_extensions(self):
+        if not get_exec().moe.enable_eplb or self.is_draft_worker:
+            return
+
+        model_config_for_expert_location = (
+            ModelConfigForExpertLocation.from_model_config(self.model_config)
+        )
+        if model_config_for_expert_location is None:
+            return
+
+        logger.info("Warming up EPLB C++ extensions.")
+        warmup_eplb_expert_location_cpp()
+
+        algorithm = eplb_algorithms.compute_algorithm(
+            raw_algorithm=get_exec().moe.eplb_algorithm,
+            num_groups=model_config_for_expert_location.num_groups,
+            num_nodes=get_parallel().nnodes,
+        )
+        if algorithm in [
+            eplb_algorithms.EplbAlgorithm.deepseek,
+            eplb_algorithms.EplbAlgorithm.deepseek_hierarchical,
+        ]:
+            warmup_eplb_deepseek_cpp()
+
+        if get_exec().moe.enable_eplb_async:
+            warmup_eplb_async_runtime_cpp()
+
     def initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
         self.maybe_init_expert_location_metadata()
         self.maybe_init_lplb_solvers()
         self.maybe_init_eplb_manager()
-        self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
+        self.maybe_init_eplb_async_host_mirror()
+        self.init_expert_location_updater()
+        self.maybe_warmup_eplb_cpp_extensions()
+
+        # Load the model
         self.sampler = create_sampler()
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
@@ -712,6 +802,7 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
+        self.prepare_eplb_async_layers()
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
@@ -774,10 +865,31 @@ class ModelRunner:
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_expert_backup_client=lambda: self.expert_backup_client,
                 get_weight_updater=lambda: self.weight_updater,
+                get_forward_pass_id=lambda: self.forward_pass_id,
             )
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
         )
+
+    def maybe_init_eplb_async_host_mirror(self):
+        self.eplb_async_host_mirror_manager = None
+        if get_exec().moe.enable_eplb_async and not self.is_draft_worker:
+            self.eplb_async_host_mirror_manager = EPLBAsyncHostMirrorManager(
+                model_config=self.model_config,
+                node_rank=get_parallel().node_rank,
+                num_nodes=get_parallel().nnodes,
+            )
+        if not self.is_draft_worker:
+            set_global_eplb_async_host_mirror_manager(
+                self.eplb_async_host_mirror_manager
+            )
+
+    def init_expert_location_updater(self):
+        self.expert_location_updater = ExpertLocationUpdater(
+            enable_async=get_exec().moe.enable_eplb_async and not self.is_draft_worker,
+        )
+        if not self.is_draft_worker:
+            set_global_expert_location_updater(self.expert_location_updater)
 
     def maybe_init_elastic_ep(self):
         if get_exec().moe.elastic_ep_backend:
@@ -804,6 +916,11 @@ class ModelRunner:
                 and get_exec().moe.elastic_ep_backend is not None
             )
             else None
+        )
+
+    def prepare_eplb_async_layers(self):
+        self.expert_location_updater.prepare_async_layers(
+            getattr(self.model, "routed_experts_weights_of_layer", None)
         )
 
     def maybe_apply_post_load_model_transforms(self):
@@ -1199,6 +1316,18 @@ class ModelRunner:
             self._finalize_elastic_ep_joiner(target_size)
 
         prebuild_deepep_v2_buffer(model=self.model)
+
+    def build_eplb_async_host_mirror(self):
+        if self.eplb_async_host_mirror_manager is None:
+            return
+        routed_experts_weights_of_layer = getattr(
+            self.model, "routed_experts_weights_of_layer", None
+        )
+        if not routed_experts_weights_of_layer:
+            return
+        self.eplb_async_host_mirror_manager.build_from_loaded_model(
+            routed_experts_weights_of_layer
+        )
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1795,6 +1924,8 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        # Transfer iteration info to eplb_async_runtime
+        self.on_forward_pass_start()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1826,6 +1957,18 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
+            if SGLANG_PROFILE_NVTX:
+                # Use forward_mode to detect real prefill; MTP decode fakes extend mode
+                if (
+                    forward_batch.forward_mode.is_extend_without_speculative()
+                    and forward_batch.extend_seq_lens_cpu is not None
+                ):
+                    p_bs = len(forward_batch.extend_seq_lens_cpu)
+                else:
+                    p_bs = 0
+                th_nvtx_range_push(
+                    f"total bs={forward_batch.batch_size}, P bs={p_bs}, forward_pass_id={self.forward_pass_id}"
+                )
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
@@ -1840,6 +1983,8 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -1863,8 +2008,8 @@ class ModelRunner:
             )
 
         # should_advance_eplb_counter is always True on non-hip platform
-        if self.eplb_manager is not None and should_advance_eplb_counter(forward_batch):
-            self.eplb_manager.on_forward_pass_end()
+        if should_advance_eplb_counter(forward_batch):
+            self.on_forward_pass_end()
 
         if dumper.may_enable:
             dumper.step()
@@ -1929,6 +2074,21 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    # Transfer iteration info to eplb_async_runtime
+    def on_forward_pass_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_forward_pass_start()
+
+    def on_forward_pass_end(self):
+        if self.eplb_manager is not None:
+            # Trigger EPLB rebalance logic at the end of forward pass
+            self.eplb_manager.on_forward_pass_end()
+
+    # Give layer owner to GPU
+    def on_eplb_async_capture_start(self):
+        if self.expert_location_updater is not None:
+            self.expert_location_updater.on_capture_start()
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -1961,11 +2121,27 @@ class ModelRunner:
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
             # Replay cuda graph if applicable
+
+            if SGLANG_PROFILE_NVTX:
+                if use_model_prof:
+                    # Skip during capture: prof_iter -> cudaDeviceSynchronize() is
+                    # illegal under CUDA Graph capture (error 900).
+                    # always use target_worker for prof_iter to avoid iteration mismatch
+                    if not get_is_capture_mode() and not self.is_draft_worker:
+                        prof_iter(self.iteration)
+                        # Increment inside guard so capture forwards don't bump
+                        # iteration and misalign the trace.
+                        self.iteration += 1
+
             if can_run_graph:
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_push("decode_cudagraph")
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_pop()
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -1985,6 +2161,8 @@ class ModelRunner:
                 dwdp_mgr.prefetch_first_layers()
 
             if forward_batch.forward_mode.is_split_prefill():
+                if SGLANG_PROFILE_NVTX:
+                    th_nvtx_range_push("forward_split_prefill")
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
                 ret = self.forward_split_prefill(
                     forward_batch,
@@ -2012,12 +2190,22 @@ class ModelRunner:
                 # load_batch time. Move it into the prefill cuda graph runner
                 # to capture only the model.forward part.
                 with device_timer_ctx(self.device_timer, category):
+                    if SGLANG_PROFILE_NVTX:
+                        th_nvtx_range_push("forward_extend")
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
+                if SGLANG_PROFILE_NVTX:
+                    mode = forward_batch.forward_mode
+                    if mode.is_decode():
+                        th_nvtx_range_push("forward_decode")
+                    if mode.is_idle():
+                        th_nvtx_range_push("forward_idle")
+                    if mode.is_extend(include_draft_extend_v2=True):
+                        th_nvtx_range_push("forward_extend")
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
@@ -2027,6 +2215,9 @@ class ModelRunner:
                 and self.pp_group.is_last_rank
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+
+            if SGLANG_PROFILE_NVTX:
+                th_nvtx_range_pop()
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
@@ -2072,6 +2263,14 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+
+        if SGLANG_PROFILE_NVTX:
+            logits_output_shape = getattr(
+                logits_output.next_token_logits, "shape", None
+            )
+            th_nvtx_range_push(
+                f"[FW_NATIVE] op:sample,logits_output:{logits_output_shape}"
+            )
         # LogitsProcessorOutput is normally invocation-scoped, but CUDA graph
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
@@ -2149,6 +2348,8 @@ class ModelRunner:
                 req_pool_indices,
                 next_token_ids,
             )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
         return next_token_ids
 
     def compute_logprobs_only(

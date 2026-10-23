@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_pooled_paged_mqa_metadata,
 )
 from sglang.srt.layers.cp.interleave_kpool import local_query_inputs
+from sglang.srt.utils import is_sail
+
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -51,13 +54,20 @@ class DeepseekSparseAttnBackendKPoolMixin:
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # PPU int8: was or dsa_impl in ("fa3", "tilelang", "trtllm")
+            # [PPU-int8] allow flashmla_sparse for kpool on SM80
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] allow FlashMLA-KV KPool tails on PPU
+            or (_is_sail and dsa_impl == "flashmla_kv")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend."
+            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] 旧代码：
+            # f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            # "backend."
+            f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
+            "backend (plus FlashMLA-KV on PPU)."
         )
 
     def _resolve_kpool_tail_backend(

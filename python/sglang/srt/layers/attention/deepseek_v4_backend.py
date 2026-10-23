@@ -48,13 +48,21 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildDsparkSwaPageIndices,
     ComputeDsparkWindowGather,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_prefill_cp_round_robin_split,
+    dsa_cp_round_robin_split_q_seqs,
+    dsa_use_prefill_cp,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -120,7 +128,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     resolve_ragged_verify_layout,
 )
-from sglang.srt.utils import ceil_align, is_cuda, is_xpu
+from sglang.srt.utils import ceil_align, is_cuda, is_sail, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
@@ -1246,6 +1254,8 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        self.index_n_heads = model_runner.model_config.hf_text_config.index_n_heads
+        self.index_head_dim = model_runner.model_config.index_head_dim
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1262,10 +1272,17 @@ class DeepseekV4AttnBackend(
         if read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT:
             return None
         if get_parallel().attn_cp_size > 1:
-            raise NotImplementedError(
-                "DSV4 ragged verify does not support context parallel (CP); "
-                "set SGLANG_RAGGED_VERIFY_MODE off for CP runs."
-            )
+            # Ragged verify never CP-splits tokens (CP is prefill-only), but under
+            # the CP topology every rank must agree on the per-step verify budget /
+            # cuda-graph tier. That is guaranteed by the rank0 budget broadcast;
+            # refuse to run without it.
+            if not envs.SGLANG_DSPARK_SYNC_VERIFY_BUDGET.get():
+                raise NotImplementedError(
+                    "DSV4 ragged verify under context parallel (CP) requires "
+                    "SGLANG_DSPARK_SYNC_VERIFY_BUDGET=1 (rank0 budget broadcast "
+                    "keeps the cuda-graph tier identical across CP ranks); "
+                    "set it, or run SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if self.online_c128_mtp.enabled():
             raise NotImplementedError(
                 "DSV4 ragged verify does not support online c128 MTP; "
@@ -1323,6 +1340,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        build_paged_mqa_logits_metadata: bool = True,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1360,6 +1378,15 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
+            q_fp8_shape=torch.Size(
+                (
+                    core_attn_metadata.c4_topk_lengths_raw.shape[0],
+                    1,
+                    self.index_n_heads,
+                    self.index_head_dim,
+                )
+            ),
         )
 
     def init_forward_metadata_decode(
@@ -1398,6 +1425,7 @@ class DeepseekV4AttnBackend(
         swa_replay_start: Optional[torch.Tensor] = None,
         cp_metadata: Optional[InterleaveContextParallelMetadata] = None,
         dspark_swa_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        build_paged_mqa_logits_metadata: bool = True,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1452,6 +1480,7 @@ class DeepseekV4AttnBackend(
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             )
             if need_compress and self.has_c4
             else None
@@ -2618,33 +2647,93 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu = tail.extend_seq_lens_cpu
         assert extend_seq_lens_cpu is not None
         num_global_queries = sum(extend_seq_lens_cpu)
-        assert num_qo_tokens >= num_global_queries, (
-            "DSV4 sparse prefill requires global query rows: "
-            f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
-            "CP-local queries must use paged attention."
-        )
+        if not can_dsa_prefill_cp_round_robin_split(forward_batch):
+            assert num_qo_tokens >= num_global_queries, (
+                "DSV4 sparse prefill requires global query rows: "
+                f"allocated {num_qo_tokens}, but request offsets cover {num_global_queries}. "
+                "CP-local queries must use paged attention."
+            )
         # Reject undersized query buffers before accessing attention metadata.
         request_layout = core_attn_metadata.request_window_layout
         assert tail is None or request_layout is not None
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+        # Global (pre-CP-split) CPU views, retained for the CP-aware total_swa
+        # loop below which indexes requests by their original position.
         seq_lens_cpu_list = seq_lens_cpu.tolist()
-        total_swa = sum(
-            min(int(seq_len), int(extend_len) + SWA_WINDOW - 1)
-            for seq_len, extend_len in zip(
-                seq_lens_cpu_list, extend_seq_lens_cpu, strict=True
-            )
+        extend_seq_lens_cpu_list = (
+            [int(x) for x in extend_seq_lens_cpu.tolist()]
+            if isinstance(extend_seq_lens_cpu, torch.Tensor)
+            else list(extend_seq_lens_cpu)
         )
-        if is_cp_active(forward_batch):
-            query_lens = torch.tensor(
-                interleave_rows_per_request(
-                    _as_int_list(extend_seq_lens_cpu),
-                    get_parallel().attn_cp_rank,
-                    get_parallel().attn_cp_size,
-                ),
-                dtype=torch.int32,
-                device=extend_seq_lens.device,
+        max_seq_len = max(seq_lens_cpu_list)
+        cache_seq_lens_cpu = seq_lens_cpu_list
+        if can_dsa_prefill_cp_round_robin_split(forward_batch) and not is_cp_active(
+            forward_batch
+        ):
+            # Legacy V1 prefill CP round-robin path, used only when no live V2
+            # strategy owns this batch (PPU binds the interleave V2 strategy,
+            # see init_cp_strategy). Restrict the chunk cache
+            # to this CP rank's locally-owned requests and size total_swa with
+            # the carry-propagated round-robin offsets so it stays sync-free.
+            (
+                cp_extend_seq_lens_cpu,
+                extend_seq_lens,
+                cp_bs_idx_cpu,
+                cp_bs_idx,
+            ) = dsa_cp_round_robin_split_q_seqs(
+                extend_seq_lens_cpu_list,
+                extend_seq_lens,
             )
-        else:
+            seq_lens = seq_lens[cp_bs_idx].contiguous()
+            req_pool_indices = req_pool_indices[cp_bs_idx].contiguous()
+            cache_seq_lens_cpu = [seq_lens_cpu_list[i] for i in cp_bs_idx_cpu]
+            max_seq_len = max(cache_seq_lens_cpu)
+            assert core_attn_metadata is not None, (
+                "CP round-robin split sparse prefill requires core_attn_metadata"
+            )
+            assert sum(cp_extend_seq_lens_cpu) <= num_qo_tokens, (
+                f"CP-local extend sum {sum(cp_extend_seq_lens_cpu)} exceeds "
+                f"q token count {num_qo_tokens}"
+            )
+            cp_size = get_parallel().attn_cp_size
+            cp_rank = get_parallel().attn_cp_rank
+            first_tok_off = []
+            stream_off = 0
+            for e in extend_seq_lens_cpu_list:
+                first_tok_off.append((cp_rank - stream_off) % cp_size)
+                stream_off += e
+            total_swa = 0
+            for j in cp_bs_idx_cpu:
+                first_pos = (
+                    seq_lens_cpu_list[j]
+                    - extend_seq_lens_cpu_list[j]
+                    + first_tok_off[j]
+                )
+                swa_first = max(0, first_pos - SWA_WINDOW + 1)
+                total_swa += seq_lens_cpu_list[j] - swa_first
+            # Under round-robin split the per-request query rows are exactly the
+            # CP-local partitioned lengths returned above.
             query_lens = extend_seq_lens.to(torch.int32)
+        else:
+            total_swa = sum(
+                min(int(seq_len_i), int(extend_len) + SWA_WINDOW - 1)
+                for seq_len_i, extend_len in zip(
+                    seq_lens_cpu_list, extend_seq_lens_cpu_list, strict=True
+                )
+            )
+            if is_cp_active(forward_batch):
+                query_lens = torch.tensor(
+                    interleave_rows_per_request(
+                        _as_int_list(extend_seq_lens_cpu),
+                        get_parallel().attn_cp_rank,
+                        get_parallel().attn_cp_size,
+                    ),
+                    dtype=torch.int32,
+                    device=extend_seq_lens.device,
+                )
+            else:
+                query_lens = extend_seq_lens.to(torch.int32)
         # padding rows are never combined
         query_pos = core_attn_metadata.seq_lens_casual[:num_qo_tokens] - 1
         if request_layout is not None:
@@ -2653,18 +2742,18 @@ class DeepseekV4AttnBackend(
         if query_pos.shape[0] < num_qo_tokens:
             query_pos = _pad_tensor_to_size(query_pos, num_qo_tokens, value=0)
         return SparsePrefillChunkCache.build(
-            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens.to(torch.int32),
             query_lens=query_lens,
             query_pos=query_pos,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+            req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,
             full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
             swa_window_size=SWA_WINDOW,
             swa_page_size=self.token_to_kv_pool.get_swa_key_page_size(),
             num_qo_tokens=num_qo_tokens,
-            max_seq_len=max(seq_lens_cpu_list),
-            seq_lens_cpu=seq_lens_cpu_list,
+            max_seq_len=max_seq_len,
+            seq_lens_cpu=cache_seq_lens_cpu,
             total_swa=total_swa,
             request_window_layout=request_layout,
         )
@@ -2777,6 +2866,9 @@ class DeepseekV4AttnBackend(
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
+                build_paged_mqa_logits_metadata=not self._use_prefill_logits(
+                    forward_batch
+                ),
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -3638,6 +3730,22 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = metadata.core_attn_metadata
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+
+        assert attn_sink is not None
+        if is_sail():
+            # Slice attn_sink to current TP rank's heads to match q's head dim
+            attn_tp_size = get_attn_tensor_model_parallel_world_size()
+            if attn_tp_size > 1:
+                attn_tp_rank = get_attn_tensor_model_parallel_rank()
+                n_local_heads = attn_sink.shape[0] // attn_tp_size
+                attn_sink = attn_sink[
+                    attn_tp_rank * n_local_heads : (attn_tp_rank + 1) * n_local_heads
+                ]
+
+        assert attn_sink.shape[0] == q.shape[1], (
+            f"attn_sink head count ({attn_sink.shape[0]}) must match "
+            f"q head count ({q.shape[1]})"
+        )
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:

@@ -71,6 +71,14 @@ def should_ignore_layer(
         should_ignore_layer = check_equal_or_regex_match(
             layer_name=layer_name, targets=ignore
         )
+        if "experts" in layer_name:
+            # Expert names can include full module paths; keep coarse prefix matches
+            # (e.g., "model.layers.{i}.") while also checking expert-specific entries.
+            should_ignore_layer = should_ignore_layer or any(
+                layer_name in ignore_name
+                for ignore_name in ignore
+                if "experts" in ignore_name
+            )
 
     assert should_ignore_layer is not None
     return should_ignore_layer

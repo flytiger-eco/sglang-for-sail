@@ -1,17 +1,28 @@
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.utils import get_device_sm, is_sail
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+@lru_cache(maxsize=1)
+def _kpool_quant_int8() -> bool:
+    # PPU int8: PPU 1.0/1.1 (SM80) cannot run the DeepGEMM fp8 indexer path, so
+    # the k-pool cache is quantized to int8 instead. Evaluated lazily: probing
+    # the device at import time would initialize CUDA before fork().
+    return is_sail() and get_device_sm() < 89
 
 
 def _preshuffle_tile() -> int:
@@ -734,24 +745,29 @@ def kpool_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
+    # PPU int8: PPU 1.0/1.1 cannot store fp8 index-K; the pool keeps the same
+    # 1-byte layout, only the dtype interpretation changes.
+    quant_int8 = _kpool_quant_int8()
+    k_dtype = torch.int8 if quant_int8 else torch.float8_e4m3fn
+
     if slot_k.shape[0] == 0:
         if return_compressed:
             return (
                 torch.empty(
                     (0, slot_k.shape[2]),
-                    dtype=torch.float8_e4m3fn,
+                    dtype=k_dtype,  # PPU int8: was torch.float8_e4m3fn
                     device=slot_k.device,
                 ),
                 torch.empty((0,), dtype=torch.float32, device=slot_k.device),
             )
         return None
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    buf_fp8 = buf.view(k_dtype)  # PPU int8: was buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     if return_compressed:
         compressed_k = torch.empty(
             (slot_k.shape[0], slot_k.shape[2]),
-            dtype=torch.float8_e4m3fn,
+            dtype=k_dtype,  # PPU int8: was torch.float8_e4m3fn
             device=slot_k.device,
         )
         compressed_scale = torch.empty(
@@ -782,6 +798,8 @@ def kpool_softmax_rotate_write_cache(
         HEAD_DIM=slot_k.shape[2],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
+        # PPU int8: select the int8 quantization branch in the kernel
+        QUANT_INT8=quant_int8,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
@@ -844,7 +862,10 @@ def kpool_decode_update_and_maybe_write_cache(
     assert block_tables.ndim == 2
     assert block_tables.shape[0] >= batch
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # PPU int8: PPU 1.0/1.1 cannot store fp8 index-K; view as int8 instead.
+    quant_int8 = _kpool_quant_int8()
+    k_dtype = torch.int8 if quant_int8 else torch.float8_e4m3fn
+    buf_fp8 = buf.view(k_dtype)  # PPU int8: was buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_decode_update_and_maybe_write_cache_kernel[(batch,)](
         buf_fp8,
@@ -878,6 +899,8 @@ def kpool_decode_update_and_maybe_write_cache(
         BLOCK_TABLE_COLS=block_tables.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
+        # PPU int8: select the int8 quantization branch in the kernel
+        QUANT_INT8=quant_int8,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         INDEX_PAGE_SIZE=pool.index_page_size,
     )
@@ -928,6 +951,8 @@ def _kpool_softmax_rotate_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    # PPU int8: quantize to int8 (q_max 127) instead of fp8 (q_max 448)
+    QUANT_INT8: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
@@ -983,8 +1008,13 @@ def _kpool_softmax_rotate_write_cache_kernel(
     x = tl.where(do_write, x, 0.0).to(tl.bfloat16).to(tl.float32)
     x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
 
-    fp8_min = -448.0
-    fp8_max = 448.0
+    # PPU int8: was fp8_min = -448.0 / fp8_max = 448.0 for the fp8 path.
+    if QUANT_INT8:
+        fp8_min = -127.0
+        fp8_max = 127.0
+    else:
+        fp8_min = -448.0
+        fp8_max = 448.0
     fp8_max_inv = 1.0 / fp8_max
     absmax = tl.max(tl.abs(x), axis=0)
     absmax = tl.maximum(absmax, 1e-4)
@@ -997,6 +1027,9 @@ def _kpool_softmax_rotate_write_cache_kernel(
 
     quantized = x / scale
     quantized = tl.minimum(tl.maximum(quantized, fp8_min), fp8_max)
+    if QUANT_INT8:
+        # PPU int8: round-to-nearest before the int8 cast
+        quantized = libdevice.round(quantized).to(tl.int8)
 
     if WRITE_CACHE:
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
@@ -1060,6 +1093,8 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    # PPU int8: quantize to int8 (q_max 127) instead of fp8 (q_max 448)
+    QUANT_INT8: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
 ):
@@ -1145,8 +1180,13 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         x = (acc / denom).to(tl.bfloat16).to(tl.float32)
         x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
 
-        fp8_min = -448.0
-        fp8_max = 448.0
+        # PPU int8: was fp8_min = -448.0 / fp8_max = 448.0 for the fp8 path.
+        if QUANT_INT8:
+            fp8_min = -127.0
+            fp8_max = 127.0
+        else:
+            fp8_min = -448.0
+            fp8_max = 448.0
         fp8_max_inv = 1.0 / fp8_max
         absmax = tl.max(tl.abs(x), axis=0)
         absmax = tl.maximum(absmax, 1e-4)
@@ -1159,6 +1199,9 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
 
         quantized = x / scale
         quantized = tl.minimum(tl.maximum(quantized, fp8_min), fp8_max)
+        if QUANT_INT8:
+            # PPU int8: round-to-nearest before the int8 cast
+            quantized = libdevice.round(quantized).to(tl.int8)
 
         pool_id = safe_pos // POOL_SIZE
         pool_page_group = pool_id // INDEX_PAGE_SIZE
@@ -1198,18 +1241,28 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
 
 
 @triton.jit
-def _hadamard_quantize_fp8(acc, denom, ROUND_SCALE: tl.constexpr):
+def _hadamard_quantize_fp8(
+    acc, denom, ROUND_SCALE: tl.constexpr, QUANT_INT8: tl.constexpr
+):
     x = (acc / denom).to(tl.bfloat16).to(tl.float32)
     x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
 
-    fp8_max_inv = 1.0 / 448.0
+    # PPU int8: was a hard-coded 448.0 fp8 scale.
+    if QUANT_INT8:
+        q_max = 127.0
+    else:
+        q_max = 448.0
+    fp8_max_inv = 1.0 / q_max
     absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
     if ROUND_SCALE:
         scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
     else:
         scale = absmax * fp8_max_inv
 
-    quantized = tl.minimum(tl.maximum(x / scale, -448.0), 448.0)
+    quantized = tl.minimum(tl.maximum(x / scale, -q_max), q_max)
+    if QUANT_INT8:
+        # PPU int8: round-to-nearest before the int8 cast
+        quantized = libdevice.round(quantized).to(tl.int8)
     return quantized, scale
 
 
@@ -1239,6 +1292,8 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    # PPU int8: quantize to int8 (q_max 127) instead of fp8 (q_max 448)
+    QUANT_INT8: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
@@ -1280,7 +1335,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
         acc = acc * rescale + k * prob
         m = new_m
 
-    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+    quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE, QUANT_INT8)
 
     loc = tl.load(loc_ptr + row)
     loc_page_index = loc // INDEX_PAGE_SIZE
@@ -1335,7 +1390,10 @@ def kpool_assemble_softmax_rotate_write_cache(
         write_mask = write_mask.contiguous()
         has_write_mask = True
 
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # PPU int8: PPU 1.0/1.1 cannot store fp8 index-K; view as int8 instead.
+    quant_int8 = _kpool_quant_int8()
+    k_dtype = torch.int8 if quant_int8 else torch.float8_e4m3fn
+    buf_fp8 = buf.view(k_dtype)  # PPU int8: was buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     index_page_size = pool.index_page_size
 
@@ -1364,6 +1422,8 @@ def kpool_assemble_softmax_rotate_write_cache(
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * INDEX_HEAD_DIM,
         ROUND_SCALE=round_scale,
+        # PPU int8: select the int8 quantization branch in the kernel
+        QUANT_INT8=quant_int8,
         HAS_WRITE_MASK=has_write_mask,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
         INDEX_PAGE_SIZE=index_page_size,
@@ -1608,6 +1668,8 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    # PPU int8: quantize to int8 (q_max 127) instead of fp8 (q_max 448)
+    QUANT_INT8: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
 ):
@@ -1667,7 +1729,9 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 acc = acc * rescale + k_ld * prob
                 m = new_m
 
-            quantized, scale = _hadamard_quantize_fp8(acc, denom, ROUND_SCALE)
+            quantized, scale = _hadamard_quantize_fp8(
+                acc, denom, ROUND_SCALE, QUANT_INT8
+            )
             loc = tl.load(write_loc_ptr + b * write_loc_stride_0 + p)
             loc_page_index = loc // INDEX_PAGE_SIZE
             loc_token_offset_in_page = loc % INDEX_PAGE_SIZE
@@ -1702,6 +1766,8 @@ def kpool_write_tail_and_maybe_compress(
     write_loc: torch.Tensor,
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
+    # Frozen batch size from the KPoolWritePlan.
+    plan_bs: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
@@ -1720,11 +1786,19 @@ def kpool_write_tail_and_maybe_compress(
     bn = key.shape[0]
     if bn == 0:
         return
-    assert bn % num_draft_tokens == 0
-    bs = bn // num_draft_tokens
+
+    # Use the frozen plan_bs rather than deriving it from bn // num_draft_tokens.
+    bs = plan_bs
+    assert bs > 0, f"plan_bs must be positive, got {bs} (bn={bn})"
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)
     assert write_loc.shape == (bs, max_closed_pools), write_loc.shape
     assert write_loc.stride(1) == 1, write_loc.stride()
+
+    assert bn >= bs * num_draft_tokens, (
+        f"token buffer too small for the write plan: bn={bn} < "
+        f"plan_bs({bs}) * num_draft_tokens({num_draft_tokens}) = "
+        f"{bs * num_draft_tokens}"
+    )
 
     key = key.contiguous()
     score = score.contiguous()
@@ -1738,7 +1812,10 @@ def kpool_write_tail_and_maybe_compress(
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
     index_page_size = pool.index_page_size
-    buf_fp8 = buf.view(torch.float8_e4m3fn)
+    # PPU int8: PPU 1.0/1.1 cannot store fp8 index-K; view as int8 instead.
+    quant_int8 = _kpool_quant_int8()
+    k_dtype = torch.int8 if quant_int8 else torch.float8_e4m3fn
+    buf_fp8 = buf.view(k_dtype)  # PPU int8: was buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
         key,
@@ -1770,6 +1847,8 @@ def kpool_write_tail_and_maybe_compress(
         PRESHUFFLE_TILE=_preshuffle_tile(),
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * pool.index_head_dim,
         ROUND_SCALE=round_scale,
+        # PPU int8: select the int8 quantization branch in the kernel
+        QUANT_INT8=quant_int8,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
     )

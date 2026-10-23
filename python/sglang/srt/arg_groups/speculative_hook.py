@@ -610,29 +610,41 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "DSpark speculative decoding only supports CUDA or NPU device."
         )
 
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    ragged_mode = read_ragged_verify_mode()
+
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        if not _is_npu and cfg.moe_a2a_backend not in (
+            "none",
+            "deepep",
+            "megamoe",
+            "mori",
+        ):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "(built-in TP MoE), 'deepep', 'megamoe', or 'mori', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
-        if not _is_npu and (
-            cfg.moe_a2a_backend != "none"
-            or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        if (
+            not _is_npu
+            and cfg.moe_a2a_backend != "none"
+            and ragged_mode is not RaggedVerifyMode.STATIC
         ):
-            from sglang.srt.speculative.ragged_verify import (
-                RaggedVerifyMode,
-                read_ragged_verify_mode,
+            logger.warning(
+                "DSpark with dp attention + "
+                f"moe_a2a_backend={cfg.moe_a2a_backend!r} may fail "
+                f"with SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value}: "
+                "an all-to-all backend sizes "
+                "its per-rank dispatch buffers from a fixed verify width, which "
+                "non-static ragged verify does not guarantee. "
+                "Use SGLANG_RAGGED_VERIFY_MODE=static to avoid potential errors."
             )
-
-            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
-                raise ValueError(
-                    "DSpark DP MoE or prefill coordination requires "
-                    "SGLANG_RAGGED_VERIFY_MODE=static."
-                )
         if cfg.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
@@ -784,12 +796,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    from sglang.srt.speculative.ragged_verify import (
-        RaggedVerifyMode,
-        read_ragged_verify_mode,
-    )
+    if cfg.enable_mixed_chunk:
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            enable_mixed_chunk=False,
+        )
+        logger.warning(
+            "Mixed chunked prefill is disabled because of using "
+            "dspark speculative decoding."
+        )
 
-    ragged_mode = read_ragged_verify_mode()
     if (
         cfg.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT

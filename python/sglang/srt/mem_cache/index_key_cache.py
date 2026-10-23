@@ -33,12 +33,19 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
-        return (
-            num_pages,
-            pool.page_size
-            // pool.index_kpool
-            * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
-        )
+        if getattr(pool, "use_fp4_indexer", False):
+            # FP4 layout per token: head_dim/2 packed E2M1 bytes +
+            # head_dim/32 ue8m0 scale bytes.
+            page_width = pool.packed_bytes_per_token + pool.scale_bytes_per_token
+        elif getattr(pool, "use_bf16_indexer", False):
+            # BF16 K cache does not need scales; this is an element-count layout.
+            page_width = pool.index_head_dim
+        else:
+            # FP8/INT8 layout: K bytes plus fp32 scale bytes per quant block.
+            page_width = pool.index_head_dim + (
+                pool.index_head_dim // pool.quant_block_size * 4
+            )
+        return (num_pages, (pool.page_size // pool.index_kpool) * page_width)
 
     def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
         pool = self.pool

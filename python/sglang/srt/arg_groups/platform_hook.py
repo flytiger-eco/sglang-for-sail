@@ -15,9 +15,115 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_host_cpu_arm64
+from sglang.srt.utils.common import is_host_cpu_arm64, is_sail
 
 logger = logging.getLogger(__name__)
+
+
+def handle_ppu_backends(server_args: Any):
+    # PPU INT8 MoE / linear layers run on the acext backend. Initialize the
+    # acext CUDA path (defaulting it on) and validate the acext version, then
+    # size its token limit from the resolved chunked-prefill size.
+    if not is_sail():
+        return
+    from sglang.srt.environ import envs
+    from sglang.srt.utils.common import (
+        check_acext_version_compatibility,
+        set_acext_token_limit,
+    )
+
+    cfg = resolving_view(server_args)
+    if not envs.SGLANG_SAIL_USE_ACEXT_CUDA.is_set():
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(True)
+    if envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
+        check_acext_version_compatibility()
+    # deep gemm init
+    if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
+    if not envs.SGLANG_SAIL_DEEPGEMM_MOE.is_set():
+        envs.SGLANG_SAIL_DEEPGEMM_MOE.set(True)
+    # DSA FlashMLA decode compute stays non-FP8 on PPU by default.
+    if not envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.is_set():
+        envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.set(False)
+    # [q_v-not-support fallback] The PPU vendor fa3 library rejects the q_v
+    # argument ("q_v is only supported for Hopper GPUs") and the DSA fa3
+    # decode path always passes q_v, so the sub-SM90 CUDA default ("fa3")
+    # crashes at CUDA-graph capture. Default the DSA decode backend to
+    # flashmla_kv, the PPU-validated DSA decode impl; the DSA
+    # split-backend resolution treats a non-None value as user-set and
+    # keeps it. An explicit "--dsa-decode-backend fa3" fails fast with an
+    # actionable message instead of the vendor crash at graph capture.
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        if cfg.dsa_decode_backend is None:
+            declare_resolution(
+                server_args,
+                "_handle_ppu_backends",
+                dsa_decode_backend="flashmla_kv",
+            )
+            logger.info(
+                "PPU fa3 does not support q_v; defaulting the DSA decode "
+                "backend to flashmla_kv."
+            )
+        elif cfg.dsa_decode_backend == "fa3":
+            raise ValueError(
+                "--dsa-decode-backend fa3 is not supported on PPU: the fa3 "
+                'vendor library rejects q_v ("q_v is only supported for '
+                'Hopper GPUs") and the DSA fa3 decode path requires it. Use '
+                "--dsa-decode-backend flashmla_kv instead (the PPU default)."
+            )
+    # Use CUDA PLA fast path by default on PPU.
+    if not envs.SGLANG_SAIL_PLA_CUDA.is_set():
+        envs.SGLANG_SAIL_PLA_CUDA.set(True)
+    # Use CUDA FLA (Flash Linear Attention) fast path by default on PPU.
+    if not envs.SGLANG_SAIL_FLA_CUDA.is_set():
+        envs.SGLANG_SAIL_FLA_CUDA.set(True)
+    # Disable DeepSeek-V4 topk_v2 on PPU by default.
+    if not envs.SGLANG_OPT_USE_TOPK_V2.is_set():
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    # K3's Blackwell-specific fused paths cannot run on PPU. Keep the
+    # flags false so an explicit environment setting cannot re-enable them.
+    # SGLANG_K3_FUSED_FRONT stays at its default (True): the PPU W4A16
+    # MMA/fused-MoE path relies on the fused MoE front.
+    for field in (
+        envs.SGLANG_K3_AR_FUSION,
+        envs.SGLANG_K3_SP_COLLECTIVE,
+        envs.SGLANG_K3_SP_ATTN_RES,
+        envs.SGLANG_K3_GEMM_AR,
+    ):
+        field.set(False)
+    # Disable shared experts fusion for mxfp4 and mixed_precision_w4: those
+    # models use a different quant method for routed experts and shared
+    # experts, so the fused shared-expert path cannot run.
+    from sglang.srt.arg_groups.model_override_base import model_config_of
+    from sglang.srt.utils.common import get_quantization_config
+
+    quant_method = get_quantization_config(model_config_of(server_args).hf_config)
+    if quant_method in ("mxfp4", "mixed_precision_w4"):
+        declare_resolution(
+            server_args,
+            "_handle_ppu_backends",
+            disable_shared_experts_fusion=True,
+        )
+        logger.info(
+            f"{quant_method} model uses different quant method for routed experts and shared experts. --disable-shared-experts-fusion is automatically set."
+        )
+    # Disable custom allreduce by default on PPU (use pccl allreduce for perf).
+    if not cfg.disable_custom_all_reduce:
+        declare_resolution(
+            server_args,
+            "_handle_ppu_backends",
+            disable_custom_all_reduce=True,
+        )
+        logger.info(
+            "Disable custom allreduce and use pccl allreduce on ppu for better perf."
+        )
+    if cfg.chunked_prefill_size is not None:
+        set_acext_token_limit(
+            acext_num_tokens=int(cfg.chunked_prefill_size * 0.5),
+        )
 
 
 def handle_hardware_runtime_validation(server_args: Any):

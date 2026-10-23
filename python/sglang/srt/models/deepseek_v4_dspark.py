@@ -52,6 +52,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -64,10 +65,11 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_sail
 
 logger = logging.getLogger(__name__)
 
+_is_sail = is_sail()
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
@@ -110,6 +112,13 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
+        # wo_b defaults to an all-TP-group reduce; when attn_tp < tp (prefill CP
+        # with attn_cp > 1, or DP attention) o is only sharded over attn_tp, so the
+        # reduce must run over the attn_tp group or it wrongly sums the CP/DP
+        # replicas. Mirrors MQALayer.forward's attn_tp_all_reduce; a no-op when
+        # attn_tp == tp (attn_tp_group is the full TP group there).
+        if self.attn_tp_size < get_parallel().tp_size:
+            self.wo_b.use_dp_attention_reduce = True
         assert self.compress_ratio == 0, (
             "DSpark draft attention requires compress_ratio == 0."
         )
@@ -279,7 +288,9 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS:
+        # On PPU q is not padded: the backend slices the full attn_sink per TP
+        # rank to n_local_heads, so q must keep its local head count.
+        elif not _is_sail and self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -313,7 +324,9 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink()
+        # PPU expects the full sink and slices it per TP rank itself; feeding it
+        # the rank-local (64-padded) sink would slice twice.
+        attn_sink = self.attn_sink if _is_sail else self._local_attn_sink()
 
         o = attn_backend.forward(
             q=q,
@@ -748,6 +761,26 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             hf_config, quant_config
         )
 
+    # The DSpark draft module tree renames the checkpoint's mtp.X.attn/* to
+    # stages.X.self_attn/*.  These mappings let hybrid quantization configs
+    # (e.g. MoE MXFP4 + dense FP8 per-channel) correctly identify which draft
+    # layers are in fp8_channelwise_layers.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"mtp.": "stages."},
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1139,6 +1172,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        if _is_sail:
+            if self.quant_config and self.quant_config.get_name() == "fp8":
+                if self.quant_config.is_fp4_experts and "mlp.experts" in mapped_rest:
+                    mapped_rest = mapped_rest.replace(
+                        ".weight_scale_inv", ".weight_scale"
+                    )
+            else:
+                mapped_rest = mapped_rest.replace(".weight_scale_inv", ".weight_scale")
         return f"stages.{stage_id}.{mapped_rest}"
 
     def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:

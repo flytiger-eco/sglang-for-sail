@@ -408,6 +408,10 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+    IS_H200 = EnvBool(False)
+    SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -440,6 +444,9 @@ class Envs:
     # ===================================================================
     # Profiling, tracing, and metrics
     # ===================================================================
+    SGLANG_PROFILE_NVTX = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_TOPID = EnvBool(False)
+    SGLANG_PROFILE_NVTX_PRINT_SEQLEN = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
     SGLANG_PROFILE_V2 = EnvBool(False)
@@ -548,6 +555,9 @@ class Envs:
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # Broadcast the compact ragged-verify token budget from TP rank0 so every
+    # rank (incl. attention-CP ranks) picks the same cuda-graph tier.
+    SGLANG_DSPARK_SYNC_VERIFY_BUDGET = EnvBool(False)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
 
     # ===================================================================
@@ -659,6 +669,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # Order the last PP stage's next-slot schedule-stream work after the prior
+    # forward launch. This is opt-in until the ordering change is generalized.
+    SGLANG_PP_LAST_STAGE_STREAM_ORDERING = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
@@ -1194,6 +1207,9 @@ class Envs:
     # Expert parallel load balancing
     # ===================================================================
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
+    SGLANG_EPLB_ASYNC_HOST_MIRROR_REUSE_SHM = EnvBool(True)
+    SGLANG_EPLB_ASYNC_HOST_MIRROR_MEMORY_LOG = EnvBool(False)
+    SGLANG_EPLB_ASYNC_DUMMY_H2D = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
@@ -1204,6 +1220,12 @@ class Envs:
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
         32, deprecated_name="SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"
     )
+    # When True, add_row (expert distribution) and set_cpu_stage (EPLB) kernels
+    # are dispatched to dedicated streams (gather_stream / async_eplb_stream),
+    # allowing them to overlap with subsequent operations at the cost of extra
+    # inter-stream synchronization.  When False (default), they run directly on
+    # the current CUDA stream, executing sequentially but avoiding sync overhead.
+    SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM
@@ -1282,6 +1304,12 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
+    # cannot read CUDA sources, so they are converted by sailify first).
+    # One of: native, all, all-ppu,
+    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+    # device only, matching how the nvcc path pins -gencode to this GPU.
+    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1305,6 +1333,11 @@ class Envs:
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
+    SGLANG_SAIL_DEEPEP_RECV_HOOK = EnvBool(True)
+    # Override MNNVL FABRIC support detection for DeepEP on PPU.
+    SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED = EnvBool(True)
+
+    # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
@@ -1329,6 +1362,88 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+
+    # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
+    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
+    )
+    SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
+    SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
+        2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
+    )
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
+    )
+    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
+    SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
+    # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
+    # directly in fp8 ("born fp8") and the standalone concat-cast kernel
+    # disappears.  Not bit-exact vs the default path (same rounding stages,
+    # different GEMM accumulation order), hence default OFF until accuracy-
+    # gated (oracle + full-set gsm8k).
+    SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q = EnvBool(False)
+    # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: pass a
+    # per-row valid-topk count (derived from the trailing -1 pad run of the
+    # topk indices) so the kernel skips whole pad-only topk blocks instead of
+    # computing masked zero contributions.  Bit-exact by construction: skipped
+    # blocks contain only -1 pads, and -1 entries inside the consumed range
+    # still take the in-kernel clamp+mask path.
+    SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH = EnvBool(False)
+    # Opt-in: run the born-fp8 q-prep (absorbed bmm + concat + fp8 cast,
+    # ~173us/layer-call) on alt_stream underneath the DSA indexer — the two
+    # chains fork independently from the q_a_layernorm output.  Requires
+    # SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q; eager-prefill-only via the born
+    # predicate.  Coarse per-layer join keeps the single-slot born-q buffer
+    # WAR-safe.
+    SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP = EnvBool(False)
+    # Opt-in: fuse the Q8KV8 non-prefix KV prep — cast-concat k/k_rope
+    # directly into the persistent fp8 kv buffer and zero the pad band in one
+    # Triton kernel (replaces bf16 _cat + copy_ cast + zero_ tail).
+    SGLANG_ENABLE_DSA_Q8KV8_KV_CAT_FUSION = EnvBool(False)
+    # Q8KV8 born-fp8 q-prep codegen: "auto" = per-K Triton dispatch (default);
+    # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
+    # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
+    SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # TRT-LLM-gen fused MoE (SiTU) via sglang JIT: path to an unpacked SiTU
+    # cubin pool (cubins + flat ABI headers + overlay/; distributed as a
+    # single downloadable archive). Needs the public flashinfer package
+    # installed for the unmodified JIT sources. Unset = feature off.
+    SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL = EnvStr(None)
+
+    # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
+    # small messages and in-place NVLS 2shot on symmetric-memory tensors for
+    # large ones, with an optional fused residual add. Covers the KDA o_proj
+    # output and the latent|shared MoE reduce; everything else falls back to
+    # the regular all-reduce path. Auto-enabled on SM100/SM103 when
+    # CustomAllReduceV2 with multicast is available; set 0/1 to override in
+    # either direction. See srt/layers/k3_ar_fusion.py.
+    SGLANG_K3_AR_FUSION = EnvBool(False)
+    # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
+    # CustomAllReduceV2's MNNVL push workspace. Auto-probed for the validated
+    # TP8 GB300 configuration; set 0/1 to override. See
+    # srt/layers/k3_sp_collective.py.
+    SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # Keep K3's post-MoE residual stream token-sharded between consecutive
+    # SP-MoE layers. The next attention-residual aggregation and snapshot
+    # bank write run on the local shard, then only the normalized attention
+    # input is all-gathered. Requires SGLANG_K3_SP_COLLECTIVE.
+    SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # Fused o_proj GEMM + all-reduce (bf16, TP 2..8, SM100+): one
+    # kernel computes the TP-local o_proj partial and the cross-rank sum over
+    # a P2P comm region, replacing the GEMM + NCCL AR pair at M <= 512.
+    SGLANG_K3_GEMM_AR = EnvBool(False)
+    # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
+    # front reads hidden_states once, and run the top-k plus the bf16 cast in one
+    # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
+    SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # Fuse full-rank K3 KDA input projections on PPU. Default on.
+    SGLANG_K3_KDA_INPUT_PROJ_FUSION = EnvBool(True)
 
     # ===================================================================
     # Top-k kernels
@@ -1663,6 +1778,8 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # Use CUDA for separate MLA K-cache quantization instead of Triton.
+    SGLANG_OPT_USE_CUDA_MLA_K_CACHE_QUANT = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
@@ -1790,6 +1907,14 @@ class Envs:
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
     SGLANG_DISABLE_M3_FP8_ATTN_GEMM = EnvBool(False)
+
+    # SAIL MiniMax-M3 MSA backend. Defaults and arch-aware behavior are resolved
+    # in minimax_sparse_ops/msa_ppu.py; see compute_msa_ppu_gate.
+    SGLANG_SAIL_MINIMAX_M3_MSA = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_MEM_BUDGET_MB = EnvInt(256)
+    SGLANG_SAIL_MINIMAX_M3_MSA_ATTEND = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8 = EnvBool(True)
+    SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_SCORE_BF16 = EnvBool(True)
     # MiniMax-M3 sparse decode indexer: single JIT radix-select kernel replaces the 2-stage split-K Triton topk.
     SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX = EnvBool(True)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
@@ -1919,6 +2044,36 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+    # Memory Pool
+    SGLANG_SORT_PAGE = EnvBool(False)  # enable page sorting when not in PD mode
+
+    # SAIL
+    SGLANG_SAIL_FUSEDMOE_OPT = EnvBool(False)
+    SGLANG_SAIL_FUSEDMOE_MAX_TOKENS = EnvInt(32768)
+    SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
+    SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
+    # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
+    # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
+    # Opt into the direct MXFP4 W4A16 MMA weight layout instead of VALU.  # codespell:ignore
+    SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
+    SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
+    SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
+    SGLANG_SAIL_PLA_CUDA = EnvBool(False)
+    # SAIL FLA CUDA: top-level gate for SAIL-accelerated FLA (Flash Linear
+    # Attention) paths on PPU. When False, all SAIL FLA dispatch (including
+    # PLA decode fast-paths) falls back to community Triton kernels.
+    SGLANG_SAIL_FLA_CUDA = EnvBool(False)
+    SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
+    SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
+    # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
+    SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
+    # Enable NaN check on logits valid range before topk_transform (debug/diag).
+    SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
 
 
 envs = Envs()

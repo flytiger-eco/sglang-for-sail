@@ -160,7 +160,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_sail()
 
 
 @lru_cache(maxsize=1)
@@ -222,20 +222,31 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+# Import torchada eagerly (at module load) so that dynamo never traces an
+# import statement when is_musa() is called from a fullgraph torch.compile
+# region: a failed import inside tracing raises "Import failure" and breaks
+# CUDA graph capture.
+try:
+    import torchada  # noqa: F401
+
+    _MUSA_VERSION = getattr(torch.version, "musa", None)
+except ImportError:
+    _MUSA_VERSION = None
+
+
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
-    if not hasattr(torch.version, "musa") or torch.version.musa is None:
-        return False
-    try:
-        import torchada  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    return _MUSA_VERSION is not None
 
 
 @lru_cache(maxsize=1)
 def is_mps() -> bool:
     return hasattr(torch, "mps") and torch.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_sail() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -1005,6 +1016,8 @@ def is_mnnvl_fabric_device() -> bool:
     v2 multinode, DCP fi_a2a)."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
+    if is_sail():
+        return True
     name = (torch.cuda.get_device_name(0) or "").upper()
     return any(tag in name for tag in ("GB200", "GB300"))
 
@@ -5140,3 +5153,25 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+def set_acext_token_limit(acext_num_tokens: int = 6144):
+    if "ACEXT_NUM_TOKENS_LIMIT" not in os.environ:
+        os.environ["ACEXT_NUM_TOKENS_LIMIT"] = str(acext_num_tokens)
+    logger.warning(f"acext token limit: {os.environ['ACEXT_NUM_TOKENS_LIMIT']}")
+
+
+def check_acext_version_compatibility(acext_version: int = 1050100):
+    if get_device_sm() >= 89:
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+        return
+    from acext import get_version as acext_get_version
+
+    current_ver = acext_get_version()
+    if current_ver < acext_version:
+        logger.warning(
+            f"acext version {current_ver} don't satisfy minimum version {acext_version}. Fallback to triton"
+        )
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+    else:
+        logger.warning(f"Current acext version: {current_ver}")

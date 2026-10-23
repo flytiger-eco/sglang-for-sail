@@ -1086,6 +1086,25 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    @staticmethod
+    def _get_msa_decode_idx_q_fp8_out(
+        forward_batch: ForwardBatch, num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        if (
+            not _is_cuda
+            or not forward_batch.forward_mode.is_decode()
+            or not has_forward_context()
+        ):
+            return None
+        sparse_backend = getattr(get_forward_context().attn_backend, "sparse", None)
+        if not getattr(sparse_backend, "use_msa_ppu", False):
+            return None
+        state = getattr(sparse_backend, "_ppu_msa_dec", None)
+        fp8_q_out = getattr(state, "idx_q_fp8", None)
+        if fp8_q_out is None or num_tokens > fp8_q_out.shape[0]:
+            return None
+        return fp8_q_out[:num_tokens]
+
     def _get_aiter_cos_sin_cache(self, packed_qkv: torch.Tensor) -> torch.Tensor:
         source = self.rotary_emb.cos_sin_cache
         cached = self._aiter_cos_sin_cache
@@ -1617,7 +1636,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        if self.is_layer_sparse:
+            hidden_states = self.mlp(
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        elif hidden_states.shape[0] != 0:
             hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
@@ -1746,7 +1770,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        # no index_v_proj in the M3 checkpoint
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }

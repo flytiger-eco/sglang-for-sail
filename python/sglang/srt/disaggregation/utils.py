@@ -27,6 +27,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.server_args import ServerArgs
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -127,6 +129,32 @@ def poll_and_all_reduce_prefill_pp(
     return polls
 
 
+def _resolve_speculative_backend_type(server_args: ServerArgs, backend_name: str):
+    backend_type = (
+        server_args.speculative_draft_attention_backend
+        if server_args.speculative_draft_attention_backend
+        else getattr(server_args, backend_name)
+    )
+    if backend_type is None:
+        backend_type = server_args.attention_backend
+    return backend_type
+
+
+def dsa_seed_backend_enabled(server_args: ServerArgs) -> bool:
+    decode_backend = _resolve_speculative_backend_type(
+        server_args, "decode_attention_backend"
+    )
+    draft_extend_backend_name = (
+        "decode_attention_backend"
+        if server_args.speculative_attention_mode == "decode"
+        else "prefill_attention_backend"
+    )
+    draft_extend_backend = _resolve_speculative_backend_type(
+        server_args, draft_extend_backend_name
+    )
+    return decode_backend in ("dsa", "nsa") and draft_extend_backend in ("dsa", "nsa")
+
+
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
@@ -144,6 +172,15 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     if req_pool_idx is None:
         raise ValueError("QSA pending-state transfer requires an allocated request row")
     return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
+def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
+    """Whether PD DSA prefill CP must bypass the legacy radix cache."""
+    return (
+        is_dsa
+        and get_disagg().disaggregation_mode != "null"
+        and get_parallel().enable_prefill_cp
+    )
 
 
 class DisaggregationMode(Enum):

@@ -2,6 +2,7 @@
 
 # --- merged from sglang.kernels.ops.attention.dsv4 (RFC #29630 Phase 4) ---
 from .attn import (
+    dequantize_k_cache_paged_cuda,
     fused_store_cache,
     get_paged_mqa_logits_metadata,
     triton_create_paged_compress_data,
@@ -16,8 +17,11 @@ from .compress import (
 from .compress_old import fused_norm_rope_inplace
 from .elementwise import (
     fused_k_norm_rope_flashmla,
+    fused_q_indexer_rope_first_fp4_quant,
+    fused_q_indexer_rope_first_int8_quant,
     fused_q_indexer_rope_first_quant,
     fused_q_indexer_rope_hadamard_fp4_quant,
+    fused_q_indexer_rope_hadamard_int8_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
@@ -25,6 +29,9 @@ from .elementwise import (
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
+    top_k_per_row_prefill,
+    top_k_per_row_prefill_bf16,
+    topk_transform_512_bf16,
     topk_transform_paged,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -37,11 +44,15 @@ __all__ = [
     "compress_forward",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
+    "dequantize_k_cache_paged_cuda",
     "fused_norm_rope_inplace",
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
     "fused_q_indexer_rope_first_quant",
+    "fused_q_indexer_rope_first_fp4_quant",
+    "fused_q_indexer_rope_first_int8_quant",
+    "fused_q_indexer_rope_hadamard_int8_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",
     "fused_k_norm_rope_flashmla",
@@ -50,7 +61,10 @@ __all__ = [
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",
     "topk_transform_paged",
+    "topk_transform_512_bf16",
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
+    "top_k_per_row_prefill",
+    "top_k_per_row_prefill_bf16",
     "plan_topk_v2",
 ]
