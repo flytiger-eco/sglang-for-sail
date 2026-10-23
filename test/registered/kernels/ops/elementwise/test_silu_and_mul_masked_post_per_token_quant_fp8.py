@@ -312,6 +312,10 @@ def test_invalid_args() -> None:
     strided_m = torch.full((2 * E,), T, dtype=torch.int32, device="cuda")[::2]
     with pytest.raises(AssertionError, match="masked_m must be contiguous"):
         silu_and_mul_masked_post_per_token_quant_fp8(inp, strided_m)
+    # masked_m must live on the same CUDA device as input
+    cpu_m = torch.full((E,), T, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="same CUDA device"):
+        silu_and_mul_masked_post_per_token_quant_fp8(inp, cpu_m)
     # aligned strides with a 2-byte offset base pointer must be rejected
     wide = torch.randn((E, T, two_N + 8), dtype=torch.bfloat16, device="cuda")
     misaligned = wide[..., 1 : 1 + two_N]
