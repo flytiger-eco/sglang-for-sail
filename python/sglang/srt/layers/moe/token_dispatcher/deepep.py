@@ -509,6 +509,10 @@ class _DeepEPDispatcherImplBase:
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
+        if "w4a8_scale_multiplier" in quant_config and not self.use_fp8:
+            raise ValueError(
+                "SAIL MXFP4 W4A8 requires FP8 DeepEP dispatch; remove the dtype override."
+            )
 
     def set_deepep_dispatcher_dtype(self) -> None:
         # DispatcherOutputDtype is inferred solely from the quant_config dict (and
@@ -680,12 +684,18 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     and self.quant_config.get("is_channel_quant", False)
                 )
 
+                use_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and (
+                    "w4a8_scale_multiplier" not in (self.quant_config or {})
+                )
                 hidden_states = sglang_per_token_group_quant_fp8(
                     hidden_states,
                     hidden_states.shape[-1] if is_channel_quant else 128,
-                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    column_major_scales=use_ue8m0,
+                    scale_tma_aligned=use_ue8m0,
+                    scale_ue8m0=use_ue8m0,
+                    scale_multiplier=(self.quant_config or {}).get(
+                        "w4a8_scale_multiplier", 1.0
+                    ),
                 )
         elif self.use_int8:
             hidden_states = per_token_quant_int8(hidden_states)

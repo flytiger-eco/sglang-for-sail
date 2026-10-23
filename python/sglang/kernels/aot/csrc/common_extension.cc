@@ -127,7 +127,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // Compatibility API: SGLang runtime dispatches to the JIT implementation,
   // but external sgl_kernel consumers still rely on this exported CUDA op.
-  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s, float scale_multiplier=1.0) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 
   /*

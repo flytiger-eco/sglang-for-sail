@@ -12,7 +12,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.utils import is_sail
+from sglang.srt.utils import get_device_sm, is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -724,6 +724,71 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad(
             lhs, rhs, bias, out, m_indices, m_rows, configs=best_config
+        )
+
+
+def grouped_gemm_nt_f8f4bf16_nopad(lhs, rhs, out, m_indices, m_rows=None):
+    assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
+    m, k = lhs[0].shape
+    e, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        e,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_NOPAD,
+        use_m_rows=m_rows is not None,
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs, out, m_indices, m_rows)
+
+
+def grouped_gemm_nt_f8f4bf16_masked(lhs, rhs, out, masked_m, expected_m):
+    assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
+    e, capacity, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m,
+        n,
+        k,
+        e,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED,
+        masked_capacity=capacity,
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            lhs, rhs, out, masked_m, expected_m
+        )
+
+
+def grouped_gemm_nt_f8f4bf16_fused(
+    lhs,
+    rhs,
+    out,
+    m_rows,
+    expert_ids_and_cumsum,
+    sorted_token_ids,
+    aligned_num_m_blocks,
+    configs,
+):
+    assert _is_sail and get_device_sm() >= 89, "W4A8 requires SAIL SM89+"
+    m, k = lhs[0].shape
+    e, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        e,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_FUSED,
+        top_k=out.shape[0] // m if m else 1,
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
         )
 
 

@@ -586,6 +586,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_deepgemm_mxfp4_w4a16_mma = (
             _is_sail and self.use_deep_gemm and mma_enabled
         )
+        self.use_deepgemm_mxfp4_w4a8 = (
+            _is_sail and envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8.get()
+        )
+        if self.use_deepgemm_mxfp4_w4a8:
+            if not self.use_deep_gemm:
+                raise ValueError(
+                    "PPU MXFP4 W4A8 requires --moe-runner-backend deep_gemm."
+                )
+            if valu_enabled or mma_enabled:
+                raise ValueError("PPU MXFP4 W4A8 and W4A16 are mutually exclusive.")
+            moe_a2a_backend = get_moe_a2a_backend()
+            if get_device_sm() < 89 or not (
+                moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()
+            ):
+                raise ValueError(
+                    "SAIL MXFP4 W4A8 requires SM89+ and none/deepep MoE a2a."
+                )
+            if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                raise RuntimeError("PPU MXFP4 W4A8 requires DeepGEMM.")
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -707,6 +726,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         use_ppu_w4a16_valu = self.use_deepgemm_mxfp4_w4a16_valu
         use_ppu_w4a16_mma = self.use_deepgemm_mxfp4_w4a16_mma
         use_ppu_w4a16 = use_ppu_w4a16_valu or use_ppu_w4a16_mma
+        if getattr(self, "use_deepgemm_mxfp4_w4a8", False) and with_bias:
+            raise ValueError("PPU MXFP4 W4A8 does not support expert bias.")
+        if getattr(self, "use_deepgemm_mxfp4_w4a8", False):
+            config = layer.moe_runner_config
+            if config.activation not in ("silu", "situ") or not config.is_gated:
+                raise ValueError("SAIL MXFP4 W4A8 requires gated SiLU or SiTU experts.")
+            if config.silu_mul_keep_fp32 or (
+                config.activation == "silu"
+                and (
+                    config.gemm1_alpha is not None
+                    or config.gemm1_clamp_limit is not None
+                )
+            ):
+                raise ValueError(
+                    "SAIL MXFP4 W4A8 does not support this activation configuration."
+                )
+            if hidden_size % 128 or intermediate_size_per_partition % 64:
+                raise ValueError(
+                    "SAIL MXFP4 W4A8 requires H % 128 == 0 and I % 64 == 0."
+                )
         if use_ppu_w4a16_mma and with_bias:
             raise ValueError("PPU MXFP4 W4A16 MMA does not support expert bias.")
         mxfp4_block = 32
@@ -908,6 +947,41 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Resolve MORI dtype overrides and build the EPv2 op before KV cache
             # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
             layer.dispatcher.set_quant_config({})
+
+        if getattr(self, "use_deepgemm_mxfp4_w4a8", False):
+            from deep_gemm import PreprocessMode, preprocess_weights_and_scales
+
+            down_k = layer.w2_weight.shape[-1] * 2
+            down_k_pad = round_up(down_k, 128) - down_k
+            if down_k_pad:
+                layer.w2_weight.data = torch.nn.functional.pad(
+                    layer.w2_weight.data, (0, down_k_pad // 2)
+                )
+                layer.w2_weight_scale.data = torch.nn.functional.pad(
+                    layer.w2_weight_scale.data,
+                    (0, down_k_pad // 32),
+                    value=_UE8M0_ONE,
+                )
+
+            for weight_name in ("w13_weight", "w2_weight"):
+                scale_name = f"{weight_name}_scale"
+                weight, scale, inv_scale = preprocess_weights_and_scales(
+                    PreprocessMode.W4A8_MXFP4_MMA,
+                    False,
+                    getattr(layer, weight_name).data,
+                    getattr(layer, scale_name).data,
+                )
+                getattr(layer, weight_name).data = weight
+                getattr(layer, scale_name).data = scale
+                setattr(layer, f"{weight_name}_inv_scale", inv_scale)
+            if get_moe_a2a_backend().is_deepep():
+                # Both dispatcher implementations retain this dictionary via
+                # set_quant_config; normal folds here, LL compensates on receipt.
+                config = dict(layer.dispatcher.quant_config)
+                config["w4a8_scale_multiplier"] = layer.w13_weight_inv_scale
+                layer.dispatcher.set_quant_config(config)
+            torch.cuda.empty_cache()
+            return
 
         if _is_sail and self.use_deepgemm_mxfp4_w4a16_mma:
             from sglang.srt.layers.quantization.ppu_mxfp4_utils import (
@@ -1990,6 +2064,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
             if _is_sail:
+                if self.use_deepgemm_mxfp4_w4a8:
+                    quant_info = DeepGemmMoeQuantInfo(
+                        w13_weight=layer.w13_weight,
+                        w2_weight=layer.w2_weight,
+                        use_mxfp4_w4a8=True,
+                        per_channel_quant=True,
+                        w13_scale=layer.w13_weight_scale,
+                        w2_scale=layer.w2_weight_scale,
+                        w13_inv_scale=layer.w13_weight_inv_scale,
+                        w2_inv_scale=layer.w2_weight_inv_scale,
+                    )
+                    return self.runner.run(dispatch_output, quant_info)
                 # PPU fused none+deep_gemm path is FP4xFP4 (physical K matches).
                 quant_info = DeepGemmMoeQuantInfo(
                     w13_weight=layer.w13_weight,
