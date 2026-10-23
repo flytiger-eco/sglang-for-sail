@@ -728,6 +728,60 @@ def grouped_gemm_nt_f4f4bf16_nopad(
         )
 
 
+def grouped_gemm_nt_f8f4bf16_nopad(lhs, rhs, out, m_indices, m_rows=None):
+    assert _is_ppu
+    m, k = lhs[0].shape
+    e, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, e, compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_NOPAD
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(lhs, rhs, out, m_indices, m_rows)
+
+
+def grouped_gemm_nt_f8f4bf16_masked(lhs, rhs, out, masked_m, expected_m):
+    assert _is_ppu
+    e, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m,
+        n,
+        k,
+        e,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED,
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            lhs, rhs, out, masked_m, expected_m
+        )
+
+
+def grouped_gemm_nt_f8f4bf16_fused(
+    lhs,
+    rhs,
+    out,
+    m_rows,
+    expert_ids_and_cumsum,
+    sorted_token_ids,
+    aligned_num_m_blocks,
+    configs,
+):
+    assert _is_ppu
+    m, k = lhs[0].shape
+    e, n, _ = rhs[0].shape
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, e, compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_FUSED
+    ):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            lhs,
+            rhs,
+            out,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            configs,
+        )
+
+
 def _get_w4a16_weight_shape(weight: torch.Tensor) -> Tuple[int, int, int]:
     if weight.dtype == torch.uint8:
         # W4FA16 MMA: [E, N, K/2], two FP4 values per byte.

@@ -679,14 +679,15 @@ class FusedMoE(torch.nn.Module):
         elif isinstance(self.quant_method, W8A8Int8MoEMethod):
             quant_config_dict["dispatcher_output_dtype"] = "int8"
         elif isinstance(self.quant_method, Mxfp4MoEMethod):
-            quant_config_dict["dispatcher_output_dtype"] = (
-                "uint8"
-                if not (
-                    self.quant_method.use_deepgemm_mxfp4_w4a16_valu
-                    or self.quant_method.use_deepgemm_mxfp4_w4a16_mma
-                )
-                else "bf16"
-            )
+            if getattr(self.quant_method, "use_deepgemm_mxfp4_w4a8", False):
+                quant_config_dict["dispatcher_output_dtype"] = "fp8"
+            elif (
+                self.quant_method.use_deepgemm_mxfp4_w4a16_valu
+                or self.quant_method.use_deepgemm_mxfp4_w4a16_mma
+            ):
+                quant_config_dict["dispatcher_output_dtype"] = "bf16"
+            else:
+                quant_config_dict["dispatcher_output_dtype"] = "uint8"
         # default use bf16 dispatcher on ppu (e.g. unquant, wn_a16)
         else:
             quant_config_dict["dispatcher_output_dtype"] = "bf16"
@@ -702,6 +703,10 @@ class FusedMoE(torch.nn.Module):
                 is_channel_quant = True
 
         if isinstance(self.quant_method, W8A8Int8MoEMethod):
+            is_channel_quant = True
+        if isinstance(self.quant_method, Mxfp4MoEMethod) and getattr(
+            self.quant_method, "use_deepgemm_mxfp4_w4a8", False
+        ):
             is_channel_quant = True
 
         quant_config_dict["is_channel_quant"] = is_channel_quant

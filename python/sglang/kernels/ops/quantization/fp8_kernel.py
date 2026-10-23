@@ -573,6 +573,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    scale_multiplier: float = 1.0,
 ):
     assert x.shape[-1] % group_size == 0, (
         "the last dimension of `x` cannot be divisible by `group_size`"
@@ -588,7 +589,9 @@ def sglang_per_token_group_quant_fp8(
         # Whole-row group quant is per-token quant; route to the dedicated
         # kernel (same [T, 1] scale shape) instead of a group kernel that
         # would need arbitrary group sizes.
-        return sglang_per_token_quant_fp8(x)
+        return sglang_per_token_quant_fp8(x, scale_multiplier=scale_multiplier)
+
+    assert scale_multiplier == 1.0
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 
@@ -764,6 +767,7 @@ def sglang_per_token_group_quant_8bit(
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,
+    scale_multiplier: float = 1.0,
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -775,7 +779,7 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    sgl_per_token_quant_fp8(x, x_q, x_s, scale_multiplier)
 
     return x_q, x_s
 
@@ -1392,3 +1396,8 @@ def per_group_transpose(
 # input  - [M, K]
 # weight - [K, N]
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
+if _is_cuda:
+
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
+    def _(input, output_q, output_s, scale_multiplier=1.0):
+        return

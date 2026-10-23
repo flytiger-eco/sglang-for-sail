@@ -286,6 +286,7 @@ class DeepGemmRunnerInput(RunnerInput):
     # Number of activation elements sharing one scale along K.
     # Records the actual input quantization group, independently of weight scales.
     activation_scale_block_size: Optional[int] = None
+    w13_scale_compensated: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -320,6 +321,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    use_mxfp4_w4a8: bool = False
+    w13_inv_scale: float = 1.0
+    w2_inv_scale: float = 1.0
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -474,6 +478,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_int8_contiguous_gemm(
                         runner_input, quant_info, running_state
                     )
+                elif quant_info.use_mxfp4_w4a8:
+                    hidden_states = self._run_w4a8_contiguous_gemm(
+                        runner_input, quant_info, running_state
+                    )
                 elif quant_info.use_mxfp4:
                     hidden_states = self._run_fp4_contiguous_gemm(
                         runner_input, quant_info, running_state
@@ -502,6 +510,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     hidden_states = self._run_masked_int8_gemm(
                         runner_input, quant_info, running_state
                     )
+                elif quant_info.use_mxfp4_w4a8:
+                    hidden_states = self._run_w4a8_masked_gemm(
+                        runner_input, quant_info, running_state
+                    )
                 elif quant_info.use_mxfp4:
                     hidden_states = self._run_masked_fp4_gemm(
                         runner_input, quant_info, running_state
@@ -519,6 +531,117 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 th_nvtx_range_pop()
 
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
+
+    def _run_w4a8_contiguous_gemm(self, runner_input, quant_info, running_state):
+        import deep_gemm
+
+        hidden_states = runner_input.hidden_states
+        all_tokens = running_state["all_tokens"]
+        n = quant_info.w13_weight.size(1)
+        k = hidden_states.size(1)
+        gateup_output = torch.empty(
+            (all_tokens, n), device=hidden_states.device, dtype=torch.bfloat16
+        )
+        hidden_states_scale = runner_input.hidden_states_scale
+        if not runner_input.w13_scale_compensated:
+            hidden_states_scale = hidden_states_scale * quant_info.w13_inv_scale
+        deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_nopad(
+            (hidden_states, hidden_states_scale),
+            (quant_info.w13_weight, quant_info.w13_scale),
+            gateup_output,
+            runner_input.m_indices,
+            running_state.get("m_rows"),
+        )
+        if self.config.activation == "situ":
+            down_input, down_scale = deep_gemm.situ_and_mul(
+                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+                gateup_output,
+                beta=(
+                    self.config.gemm1_alpha
+                    if self.config.gemm1_alpha is not None
+                    else 4.0
+                ),
+                linear_beta=self.config.gemm1_clamp_limit,
+                weight_inv_scale=quant_info.w2_inv_scale,
+            )
+        else:
+            down_input, down_scale = deep_gemm.silu_and_mul(
+                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+                gateup_output,
+                swiglu_limit=self.swiglu_limit,
+                weight_inv_scale=quant_info.w2_inv_scale,
+            )
+        down_k_pad = quant_info.w2_weight.shape[-1] * 2 - down_input.shape[-1]
+        if down_k_pad:
+            down_input = torch.nn.functional.pad(down_input, (0, down_k_pad))
+        down_output = torch.empty(
+            (all_tokens, k), device=hidden_states.device, dtype=torch.bfloat16
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_nopad(
+            (down_input, down_scale),
+            (quant_info.w2_weight, quant_info.w2_scale),
+            down_output,
+            runner_input.m_indices,
+            running_state.get("m_rows"),
+        )
+        return down_output
+
+    def _run_w4a8_masked_gemm(self, runner_input, quant_info, running_state):
+        import deep_gemm
+
+        hidden_states = runner_input.hidden_states
+        e, t, k = hidden_states.shape
+        n = quant_info.w13_weight.size(1)
+        gateup_output = torch.empty(
+            (e, t, n), device=hidden_states.device, dtype=torch.bfloat16
+        )
+        hidden_states_scale = runner_input.hidden_states_scale
+        if not runner_input.w13_scale_compensated:
+            hidden_states_scale = hidden_states_scale * quant_info.w13_inv_scale
+        deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_masked(
+            (hidden_states, hidden_states_scale.contiguous()),
+            (quant_info.w13_weight, quant_info.w13_scale),
+            gateup_output,
+            runner_input.masked_m,
+            runner_input.expected_m,
+        )
+        if self.config.activation == "situ":
+            down_input, down_scale = deep_gemm.situ_and_mul(
+                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+                gateup_output,
+                beta=(
+                    self.config.gemm1_alpha
+                    if self.config.gemm1_alpha is not None
+                    else 4.0
+                ),
+                linear_beta=self.config.gemm1_clamp_limit,
+                masked_m=runner_input.masked_m,
+                expected_m=runner_input.expected_m,
+                weight_inv_scale=quant_info.w2_inv_scale,
+            )
+        else:
+            down_input, down_scale = deep_gemm.silu_and_mul(
+                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+                gateup_output,
+                masked_m=runner_input.masked_m,
+                expected_m=runner_input.expected_m,
+                swiglu_limit=self.swiglu_limit,
+                weight_inv_scale=quant_info.w2_inv_scale,
+            )
+        down_k_pad = quant_info.w2_weight.shape[-1] * 2 - down_input.shape[-1]
+        if down_k_pad:
+            down_input = torch.nn.functional.pad(down_input, (0, down_k_pad))
+        down_output = torch.empty(
+            (e, t, k), device=hidden_states.device, dtype=torch.bfloat16
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_masked(
+            (down_input, down_scale),
+            (quant_info.w2_weight, quant_info.w2_scale),
+            down_output,
+            runner_input.masked_m,
+            runner_input.expected_m,
+        )
+        return down_output
 
     def _run_contiguous_gemm(
         self,
@@ -2191,7 +2314,7 @@ def pre_permute_standard_to_deep_gemm(
         deep_gemm_sm120.allows_masked_standard_layout()
         and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
     ) or _is_ppu:
-        if quant_info.use_fp8:
+        if quant_info.use_fp8 or quant_info.use_mxfp4_w4a8:
             output_dtype = torch.float8_e4m3fn
         elif quant_info.use_int8:
             output_dtype = torch.int8
@@ -2211,6 +2334,9 @@ def pre_permute_standard_to_deep_gemm(
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
                 expert_start=expert_start,
+                scale_multiplier=(
+                    quant_info.w13_inv_scale if quant_info.use_mxfp4_w4a8 else 1.0
+                ),
             )
         )
         # Use the global expert count because expected_m is a tuning hint, not
@@ -2241,6 +2367,7 @@ def pre_permute_standard_to_deep_gemm(
             activation_scale_block_size=(
                 quant_info.block_shape[1] if quant_info.block_shape else 128
             ),
+            w13_scale_compensated=quant_info.use_mxfp4_w4a8,
         )
 
     # The compact layout avoids scaling masked buffers with the expert count.
@@ -2592,7 +2719,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         ).transpose(0, 1)
     else:
         is_block_wise = quant_info.block_shape is not None
-        if quant_info.use_fp8:
+        if quant_info.use_fp8 or quant_info.use_mxfp4_w4a8:
             if is_block_wise:
                 input_tensor_scale = buffer_init(
                     (all_tokens, K // 128),
@@ -2684,6 +2811,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         use_masked_gemm=False,
         m_indices=m_indices,
         activation_scale_block_size=128,
+        w13_scale_compensated=quant_info.use_mxfp4_w4a8,
     )
 
 

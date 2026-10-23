@@ -240,7 +240,7 @@ void sgl_per_token_group_quant_8bit_v2(
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
-void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, double scale_multiplier = 1.0);
 
 /*
  * From csrc/moe
