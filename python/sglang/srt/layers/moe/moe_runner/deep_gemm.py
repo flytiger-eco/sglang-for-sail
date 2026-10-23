@@ -1494,6 +1494,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
                 num_real_tokens=num_real_tokens,
                 silu_mul_keep_fp32=self.config.silu_mul_keep_fp32,
+                expected_m=expected_m,
             )
         if trace_deepep_v2_masked:
             torch.cuda.synchronize()
@@ -1679,9 +1680,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.ep_moe_kernels import (
-            silu_and_mul_masked_post_quant_fwd,
-        )
         from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
@@ -1729,39 +1727,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if self.swiglu_limit is not None:
             swiglu_limit_arg = self.swiglu_limit
 
-        # Act
-        scale_block_size = gateup_output.shape[2] // 2
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=gateup_output.device,
-            dtype=hidden_states.dtype,
-        )
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                1,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
-        )
-        silu_and_mul_masked_post_quant_fwd(
+        # Act: channel-wise weights consume one FP8 activation scale per token.
+        down_input, down_input_scale = _masked_deep_gemm_silu_mul_quant(
             gateup_output,
-            down_input,
-            down_input_scale,
-            scale_block_size,
             masked_m,
-            use_fp8=hidden_states.dtype == torch.float8_e4m3fn
-            or hidden_states.dtype == torch.float8_e5m2,
-            use_int8=hidden_states.dtype == torch.int8,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            out_dtype=hidden_states.dtype,
+            expected_m=expected_m,
             swiglu_limit=swiglu_limit_arg,
-            gemm1_alpha=self.config.gemm1_alpha or 0.0,
-            gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
+            gemm1_alpha=self.config.gemm1_alpha,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+            silu_mul_keep_fp32=self.config.silu_mul_keep_fp32,
         )
         del gateup_output
 
@@ -2784,6 +2759,70 @@ def _varlen_deep_gemm_situ_mul_quant(
     return down_input, down_input_scale
 
 
+def _masked_deep_gemm_silu_mul_quant(
+    gateup_output: torch.Tensor,
+    masked_m: torch.Tensor,
+    out_dtype: torch.dtype = torch.float8_e4m3fn,
+    expected_m: Optional[int] = None,
+    swiglu_limit: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_clamp_limit: Optional[float] = None,
+    silu_mul_keep_fp32: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token masked quantization shared by channel-wise and varlen routes."""
+    E, T, two_H = gateup_output.shape
+    H = two_H // 2
+    # The Triton fallback only selects oai-swiglu for strictly positive alpha.
+    alpha_arg = gemm1_alpha if gemm1_alpha is not None and gemm1_alpha > 0 else None
+    if (
+        _is_sail
+        and gateup_output.dtype == torch.bfloat16
+        and out_dtype == torch.float8_e4m3fn
+        and two_H % 2 == 0
+        and H > 0
+        and H % 8 == 0
+        and not silu_mul_keep_fp32
+        and envs.SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA.get()
+    ):
+        from sglang.kernels.ops.elementwise.silu_mul_quant import (
+            silu_and_mul_masked_post_per_token_quant_fp8,
+        )
+
+        return silu_and_mul_masked_post_per_token_quant_fp8(
+            gateup_output,
+            masked_m,
+            swiglu_limit=swiglu_limit,
+            expected_m=expected_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            gemm1_alpha=alpha_arg,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
+
+    from sglang.kernels.ops.moe.ep_moe_kernels import (
+        silu_and_mul_masked_post_quant_fwd,
+    )
+
+    # Both kernels leave rows outside masked_m untouched; do not read padding.
+    down_input = torch.empty((E, T, H), device=gateup_output.device, dtype=out_dtype)
+    down_input_scale = torch.empty(
+        (E, T, 1), device=gateup_output.device, dtype=torch.float32
+    )
+    silu_and_mul_masked_post_quant_fwd(
+        gateup_output,
+        down_input,
+        down_input_scale,
+        H,
+        masked_m,
+        use_fp8=out_dtype in (torch.float8_e4m3fn, torch.float8_e5m2),
+        use_int8=out_dtype == torch.int8,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        swiglu_limit=swiglu_limit,
+        gemm1_alpha=gemm1_alpha or 0.0,
+        gemm1_clamp_limit=gemm1_clamp_limit or 0.0,
+    )
+    return down_input, down_input_scale
+
+
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
@@ -2795,6 +2834,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     gemm1_clamp_limit: Optional[float] = None,
     num_real_tokens: Optional[int] = None,
     silu_mul_keep_fp32: bool = False,
+    expected_m: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert masked_m is not None
     hidden_states_device = gateup_output.device
@@ -2805,6 +2845,24 @@ def _varlen_deep_gemm_silu_mul_quant(
 
     if silu_mul_keep_fp32 and gemm1_alpha is not None:
         raise ValueError("silu_mul_keep_fp32 does not support gemm1_alpha")
+
+    # Only a full-width group has the per-token scale contract of the SAIL
+    # fusion. Grouped/packed/swizzled quantization and FP32 requests stay below.
+    if _is_sail and group_size == D and not swizzle and not silu_mul_keep_fp32:
+        return _masked_deep_gemm_silu_mul_quant(
+            gateup_output,
+            masked_m,
+            expected_m=(
+                expected_m
+                if expected_m is not None
+                else ceil_div(num_real_tokens * topk, E)
+                if num_real_tokens
+                else None
+            ),
+            swiglu_limit=swiglu_limit,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+        )
 
     # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
     # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
@@ -2885,7 +2943,8 @@ def _varlen_deep_gemm_silu_mul_quant(
     # the outputs itself, with scales directly in the layout deep_gemm consumes
     # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
     # so the caller's get_mn_major transform short-circuits.
-    expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
+    if expected_m is None:
+        expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
         group_size=group_size,
