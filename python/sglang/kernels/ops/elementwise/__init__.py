@@ -39,3 +39,20 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+# PPU exposes itself as a CUDA device, so the registry can only express CUDA;
+# the wrapper's callers gate on is_ppu() before dispatching to it.
+register_kernel(
+    KernelSpec(
+        op="elementwise.silu_and_mul_masked_post_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.elementwise.silu_mul_quant:"
+            "silu_and_mul_masked_post_per_token_quant_fp8"
+        ),
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description=(
+            "Masked SiLU+mul fused with per-token FP8 quantization "
+            "(sglang.kernels.jit, PPU only)."
+        ),
+    )
+)
