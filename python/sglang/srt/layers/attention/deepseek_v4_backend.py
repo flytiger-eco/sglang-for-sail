@@ -928,6 +928,15 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     # into the extend, padding rows to a dummy row past the end.
     scatter_indices: Optional[torch.Tensor] = None
     real_rows_count: Optional[int] = None
+    global_token_indices: Optional[torch.Tensor] = None
+
+    @property
+    def output_token_indices(self) -> torch.Tensor:
+        return (
+            self.global_token_indices
+            if self.global_token_indices is not None
+            else self.token_indices
+        )
 
     def rows(self, t: torch.Tensor) -> torch.Tensor:
         rows = self.real_rows(t)
@@ -1815,6 +1824,7 @@ class DeepseekV4AttnBackend(
                 local_lens_cpu=cp_tail["local_lens_cpu"],
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
+                global_token_indices=token_indices,
             )
         return metadata
 
@@ -2084,6 +2094,21 @@ class DeepseekV4AttnBackend(
                     req_pool_indices=req_pool_indices,
                 )
             )
+            # Attention-TP padding may add a partial verify block. Use the same
+            # dummy rows as ragged/prefill expansion, keeping num_q_tokens logical
+            # so compressors do not consume the padding as real request tokens.
+            pad_size = out_cache_loc.shape[0] - num_q_tokens
+            assert pad_size >= 0
+            if pad_size:
+                seq_lens_casual = torch.nn.functional.pad(
+                    seq_lens_casual, (0, pad_size), value=1
+                )
+                req_pool_indices_repeated = torch.cat(
+                    (
+                        req_pool_indices_repeated,
+                        req_pool_indices_repeated[-1:].expand(pad_size),
+                    )
+                )
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
