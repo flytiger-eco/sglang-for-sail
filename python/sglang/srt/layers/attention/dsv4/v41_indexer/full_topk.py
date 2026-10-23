@@ -12,8 +12,10 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
+from sglang.srt.utils import is_sail
 
 from .scoring import (
+    decode_score_chunks,
     decode_scores,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
@@ -22,6 +24,7 @@ from .scoring import (
     prefill_requests,
     quantize_index_q,
     select_decode,
+    write_decode,
     write_prefill,
 )
 from .types import (
@@ -127,6 +130,17 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
+        if is_sail():
+            for d in decode_score_chunks(
+                inputs=inputs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+            ):
+                k = min(inputs.indexer.index_topk, d.lmax)
+                idx = d.scores.topk(k, dim=-1, sorted=False).indices
+                write_decode(inputs, d, idx)
+                del d  # release this chunk's logits before the next chunk is scored
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,

@@ -1374,7 +1374,8 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                (self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120)
+                or (compress_ratio in (1, 2) and is_sail())
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -1581,10 +1582,14 @@ class DeepseekV4AttnBackend(
     @property
     def low_ratio_prefill_graph(self) -> bool:
         """Whether ratio-1/2 sources use captured projections and indexer metadata."""
+        # PPU ships the same fp8_fp4 mqa-logits kernels through DeepGEMM-for-sail
+        # (has_dense_fp4_indexer), so the captured path is graph-safe there too;
+        # without it the capture warmup runs the eager candidate path that needs
+        # host-synced publish state and trips a device-side assert.
         return (
             bool(self.low_ratios)
             and has_dense_fp4_indexer()
-            and is_sm100_or_newer()
+            and (is_sm100_or_newer() or is_sail())
             and get_parallel().attn_cp_size == 1
         )
 
