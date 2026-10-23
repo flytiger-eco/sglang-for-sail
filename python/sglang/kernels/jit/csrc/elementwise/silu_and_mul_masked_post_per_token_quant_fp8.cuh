@@ -327,8 +327,10 @@ struct SiluMulFp8MaskedEP {
     RuntimeCheck(two_N % 2 == 0, "input last dim must be even");
     RuntimeCheck(N % kElemPerThread == 0, "N must be multiple of ", kElemPerThread, ", got N=", N);
     RuntimeCheck(masked_m.ndim() == 1 && masked_m.size(0) == E, "masked_m must have shape (E,)");
+    RuntimeCheck(masked_m.is_contiguous(), "masked_m must be contiguous");
     RuntimeCheck(input.stride(2) == 1, "input must be contiguous in the last dim");
     RuntimeCheck(input.stride(1) % 8 == 0 && input.stride(0) % 8 == 0, "input strides must be 16-byte aligned");
+    RuntimeCheck(std::bit_cast<uintptr_t>(input.data_ptr()) % 16 == 0, "input data pointer must be 16-byte aligned");
     RuntimeCheck(
         output.stride(2) == 1 && output.stride(1) % 8 == 0 && output.stride(0) % 8 == 0,
         "output strides must be 8-byte aligned");
