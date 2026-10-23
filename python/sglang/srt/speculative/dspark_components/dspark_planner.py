@@ -11,10 +11,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     ScheduleVerifyLensTopk,
     compute_sort_survival,
 )
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import get_dp_tp_group, is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -159,10 +158,12 @@ class DSparkVerifyPlanner:
             # With a real (non-flat) SPS table the per-step budget must be
             # identical on every rank, otherwise ranks can pick different
             # cuda-graph tiers and desync collectives (required for compact
-            # under attention-CP).
+            # under attention-CP). The broadcast is scoped to the ranks that
+            # run one DP rank's batch: under DP attention, other DP ranks may
+            # be idle or prefilling and never reach this collective.
             self._sync_verify_budget = (
                 envs.SGLANG_DSPARK_SYNC_VERIFY_BUDGET.get()
-                and get_tp_group().world_size > 1
+                and get_dp_tp_group().world_size > 1
                 and not self._is_verify_all
             )
             if self._sync_verify_budget:
@@ -388,7 +389,7 @@ class DSparkVerifyPlanner:
             raise RuntimeError(
                 "_budget_sync_tensor not initialized when sync_verify_budget is True"
             )
-        tp_group = get_tp_group()
+        tp_group = get_dp_tp_group()
         local_value = -1 if budget is None else budget
         self._budget_sync_tensor[0] = local_value if tp_group.rank_in_group == 0 else 0
         torch.distributed.broadcast(
