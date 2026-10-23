@@ -51,3 +51,19 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+# SAIL exposes a CUDA device; the wrapper gates dispatch on is_sail().
+register_kernel(
+    KernelSpec(
+        op="elementwise.silu_and_mul_masked_post_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.elementwise.silu_mul_quant:"
+            "silu_and_mul_masked_post_per_token_quant_fp8"
+        ),
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        description=(
+            "Masked SiLU+mul fused with per-token FP8 quantization "
+            "(sglang.kernels.jit, PPU only)."
+        ),
+    )
+)

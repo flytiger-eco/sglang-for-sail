@@ -240,6 +240,7 @@ def silu_and_mul_masked_post_per_token_quant_fp8(
     assert input.ndim == 3, "input must be 3D (E, T, 2H)"
     assert input.dtype == torch.bfloat16, "input must be bfloat16"
     assert masked_m.dtype == torch.int32, "masked_m must be int32"
+    assert masked_m.is_contiguous(), "masked_m must be contiguous"
     assert input.shape[0] == masked_m.shape[0]
 
     E, T, two_H = input.shape
