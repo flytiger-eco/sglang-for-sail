@@ -540,6 +540,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            self.deepep_adapter.capture_complete()
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (

@@ -1368,6 +1368,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                self.deepep_adapter.capture_complete()
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
