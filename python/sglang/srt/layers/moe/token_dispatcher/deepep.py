@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -31,19 +32,24 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_sail,
     load_json_config,
 )
 
 _is_npu = is_npu()
 _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
+_is_sail = is_sail()
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 
 _deepep_import_error: Optional[BaseException] = None
 try:
@@ -64,6 +70,11 @@ except Exception as exc:
     # failure to the first DeepEP use so other models still start.
     use_deepep = False
     _deepep_import_error = exc
+
+DEEPEP_SUPPORT_TIMEOUT_CONTROL = hasattr(Buffer, "set_timeout_seconds")
+DEEPEP_SUPPORT_USE_FABRIC = (
+    "use_fabric" in inspect.signature(Buffer.__init__).parameters
+)
 
 from enum import Enum, IntEnum, auto
 
@@ -90,6 +101,9 @@ def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
 
 
 def _is_mnnvl_fabric_supported() -> bool:
+    # On PPU this whole function is replaced by a REPLACE plugin hook
+    # (hardware_backend/ppu/moe/ppu_deepep_hooks.py), so anything added here is
+    # dead code there.
     if not is_flashinfer_available():
         return False
 
@@ -290,18 +304,18 @@ class DeepEPBuffer:
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
-        # cudaIpcOpenMemHandle. The DeepEP build we ship is keyed on the CUDA major
-        # version:
-        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
-        #            pass it when the device advertises fabric support.
-        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
-        #            auto-enables fabric in C++ when supported, so we skip it:
-        #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
-        is_cu12 = get_cuda_version()[0] == 12
-        if not is_cu12 and use_mnnvl_fabric:
+        # cudaIpcOpenMemHandle. Only some DeepEP builds expose this as a kwarg
+        # (hybrid-ep does; fzyzcjy/DeepEP has none and instead auto-enables fabric
+        # in C++ when supported, and the PPU build has neither), so gate on the
+        # actual signature rather than on the CUDA major version.
+        # https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
+        if use_mnnvl_fabric and DEEPEP_SUPPORT_USE_FABRIC:
             buffer_kwargs["use_fabric"] = True
 
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        if DEEPEP_SUPPORT_TIMEOUT_CONTROL:
+            timeout = envs.SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT.get()
+            state.buffer.set_timeout_seconds(timeout)
         return state.buffer
 
     @classmethod
@@ -396,7 +410,6 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
-
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
@@ -444,6 +457,8 @@ class _DeepEPDispatcherImplBase:
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        # DispatcherOutputDtype is inferred solely from the quant_config dict (and
+        # server args / env vars handled inside get_deepep_output_dtype).
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
         # Configuration mapping for each dtype
@@ -452,39 +467,53 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": False,
                 "use_mxfp4": False,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.FP8: {
                 "use_fp8": True,
                 "use_mxfp4": False,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
             # despite the use_fp8 flag,
             # quantization will be performed in int8
             DispatcherOutputDtype.INT8: {
-                "use_fp8": True,
+                "use_mxfp8": False,
+                "use_fp8": False,
+                "use_int8": True,
+                "use_nvfp4": False,
                 "use_mxfp4": False,
+            },
+            # PPU-only: uint8 dispatch uses the mxfp4 code path
+            DispatcherOutputDtype.UINT8: {
+                "use_fp8": False,
+                "use_int8": False,
                 "use_mxfp8": False,
                 "use_nvfp4": False,
+                "use_mxfp4": True,
             },
             DispatcherOutputDtype.NVFP4: {
                 "use_fp8": False,
                 "use_mxfp4": False,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": True,
             },
             DispatcherOutputDtype.MXFP4: {
                 "use_fp8": False,
                 "use_mxfp4": True,
                 "use_mxfp8": False,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
             DispatcherOutputDtype.MXFP8: {
                 "use_fp8": False,
                 "use_mxfp4": False,
                 "use_mxfp8": True,
+                "use_int8": False,
                 "use_nvfp4": False,
             },
         }
@@ -497,11 +526,24 @@ class _DeepEPDispatcherImplBase:
         self.use_fp8 = config["use_fp8"]
         self.use_mxfp4 = config["use_mxfp4"]
         self.use_mxfp8 = config["use_mxfp8"]
+        self.use_int8 = config["use_int8"]
         self.use_nvfp4 = config["use_nvfp4"]
+
+        # NPU-specific: INT8 reuses the fp8 dispatch path on NPU
+        # (quantization is performed in int8 internally on NPU)
+        if _is_npu and self.deepep_output_dtype == DispatcherOutputDtype.INT8:
+            self.use_fp8 = True
+            self.use_int8 = False
 
         # Handle environment variables
         if _is_npu:
             self._update_int8_quant_env()
+
+        logger.info_once(
+            f"set_deepep_dispatcher_dtype {self.deepep_output_dtype=} "
+            f"{self.use_fp8=} {self.use_int8=} "
+            f"{self.use_nvfp4=} {self.use_mxfp4=}"
+        )
 
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
@@ -519,6 +561,16 @@ class _DeepEPDispatcherImplBase:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
+            elif self.deepep_output_dtype == DispatcherOutputDtype.UINT8:
+                raise RuntimeError(
+                    "Ascend A2/A3 NPU does not support uint8 deepep_dispatcher_output_dtype."
+                )
+        elif _is_sail:
+            # PPU supports int8 and uint8 dispatch
+            if self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
+                raise RuntimeError(
+                    "PPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
         else:
             if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
@@ -526,6 +578,10 @@ class _DeepEPDispatcherImplBase:
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
                 self.deepep_output_dtype = DispatcherOutputDtype.FP8
+            elif self.deepep_output_dtype == DispatcherOutputDtype.UINT8:
+                raise RuntimeError(
+                    "GPU does not support uint8 deepep_dispatcher_output_dtype."
+                )
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
@@ -562,13 +618,26 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids = topk_ids.to(torch.int64)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
-            hidden_states = sglang_per_token_group_quant_fp8(
-                hidden_states,
-                128,
-                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            )
+            if self.use_fp8:
+                # FP8 block-wise by default; FP8 channel-wise when requested via
+                # the ``is_channel_quant`` flag in the quant config dict.
+                is_channel_quant = bool(
+                    isinstance(self.quant_config, dict)
+                    and self.quant_config.get("is_channel_quant", False)
+                )
+
+                hidden_states = sglang_per_token_group_quant_fp8(
+                    hidden_states,
+                    hidden_states.shape[-1] if is_channel_quant else 128,
+                    column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                )
+        elif self.use_int8:
+            hidden_states = per_token_quant_int8(hidden_states)
+        elif self.use_mxfp4:
+            # [WA] before deepep support uint16_t column major scale
+            hidden_states = downcast_to_mxfp(hidden_states, torch.uint8, axis=1)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_ids, topk_weights, previous_event
 
@@ -674,7 +743,10 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            # Use 1 here in PPU for better compatibility, avoiding recv more token than actually needed
+            expert_alignment=(
+                128 if (deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not _is_sail) else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
             **npu_quantization_opts,
         )
@@ -755,6 +827,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.device_module = torch.get_device_module()
         self.quant_config = {}
 
+        self._masked_m_cache = None
+
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
@@ -767,10 +841,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
+        # FP8 block-wise by default; FP8 channel-wise when requested via
+        # the ``is_channel_quant`` flag in the quant config dict.
+        is_channel_quant = bool(
+            self.use_int8
+            or (
+                isinstance(self.quant_config, dict)
+                and self.quant_config.get("is_channel_quant", False)
+            )
+        )
+        quant_size = hidden_states.shape[-1] if is_channel_quant else 128
+        if self.use_mxfp4:
+            quant_size = 32
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
             topk_weights,
+            quant_size=quant_size,
         )
         return (
             hidden_states,
@@ -794,9 +881,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
 
-        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
-            masked_m
-        )
+        self._masked_m_cache = masked_m
 
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
@@ -818,8 +903,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        quant_size: int = 128,
     ):
-        input_global_scale = self.quant_config.get("input_global_scale", None)
+        input_global_scale = None
+        if hasattr(self.quant_config, "get"):
+            input_global_scale = self.quant_config.get("input_global_scale", None)
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific. Dropping use_ue8m0
         # makes DeepEP return fp32 column-major scales the e8m0 cast cannot view.
@@ -859,6 +947,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 **fp8_deepgemm_scale_opts,
+                **(
+                    dict(
+                        use_int8=self.use_int8,
+                        use_mxfp4=self.use_mxfp4,
+                        quant_size=quant_size,
+                        mxfp4_scale_row_major=False,
+                    )
+                    if _is_sail
+                    else {}
+                ),
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -895,7 +993,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states,
             topk_ids,
             topk_weights,
+            masked_m_cache=self._masked_m_cache,
         )
+        self._masked_m_cache = None
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
@@ -915,6 +1015,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        masked_m_cache: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
@@ -954,6 +1055,21 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 return_recv_hook=self.return_recv_hook,
                 **overlap_args_dict,
             )
+            # Run add_row_kernel and set_cpu_stage after DeepEP combine.
+            # The actual stream behaviour is controlled by the environment
+            # variable SGLANG_EPLB_KERNEL_OVERLAP_WITH_COMBINE:
+            #   True  – kernels are dispatched to separate streams
+            #           (gather_stream / async_eplb_stream), allowing overlap
+            #           with subsequent operations.
+            #   False – kernels run directly on the current stream (default),
+            #           avoiding extra inter-stream sync but executing
+            #           sequentially with combine.
+            if masked_m_cache is not None:
+                get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+                    masked_m_cache
+                )
+            updater = get_global_expert_location_updater()
+            updater.set_cpu_stage()
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook

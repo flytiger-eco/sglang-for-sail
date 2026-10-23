@@ -265,6 +265,16 @@ def init_cp_strategy(
         return
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
+    from sglang.srt.utils.common import is_sail
+
+    if is_sail() and kind != ContextParallelStrategyKind.INTERLEAVE:
+        # PPU only runs the interleave (DSA) V2 strategy; zigzag drives
+        # FlashAttention-style backends that PPU does not provide, so
+        # non-interleave prefill CP stays on the legacy shared V1 path with
+        # a dormant strategy there.
+        _STRATEGY = None
+        return
+
     if kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 

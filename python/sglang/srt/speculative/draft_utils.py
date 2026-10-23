@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from sglang.srt.layers.attention.qsa.config import QSAProfile
@@ -9,7 +10,10 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_sail,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _assert_draft_needs_no_conv_sidecar(draft_model_runner) -> None:
@@ -44,13 +48,7 @@ class DraftBackendFactory:
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
-    def _create_backend(
-        self,
-        backend_name: str,
-        backend_map: dict,
-        error_template: str,
-        stamps_children: bool = False,
-    ):
+    def _resolve_backend_type(self, backend_name: str):
         # The split pair with the base-backend fallback already applied.
         prefill_backend, decode_backend = attention_backends()
         configured = (
@@ -58,7 +56,27 @@ class DraftBackendFactory:
             if backend_name == "decode_attention_backend"
             else prefill_backend
         )
-        backend_type = self.draft_attn_backend or configured
+        return self.draft_attn_backend or configured
+
+    def resolve_decode_backend_type(self):
+        return self._resolve_backend_type("decode_attention_backend")
+
+    def resolve_draft_extend_backend_type(self):
+        backend_name = (
+            "decode_attention_backend"
+            if get_spec().speculative_attention_mode == "decode"
+            else "prefill_attention_backend"
+        )
+        return self._resolve_backend_type(backend_name)
+
+    def _create_backend(
+        self,
+        backend_name: str,
+        backend_map: dict,
+        error_template: str,
+        stamps_children: bool = False,
+    ):
+        backend_type = self._resolve_backend_type(backend_name)
 
         if backend_type not in backend_map:
             raise ValueError(error_template.format(backend_type=backend_type))
@@ -564,6 +582,14 @@ class DraftBackendFactory:
         return ("ascend", AscendAttnBackend(self.draft_model_runner))
 
     def _create_flashmla_prefill_backend(self):
+        if is_sail():
+            # ppu does not use flashinfer for mla model prefill
+            logger.warning(
+                "flashmla prefill backend is not yet supported for draft extend "
+                "on PPU, falling back to HybridAttnBackend (fa3 prefill)."
+            )
+            return None, None
+
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
         return (

@@ -179,6 +179,9 @@ class _MoeRunnerBackendPredicates:
     def is_intel_xpu(self):
         return self.value == MoeRunnerBackend.INTEL_XPU.value
 
+    def is_acext(self):
+        return self.value == MoeRunnerBackend.ACEXT.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -200,6 +203,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
+    ACEXT = "acext"
 
 
 @dataclass(frozen=True)
@@ -287,6 +291,7 @@ class DispatcherOutputDtype(Enum):
     - BF16: dispatch hidden states in bf16
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
+    - UINT8: dispatch hidden states in uint8 (mxfp4, PPU only)
     - NVFP4: dispatch hidden states in nvfp4
     - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
@@ -295,6 +300,7 @@ class DispatcherOutputDtype(Enum):
     BF16 = "bf16"
     FP8 = "fp8"
     INT8 = "int8"
+    UINT8 = "uint8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
@@ -356,8 +362,10 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         )
         return DispatcherOutputDtype.BF16
 
-    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
-    if self.quant_config is not None:
+    # 2. / 3. Parse the quant config dict. We intentionally only support dicts
+    # here; callers are expected to convert any quant-config objects into a
+    # dictionary before calling set_quant_config.
+    if self.quant_config is not None and isinstance(self.quant_config, dict):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             return DispatcherOutputDtype.NVFP4

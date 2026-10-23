@@ -268,7 +268,7 @@ def commit_kv_proj_fused(
             input=main_x,
             weight=stacked.weight,
             block_size=quant_method.quant_config.weight_block_size,
-            weight_scale=stacked.fp8_scale,
+            weight_scale=stacked.fp8_scale.contiguous(),
             input_scale=None,
             bias=None,
         )
@@ -329,6 +329,11 @@ def _dequant_supported(linear: torch.nn.Module) -> bool:
         return True
     # the gfx950 native MXFP8 route keeps the weight in a 3-D lane-order layout
     if weight.dtype != torch.float8_e4m3fn or weight.dim() != 2:
+        return False
+    # Per-channel FP8 (e.g. W8A8Fp8LinearMethod) uses weight_scale, not the
+    # 128x128 block scale weight_scale_inv. The fused dequant path only
+    # handles block scales, so fall back to the per-linear torch path.
+    if not hasattr(linear, "weight_scale_inv"):
         return False
     block = 128
     out_dim, in_dim = weight.shape

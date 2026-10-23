@@ -1314,16 +1314,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
-
         if self.global_num_tokens_cpu is not None:
-            # DP / MLP-sync path: per-DP padded width.
-            if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[
-                    dp_slot_in(self.global_num_tokens_cpu)
-                ]
-            else:
-                num_tokens_per_dp = self.global_num_tokens_cpu[0]
+            # DP / MLP-sync path: per-DP padded width. The list's own length
+            # picks the slot, not require_mlp_tp_gather(): the scheduler
+            # stores a length-1 list when no MLP TP-gather runs, and the
+            # draft forward re-evaluates that flag under the patched
+            # draft-TP context (tp_size == attn_tp_size), flipping the
+            # branch and indexing the length-1 list by attn_dp_rank.
+            num_tokens_per_dp = self.global_num_tokens_cpu[
+                dp_slot_in(self.global_num_tokens_cpu)
+            ]
         else:
             # Pure TP+SP: local input width.
             num_tokens_per_dp = self._forward_num_tokens()
@@ -1680,6 +1680,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+
+        # Legacy V1 prefill CP requires batch-level alignment: round-robin
+        # split asserts len(input_ids) % attn_cp_size == 0 (can_dsa_cp_split).
+        # CP-v2 pads each rank-local shard physically instead
+        # (pad_logical_token_to_physical), so only pad when no CP-v2 strategy
+        # is bound (PPU binds the interleave V2 strategy; only non-interleave
+        # CP keeps a dormant strategy there and runs V1).
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance;
+        # other CP modes pad to attn_cp_size; CP off pads nothing (align size
+        # 1) -- extra padding breaks EAGLE/MTP draft prefill with NaN draft
+        # logits, see #23269.
+        # Local imports: module-level CP helper imports here are circular (#27014).
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import is_cp_enabled
+
+        if not is_cp_enabled():
+            cp_align_size = get_cp_padding_align_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens

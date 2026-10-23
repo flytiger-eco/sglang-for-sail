@@ -50,6 +50,15 @@ from sglang.srt.utils import is_pin_memory_available
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
@@ -1279,6 +1288,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not mode.is_draft_extend_v2()
         )
 
+    @staticmethod
+    def _is_rewritten_idle(forward_batch: ForwardBatch) -> bool:
+        """Whether DP sync rewrote a logical IDLE batch for SSM verification."""
+        return (
+            getattr(forward_batch, "_original_forward_mode", None) == ForwardMode.IDLE
+            and not forward_batch.forward_mode.is_idle()
+        )
+
     def linear_extend_in_graph(self) -> bool:
         """Whether the linear layers of the prefill being captured run inside
         the graph (no eager break)."""
@@ -1343,6 +1360,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
             # linear/mamba metadata (it requires query_start_loc).
             self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
+        if self._is_rewritten_idle(forward_batch):
+            # Hybrid speculative DP rewrites IDLE to TARGET_VERIFY so linear
+            # ReplaySSM can participate in synchronization. The empty rank has no
+            # full-attention metadata, so FlashMLA/other MHA backends must be skipped.
+            self.linear_attn_backend.init_forward_metadata(forward_batch)
             return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
@@ -1411,7 +1434,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_decode(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_decode,type:D,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+        output = self.linear_attn_backend.forward_decode(
             q=q,
             k=k,
             v=v,
@@ -1423,6 +1453,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward_extend(
         self,
@@ -1441,7 +1474,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             return self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_extend(
+        if SGLANG_PROFILE_NVTX:
+            a_shape = getattr(a, "shape", None)
+            b_shape = getattr(b, "shape", None)
+            mixed_qvk_shape = getattr(mixed_qkv, "shape", None)
+            th_nvtx_range_push(
+                f"[FW_FLA] op:forward_extend,type:P,mixed_qkv:{mixed_qvk_shape},a:{a_shape},b:{b_shape}"
+            )
+
+        output = self.linear_attn_backend.forward_extend(
             q=q,
             k=k,
             v=v,
@@ -1453,6 +1494,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
+        return output
 
     def forward(
         self,
@@ -1471,10 +1515,15 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
-                return mixed_qkv.new_empty(
+                return mixed_qkv.new_zeros(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
-            return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+        elif self._is_rewritten_idle(forward_batch) and not is_linear_attn:
+            # Rewritten idle batches can carry physical DP-padding rows. Their
+            # attention contribution must be zero; uninitialized rows would flow
+            # through o_proj/residual and poison the rank-synchronous MLP result.
+            return q.new_zeros(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
                 layer,

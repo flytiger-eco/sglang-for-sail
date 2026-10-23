@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import logging
 import time
 from typing import List, Optional
@@ -11,6 +12,54 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
+
+# ==== NVTX profiling for MTP stages ====
+# Import-guarded NVTX helpers (mirror model_runner.py) so non-NVTX builds work.
+try:
+    from torch.cuda.nvtx import range_pop as _th_nvtx_range_pop  # type: ignore
+    from torch.cuda.nvtx import range_push as _th_nvtx_range_push  # type: ignore
+except ImportError:
+
+    def _th_nvtx_range_push(label):  # type: ignore
+        pass
+
+    def _th_nvtx_range_pop():  # type: ignore
+        pass
+
+
+_SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if _SGLANG_PROFILE_NVTX:
+    try:
+        from model_prof import prof_iter as _prof_iter
+
+        from sglang.srt.model_executor.cuda_graph_runner import (
+            get_is_capture_mode as _get_is_capture_mode,
+        )
+
+        _use_model_prof = True
+    except ImportError:
+        _use_model_prof = False
+
+
+def _mtp_nvtx(name: str):
+    """Bracket an MTP stage method with an NVTX range; active under SGLANG_PROFILE_NVTX."""
+
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if _SGLANG_PROFILE_NVTX:
+                _th_nvtx_range_push(name)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if _SGLANG_PROFILE_NVTX:
+                    _th_nvtx_range_pop()
+
+        return _wrapped
+
+    return _deco
+
+
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
@@ -289,7 +338,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.topk == 1
         )
         # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # (last verified token), not draft-decode step 0. The backend gate is
+        # applied in init_attention_backend(), after speculative backend names
+        # are resolved from ServerArgs.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
@@ -379,6 +430,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
             seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
             qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
+        )
+        dsa_index_share_backend = (
+            draft_backend_factory.resolve_decode_backend_type() in ("dsa", "nsa")
+            and draft_backend_factory.resolve_draft_extend_backend_type()
+            in ("dsa", "nsa")
+        )
+        self.index_share_for_mtp_iteration = (
+            self.index_share_for_mtp_iteration and dsa_index_share_backend
+        )
+        self.seed_dsa_topk_from_draft_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+        )
+        draft_backend_factory.seed_dsa_topk_from_draft_extend = (
+            self.seed_dsa_topk_from_draft_extend
         )
 
         # Initialize decode attention backend
@@ -611,6 +676,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
+    @_mtp_nvtx("mtp_draft_decode")
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
@@ -644,29 +710,57 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         with canary_outside_ctx:
             # Run draft
-            if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+            # NVTX: draft bypasses model_runner, so mirror forward() to emit the
+            # same prof_range as verify (throwaway label absorbs prof_iter's pop).
+            _draft_prof = (
+                _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+            )
+            if _draft_prof:
+                # always use target_worker.model_runner's iteration to keep id sync
+                target_iteration = getattr(
+                    self.target_worker.model_runner, "iteration", 0
                 )
-                if draft_probs is not None:
-                    # draft_probs is the one graph output read after the target
-                    # forward rather than by it, and it points into the graph's
-                    # private memory pool. The pool recycles that block in the
-                    # meantime -- in practice the DSA top-k mask lands there and
-                    # eagle_sample sees -inf. Copy out at the boundary.
-                    draft_probs = draft_probs.clone()
-            else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
+                _th_nvtx_range_push(
+                    f"total bs={forward_batch.batch_size}, "
+                    f"forward_pass_id={target_iteration}"
                 )
+                _prof_iter(target_iteration)
+
+            # Draft execution is handled solely by the try block below (graph
+            # or eager); no else branch runs draft_forward ahead of it.
+            try:
+                if can_run_decode_cuda_graph:
+                    # cudagraph label, analog of model_runner's decode_cudagraph.
+                    if _SGLANG_PROFILE_NVTX:
+                        _th_nvtx_range_push("draft_decode_cudagraph")
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
+                    if draft_probs is not None:
+                        # draft_probs is the one graph output read after the target
+                        # forward rather than by it, and it points into the graph's
+                        # private memory pool. The pool recycles that block in the
+                        # meantime -- in practice the DSA top-k mask lands there and
+                        # eagle_sample sees -inf. Copy out at the boundary.
+                        draft_probs = draft_probs.clone()
+                    if _SGLANG_PROFILE_NVTX:
+                        _th_nvtx_range_pop()
+                else:
+                    if (
+                        not forward_batch.forward_mode.is_idle()
+                        and self.speculative_num_steps > 1
+                    ):
+                        # Skip attention backend init for 1-step draft,
+                        # `draft_forward` only does sample in this case.
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    parent_list, top_scores_index, draft_tokens, draft_probs = (
+                        self.draft_forward(forward_batch)
+                    )
+            finally:
+                if _draft_prof:
+                    # Close prof_range opened by prof_iter (mirrors forward()).
+                    _th_nvtx_range_pop()
 
         verify_input = build_eagle_verify_input(
             batch,
@@ -907,6 +1001,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    @_mtp_nvtx("mtp_draft_extend_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -925,6 +1020,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             kv_loc_plan: The target prefill's plan; the draft writes the same
                 slots.
         """
+
+        # nvtx: use target_worker.model_runner's iteration to keep id sync
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration - 1}")
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1027,6 +1131,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        if _draft_prof:
+            _th_nvtx_range_pop()
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1051,6 +1157,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    @_mtp_nvtx("mtp_draft_extend_decode")
     def _draft_extend_for_decode(
         self,
         batch: ScheduleBatch,
@@ -1058,6 +1165,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         *,
         kv_loc_plan: Optional[KVLocPlan] = None,
     ):
+        # nvtx: use target_worker.model_runner's iteration to keep id sync
+        _draft_prof = (
+            _SGLANG_PROFILE_NVTX and _use_model_prof and not _get_is_capture_mode()
+        )
+        if _draft_prof:
+            target_iteration = getattr(self.target_worker.model_runner, "iteration", 0)
+            _th_nvtx_range_push(f"[prof_range]: iter {target_iteration - 1}")
+
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1086,7 +1201,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 + batch_result.accept_lens
                 - 1
             )
-
             next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Batch 2: Draft extend
@@ -1234,6 +1348,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_draft_input.cuda_graph_compatible = not (
             self.seed_dsa_topk_from_draft_extend and dsa_seed_topk_indices is None
         )
+        if _draft_prof:
+            _th_nvtx_range_pop()
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -1904,6 +2020,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
+    @_mtp_nvtx("mtp_target_verify")
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
         return run_eagle_verify(
             batch,

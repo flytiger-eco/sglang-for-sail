@@ -419,10 +419,14 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
-    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+    model_arch = hf_config.architectures[0]
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        return view.linear_attn_backend == "triton" or (
+            model_arch == "KimiK3ForConditionalGeneration"
+            and view.linear_attn_backend == "flashkda"
+        )
     return False
 
 
@@ -452,7 +456,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
@@ -1301,6 +1309,121 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
 
 
 @register_post_process
+def _attention_backend_dual_chunk(view: Any) -> dict:
+    if (
+        getattr(model_config_of(view).hf_config, "dual_chunk_attention_config", None)
+        is not None
+    ):
+        if view.attention_backend is None:
+            logger.info("Dual chunk attention is turned on by default.")
+            return {"attention_backend": "dual_chunk_flash_attn"}
+        elif view.attention_backend != "dual_chunk_flash_attn":
+            raise ValueError(
+                "Dual chunk attention is enabled, but attention backend is set to "
+                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
+            )
+    return {}
+
+
+@register_post_process
+def _ppu_fa3_chunked_prefix_cache_threshold(view: Any) -> dict:
+    # PPU FA3 cannot consume a chunked prefix cache; force the threshold to 0
+    # so the FA3 prefill path never takes the chunked prefix branch on PPU.
+    from sglang.srt.utils.common import is_sail
+
+    if is_sail() and (
+        view.attention_backend == "fa3"
+        or view.decode_attention_backend == "fa3"
+        or view.prefill_attention_backend == "fa3"
+    ):
+        envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
+    return {}
+
+
+@register_post_process
+def _ppu_fa3_flashmla_qv_fallback(view: Any) -> dict:
+    # [q_v-not-support fallback] On PPU, fa3+flashmla combo crashes with
+    # "q_v not support" under certain configs; detect and fall back to flashmla.
+    from sglang.srt.utils.common import is_sail
+
+    if not (
+        is_sail()
+        and view.prefill_attention_backend == "fa3"
+        and view.decode_attention_backend == "flashmla"
+    ):
+        return {}
+
+    mtp_wo_decode_sam = (
+        view.speculative_algorithm is not None
+        and view.speculative_attention_mode != "decode"
+    )
+    prefill_cg_enabled = (
+        view.cuda_graph_config is not None
+        and view.cuda_graph_config.prefill.backend != Backend.DISABLED
+    )
+    chunked_prefix_disabled = view.disable_chunked_prefix_cache
+    if not (mtp_wo_decode_sam or prefill_cg_enabled or chunked_prefix_disabled):
+        return {}
+
+    reasons = []
+    if mtp_wo_decode_sam:
+        reasons.append(
+            "MTP enabled without --speculative-attention-mode decode "
+            "(draft-extend would run on the fa3 prefill backend)"
+        )
+    if prefill_cg_enabled:
+        reasons.append(
+            "prefill-phase CUDA graph is not disabled "
+            "(fa3 prefill backend would be captured)"
+        )
+    if chunked_prefix_disabled:
+        reasons.append(
+            "--disable-chunked-prefix-cache is set (MLA dispatch would pass q_v to fa3)"
+        )
+    logger.warning(
+        "Unsafe attention backend combo detected: "
+        "--prefill-attention-backend fa3 --decode-attention-backend "
+        "flashmla with "
+        + "; ".join(reasons)
+        + ". This triggers the 'q_v not support' crash. Falling back "
+        "to a unified flashmla backend (--prefill-attention-backend "
+        "flashmla), which is MLA-native and supports q_v and CUDA "
+        "graph capture. To keep the fa3 prefill backend, set "
+        "--speculative-attention-mode decode, disable the prefill "
+        "CUDA graph (--disable-piecewise-cuda-graph), and do NOT set "
+        "--disable-chunked-prefix-cache."
+    )
+    return {"prefill_attention_backend": "flashmla"}
+
+
+@register_post_process
+def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
+    # [fp8-kv-cache fallback] On PPU, flashmla/flashmla_sparse do not support
+    # fp8_e4m3 kv-cache; disable fp8 kv-cache and keep backend unchanged.
+    from sglang.srt.utils.common import is_sail
+
+    if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
+        return {}
+    if not (
+        view.decode_attention_backend == "flashmla"
+        or view.dsa_prefill_backend == "flashmla_sparse"
+    ):
+        return {}
+
+    incompatible = []
+    if view.decode_attention_backend == "flashmla":
+        incompatible.append("--decode-attention-backend flashmla")
+    if view.dsa_prefill_backend == "flashmla_sparse":
+        incompatible.append("--dsa-prefill-backend flashmla_sparse")
+    logger.warning(
+        f"On PPU, {' and '.join(incompatible)} does not support "
+        "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
+        "(falling back to --kv-cache-dtype auto)."
+    )
+    return {"kv_cache_dtype": "auto"}
+
+
+@register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
@@ -1546,8 +1669,11 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
+    from sglang.srt.utils.common import is_sail
 
     moe_a2a_backend = view.moe_a2a_backend
+    if is_sail() and moe_a2a_backend == "megamoe":
+        raise ValueError("MegaMoE is not supported on PPU; use --moe-a2a-backend none.")
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(
             "moe_a2a_backend is overridden to 'deepep' because Waterfill "

@@ -41,7 +41,9 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
 )
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -59,7 +61,10 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
@@ -109,6 +114,10 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+    CompressedTensorsW8A8Fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -118,8 +127,17 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     can_fuse_all_reduce,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_round_robin_input_ids,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -179,6 +197,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_cuda,
     _is_hip,
     _is_npu,
+    _is_sail,
     _is_xpu,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
@@ -195,6 +214,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
+
+if not _is_hip:
+    pass
+
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -894,7 +918,23 @@ class MqaAttentionBase(nn.Module):
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
-        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
+        # PPU: MQALayer.forward's absorb-einsum dispatch is keyed on the global
+        # _FP8_WO_A_GEMM switch (not the per-instance wo_a_fp8) and only has
+        # quantized arms (Fp8 / W8A8Int8 / W8A8Fp8 / compressed-tensors), so a
+        # quantized model must keep its quant_config on wo_a even when
+        # wo_a_fp8_gemm_enabled() is False (e.g. w8a8_int8) -- otherwise wo_a
+        # is built bf16 and the dispatch raises NotImplementedError. Callers
+        # passing wo_a_fp8 explicitly (DSpark draft's bf16 wo_a) are exempt.
+        quantize_wo_a = (
+            fp8
+            or self.use_npu_arch35_mxfp8_wo_a
+            or (
+                wo_a_fp8 is None
+                and _FP8_WO_A_GEMM
+                and _is_sail
+                and quant_config is not None
+            )
+        )
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -906,6 +946,7 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config = quant_config
         else:
             wo_a_quant_config = None
+        self.quant_config = quant_config
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
@@ -954,28 +995,38 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if quantize_wo_a:
-            assert hasattr(self.wo_a, "weight_scale_inv"), (
-                "FP8 quant_config must create weight_scale_inv"
-            )
         if self.use_npu_arch35_mxfp8_wo_a:
             # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
-        elif fp8:
-            self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
-            # wo_a is quantized but never *applied* through its quant method:
-            # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
-            # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
-            # [G, R, D] weight. Opt out of any backend-private weight layout the
-            # linear method would otherwise install for its own GEMM -- on ROCm
-            # that is aiter's B-preshuffle, which silently permutes the weight
-            # in place (same shape, dtype and strides) and makes this GEMM
-            # return noise.
-            self.wo_a.keep_plain_weight_layout = True
+        elif fp8 and wo_a_quant_config is not None:
+            # Gate on this instance's quantization, never on the process-wide
+            # _FP8_WO_A_GEMM: the DSpark draft builds wo_a unquantized
+            # (wo_a_fp8=False, wo_a_keeps_quant_config=False) and its forward
+            # runs its own bf16 einsum, so it must skip these asserts entirely.
+            if isinstance(wo_a_quant_config, Fp8Config):
+                assert hasattr(self.wo_a, "weight_scale_inv"), (
+                    "FP8 quant_config must create weight_scale_inv"
+                )
+                self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
+                # wo_a is quantized but never *applied* through its quant method:
+                # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
+                # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
+                # mxscale BMM on gfx950), both of which want the plain row-major
+                # [G, R, D] weight. Opt out of any backend-private weight layout the
+                # linear method would otherwise install for its own GEMM -- on ROCm
+                # that is aiter's B-preshuffle, which silently permutes the weight
+                # in place (same shape, dtype and strides) and makes this GEMM
+                # return noise.
+                self.wo_a.keep_plain_weight_layout = True
+            else:
+                # channelwise (W8A8 int8 / fp8): those linear methods register
+                # only `weight_scale`, never `weight_scale_inv`.
+                assert hasattr(self.wo_a, "weight_scale"), (
+                    "FP8 quant_config must create weight_scale"
+                )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1033,6 +1084,12 @@ class MqaAttentionBase(nn.Module):
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        if _is_sail:
+            # PPU FlashMLA accepts the native per-rank query width; padding to
+            # 64 heads would mismatch the backend's PPU attn_sink slice
+            # (attn_sink is sharded to n_local_heads there, not padded).
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -2192,6 +2249,47 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _get_wo_a_channel_einsum_args(
+        self, G: int, R: int, D: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
+        # Lazy-build the (weight, scale, recipe) for fp8_einsum on the
+        # channelwise FP8 path. (block-FP8 doesn't come through here.)
+        #
+        # Channelwise stores wo_a transposed:
+        #   wo_a.weight       : qweight.t()         -> [D, G*R], non-contig
+        #   wo_a.weight_scale : scale.t().contig()  -> [1, G*R]
+        # We restore weight to [G, R, D], reshape scale to [G, R, 1], and
+        # set recipe[2]=D (contract-block size; channelwise == full row,
+        # not the 128 used by block-FP8).
+        #
+        # Lazy on first forward (not post_load_weights): the quant hook
+        # may run again after post_load_weights (hot reload, draft copy,
+        # offloader requant), so this is the safest snapshot point.
+        # .clone() decouples the cache from later in-place writes.
+        wo_a = self.wo_a
+        cached = getattr(wo_a, "_einsum_args_cache", None)
+        if cached is not None:
+            return cached
+
+        w = wo_a.weight.data
+        assert w.shape == (D, G * R), (
+            f"channelwise wo_a.weight expected ({D}, {G * R}), got {tuple(w.shape)}"
+        )
+        weight_3d = w.t().contiguous().clone().view(G, R, D)
+
+        ws = wo_a.weight_scale.data
+        assert ws.numel() == G * R, (
+            f"channelwise weight_scale expected {G * R} elems, "
+            f"got shape {tuple(ws.shape)}"
+        )
+        scale = ws.reshape(G * R).contiguous().clone().view(G, R, 1)
+
+        recipe = (1, 1, D)
+
+        out = (weight_3d, scale, recipe)
+        wo_a._einsum_args_cache = out
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2354,7 +2452,9 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink(kernel_num_heads)
+        attn_sink = (
+            self._local_attn_sink(kernel_num_heads) if not _is_sail else self.attn_sink
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -2541,7 +2641,76 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if fuse_rope_wo_a:
+            # Exclusive chain branch: the wo_a absorb einsum must run exactly
+            # once. If this PPU dispatch is hoisted out as a standalone `if`
+            # before the chain, the generic `_FP8_WO_A_GEMM` branch below also
+            # fires on the already-absorbed [T, G, R] output and crashes
+            # viewing the weight (rank mistaken for the head dim).
+            if _FP8_WO_A_GEMM and _is_sail:
+                import deep_gemm
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                if isinstance(self.wo_a.quant_method, Fp8LinearMethod):
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                        o.reshape(T * G, D).contiguous(),
+                        group_size=128,
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (
+                            self.wo_a.weight.view(G, R, D),
+                            self.wo_a.weight_scale_inv.data,
+                        ),
+                        output,
+                        recipe=(1, 1, 128),
+                    )
+                # rely on deep_gemm commit "[DeepGemm] : add int8 einsum"
+                # w8a8 int8 and w4a8 int8 both use int8_einsum
+                elif isinstance(self.wo_a.quant_method, W8A8Int8LinearMethod):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_int8, o_s = per_token_quant_int8(o.reshape(T * G, D).contiguous())
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.int8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_int8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                elif isinstance(self.wo_a.quant_method, W8A8Fp8LinearMethod) or (
+                    isinstance(self.wo_a.quant_method, CompressedTensorsLinearMethod)
+                    and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8)
+                ):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_fp8, o_s = sglang_per_token_quant_fp8(
+                        o.reshape(T * G, D).contiguous()
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                else:
+                    quant_name = type(self.wo_a.quant_method).__name__
+                    scheme_obj = getattr(self.wo_a, "scheme", None)
+                    scheme_name = (
+                        type(scheme_obj).__name__ if scheme_obj is not None else "None"
+                    )
+                    raise NotImplementedError(
+                        f"Unsupported wo_a quant_method on PPU: quant_method={quant_name}, scheme={scheme_name}"
+                    )
+                o = output
+            elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 out = fused_rope_wo_a_bf16(
                     o,
@@ -4019,6 +4188,9 @@ class DeepseekV4Model(nn.Module):
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_size = get_parallel().attn_cp_size
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
@@ -4451,6 +4623,20 @@ class DeepseekV4Model(nn.Module):
 
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
 
+        use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
+            forward_batch
+        )
+        if use_prefill_cp and not run_tbo and not is_cp_active(forward_batch):
+            # Legacy V1 prefill CP: the CP-v2 runner shards at the model
+            # boundary, while V1 has no live strategy, so this model must
+            # split activations itself. is_cp_active() gates the V2 runner
+            # path, which arrives here already sharded -- never re-split.
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+            input_ids = cp_round_robin_input_ids(input_ids)
+            input_ids_global = input_ids
+
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
             # config on the current stream, before the layer loop forks the
@@ -4521,6 +4707,29 @@ class DeepseekV4Model(nn.Module):
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
 
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if (
+            self.pp_group.is_last_rank
+            and use_prefill_cp
+            and not is_cp_active(forward_batch)
+            and not run_tbo
+        ):
+            stream = torch.cuda.current_stream()
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                self.cp_size,
+                forward_batch,
+                stream,
+            )
+            # Gather DSpark aux tensors on the same CP token split.
+            if capture_dspark:
+                dspark_aux_hidden_states = [
+                    cp_all_gather_rerange_output(
+                        aux, self.cp_size, forward_batch, stream
+                    )
+                    for aux in dspark_aux_hidden_states
+                ]
+
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
@@ -4571,6 +4780,33 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        packed_modules_mapping["wqkv_a"] = ["wq_a", "wkv"]
+
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+        orig_to_new_prefix={
+            "mtp.0.self_attn": "model.decoder.self_attn",
+            "mtp.0.mlp": "model.decoder.mlp",
+            "mtp.0.e_proj": "model.e_proj",
+            "mtp.0.h_proj": "model.h_proj",
+        },
+    )
 
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
@@ -4658,6 +4894,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Expose start_layer/end_layer for model_runner PP support
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
+
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
 
         # update_weights_from_disk/_tensor/_distributed re-enter load_weights
         # mid-serving (RL refit sends many partial batches); the prewarm and
@@ -4863,9 +5104,29 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        input_ids, input_embeds = self.prepare_language_model_inputs(
-            input_ids, forward_batch, input_embeds
-        )
+        # V1 legacy prefill CP metadata path; skipped when a live V2 strategy
+        # owns the batch (the V2 runner shards inputs at the model boundary
+        # and bypasses this forward entirely).
+        if self.dsa_enable_prefill_cp and not is_cp_active(forward_batch):
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    len(input_ids),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+                )
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related(is_prefill=True)
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            attn_backend.init_forward_metadata_indexer(core_meta)
+                        )
+
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4973,7 +5234,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if self.wo_a_fp8:
+        # PPU keeps wo_a weight scales in the correct layout already; skip setup.
+        if self.wo_a_fp8 and not _is_sail:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         if is_nextn:
@@ -5025,6 +5287,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> str:
         if name.startswith("vision."):
             return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
@@ -5088,6 +5351,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+
+        if _is_sail:
+            if quant_config and quant_config.get_name() == "fp8":
+                if quant_config.is_fp4_experts and "mlp.experts" in name:
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+            else:
+                name = name.replace(".weight_scale_inv", ".weight_scale")
 
         return name
 
@@ -5178,7 +5448,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (
+            self.wo_a_fp8
+            or use_npu_arch35_mxfp8_wo_a(self.quant_config)
+            or (_FP8_WO_A_GEMM and _is_sail and self.quant_config is not None)
+        ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
@@ -5234,11 +5508,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.wo_a_fp8
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
+                    and not (_is_sail and loaded_weight.dtype == torch.int8)
                 ):
                     raise ValueError(
                         f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
-                        "torch.float8_e4m3fn. This checkpoint does not provide "
+                        "torch.float8_e4m3fn"
+                        + (" or torch.int8 (PPU)" if _is_sail else "")
+                        + ". This checkpoint does not provide "
                         "a supported fp8-quantized wo_a; rerun with "
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
@@ -5249,6 +5526,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        quant_config=self.quant_config,
                     )
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
@@ -5441,8 +5719,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and ".engram." not in name
                                 and (
                                     name.endswith(".wq_a.weight")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wkv.weight_scale_inv")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
@@ -5624,7 +5904,7 @@ def _dequant_fp8_wo_a_streaming(
             if scale is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield name, _dequant_fp8(tensor, scale)
+                yield name, _dequant(tensor, scale)
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -5637,7 +5917,7 @@ def _dequant_fp8_wo_a_streaming(
             if weight is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield prefix + ".weight", _dequant_fp8(weight, tensor)
+                yield prefix + ".weight", _dequant(weight, tensor)
             else:
                 bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -5654,6 +5934,30 @@ def _dequant_fp8_wo_a_streaming(
             yield prefix + ".scale", bucket["scale"]
 
 
+def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    from einops import rearrange
+
+    assert weight.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ), f"expected fp8_e4m3f or int8, got {weight.dtype}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
+
+    bn = weight.shape[0] // scale.shape[0]
+    bk = weight.shape[1] // scale.shape[1]
+    weight_f32 = rearrange(
+        weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=bn, bk=bk
+    )
+    result = rearrange(
+        weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
+    )
+
+    return result.to(torch.bfloat16)
+
+
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -5668,7 +5972,7 @@ def _dequant_fp8_wo_a(
         assert scale_name in weights_dict
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
+        yield name, _dequant(weight, scale)
 
     yield from weights_dict.items()
 

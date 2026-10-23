@@ -70,6 +70,15 @@ from sglang.srt.utils.common import (
     use_intel_amx_backend,
 )
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
@@ -637,6 +646,32 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
+        # Guard against empty hidden_states. Under DP attention, some DP
+        # ranks may receive zero tokens for a given batch (e.g., when the
+        # batch has fewer requests than dp_size). The model forward already
+        # skips the final norm for empty states (see MiniMaxM2Model.forward),
+        # so hidden_states arrives here as a size-0 tensor. Indexing it
+        # would raise IndexError; return empty results instead.
+        if hidden_states.shape[0] == 0:
+            # When aux_hidden_states is not None (e.g., EAGLE3 capture),
+            # set aux_pruned_states to match so that downstream assertions
+            # in _get_hidden_states_to_store (assert aux_pruned_states is
+            # not None) are satisfied.
+            if aux_hidden_states is not None:
+                aux_pruned_states = (
+                    aux_hidden_states
+                    if isinstance(aux_hidden_states, torch.Tensor)
+                    else [hidden for hidden in aux_hidden_states]
+                )
+            return (
+                hidden_states,
+                pruned_states_before_norm,
+                aux_pruned_states,
+                None,  # sample_indices
+                None,  # input_logprob_indices
+                token_to_seq_idx,
+            )
+
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -907,6 +942,18 @@ class LogitsProcessor(nn.Module):
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
             logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if SGLANG_PROFILE_NVTX:
+            lm_head_weight_shape = getattr(lm_head.weight, "shape", None)
+            logit_scale_shape = getattr(self.logit_scale, "shape", None)
+            if torch.cuda.is_current_stream_capturing():
+                th_nvtx_range_push(
+                    f"[FW:GEMM] op:compute_logits,type:D,hidden_states:{hidden_states.shape},lm_head_weight:{lm_head_weight_shape},logit_scale:{logit_scale_shape}"
+                )
+            else:
+                th_nvtx_range_push(
+                    f"[FW:GEMM] op:compute_logits,type:P,hidden_states:{hidden_states.shape},lm_head_weight:{lm_head_weight_shape},logit_scale:{logit_scale_shape}"
+                )
+        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -915,6 +962,8 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+        if SGLANG_PROFILE_NVTX:
+            th_nvtx_range_pop()
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
