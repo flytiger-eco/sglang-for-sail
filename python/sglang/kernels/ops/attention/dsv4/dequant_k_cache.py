@@ -9,9 +9,12 @@ from sglang.kernels.ops.attention.dsa.triton_kernel import _supports_fp8
 from sglang.kernels.ops.attention.dsv4 import (
     dequantize_k_cache_paged_cuda as _dequantize_k_cache_paged_cuda,
 )
+from sglang.kernels.ops.attention.dsv4 import (
+    dequantize_k_cache_paged_v2_cuda as _dequantize_k_cache_paged_v2_cuda,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, print_warning_once
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -26,6 +29,37 @@ TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
 NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+
+# One warp per token: the warp then reads that token's 576 cache bytes and
+# writes its 1024 output bytes as contiguous 16-byte vectors. Fastest of
+# 8/16/32 measured on ZW-M890P.
+VECTORIZED_THREADS_PER_TOKEN = 32
+
+
+def _vector_access_ok(cache_u8: torch.Tensor, out: torch.Tensor) -> bool:
+    """Whether both buffers support the 16-byte accesses the vector kernel needs.
+
+    Warns once per unmet condition when they do not: the scalar fallback is
+    correct but roughly 18x slower, so staying quiet about it would hide a
+    large slowdown behind identical numerics. The message names the failed
+    conditions rather than their pointer values so the warning stays a single
+    line no matter how many distinct buffers trip it.
+    """
+    checks = (
+        ("k_cache data_ptr must be 16-byte aligned", cache_u8.data_ptr() % 16 == 0),
+        ("out data_ptr must be 16-byte aligned", out.data_ptr() % 16 == 0),
+        ("out stride(0) must be a multiple of 8", out.stride(0) % 8 == 0),
+        ("bytes_per_page must be a multiple of 16", cache_u8.shape[-1] % 16 == 0),
+    )
+    failed = [name for name, ok in checks if not ok]
+    if failed:
+        print_warning_once(
+            "dequantize_k_cache_paged is using the scalar kernel instead of the "
+            "vectorized one; results are unaffected but it is ~18x slower. "
+            "Unmet condition(s): " + "; ".join(failed)
+        )
+        return False
+    return True
 
 
 def dequantize_k_cache_paged(
@@ -74,13 +108,23 @@ def dequantize_k_cache_paged(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
-    _dequantize_k_cache_paged_cuda(
-        out=out,
-        k_cache=quant_k_cache_u8,
-        page_table=page_table_1_flattened,
-        page_size=page_size,
-        use_fp8_native=_supports_fp8(),
-    )
+    if _vector_access_ok(quant_k_cache_u8, out):
+        _dequantize_k_cache_paged_v2_cuda(
+            out=out,
+            k_cache=quant_k_cache_u8,
+            page_table=page_table_1_flattened,
+            page_size=page_size,
+            use_fp8_native=_supports_fp8(),
+            threads_per_token=VECTORIZED_THREADS_PER_TOKEN,
+        )
+    else:
+        _dequantize_k_cache_paged_cuda(
+            out=out,
+            k_cache=quant_k_cache_u8,
+            page_table=page_table_1_flattened,
+            page_size=page_size,
+            use_fp8_native=_supports_fp8(),
+        )
     return out
 
 
