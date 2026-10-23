@@ -77,10 +77,19 @@ def sgl_per_token_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
+    scale_multiplier: float = 1.0,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
     if input.shape[0] == 0:
         return
+    if scale_multiplier != 1.0:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            _per_token_quant_fp8_scaled_aot,
+        )
+
+        return _per_token_quant_fp8_scaled_aot(
+            input, output_q, output_s, scale_multiplier
+        )
     return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )

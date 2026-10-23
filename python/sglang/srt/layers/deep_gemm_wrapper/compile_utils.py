@@ -165,9 +165,13 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
+    GROUPED_GEMM_NT_F8F4BF16_NOPAD = auto()
+    GROUPED_GEMM_NT_F8F4BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F8F4BF16_FUSED = auto()
 
 
-_INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+# Legacy keys are (kind, N, K, E); W4A8 appends its dispatch layout.
+_INITIALIZATION_DICT: Dict[Tuple, bool] = dict()
 
 
 @contextmanager
@@ -199,11 +203,15 @@ def _maybe_compile_deep_gemm_one_type_all(
     n: int,
     k: int,
     num_groups: int,
+    **executor_kwargs,
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
     query_key = (kernel_type, n, k, num_groups)
+    if executor_kwargs:
+        # W4A8 dispatch layouts affect compilation independently of N/K/E.
+        query_key += (tuple(sorted(executor_kwargs.items())),)
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
@@ -237,6 +245,7 @@ def _maybe_compile_deep_gemm_one_type_all(
                 k=k,
                 num_groups=num_groups,
                 m_list=_BUILTIN_M_LIST,
+                **executor_kwargs,
             )
 
 
@@ -247,6 +256,7 @@ def _compile_deep_gemm_one_type_all(
     k: int,
     num_groups: int,
     m_list: List[int],
+    **executor_kwargs,
 ) -> None:
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
@@ -275,7 +285,12 @@ def _compile_deep_gemm_one_type_all(
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
         required_memory = _BaseWarmupExecutor.get_memory_requirement(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+            kernel_type,
+            max_m=max_m,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            **executor_kwargs,
         )
         logger.info(
             f"Required memory for warmup: {required_memory}GB, Available memory: {memory_budget}GB"
@@ -284,7 +299,12 @@ def _compile_deep_gemm_one_type_all(
             # TODO: Maybe compute the max_m based on the memory budget
             while (
                 _BaseWarmupExecutor.get_memory_requirement(
-                    kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+                    kernel_type,
+                    max_m=max_m,
+                    n=n,
+                    k=k,
+                    num_groups=num_groups,
+                    **executor_kwargs,
                 )
                 > memory_budget
                 and max_m > 2048
@@ -297,7 +317,12 @@ def _compile_deep_gemm_one_type_all(
 
         # Need some methods to estimate needed memory for warmup
         executor = _BaseWarmupExecutor.create(
-            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+            kernel_type,
+            max_m=max_m,
+            n=n,
+            k=k,
+            num_groups=num_groups,
+            **executor_kwargs,
         )
 
         has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
@@ -400,14 +425,41 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_NOPAD: _GroupedNopadWarmupExecutor_w4a8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED: _GroupedMaskedWarmupExecutor_w4a8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_FUSED: _GroupedFusedWarmupExecutor_w4a8,
         }[kernel_type](**kwargs)
 
     @staticmethod
     def get_memory_requirement(
-        kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
+        kernel_type: DeepGemmKernelType,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        **executor_kwargs,
     ) -> float:
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
+        if kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_NOPAD,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_FUSED,
+        ):
+            # Raw and preprocessed weights coexist during preprocessing.
+            weights = 2 * num_groups * n * (k // 2 + k // 32)
+            if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_MASKED:
+                capacity = executor_kwargs.get("masked_capacity", max_m)
+                return (weights + num_groups * (capacity * (k + 4 + 2 * n) + 4)) / _GB
+            top_k = executor_kwargs.get("top_k", 1)
+            assignments = max_m * top_k
+            buffers = (
+                max_m * (k + 4) + assignments * n * 2 + assignments * 4 + num_groups * 4
+            )
+            if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F4BF16_FUSED:
+                # Conservative bound on padded alignment metadata/workspace.
+                buffers += (assignments + num_groups * 256) * 32 + num_groups * 16
+            return (weights + buffers) / _GB
         is_dense_fp8 = kernel_type in (
             DeepGemmKernelType.GEMM_NT_F8F8BF16,
             DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
@@ -845,20 +897,34 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
 
 
 def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+    kernel_type: DeepGemmKernelType,
+    **executor_kwargs,
 ):
     if _is_musa:
         return nullcontext()
 
-    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
+    return _deep_gemm_execution_hook(
+        m, n, k, num_groups, kernel_type, **executor_kwargs
+    )
 
 
 @contextmanager
 def _deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int,
+    n: int,
+    k: int,
+    num_groups: int,
+    kernel_type: DeepGemmKernelType,
+    **executor_kwargs,
 ):
     if m > 0:
-        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+        _maybe_compile_deep_gemm_one_type_all(
+            kernel_type, n, k, num_groups, **executor_kwargs
+        )
     yield
 
 
@@ -1633,6 +1699,106 @@ class _GroupedFusedWarmupExecutor_fp4(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedNopadWarmupExecutor_w4a8(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int, **layout):
+        # Do not swallow missing/incompatible W4A8 APIs as an allocation failure.
+        self.setup_tensors(max_m, n, k, num_groups, **layout)
+        # The inherited execute guard is exclusive; include the largest M.
+        self.max_m = max_m + 1
+
+    def setup_weights(self, n: int, k: int, num_groups: int):
+        weight = torch.zeros((num_groups, n, k // 2), device="cuda", dtype=torch.uint8)
+        scale = torch.full(
+            (num_groups, n, k // 32), 127, device="cuda", dtype=torch.uint8
+        )
+        self.rhs_q, self.rhs_s, _ = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, weight, scale
+        )
+
+    def setup_tensors(
+        self, max_m: int, n: int, k: int, num_groups: int, use_m_rows: bool = False
+    ):
+        self.setup_weights(n, k, num_groups)
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.m_rows = (
+            torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+            if use_m_rows
+            else None
+        )
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        if self.m_rows is not None:
+            self.m_rows.zero_()
+            self.m_rows[0] = m
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            self.m_indices[:m],
+            self.m_rows,
+        )
+
+
+class _GroupedMaskedWarmupExecutor_w4a8(_GroupedNopadWarmupExecutor_w4a8):
+    def setup_tensors(
+        self, max_m: int, n: int, k: int, num_groups: int, masked_capacity: int = None
+    ):
+        self.setup_weights(n, k, num_groups)
+        capacity = max_m if masked_capacity is None else masked_capacity
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((num_groups, capacity, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, capacity, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            self.masked_m,
+            m,
+        )
+
+
+class _GroupedFusedWarmupExecutor_w4a8(_GroupedNopadWarmupExecutor_w4a8):
+    def setup_tensors(
+        self, max_m: int, n: int, k: int, num_groups: int, top_k: int = 1
+    ):
+        self.setup_weights(n, k, num_groups)
+        self.top_k = top_k
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        self.out = torch.empty((max_m * top_k, n), device="cuda", dtype=torch.bfloat16)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, top_k), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m]
+        )
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[: m * self.top_k],
             m_rows,
             expert_ids_and_cumsum,
             sorted_token_ids,
