@@ -187,6 +187,11 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
   // the low byte of the pack's 16-bit storage, whether fp8x2_e4m3_t is an integer or HIP's fp8 pair
   const auto scale_bits = static_cast<uint8_t>(std::bit_cast<uint16_t>(fp8::pack_fp8(scale, scale)));
+#elif defined(SGL_SAIL) || defined(__HGGCCC__)
+  // SAIL's scalar e4m3 conversion rounds ties toward zero; round to the grid in software
+  // first, after which the conversion of the on-grid value is exact.
+  const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
+  const uint8_t scale_bits = __nv_fp8_e4m3{scale}.__x;
 #else
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
