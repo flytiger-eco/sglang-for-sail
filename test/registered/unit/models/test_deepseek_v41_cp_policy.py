@@ -208,6 +208,43 @@ class TestDeepseekV41CPPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "incompatible"):
                 handle_language_model_only(args)
 
+    def test_indexer_query_shape_uses_selected_compression_ratio(self):
+        module = "sglang.srt.layers.attention.deepseek_v4_backend"
+        backend = NS(
+            page_size=256,
+            token_to_kv_pool=NS(get_index_k_page_size=lambda ratio: 64),
+            dsa_topk_backend=NS(should_use_topk_v2=lambda: False),
+            enable_deepseek_v4_fp4_indexer=False,
+            index_n_heads=64,
+            index_head_dim=128,
+        )
+        for ratio, rows in ((1, 3), (2, 6), (4, 2)):
+            with self.subTest(ratio=ratio):
+                lengths = torch.ones(rows, dtype=torch.int32)
+                core = NS(
+                    page_table=torch.zeros(rows, 1, dtype=torch.int32),
+                    c1_topk_lengths_clamp1=lengths if ratio == 1 else None,
+                    c2_topk_lengths_clamp1=lengths if ratio == 2 else None,
+                    c4_topk_lengths_raw=lengths if ratio == 4 else None,
+                )
+                with (
+                    patch(module + ".PagedIndexerMetadata") as metadata,
+                    patch(
+                        module + ".expand_index_page_table",
+                        return_value=core.page_table,
+                    ),
+                    patch(module + ".get_platform", return_value=NS(is_sm120=False)),
+                    patch(module + ".is_ppu", return_value=True),
+                ):
+                    DeepseekV4AttnBackend.init_forward_metadata_indexer(
+                        backend, core, compress_ratio=ratio
+                    )
+                    args = metadata.call_args.kwargs
+                    self.assertIs(args["compressed_seq_lens"], lengths)
+                    self.assertEqual(
+                        args["q_fp8_shape"], torch.Size((rows, 1, 64, 128))
+                    )
+
     def test_low_ratio_captured_metadata_excludes_cp(self):
         module = "sglang.srt.layers.attention.deepseek_v4_backend"
         for cp_size, expected in ((1, True), (4, False)):
