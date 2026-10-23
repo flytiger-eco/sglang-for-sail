@@ -132,3 +132,53 @@ def sparse_logits(
         topk_blocks,
         CANDIDATE_BLOCK_SIZE,
     )
+
+
+def sparse_varlen_schedule(
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    num_kv_tokens: int,
+    blocks: torch.Tensor,
+    q_dtype: torch.dtype,
+) -> torch.Tensor:
+    """DeepGEMM's schedule for the published blocks of a *row set*: ``ks``/``ke``
+    ``[rows]`` int32 windows into the flattened index K of ``num_kv_tokens``,
+    ``blocks`` ``[rows, topk_blocks]`` int32 block ids in that flattened K. The
+    schedule is per row set, so a different row set (a late-layer tail) needs a
+    new one; it is not sliceable. Unaligned ``ks`` anchor every block at
+    ``floor(ks / 8) * 8 + 8 * j + ks % 8``, i.e. the row's own causal grid."""
+    import deep_gemm
+
+    return deep_gemm.get_sparse_mqa_logits_metadata(
+        ks.contiguous(),
+        ke.contiguous(),
+        num_kv_tokens,
+        blocks,
+        q_dtype,
+        CANDIDATE_BLOCK_SIZE,
+        True,
+    )
+
+
+def sparse_varlen_logits(
+    q_fp4: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv: Tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    schedule: torch.Tensor,
+    topk_blocks: int,
+) -> torch.Tensor:
+    """bf16 logits ``[rows, topk_blocks * 8]`` of ``kv``, the flattened index K
+    ``(int8 [n, 64], int32 [n])`` of a prefill request set; ``schedule`` comes
+    from :func:`sparse_varlen_schedule` over the same row set."""
+    import deep_gemm
+
+    return deep_gemm.fp8_fp4_sparse_mqa_logits(
+        (q_fp4, q_sf),
+        kv,
+        weights,
+        schedule,
+        topk_blocks,
+        CANDIDATE_BLOCK_SIZE,
+        True,
+    )

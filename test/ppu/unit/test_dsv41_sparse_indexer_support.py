@@ -56,16 +56,28 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
             return gate()
 
     def factory(
-        self, *, ppu, sm, supported=True, topk=16, cp=1, prefill=True, int8=False
+        self,
+        *,
+        ppu,
+        sm,
+        supported=True,
+        topk=16,
+        cp=1,
+        prefill=True,
+        varlen=True,
+        int8=False,
     ):
         package = "sglang.srt.layers.attention.dsv4.v41_indexer"
         config_name = "sglang.srt.layers.deep_gemm_wrapper.configurer"
         config = ModuleType(config_name)
         config.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = supported
+        config.DEEPGEMM_SPARSE_MQA_LOGITS = varlen
         dense = ModuleType(package + ".dense_blocks")
         dense.DenseBlocksBackend = Mock()
         sparse = ModuleType(package + ".sparse_table")
         sparse.SparseTableBackend = Mock()
+        varlen_module = ModuleType(package + ".sparse_varlen")
+        varlen_module.VarlenSparsePrefillBackend = Mock()
         runtime = ModuleType("sglang.srt.runtime_context")
         runtime.get_parallel = lambda: SimpleNamespace(attn_cp_size=cp)
         factory = load_function(
@@ -87,6 +99,7 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
                 config_name: config,
                 dense.__name__: dense,
                 sparse.__name__: sparse,
+                varlen_module.__name__: varlen_module,
                 runtime.__name__: runtime,
             },
         ):
@@ -97,15 +110,20 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
                 candidate_topk_blocks=topk,
                 candidate_block_size=8,
             )
-        return result, sparse.SparseTableBackend, dense.DenseBlocksBackend
+        return (
+            result,
+            sparse.SparseTableBackend,
+            dense.DenseBlocksBackend,
+            varlen_module.VarlenSparsePrefillBackend,
+        )
 
     def test_ppu_sm89_and_newer_select_sparse_engine(self):
         for sm in (89, 90, 100):
             with self.subTest(sm=sm):
                 self.assertTrue(self.supports(ppu=True, sm=sm))
-                result, constructor, dense = self.factory(ppu=True, sm=sm)
+                result, constructor, _, varlen = self.factory(ppu=True, sm=sm)
                 self.assertEqual(
-                    result, (constructor.return_value, constructor.return_value)
+                    result, (varlen.return_value, constructor.return_value)
                 )
                 constructor.assert_called_once_with(
                     token_to_kv_pool=None,
@@ -119,39 +137,63 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
         for sm in (80, 86, 88):
             with self.subTest(sm=sm):
                 self.assertFalse(self.supports(ppu=True, sm=sm))
-                result, constructor, dense = self.factory(ppu=True, sm=sm)
+                result, constructor, dense, _ = self.factory(ppu=True, sm=sm)
                 self.assertEqual(result, (dense.return_value, dense.return_value))
                 constructor.assert_not_called()
 
-    def test_deepgemm_disabled_or_missing_api_falls_back_to_dense(self):
-        result, constructor, dense = self.factory(ppu=True, sm=89, supported=False)
+    def test_missing_paged_api_keeps_varlen_prefill(self):
+        result, constructor, dense, varlen = self.factory(
+            ppu=True, sm=89, supported=False
+        )
+        self.assertEqual(result, (varlen.return_value, dense.return_value))
+        constructor.assert_not_called()
+
+    def test_missing_both_apis_falls_back_to_dense(self):
+        result, constructor, dense, varlen = self.factory(
+            ppu=True, sm=89, supported=False, varlen=False
+        )
         self.assertEqual(result, (dense.return_value, dense.return_value))
         constructor.assert_not_called()
 
     def test_nvidia_gate_is_preserved(self):
         self.assertFalse(self.supports(ppu=False, sm=90))
-        result, constructor, dense = self.factory(ppu=False, sm=90)
+        result, constructor, dense, _ = self.factory(ppu=False, sm=90)
         self.assertEqual(result, (dense.return_value, dense.return_value))
         constructor.assert_not_called()
         self.assertTrue(self.supports(ppu=False, sm=100, blackwell=True))
-        result, constructor, dense = self.factory(ppu=False, sm=100)
-        self.assertEqual(result, (constructor.return_value, constructor.return_value))
+        result, constructor, _, varlen = self.factory(ppu=False, sm=100)
+        self.assertEqual(result, (varlen.return_value, constructor.return_value))
 
     def test_disabled_candidate_budget_skips_engine(self):
-        result, constructor, dense = self.factory(ppu=True, sm=89, topk=0)
+        result, constructor, dense, _ = self.factory(ppu=True, sm=89, topk=0)
         self.assertEqual(result, (dense.return_value, dense.return_value))
         constructor.assert_not_called()
 
-    def test_cp_and_torch_prefill_keep_dense_prefill_sparse_decode(self):
-        for cp, prefill in ((2, True), (1, False)):
-            with self.subTest(cp=cp, prefill=prefill):
-                result, sparse, dense = self.factory(
-                    ppu=True, sm=89, cp=cp, prefill=prefill
-                )
-                self.assertEqual(result, (dense.return_value, sparse.return_value))
+    def test_torch_prefill_keeps_dense_prefill_sparse_decode(self):
+        result, sparse, dense, _ = self.factory(ppu=True, sm=89, prefill=False)
+        self.assertEqual(result, (dense.return_value, sparse.return_value))
+
+    def test_varlen_prefill_backend_is_selected(self):
+        for cp in (1, 8):
+            with self.subTest(cp=cp):
+                result, sparse, dense, varlen = self.factory(ppu=True, sm=89, cp=cp)
+                self.assertEqual(result, (varlen.return_value, sparse.return_value))
+        varlen.assert_called()
+        varlen.assert_called_with(
+            token_to_kv_pool=None,
+            req_to_token=None,
+            candidate_topk_blocks=16,
+        )
+
+    def test_missing_varlen_api_falls_back_to_the_paged_table(self):
+        result, sparse, dense, varlen = self.factory(
+            ppu=True, sm=89, cp=8, varlen=False
+        )
+        self.assertEqual(result, (sparse.return_value, sparse.return_value))
+        varlen.assert_not_called()
 
     def test_int8_format_keeps_dense_for_both_phases(self):
-        result, sparse, dense = self.factory(ppu=True, sm=89, int8=True)
+        result, sparse, dense, _ = self.factory(ppu=True, sm=89, int8=True)
         self.assertEqual(result, (dense.return_value, dense.return_value))
         sparse.assert_not_called()
 
