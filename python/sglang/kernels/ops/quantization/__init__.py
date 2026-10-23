@@ -32,6 +32,20 @@ register_kernel(
         description="Per-token FP8 quantization (sglang.kernels.jit).",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="quantization.sgl_per_token_quant_fp8",
+        backend=KernelBackend.AOT,
+        target="sgl_kernel:sgl_per_token_quant_fp8",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            in_place=True,
+            description="per-token FP8 quantization with scale compensation",
+        ),
+        description="Per-token FP8 quantization with scale multiplier (sgl_kernel wheel).",
+    )
+)
 # fp8 / int8 are legacy aliases of the same 8bit kernel in the wheel; register
 # each public name so runtime imports resolve to a stable spec.
 for _name in (
@@ -77,10 +91,15 @@ def sgl_per_token_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
+    scale_multiplier: float = 1.0,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
     if input.shape[0] == 0:
         return
+    if scale_multiplier != 1.0:
+        return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.AOT)(
+            input, output_q, output_s, scale_multiplier
+        )
     return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )

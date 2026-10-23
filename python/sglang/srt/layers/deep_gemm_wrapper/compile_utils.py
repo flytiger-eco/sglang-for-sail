@@ -159,6 +159,9 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
     GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
+    GROUPED_GEMM_NT_W4A8_NOPAD = auto()
+    GROUPED_GEMM_NT_W4A8_MASKED = auto()
+    GROUPED_GEMM_NT_W4A8_FUSED = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -391,6 +394,9 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_NOPAD: _GroupedNopadWarmupExecutor_w4a8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_MASKED: _GroupedMaskedWarmupExecutor_w4a8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_FUSED: _GroupedFusedWarmupExecutor_w4a8,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -414,6 +420,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_NOPAD,
         ]:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
         elif kernel_type in [
@@ -428,6 +435,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_MASKED,
         ]:
             return (
                 num_groups * max_m * k
@@ -501,6 +509,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED,
+            DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED,
@@ -592,6 +601,12 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                     + num_groups * n * k
                     + num_groups * n * ceil_div(k, _GROUP_SIZE) * 2  # 2 means uint16_t
                     + max_m * n * 2  # 2 means bfloat16
+                    + _moe_align_mem
+                ) / _GB
+            elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_W4A8_FUSED:
+                return (
+                    max_m * (k + 4 + n * 2)
+                    + num_groups * n * (k // 2 + k // 32)
                     + _moe_align_mem
                 ) / _GB
             else:  # BF16_FUSED
@@ -1547,6 +1562,78 @@ class _GroupedFusedWarmupExecutor_fp4(_BaseWarmupExecutor):
             self.lhs_q[:m], self.rhs_q, self.topk_ids[:m], perchannel_quant=False
         )
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            config,
+        )
+
+
+class _GroupedNopadWarmupExecutor_w4a8(_BaseWarmupExecutor):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((max_m, k))
+        weight = torch.zeros((num_groups, n, k // 2), device="cuda", dtype=torch.uint8)
+        scale = torch.full(
+            (num_groups, n, k // 32), 127, device="cuda", dtype=torch.uint8
+        )
+        self.rhs_q, self.rhs_s, _ = deep_gemm.preprocess_weights_and_scales(
+            deep_gemm.PreprocessMode.W4A8_MXFP4_MMA, False, weight, scale
+        )
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_w4a8(_GroupedNopadWarmupExecutor_w4a8):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        super().setup_tensors(max_m, n, k, num_groups)
+        self.lhs_q, self.lhs_s = _empty_token_fp8_channel((num_groups, max_m, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            self.masked_m,
+            m,
+        )
+
+
+class _GroupedFusedWarmupExecutor_w4a8(_GroupedNopadWarmupExecutor_w4a8):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        super().setup_tensors(max_m, n, k, num_groups)
+        self.topk_ids = torch.randint(
+            0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
+        )
+
+    def execute(self, m):
+        (
+            config,
+            m_rows,
+            expert_ids_and_cumsum,
+            sorted_token_ids,
+            aligned_num_m_blocks,
+            _,
+            _,
+        ) = deep_gemm.moe_align_block_size(
+            self.lhs_q[:m], self.rhs_q, self.topk_ids[:m]
+        )
+        deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_fused(
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
