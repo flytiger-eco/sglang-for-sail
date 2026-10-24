@@ -2145,6 +2145,7 @@ def moe_ep_deepgemm_preprocess(
     output_dtype: torch.dtype = torch.float8_e4m3fn,
     use_mxfp8: bool = False,
     expert_start: int = 0,
+    scale_multiplier: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
@@ -2231,7 +2232,14 @@ def moe_ep_deepgemm_preprocess(
             else:
                 assert len(block_shape) == 2
                 block_k = block_shape[1]
-            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+            quant_kwargs = (
+                {"scale_multiplier": scale_multiplier}
+                if scale_multiplier != 1.0
+                else {}
+            )
+            hidden_states, scale = per_token_group_quant_fp8(
+                hidden_states, block_k, **quant_kwargs
+            )
         elif output_dtype == torch.int8:
             assert block_shape is None
             hidden_states, scale = per_token_quant_int8(hidden_states)

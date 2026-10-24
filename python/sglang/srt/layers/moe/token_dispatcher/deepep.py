@@ -673,6 +673,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                     scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                     scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                    scale_multiplier=self.quant_config.get(
+                        "w4a8_scale_multiplier", 1.0
+                    ),
                 )
         elif self.use_int8:
             hidden_states = per_token_quant_int8(hidden_states)
