@@ -4825,6 +4825,11 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
+def _has_fp8_channelwise_layers(config: DeepSeekV4Config) -> bool:
+    quantization_config = getattr(config, "quantization_config", None) or {}
+    return bool(quantization_config.get("fp8_channelwise_layers"))
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
     # Mapping from fused module names to their component weight names.
@@ -4859,7 +4864,13 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
         # The loader hands this mapper to every quant config; other formats were
         # written against different names, so only Quark checkpoints get it.
-        return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
+        if _is_quark_checkpoint(config):
+            return _QUARK_CKPT_TO_SGLANG_MAPPER
+        # Channelwise FP8 checkpoints carry ffn/w1/w2/w3 names that must reach
+        # the quant config as mlp/gate_proj/down_proj/up_proj module prefixes.
+        if _has_fp8_channelwise_layers(config):
+            return cls.hf_to_sglang_mapper
+        return None
 
     def __init__(
         self,
@@ -5955,7 +5966,6 @@ def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
-    saw_wo_a_scale = False
     emitted = False
 
     for name, tensor in weights:
@@ -5971,9 +5981,16 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
-            saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+        scale_suffix = next(
+            (
+                suffix
+                for suffix in (".scale", ".weight_scale", ".weight_scale_inv")
+                if name.endswith(".wo_a" + suffix)
+            ),
+            None,
+        )
+        if scale_suffix is not None:
+            prefix = name[: -len(scale_suffix)]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
@@ -5987,13 +6004,16 @@ def _dequant_fp8_wo_a_streaming(
         yield name, tensor
 
     if emitted:
-        logger.info("Finished streaming dequant fp8 wo_a")
+        logger.info("Finished streaming dequant FP8/INT8 wo_a to BF16")
     for prefix, bucket in pending.items():
         if "weight" in bucket:
-            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            if bucket["weight"].dtype in (torch.int8, torch.float8_e4m3fn):
+                raise ValueError(
+                    f"{prefix}: quantized wo_a weight is missing its scale"
+                )
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
-            yield prefix + ".scale", bucket["scale"]
+            raise ValueError(f"{prefix}: wo_a scale is missing its weight")
 
 
 def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
