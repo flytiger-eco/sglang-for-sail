@@ -63,7 +63,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.is_sgl_kernel():
-            from sgl_kernel import fast_topk_v2
+            from sglang.kernels.ops.attention.fast_topk import fast_topk_v2
 
             return fast_topk_v2(score, lengths, topk, row_starts=row_starts)
         if self.is_torch():
@@ -249,7 +249,7 @@ class DSATopKBackend(Enum):
         assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
-            from sgl_kernel import (
+            from sglang.kernels.ops.attention.fast_topk import (
                 fast_topk_transform_fused,
                 fast_topk_transform_ragged_fused,
             )
