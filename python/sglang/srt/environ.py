@@ -1982,7 +1982,7 @@ class Envs:
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
     # Opt into the direct MXFP4 W4A16 MMA weight layout instead of VALU.  # codespell:ignore
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
-    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(True)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
