@@ -379,9 +379,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
             # Late-layer communication uses one row count per attention-DP rank.
             # Attention TP/CP shards need a separate tail padding layout.
+            # PPU adaptation (not upstream): a PD *decode* role never replays --
+            # its forwards are extend-free, so every replay consumer in the backend
+            # is guarded off (see deepseek_v4.py:4364 / backend 2631,2989) and the
+            # PD wire carries no replay state. Exempt that role so a uniform
+            # four-node flag deployment is not rejected by this clause.
             (
                 "DP attention other than attention TP 1 with supported MoE backends",
                 attn_dp_enabled_of(cfg)
+                and cfg.disaggregation_mode != "decode"
                 and not (
                     cfg.attn_dp_size == cfg.tp_size
                     and cfg.attn_cp_size == 1
