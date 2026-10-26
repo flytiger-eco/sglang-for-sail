@@ -1,9 +1,10 @@
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_npu, is_ppu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -179,6 +180,27 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        if envs.SGLANG_SAIL_PLA_CUDA.get() and is_ppu() and q.is_cuda:
+            from sglang.srt.layers.attention.linear.kernels.gdn_pla import (
+                log_pla_prefill_track_fallback,
+                pla_gdn_prefill,
+            )
+
+            if kwargs.get("requires_intermediate_states", False):
+                log_pla_prefill_track_fallback()
+            else:
+                return pla_gdn_prefill(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=kwargs.get("seq_lens_cpu"),
+                )
+
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
