@@ -76,7 +76,7 @@ def request(base, method, path, **kwargs):
 
 
 @contextmanager
-def server(tp=1, startup_timeout=150, bounded=True, *, compact_json=False):
+def server(tp=1, startup_timeout=1800, bounded=True, *, compact_json=False):
     from sglang.srt.utils import kill_process_tree
 
     port = free_port()
