@@ -29,13 +29,19 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module():
+def _jit_topk_v2_module(dtype: torch.dtype = torch.float32):
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"v2 top-k supports float32 or bfloat16 scores, got {dtype}")
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
 
-    args = make_cpp_args(is_arch_support_pdl())
+    args = (
+        make_cpp_args(is_arch_support_pdl())
+        if dtype == torch.float32
+        else make_cpp_args(is_arch_support_pdl(), dtype)
+    )
     # Enable each cluster path only when its occupancy probe reports capacity.
     extra_cuda_cflags = []
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
@@ -53,11 +59,9 @@ def _jit_topk_v2_module():
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
     ]
-    if is_hip_runtime():
-        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
-        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
@@ -206,7 +210,7 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = -1) -> torch.Te
                              prefer the cluster implementation.
                              Negative number means internal heuristic.
     """
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(torch.float32)
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
     module.topk_plan(seq_lens, metadata, static_threshold)
@@ -222,7 +226,7 @@ def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
         dtype=torch.int32,
         device=seq_lens.device,
     )
-    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
+    _jit_topk_v2_module(torch.float32).topk_plan(seq_lens, probe, -1)
     return probe[0, 1].item() != -1
 
 
@@ -259,7 +263,7 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(scores.dtype)
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
@@ -313,7 +317,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(scores.dtype)
     module.topk_transform_paged(
         scores,
         seq_lens,
@@ -349,18 +353,16 @@ def topk_transform_packed_v2(
     an additive offset. Like ragged, it dispatches the implementation per row at
     runtime, so it needs no plan and no :func:`plan_topk_v2` metadata.
 
-    NOTE: ``scores`` is MODIFIED IN PLACE -- the <= 3 columns ahead of each row's
-    window that the 16-byte-aligned read base pulls in are masked out. They are
-    invalid for that row and the buffer must have no other consumer, so do not
-    pass a view with overlapping rows.
-    ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
-
-    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
-    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
-    produces this layout today.
+    NOTE: supports fp32/bf16 scores on CUDA/PPU and ROCm, but not XPU.
+    Vectorized reads align the base to four input elements (16B for fp32, 8B
+    for bf16). Up to three columns before each window are masked in place;
+    score rows must not overlap and the buffer must have no other consumer.
+    ``seq_lens`` must be non-negative, and ``row_to_batch`` must reference valid
+    rows of the current request page table.
     """
-    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
-    module = _jit_topk_v2_module()
+    if is_xpu():
+        raise NotImplementedError("packed v2 top-k is not supported on XPU")
+    module = _jit_topk_v2_module(scores.dtype)
     module.topk_transform_packed(
         scores,
         seq_lens,
@@ -426,10 +428,12 @@ def top_k_per_row_prefill_bf16(
     scores: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    row_to_page: Optional[torch.Tensor] = None,
+    out_offsets: Optional[torch.Tensor] = None,
 ) -> None:
     """Top-K per row for prefill with bf16 scores input.
 
@@ -444,4 +448,6 @@ def top_k_per_row_prefill_bf16(
         out_page_indices,
         page_size,
         out_raw_indices,
+        row_to_page,
+        out_offsets,
     )

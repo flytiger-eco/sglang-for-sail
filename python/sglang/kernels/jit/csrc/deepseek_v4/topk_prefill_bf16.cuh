@@ -61,6 +61,8 @@ struct TopKPrefillBF16Params {
   const int32_t* __restrict__ row_starts;
   const int32_t* __restrict__ row_ends;
   const int32_t* __restrict__ page_table;
+  const int32_t* __restrict__ row_to_page;
+  const int32_t* __restrict__ out_offsets;
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;  // optional, may be nullptr
   const int64_t score_stride;
@@ -152,6 +154,12 @@ SGL_DEVICE uint32_t extract_coarse_bin_pf(float x) {
 SGL_DEVICE int32_t page_to_indices_pf(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
   const uint32_t mask = (1u << page_bits) - 1u;
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
+}
+
+SGL_DEVICE int32_t output_indices_pf(
+    const TopKPrefillBF16Params& params, const int32_t* __restrict__ page_table, uint32_t i) {
+  if (page_table != nullptr) return page_to_indices_pf(page_table, i, params.page_bits);
+  return static_cast<int32_t>(i) + params.out_offsets[blockIdx.x];
 }
 
 SGL_DEVICE uint32_t cdiv_pf(uint32_t a, uint32_t b) {
@@ -612,7 +620,7 @@ SGL_DEVICE static void tie_handle_and_transform_bf16(
   for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
     const auto raw = s_topk_indices[i];
     if (raw >= 0) {
-      page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+      page_indices_ptr[i] = output_indices_pf(params, page_ptr, static_cast<uint32_t>(raw));
       if (raw_indices_ptr != nullptr) raw_indices_ptr[i] = raw;
     } else {
       page_indices_ptr[i] = -1;
@@ -631,11 +639,11 @@ SGL_DEVICE static void naive_transform_bf16(
     int32_t* __restrict__ page_indices_ptr,
     int32_t* __restrict__ raw_indices_ptr,
     const uint32_t length,
-    const uint32_t page_bits) {
+    const TopKPrefillBF16Params& params) {
   using namespace prefill_bf16;
   for (uint32_t i = threadIdx.x; i < kTopK; i += kBlockSize) {
     if (i < length) {
-      page_indices_ptr[i] = page_to_indices_pf(page_ptr, i, page_bits);
+      page_indices_ptr[i] = output_indices_pf(params, page_ptr, i);
       if (raw_indices_ptr != nullptr) raw_indices_ptr[i] = static_cast<int32_t>(i);
     } else {
       page_indices_ptr[i] = -1;
@@ -959,7 +967,7 @@ SGL_DEVICE static void register_transform_bf16(
   for (uint32_t i = threadIdx.x; i < kTopK; i += kBlockSize) {
     const auto raw = s_topk_indices[i];
     if (raw >= 0) {
-      page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+      page_indices_ptr[i] = output_indices_pf(params, page_ptr, static_cast<uint32_t>(raw));
       if (raw_indices_ptr != nullptr) raw_indices_ptr[i] = raw;
     } else {
       page_indices_ptr[i] = -1;
@@ -1047,7 +1055,10 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
   const auto length = row_end > row_start ? static_cast<uint32_t>(row_end - row_start) : 0u;
 
   const auto scores_ptr = params.scores + static_cast<int64_t>(row_id) * params.score_stride + row_start;
-  const auto page_ptr = params.page_table + static_cast<int64_t>(row_id) * params.page_table_stride;
+  const auto page_row = params.row_to_page == nullptr ? row_id : params.row_to_page[row_id];
+  const auto page_ptr = params.page_table == nullptr
+                            ? nullptr
+                            : params.page_table + static_cast<int64_t>(page_row) * params.page_table_stride;
   auto page_indices_ptr = params.page_indices + static_cast<int64_t>(row_id) * kTopK;
   auto raw_indices_ptr =
       params.raw_indices == nullptr ? nullptr : params.raw_indices + static_cast<int64_t>(row_id) * kTopK;
@@ -1057,7 +1068,7 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
     const auto tx = threadIdx.x;
     for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
       if (i < length) {
-        page_indices_ptr[i] = page_to_indices_pf(page_ptr, i, params.page_bits);
+        page_indices_ptr[i] = output_indices_pf(params, page_ptr, i);
         if (raw_indices_ptr != nullptr) {
           raw_indices_ptr[i] = static_cast<int32_t>(i);
         }
@@ -1076,7 +1087,7 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
     for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
       const auto raw = s_topk_indices[i];
       if (raw >= 0) {
-        page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+        page_indices_ptr[i] = output_indices_pf(params, page_ptr, static_cast<uint32_t>(raw));
         if (raw_indices_ptr != nullptr) {
           raw_indices_ptr[i] = raw;
         }
@@ -1096,7 +1107,7 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
     for (uint32_t i = tx; i < kTopK; i += kBlockSize) {
       const auto raw = s_topk_indices[i];
       if (raw >= 0) {
-        page_indices_ptr[i] = page_to_indices_pf(page_ptr, static_cast<uint32_t>(raw), params.page_bits);
+        page_indices_ptr[i] = output_indices_pf(params, page_ptr, static_cast<uint32_t>(raw));
         if (raw_indices_ptr != nullptr) {
           raw_indices_ptr[i] = raw;
         }
@@ -1133,13 +1144,16 @@ __global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16
   const auto length = row_end > row_start ? static_cast<uint32_t>(row_end - row_start) : 0u;
 
   const auto scores_raw = params.scores + static_cast<int64_t>(row_id) * params.score_stride + row_start;
-  const auto page_ptr = params.page_table + static_cast<int64_t>(row_id) * params.page_table_stride;
+  const auto page_row = params.row_to_page == nullptr ? row_id : params.row_to_page[row_id];
+  const auto page_ptr = params.page_table == nullptr
+                            ? nullptr
+                            : params.page_table + static_cast<int64_t>(page_row) * params.page_table_stride;
   auto page_indices_ptr = params.page_indices + static_cast<int64_t>(row_id) * kTopK;
   auto raw_indices_ptr =
       params.raw_indices == nullptr ? nullptr : params.raw_indices + static_cast<int64_t>(row_id) * kTopK;
 
   if (length <= kTopK) {
-    naive_transform_bf16(page_ptr, page_indices_ptr, raw_indices_ptr, length, params.page_bits);
+    naive_transform_bf16(page_ptr, page_indices_ptr, raw_indices_ptr, length, params);
     return;
   }
 
@@ -1175,10 +1189,12 @@ struct TopKPrefillBF16Kernel {
       const tvm::ffi::TensorView scores,        // [batch, max_len] bf16
       const tvm::ffi::TensorView row_starts,    // [batch] int32
       const tvm::ffi::TensorView row_ends,      // [batch] int32
-      const tvm::ffi::TensorView page_table,    // [batch, num_pages] int32
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,  // [batch, kTopK] int32
       const uint32_t page_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_page,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -1189,7 +1205,26 @@ struct TopKPrefillBF16Kernel {
     TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<bf16_t>().with_device(device_).verify(scores);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts);
     TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_ends);
-    TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table);
+    RuntimeCheck(page_table.has_value() != out_offsets.has_value(), "provide page_table or out_offsets, not both");
+    const int32_t* page_table_ptr = nullptr;
+    const int32_t* row_to_page_ptr = nullptr;
+    const int32_t* out_offsets_ptr = nullptr;
+    int64_t page_table_stride = 0;
+    if (page_table.has_value()) {
+      if (row_to_page.has_value()) {
+        TensorMatcher({-1, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table.value());
+        TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_to_page.value());
+        row_to_page_ptr = static_cast<const int32_t*>(row_to_page.value().data_ptr());
+      } else {
+        TensorMatcher({B, -1}).with_strides({P, 1}).with_dtype<int32_t>().with_device(device_).verify(page_table.value());
+      }
+      page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
+      page_table_stride = P.unwrap();
+    } else {
+      RuntimeCheck(!row_to_page.has_value(), "row_to_page requires page_table");
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_offsets.value());
+      out_offsets_ptr = static_cast<const int32_t*>(out_offsets.value().data_ptr());
+    }
     TensorMatcher({B, prefill_bf16::kTopK}).with_dtype<int32_t>().with_device(device_).verify(page_indices);
 
     int32_t* raw_indices_ptr = nullptr;
@@ -1205,11 +1240,13 @@ struct TopKPrefillBF16Kernel {
         .scores = static_cast<const __nv_bfloat16*>(scores.data_ptr()),
         .row_starts = static_cast<int32_t*>(row_starts.data_ptr()),
         .row_ends = static_cast<int32_t*>(row_ends.data_ptr()),
-        .page_table = static_cast<int32_t*>(page_table.data_ptr()),
+        .page_table = page_table_ptr,
+        .row_to_page = row_to_page_ptr,
+        .out_offsets = out_offsets_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
         .score_stride = S.unwrap(),
-        .page_table_stride = P.unwrap(),
+        .page_table_stride = page_table_stride,
         .page_bits = page_bits,
     };
 
