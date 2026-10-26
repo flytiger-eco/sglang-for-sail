@@ -364,6 +364,29 @@ class CommandStateTest(unittest.TestCase):
         ):
             api.comments(123)
 
+    def test_repository_metadata_url_has_no_trailing_slash(self):
+        api = object.__new__(commands.GitHub)
+        api.repository = "example/sglang"
+        api.base = "https://api.github.com"
+        api.token = "fixture"
+        api._metadata = None
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
+        with mock.patch.object(
+            commands.urllib.request, "Request", wraps=urllib.request.Request
+        ) as request, mock.patch.object(
+            commands.urllib.request, "build_opener", return_value=opener
+        ):
+            self.assertEqual(api.metadata(), {})
+            api.get("issues/123/comments")
+        self.assertEqual(
+            [call.args[0] for call in request.call_args_list],
+            [
+                "https://api.github.com/repos/example/sglang",
+                "https://api.github.com/repos/example/sglang/issues/123/comments",
+            ],
+        )
+
     def test_redirect_strips_token_on_cross_host_and_rejects_http(self):
         request = urllib.request.Request(
             "https://api.github.com/example",

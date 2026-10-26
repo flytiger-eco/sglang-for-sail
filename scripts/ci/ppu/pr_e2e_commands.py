@@ -94,7 +94,7 @@ class GitHub:
             not path.startswith("/") and ".." not in path.split("/"), "Unsafe API path"
         )
         request = urllib.request.Request(
-            self.base + "/repos/" + self.repository + "/" + path,
+            self.base + "/repos/" + self.repository + ("/" + path if path else ""),
             data=None if data is None else json.dumps(data).encode(),
             headers={
                 "Authorization": "Bearer " + self.token,
