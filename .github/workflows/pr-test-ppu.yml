@@ -90,7 +90,6 @@ defaults:
     shell: bash
 
 env:
-  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
   PPU_SMALL_MODEL_PATH: /nas_aisw/datasets/checkpoints/LLM/qwen/v2.5/Qwen2.5-0.5B-Instruct
 
@@ -120,9 +119,9 @@ jobs:
         id: run-mode
         run: |
           if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
-            echo "run_all_tests=true" >> $GITHUB_OUTPUT
+            echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run_all_tests=false" >> $GITHUB_OUTPUT
+            echo "run_all_tests=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Detect file changes
@@ -222,6 +221,32 @@ jobs:
       cool-down-minutes: 0
     secrets: inherit
 
+  # Resolve once after authorization; CPU validation remains independent of registry availability.
+  resolve-nightly-image:
+    needs: [check-changes, pr-gate]
+    if: >-
+      inputs.cpu_only != true && needs.pr-gate.result == 'success' &&
+      (needs.check-changes.outputs.ppu_single == 'true' ||
+      needs.check-changes.outputs.ppu_kernel == 'true' ||
+      needs.check-changes.outputs.ppu_multi == 'true' || inputs.e2e_requested == true)
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 5
+    env:
+      PPU_BASE_IMAGE: ${{ vars.PPU_NIGHTLY_IMAGE_REPOSITORY }}:v0.5.18-latest
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+      digest: ${{ steps.resolve.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Resolve last successful nightly image
+        id: resolve
+        run: bash scripts/ci/ppu/resolve_nightly_image.sh
+
   # CPU needs only path selection. Full CI reuses the caller's verified result;
   # standalone/manual runs execute the same shortlist and evidence checks here.
   stage-a-test-cpu-ppu:
@@ -309,14 +334,20 @@ jobs:
   # Allow cold dependency/kernel setup while keeping test-suite limits unchanged.
   # Each worker deadline leaves five minutes for orchestration and evidence.
   stage-a-test-1-gpu-ppu:
-    needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.ppu_single == 'true' && needs.pr-gate.result == 'success'
+    needs: [check-changes, pr-gate, resolve-nightly-image]
+    if: >-
+      needs.check-changes.outputs.ppu_single == 'true' && needs.pr-gate.result == 'success' &&
+      needs.resolve-nightly-image.result == 'success'
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 45
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
+    env:
+      PPU_BASE_IMAGE: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_REF: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.resolve-nightly-image.outputs.digest }}
     steps:
       - name: Checkout code
         id: checkout
@@ -337,8 +368,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Resolve immutable image
-        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Prepare worker evidence
         env:
           PPU_ENV_HASHED_NAME: 'true'
@@ -418,9 +447,10 @@ jobs:
 
   # Both base-b bodies wait for selected CPU/smoke success, not for each other.
   stage-b-test-1-gpu-ppu:
-    needs: [check-changes, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
+    needs: [check-changes, resolve-nightly-image, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: |
       always() && !failure() && !cancelled() &&
+      needs.resolve-nightly-image.result == 'success' &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.ppu_single == 'true' &&
       (needs.check-changes.outputs.cpu == 'false' || needs.stage-a-test-cpu-ppu.result == 'success') &&
@@ -431,6 +461,10 @@ jobs:
     timeout-minutes: 60
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
+    env:
+      PPU_BASE_IMAGE: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_REF: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.resolve-nightly-image.outputs.digest }}
     steps:
       - name: Checkout code
         id: checkout
@@ -451,8 +485,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Resolve immutable image
-        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Prepare worker evidence
         env:
           PPU_ENV_HASHED_NAME: 'true'
@@ -533,9 +565,10 @@ jobs:
   stage-c-test-2-gpu-ppu:
     # Legacy stage-c ID is retained for compatibility; this is a parallel body.
     name: Two-PPU parallel body (legacy stage-c)
-    needs: [check-changes, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
+    needs: [check-changes, resolve-nightly-image, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: |
       always() && !failure() && !cancelled() &&
+      needs.resolve-nightly-image.result == 'success' &&
       needs.check-changes.result == 'success' &&
       needs.check-changes.outputs.ppu_multi == 'true' &&
       (needs.check-changes.outputs.cpu == 'false' || needs.stage-a-test-cpu-ppu.result == 'success') &&
@@ -546,6 +579,10 @@ jobs:
     timeout-minutes: 60
     outputs:
       evidence_ok: ${{ steps.evidence.outputs.evidence_ok }}
+    env:
+      PPU_BASE_IMAGE: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_REF: ${{ needs.resolve-nightly-image.outputs.image }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.resolve-nightly-image.outputs.digest }}
     steps:
       - name: Checkout code
         id: checkout
@@ -566,8 +603,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Resolve immutable image
-        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Prepare worker evidence
         env:
           PPU_ENV_HASHED_NAME: 'true'
@@ -650,16 +685,19 @@ jobs:
   # always() status check keeps an unselected (skipped) smoke lane from
   # implicitly skipping authorized E2E execution.
   e2e:
-    needs: [check-changes, pr-gate, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
+    needs: [check-changes, pr-gate, resolve-nightly-image, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu]
     if: >-
       always() && !cancelled() &&
       inputs.cpu_only != true && inputs.e2e_requested == true &&
+      needs.resolve-nightly-image.result == 'success' &&
       needs.pr-gate.result == 'success' && needs.stage-a-test-cpu-ppu.result == 'success' &&
       needs.stage-a-test-cpu-ppu.outputs.evidence_ok == 'true' &&
       (needs.check-changes.outputs.ppu_single != 'true' ||
       needs.stage-a-test-1-gpu-ppu.result == 'success')
     uses: ./.github/workflows/pr-test-ppu-e2e.yml
     with:
+      image_ref: ${{ needs.resolve-nightly-image.outputs.image }}
+      image_digest: ${{ needs.resolve-nightly-image.outputs.digest }}
       plan_hash: ${{ inputs.e2e_plan_hash }}
       cpu_identity: ${{ needs.stage-a-test-cpu-ppu.outputs.identity }}
       cpu_evidence_ok: ${{ needs.stage-a-test-cpu-ppu.outputs.evidence_ok }}
@@ -667,7 +705,7 @@ jobs:
 
   pr-test-ppu-finish:
     needs:
-      [check-changes, pr-gate, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu, stage-b-test-1-gpu-ppu, stage-c-test-2-gpu-ppu, e2e]
+      [check-changes, pr-gate, resolve-nightly-image, stage-a-test-cpu-ppu, stage-a-test-1-gpu-ppu, stage-b-test-1-gpu-ppu, stage-c-test-2-gpu-ppu, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:

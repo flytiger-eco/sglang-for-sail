@@ -166,7 +166,17 @@ class TestWorkflowCacheIdentity(unittest.TestCase):
         for filename, sdk_version in self.WORKFLOW_SDK_VERSIONS.items():
             with self.subTest(filename=filename):
                 text = (workflow_dir / filename).read_text()
-                self.assertIn(f"  PPU_BASE_IMAGE: {SDK_2_2_IMAGE}\n", text)
+                if filename == "pr-test-ppu.yml":
+                    self.assertNotIn(SDK_2_2_IMAGE, text)
+                    self.assertIn("vars.PPU_NIGHTLY_IMAGE_REPOSITORY", text)
+                    self.assertIn("needs.resolve-nightly-image.outputs.digest", text)
+                elif filename == "nightly-test-ppu.yml":
+                    self.assertNotIn(SDK_2_2_IMAGE, text)
+                    self.assertIn("needs.build-image.outputs.digest", text)
+                else:
+                    self.assertIn(SDK_2_2_IMAGE, text)
+                    self.assertIn("inputs.image_ref", text)
+                    self.assertIn("inputs.image_digest", text)
                 self.assertIn(f"  PPU_SDK_VERSION: {sdk_version}\n", text)
 
     def test_k8s_extra_env_forwards_image_and_sdk_identity(self):
@@ -181,18 +191,30 @@ class TestWorkflowCacheIdentity(unittest.TestCase):
             self.assertTrue(extra_env_lines, filename)
             for line in extra_env_lines:
                 with self.subTest(filename=filename):
-                    self.assertIn("PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }}", line)
+                    if filename == "pr-test-ppu.yml":
+                        self.assertIn("PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }}", line)
+                    else:
+                        self.assertRegex(
+                            line,
+                            r"PPU_BASE_IMAGE=\$\{\{ inputs\.image_ref \|\| "
+                            r"(?:env\.PPU_BASE_IMAGE_REF \|\| )?env\.PPU_BASE_IMAGE \}\}",
+                        )
+                    self.assertIn("PPU_BASE_IMAGE_DIGEST=", line)
                     self.assertIn("PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }}", line)
                     self.assertIn(
                         "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/", line
                     )
                     self.assertIn("PIP_TRUSTED_HOST=mirrors.aliyun.com", line)
 
-    def test_bare_metal_jobs_forward_image_and_sdk_identity(self):
+    def test_nightly_forwards_built_identity_to_all_families(self):
         text = (REPO_ROOT / ".github/workflows/nightly-test-ppu.yml").read_text()
-        install_count = text.count("bash scripts/ci/ppu/ppu_install_dependency.sh")
-        self.assertEqual(text.count("-e PPU_BASE_IMAGE \\\n"), install_count)
-        self.assertEqual(text.count("-e PPU_SDK_VERSION \\\n"), install_count)
+        self.assertEqual(
+            text.count("image_ref: ${{ needs.build-image.outputs.image }}"), 9
+        )
+        self.assertEqual(
+            text.count("image_digest: ${{ needs.build-image.outputs.digest }}"), 9
+        )
+        self.assertNotIn("ppu_install_dependency.sh", text)
 
 
 if __name__ == "__main__":

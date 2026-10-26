@@ -39,7 +39,12 @@ venv_python="${EVALSCOPE_VENV}/bin/python"
 
 # Idempotent, because a pod that retries a step should not pay for the install
 # twice and because a human debugging inside the pod runs this by hand.
-if [ -x "${evalscope_bin}" ] && "${venv_python}" -c "import evalscope" >/dev/null 2>&1; then
+if [[ "${PPU_TEST_BAKED_IMAGE:-0}" == "1" ]]; then
+  if [[ ! -x "${evalscope_bin}" || ! -x "${venv_python}" ]]; then
+    echo "ERROR: baked EvalScope environment missing at ${EVALSCOPE_VENV}; rebuild the CI image" >&2
+    exit 1
+  fi
+elif [ -x "${evalscope_bin}" ] && "${venv_python}" -c "import evalscope" >/dev/null 2>&1; then
   echo "EvalScope environment already present at ${EVALSCOPE_VENV}"
 else
   echo "Building the EvalScope environment at ${EVALSCOPE_VENV}"

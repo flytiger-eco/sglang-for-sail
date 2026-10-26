@@ -15,6 +15,14 @@ on:
   # 手动运行统一走 main 的 nightly 入口，避免绕过全局锁。
   workflow_call:
     inputs:
+      image_ref:
+        required: false
+        type: string
+        default: ''
+      image_digest:
+        required: false
+        type: string
+        default: ''
       ref:
         description: 'Git ref (branch, tag, or SHA) to test.'
         required: false
@@ -29,7 +37,8 @@ permissions:
   contents: read
 
 env:
-  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_BASE_IMAGE: ${{ inputs.image_ref || 'pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001' }}
+  PPU_BASE_IMAGE_DIGEST: ${{ inputs.image_digest }}
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
@@ -105,6 +114,22 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
+      - name: Validate candidate image inputs
+        shell: bash
+        env:
+          IMAGE_REF: ${{ inputs.image_ref }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$IMAGE_REF" && -z "$IMAGE_DIGEST" ]]; then
+            exit 0
+          fi
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ||
+                ! "$IMAGE_REF" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*(:[0-9]+)?(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*@sha256:[0-9a-fA-F]{64}$ ||
+                "${IMAGE_REF##*@}" != "$IMAGE_DIGEST" ]]; then
+            echo '::error::image_ref and image_digest must be supplied together as matching repo@digest and sha256:64hex'
+            exit 1
+          fi
 
       - name: Observe compute Pod environment
         continue-on-error: true
@@ -118,7 +143,7 @@ jobs:
         uses: flytiger-eco/ppu-distributed-action@main
         with:
           job_suffix: ans16-${{ strategy.job-index }}
-          image: ${{ env.PPU_BASE_IMAGE }}
+          image: ${{ inputs.image_ref || env.PPU_BASE_IMAGE }}
           # Two nodes of eight, gang-scheduled: the action turns nnodes > 1 into
           # a PodGroup with minMember 2, so the group either gets both boards or
           # waits, rather than one pod holding eight devices while the other
@@ -132,14 +157,19 @@ jobs:
           nproc_per_node: 8
           node_selector: "board-type=ZW-M890P"
           command: |
-            mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+            set -e
+            if [ "${PPU_TEST_BAKED_IMAGE:-0}" = "1" ]; then
+              source /workspace/source/scripts/ci/ppu/use_nightly_image.sh
+            else
+              mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
             [global]
             index-url = https://mirrors.aliyun.com/pypi/simple/
             trusted-host = mirrors.aliyun.com
             PIPEOF
-            set -e
-            cd /workspace/source
-            git config --global --add safe.directory /workspace/source
+              set -e
+              cd /workspace/source
+              git config --global --add safe.directory /workspace/source
+            fi
             SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
             export SGLANG_PPU_SOURCE_REVISION
             # First thing after the checkout is in place, and before the install:
@@ -198,19 +228,21 @@ jobs:
             echo "gloo interface:  $GLOO_SOCKET_IFNAME"
             echo "visible devices: $CUDA_VISIBLE_DEVICES"
             echo "checkpoint:      $ANSWER_MODEL_PATH"
-            bash scripts/ci/ppu/ppu_install_dependency.sh
-            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-            # Kept off the critical path: pinning only lets ninja reuse the NAS
-            # cache, but under the set -e above a find that cannot resolve the
-            # tree takes the whole gang-scheduled job with it. That is how run
-            # 34918954292 lost two boards six minutes in, once v0.5.18 moved this
-            # directory out from under the python/sglang/jit_kernel path these
-            # workflows were written against.
-            if [ "$JIT_MTIME" != 0 ]; then
-              if find python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} +; then
-                echo 'Pinned JIT source mtimes'
-              else
-                echo 'Skipped JIT mtime pinning; JIT will recompile'
+            if [ "${PPU_TEST_BAKED_IMAGE:-0}" != "1" ]; then
+              bash scripts/ci/ppu/ppu_install_dependency.sh
+              JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+              # Kept off the critical path: pinning only lets ninja reuse the NAS
+              # cache, but under the set -e above a find that cannot resolve the
+              # tree takes the whole gang-scheduled job with it. That is how run
+              # 34918954292 lost two boards six minutes in, once v0.5.18 moved this
+              # directory out from under the python/sglang/jit_kernel path these
+              # workflows were written against.
+              if [ "$JIT_MTIME" != 0 ]; then
+                if find python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} +; then
+                  echo 'Pinned JIT source mtimes'
+                else
+                  echo 'Skipped JIT mtime pinning; JIT will recompile'
+                fi
               fi
             fi
             # The JIT build directory moves off the shared NAS cache before
@@ -233,7 +265,7 @@ jobs:
             bash ../scripts/ci/ppu/run_answer_suite_node.sh \
               ${{ env.ANSWER_SUITE }} ${{ matrix.timeout_per_file }} "$SGLANG_PPU_ANSWER_RESULTS_DIR/ranks"
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=${{ env.ANSWER_RESULTS_IN_POD }}/environment-pods.tsv,SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com,GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
+          extra_env: "SGLANG_PPU_DISTRIBUTED_ACTION_SHA=caa3fabd1707bc11db2e29a40b14ad3ba15d3cb9,SGLANG_PPU_WORKFLOW_SHA=${{ github.workflow_sha }},SGLANG_PPU_POD_METADATA=${{ env.ANSWER_RESULTS_IN_POD }}/environment-pods.tsv,SGLANG_IS_IN_CI=true,SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ inputs.image_ref == '' && secrets.PPU_ARTIFACTORY_USER || '' }},PPU_ARTIFACTORY_PASSWORD=${{ inputs.image_ref == '' && secrets.PPU_ARTIFACTORY_PASSWORD || '' }},PPU_SUPPORTS_FP8=0,PPU_BASE_IMAGE=${{ inputs.image_ref || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_TEST_BAKED_IMAGE=${{ inputs.image_ref != '' && '1' || '0' }},PPU_CI_SOURCE_SHA=${{ inputs.ref }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com,GITHUB_REPOSITORY=${{ github.repository }},GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},GITHUB_SERVER_URL=${{ github.server_url }},SGLANG_PPU_ANSWER_TEST_CONFIG=/workspace/source/${{ env.ANSWER_CONFIG }},SGLANG_PPU_ANSWER_INCLUDE_RAW_OUTPUTS=1,SGLANG_PPU_ANSWER_RESULTS_DIR=${{ env.ANSWER_RESULTS_IN_POD }}"
           container_options: |
             privileged: true
             host_ipc: true

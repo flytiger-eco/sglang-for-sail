@@ -3,6 +3,12 @@ name: PPU PR E2E Entry
 on:
   workflow_call:
     inputs:
+      image_ref:
+        required: true
+        type: string
+      image_digest:
+        required: true
+        type: string
       entry:
         required: true
         type: string
@@ -32,7 +38,6 @@ defaults:
     shell: bash
 
 env:
-  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
@@ -42,10 +47,24 @@ jobs:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: ${{ inputs.job_minutes }}
     env:
+      PPU_BASE_IMAGE: ${{ inputs.image_ref }}
+      PPU_BASE_IMAGE_REF: ${{ inputs.image_ref }}
+      PPU_BASE_IMAGE_DIGEST: ${{ inputs.image_digest }}
       ENTRY: ${{ inputs.entry }}
       PLAN_HASH: ${{ inputs.plan_hash }}
       EVIDENCE_SOURCE: /wl_nas/pr-ci/e2e/${{ github.run_id }}/${{ github.run_attempt }}/${{ inputs.entry }}
     steps:
+      - name: Validate immutable image inputs
+        run: |
+          host='[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?'
+          component='[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*'
+          repository_pattern="${host}(\.${host})*(:[0-9]+)?/${component}(/${component})*"
+          if [[ ! "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ||
+                ! "$PPU_BASE_IMAGE_REF" =~ ^${repository_pattern}@sha256:[a-f0-9]{64}$ ||
+                "$PPU_BASE_IMAGE_REF" != *"@$PPU_BASE_IMAGE_DIGEST" ]]; then
+            echo 'A valid digest-pinned image_ref and matching image_digest are required.' >&2
+            exit 1
+          fi
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -72,8 +91,6 @@ jobs:
         run: |
           python3 scripts/ci/ppu/select_pr_e2e.py entry --plan .ppu-e2e/selection.json
           python3 scripts/ci/ppu/pr_e2e_report.py dependencies --plan .ppu-e2e/selection.json --entry "$ENTRY" --directory e2e-dependencies
-      - name: Resolve immutable image
-        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Fresh authorization before resource allocation
         env:
           GH_TOKEN: ${{ github.token }}

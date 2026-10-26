@@ -33,11 +33,13 @@
 # Usage: bash /workspace/source/scripts/ci/ppu/run_pd_perf_suite_node.sh
 set -e
 
-mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
+if [[ "${PPU_TEST_BAKED_IMAGE:-0}" != "1" ]]; then
+  mkdir -p ~/.pip && cat > ~/.pip/pip.conf << 'PIPEOF'
 [global]
 index-url = https://mirrors.aliyun.com/pypi/simple/
 trusted-host = mirrors.aliyun.com
 PIPEOF
+fi
 
 : "${SGLANG_PPU_PD_PERF_TEST_CONFIG:?the reviewed PD config path is required}"
 : "${SGLANG_PPU_PD_PERF_RESULTS_DIR:?the shared results directory is required}"
@@ -101,12 +103,17 @@ export SGLANG_SAIL_PLA_CUDA=0
 # derivation the multi-node colocated entry performs has nothing to derive here.
 export GLOO_SOCKET_IFNAME=lo
 
-cd /workspace/source
-if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
-  git config --global --add safe.directory /workspace/source
+if [[ "${PPU_TEST_BAKED_IMAGE:-0}" == "1" ]]; then
+  # shellcheck source=scripts/ci/ppu/use_nightly_image.sh
+  source /sgl-workspace/sglang/scripts/ci/ppu/use_nightly_image.sh
+else
+  cd /workspace/source
+  if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
+    git config --global --add safe.directory /workspace/source
+  fi
+  SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
+  export SGLANG_PPU_SOURCE_REVISION
 fi
-SGLANG_PPU_SOURCE_REVISION=$(git rev-parse HEAD)
-export SGLANG_PPU_SOURCE_REVISION
 
 # The RoCE GID index, which the Mooncake transfer engine needs told even though
 # no collective here crosses the node boundary -- each server is tp 8 inside one
@@ -325,14 +332,16 @@ except Exception as error:
   echo "port probe:      $probe_address:$probe_port answers $probe_answer with nothing of ours listening"
 done
 
-bash scripts/ci/ppu/ppu_install_dependency.sh
+if [[ "${PPU_TEST_BAKED_IMAGE:-0}" != "1" ]]; then
+  bash scripts/ci/ppu/ppu_install_dependency.sh
 
-# The JIT cache is keyed on source mtime, and a fresh checkout stamps every file
-# with the checkout time, so without this every run recompiles.
-JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-if [ "$JIT_MTIME" != 0 ] && [ -d "python/sglang/kernels/jit" ]; then
-  find python/sglang/kernels/jit -type f -exec touch -d @"$JIT_MTIME" {} +
-  echo 'Pinned JIT source mtimes'
+  # The JIT cache is keyed on source mtime, and a fresh checkout stamps every file
+  # with the checkout time, so without this every run recompiles.
+  JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+  if [ "$JIT_MTIME" != 0 ] && [ -d "python/sglang/kernels/jit" ]; then
+    find python/sglang/kernels/jit -type f -exec touch -d @"$JIT_MTIME" {} +
+    echo 'Pinned JIT source mtimes'
+  fi
 fi
 
 # The JIT build directory moves off the shared NAS cache before anything can

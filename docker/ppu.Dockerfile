@@ -425,6 +425,41 @@ WORKDIR /sgl-workspace/sglang
 
 CMD ["/bin/bash"]
 
+# Keep runtime last so CI dependencies require an explicit --target ci.
+FROM framework AS ci
+
+# The broad [test] extra would pull CUDA-only dependencies.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -c /sgl-workspace/ppu_constraints.txt \
+        pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate \
+        "maturin>=1,<2" "dill>=0.3.8,<0.3.9" "uvicorn>=0.37.0"
+
+# A published kernel wheel cannot validate this source commit.
+RUN GITHUB_WORKSPACE=/sgl-workspace/sglang SGL_KERNEL_WHEEL_CACHE=0 \
+    bash /sgl-workspace/sglang/scripts/ci/ppu/ppu_build_kernel.sh
+
+RUN --mount=type=bind,from=ppu-eic,source=.,target=/tmp/ppu-eic,ro \
+    bash /sgl-workspace/sglang/scripts/ci/ppu/install_ci_image.sh
+
+# EvalScope stays isolated from the serving stack, including at build time.
+RUN bash /sgl-workspace/sglang/scripts/ci/ppu/setup_evalscope.sh
+
+# Late metadata arguments preserve the compiled-layer cache.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:ppu-ci
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:ppu-ci}
+LABEL org.opencontainers.image.source="https://github.com/flytiger-eco/sglang-for-sail" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+RUN test "$(git -C /sgl-workspace/sglang rev-parse HEAD)" = "${SGLANG_BUILD_COMMIT}"
+
 ########################################################
 ########## Runtime Image ##############################
 ########################################################

@@ -3,6 +3,12 @@ name: PPU PR E2E
 on:
   workflow_call:
     inputs:
+      image_ref:
+        required: true
+        type: string
+      image_digest:
+        required: true
+        type: string
       plan_hash:
         required: true
         type: string
@@ -61,6 +67,8 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.default) }}
     uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
     with:
+      image_ref: ${{ inputs.image_ref }}
+      image_digest: ${{ inputs.image_digest }}
       entry: ${{ matrix.id }}
       nodes: ${{ matrix.nodes }}
       job_minutes: ${{ matrix.job_minutes }}
@@ -81,6 +89,8 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.extended) }}
     uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
     with:
+      image_ref: ${{ inputs.image_ref }}
+      image_digest: ${{ inputs.image_digest }}
       entry: ${{ matrix.id }}
       nodes: ${{ matrix.nodes }}
       job_minutes: ${{ matrix.job_minutes }}
@@ -102,6 +112,8 @@ jobs:
       matrix: ${{ fromJSON(needs.prepare.outputs.distributed) }}
     uses: ./.github/workflows/pr-test-ppu-e2e-entry.yml
     with:
+      image_ref: ${{ inputs.image_ref }}
+      image_digest: ${{ inputs.image_digest }}
       entry: ${{ matrix.id }}
       nodes: ${{ matrix.nodes }}
       job_minutes: ${{ matrix.job_minutes }}

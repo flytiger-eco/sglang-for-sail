@@ -6,7 +6,7 @@ PIP_INSTALL="python3 -m pip install --no-cache-dir"
 PPU_INSTALL_PROFILE="${PPU_INSTALL_PROFILE:-nightly}"
 case "$PPU_INSTALL_PROFILE" in
     nightly) ;;
-    pr) PIP_INSTALL="python3 -m pip install" ;;
+    pr) exec bash "${REPO_ROOT}/scripts/ci/ppu/install_pr_from_nightly.sh" ;;
     *) echo "Unknown PPU installation profile" >&2; exit 1 ;;
 esac
 
@@ -141,19 +141,7 @@ cd "${REPO_ROOT}" && ${PIP_INSTALL} -v -e "python[runtime_common,tracing]" --no-
 # Note on DSA (FlashMLA): ppu_flashmla_hooks.py REPLACEs sgl_kernel.flash_mla.*
 # at runtime with a thin wrapper over the standalone flash_mla package (from the
 # image), so this override does not change DSA behavior either way.
-_kernel_start=$SECONDS
 bash "${REPO_ROOT}/scripts/ci/ppu/ppu_build_kernel.sh"
-if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
-    printf '{"aot_seconds":%s}\n' "$((SECONDS-_kernel_start))" > "${PPU_INSTALL_EVIDENCE_DIR:-${PPU_EVIDENCE_DIR:?}}/aot.json"
-fi
-
-# PR suites need pytest but never PD/EIC installation; nightly keeps its defaults.
-if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
-    ${PIP_INSTALL} pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate
-    if [[ "${PPU_E2E_REQUIRE_PD:-false}" != true ]]; then
-        exit 0
-    fi
-fi
 
 # ==================== EIC SDK + mooncake-barex (for disaggregation tests) ==================== #
 EIC_PKG_DIR=/nas_aisw/datasets/packages/eic-sdk

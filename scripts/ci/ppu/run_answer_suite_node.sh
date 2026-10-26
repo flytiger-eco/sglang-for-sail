@@ -29,8 +29,12 @@ mkdir -p "$rank_dir"
 log="${rank_dir}/rank-${node_rank}.log"
 status_file="${rank_dir}/rank-${node_rank}.status"
 
+suite_command=(python3 run_suite.py)
+if [[ "${PPU_TEST_BAKED_IMAGE:-0}" == "1" ]]; then
+  suite_command=(bash /sgl-workspace/sglang/scripts/ci/ppu/run_baked_suite.sh)
+fi
 set -o pipefail
-python3 run_suite.py \
+"${suite_command[@]}" \
   --hw ppu \
   --suite "$suite" \
   --nightly \

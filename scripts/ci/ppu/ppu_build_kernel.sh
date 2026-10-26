@@ -217,9 +217,12 @@ done
 echo "Building wheel (MAX_JOBS=${MAX_JOBS})..."
 BUILD_START=$(date +%s)
 
+# Capture the compiler status before a fallback overwrites PIPESTATUS and permits a stale wheel.
+set +e
 python3 setup_ppu.py bdist_wheel 2>&1 | tee /tmp/sgl_kernel_build.log | \
-    grep -E "^(Building|running|creating|Cloning|copying|nvcc|error:|warning:.*error)" || :
+    grep -E "^(Building|running|creating|Cloning|copying|nvcc|error:|warning:.*error)"
 BUILD_RC=${PIPESTATUS[0]}
+set -e
 
 BUILD_END=$(date +%s)
 BUILD_ELAPSED=$((BUILD_END - BUILD_START))
