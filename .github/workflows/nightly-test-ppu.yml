@@ -38,10 +38,17 @@ permissions:
 # nightly-test-nvidia.yml are: one level failing no longer stops the rest, and
 # the ladder's verdict is settled by finish, which reads every level. A level
 # claims a pod of its own, so the ladder no longer holds one board for most of a
-# day while the board sits idle between levels. nproc_per_node is a resource
-# request, not device isolation, so a level that needs eight PPUs still holds
-# the whole board; run_nightly_suite_board.sh narrows CUDA_VISIBLE_DEVICES to
-# NIGHTLY_DEVICE_COUNT so a one-PPU level cannot gate on its neighbour's memory.
+# day while the board sits idle between levels.
+#
+# The two one-PPU levels, the two-PPU one and the four-PPU one share a board
+# instead of taking four: together they ask for 88 cpus, one board's worth, and
+# each claims a device slice of its own (0, 1, 2-3, 4-7) via
+# NIGHTLY_DEVICE_OFFSET and NIGHTLY_DEVICE_COUNT, so the CUDA_VISIBLE_DEVICES a
+# pod exports lists only its own cards. That is what makes sharing safe:
+# nproc_per_node sizes the pod without pinning devices, and
+# _wait_for_gpu_idle_in_ci -- the guard that failed nightly-4-ppu on an 83GiB
+# neighbour -- inspects only the devices a pod lists. nightly-8-ppu needs all
+# eight, so it keeps a board to itself.
 #
 # The action is pinned to the revision pr-test-ppu.yml uses, not @main, so the
 # nightly ladder does not change mid-series (`uses:` cannot read `env:`).
@@ -107,7 +114,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_PARTITION_ID=0,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_DEVICE_OFFSET=0,NIGHTLY_PARTITION_ID=0,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -206,7 +213,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_PARTITION_ID=1,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=true,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_DEVICE_OFFSET=1,NIGHTLY_PARTITION_ID=1,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=true,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -298,7 +305,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-2-ppu,NIGHTLY_DEVICE_COUNT=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-2-ppu,NIGHTLY_DEVICE_COUNT=2,NIGHTLY_DEVICE_OFFSET=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -390,7 +397,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-4-ppu,NIGHTLY_DEVICE_COUNT=4,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-4-ppu,NIGHTLY_DEVICE_COUNT=4,NIGHTLY_DEVICE_OFFSET=4,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -531,9 +538,44 @@ jobs:
   nightly-test-ppu-finish:
     needs: [nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu, nightly-8-ppu]
     if: always()
-    # Board-free: this job only reads the `needs` verdicts.
+    # Board-free: this job only reads the `needs` verdicts and the artifacts the
+    # levels uploaded.
     runs-on: ubuntu-latest
+    # Rendered here, not in the level jobs: their container hook drops writes to
+    # $GITHUB_STEP_SUMMARY (see collect_answer_evidence.sh); this one keeps them.
+    # `actions: read` is for downloading the levels' artifacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 1
+      # Best effort, like the uploads: a lost upload just leaves that level unlisted.
+      - name: Download nightly results
+        id: download
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-nightly-k8s-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: nightly-artifacts
+      - name: Name the files that failed
+        if: always()
+        shell: bash
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          # This table must never decide the ladder: a broken renderer leaves the
+          # verdict step below untouched.
+          if python3 scripts/ci/ppu/nightly_failures.py nightly-artifacts > nightly-failures.md; then
+            cat nightly-failures.md
+            cat nightly-failures.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not render the failed-file table; each level job's \`✗ FAILED:\` annotations still name its failing files"
+          fi
       - name: Check all dependent job statuses
         env:
           NEEDS_JSON: ${{ toJson(needs) }}

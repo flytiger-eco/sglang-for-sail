@@ -6,7 +6,8 @@
 # to sit in the workflow now happens here. Per-partition values come from the
 # environment:
 #   NIGHTLY_SUITE            registered suite name for run_suite.py
-#   NIGHTLY_DEVICE_COUNT     PPUs to expose; must equal nproc_per_node
+#   NIGHTLY_DEVICE_COUNT     PPUs the suite may use
+#   NIGHTLY_DEVICE_OFFSET    first device of this level's slice (default 0)
 #   NIGHTLY_TIMEOUT_PER_FILE seconds run_suite.py gives each registered file
 #   NIGHTLY_WARM_MODELS      '|'-separated checkpoints to page-warm first
 #   NIGHTLY_PARTITION_ID     LPT partition to run; omit to run the whole suite
@@ -52,12 +53,24 @@ export SGL_KERNEL_WHEEL_CACHE_DIR=/mnt/wl_nas/cache/sgl-kernel-wheels
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 export SGLANG_SAIL_PLA_CUDA=0
 
-# nproc_per_node is a resource request, not device isolation: a pod that asks
-# for one PPU still sees all eight, so narrow the visible set here or
-# _wait_for_gpu_idle_in_ci gates on a neighbour's memory. The PPU shim parses
-# comma lists only ("0-3" is read as a single device), and `seq -s` leaves a
-# trailing comma to trim.
-visible_devices="$(seq -s, 0 "$((NIGHTLY_DEVICE_COUNT - 1))")"
+# nproc_per_node sizes the pod but does not pin devices: the pod still sees all
+# eight PPUs of the board it landed on. CUDA_VISIBLE_DEVICES is what decides
+# which of them a suite may touch, so each level takes a slice of its own --
+# NIGHTLY_DEVICE_OFFSET picks where the slice starts, NIGHTLY_DEVICE_COUNT how
+# wide it is. The slices are disjoint, so levels may share a board: 1a+1b+2+4
+# ask for 88 cpus between them, one board's worth, on devices 0, 1, 2-3 and
+# 4-7. _wait_for_gpu_idle_in_ci inspects only the devices listed here, so a
+# neighbour on another slice is none of this suite's business -- which is how
+# sharing a board stops failing the way nightly-4-ppu failed on an 83GiB
+# process it never asked for. The PPU shim parses comma lists only ("0-3" is a
+# single device), and `seq -s` leaves a trailing comma to trim.
+device_offset="${NIGHTLY_DEVICE_OFFSET:-0}"
+device_last=$((device_offset + NIGHTLY_DEVICE_COUNT - 1))
+if ((device_last > 7)); then
+  echo "ERROR: devices ${device_offset}-${device_last} exceed the board's eight PPUs" >&2
+  exit 1
+fi
+visible_devices="$(seq -s, "$device_offset" "$device_last")"
 export CUDA_VISIBLE_DEVICES="${visible_devices%,}"
 
 cd /workspace/source
