@@ -50,9 +50,7 @@ def model_configuration(family):
         "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
     }
     if family == "kimi":
-        model = os.getenv(
-            "MODEL_PATH", "modelscope.cn/organization/T-HEAD/Kimi-K3"
-        )
+        model = os.getenv("MODEL_PATH", "modelscope.cn/organization/T-HEAD/Kimi-K3")
         common += [
             "--prefill-attention-backend",
             "fa3",
