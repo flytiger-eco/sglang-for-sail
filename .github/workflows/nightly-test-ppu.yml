@@ -74,12 +74,14 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     # One job for the whole 1-PPU suite: 64 files, ~74min of in-source est_time.
-    # The two LPT partitions this used to be cut into bought ~37min of wall clock
-    # each and cost a second pod, a second dependency install and a second device
-    # slice to keep clear. The watchdog below covers the suite plus that install
-    # and the model warm-up; this adds the 30min every level allows for the pod to
-    # be scheduled.
-    timeout-minutes: 195
+    # The two LPT partitions this used to be cut into bought ~37min of est each
+    # and cost a second pod, a second dependency install and a second device
+    # slice to keep clear. Runs 40482998667 and 40468436377 measured the halves
+    # at 69/60min and 55/93min including their own install and warm-up, so the
+    # whole suite is about their sum less one setup; the watchdog below keeps
+    # ~40min over the worse pair, and this adds the 30min every level allows for
+    # the pod to be scheduled.
+    timeout-minutes: 225
     steps:
       - name: Checkout code
         id: checkout
@@ -138,7 +140,7 @@ jobs:
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 165
+          timeout_minutes: 195
           cleanup_policy: always
       - name: Collect nightly results
         if: always()
