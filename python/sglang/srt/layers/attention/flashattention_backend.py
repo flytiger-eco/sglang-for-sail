@@ -1896,6 +1896,8 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         if is_swa_layer and layer.attn_type == AttentionType.ENCODER_ONLY:
+            # Shared across platforms: non-causal encoder-only SWA needs right
+            # context too, matching forward_extend (e.g. DFlash draft blocks).
             window_size = (layer.sliding_window_size, layer.sliding_window_size)
         elif is_swa_layer:
             window_size = (layer.sliding_window_size, 0)

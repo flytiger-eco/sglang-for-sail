@@ -139,6 +139,11 @@ jobs:
             cd /workspace/source &&
             bash scripts/ci/ppu/ppu_install_dependency.sh &&
             git config --global --add safe.directory /workspace/source &&
+            python3 -m pytest -q \
+              test/registered/unit/models/test_dflash_attention_sink.py \
+              test/registered/unit/models/test_mimo_v2_expert_weight_loading.py \
+              test/registered/unit/model_executor/test_pool_configurator.py \
+              test/registered/unit/layers/test_flashattention_paged_mha.py &&
             JIT_MTIME=$(git -C /workspace/source log -1 --format=%ct 2>/dev/null || echo 0) &&
             { [ "$JIT_MTIME" != 0 ] && find /workspace/source/python/sglang/kernels/jit -type f -exec touch -d @$JIT_MTIME {} + && echo 'Pinned JIT source mtimes' || true; } &&
             cd test &&
