@@ -320,6 +320,13 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+
+    # The PPU KDA prefill default (SAIL PLA / "flashkda") is intentionally NOT
+    # written here: a process-wide arg would also bind a speculative draft
+    # runner whose model may not be KDA. It is applied per runner in
+    # attention_registry via resolve_linear_attn_backends(prefill_default=...),
+    # so only the KDA runner opts in and an explicit
+    # --linear-attn-prefill-backend still wins.
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (

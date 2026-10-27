@@ -429,6 +429,15 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         prefill_default = None
         if hybrid_gdn_config(runner.model_config) is not None and not is_npu():
             prefill_default = flashinfer_gdn_prefill_default(runner)
+        if prefill_default is None and not is_npu():
+            # Per-runner PPU KDA default (SAIL PLA prefill). Kept per runner so
+            # a heterogeneous target/draft pair cannot hand a FlashKDA prefill
+            # backend to a GDN runner, which has no such kernel.
+            from sglang.srt.layers.attention.linear.kda_backend import (
+                ppu_pla_prefill_default,
+            )
+
+            prefill_default = ppu_pla_prefill_default(runner.model_config)
         runner.linear_attn_backends = resolve_linear_attn_backends(
             prefill_default=prefill_default
         )
