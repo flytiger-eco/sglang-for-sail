@@ -235,6 +235,8 @@ def _bf16_gemm_dispatch_fake(
 def bf16_gemm_dispatch(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
+    if x.shape[-1] == 0:
+        return F.linear(x, weight, bias)
     m = x.numel() // x.shape[-1]
     if envs.SGLANG_BF16_GEMM_LOG_SHAPES.get():
         _log_bf16_gemm_shape(m, weight.shape[0], weight.shape[1])
@@ -333,6 +335,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if x.shape[-1] == 0:
+            return F.linear(x, layer.weight, bias)
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:
@@ -352,14 +356,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             is_ppu()
+            and envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
             and (bias is None or bias.dtype == torch.bfloat16)
             and get_bf16_gemm_backend().is_auto()
         ):
-            x_2d = x.reshape(-1, x.shape[-1]).contiguous()
-            weight = layer.weight.contiguous()
+            x_2d = x.reshape(-1, x.shape[-1])
+            weight = layer.weight
+            if not (
+                x_2d.is_contiguous()
+                and x_2d.stride(-1) == 1
+                and weight.is_contiguous()
+                and weight.stride(-1) == 1
+            ):
+                if not envs.SGLANG_SAIL_TO_KMAJOR_DENSE_BF16.get():
+                    return F.linear(x, layer.weight, bias)
+                x_2d = x_2d.contiguous()
+                weight = weight.contiguous()
             output = torch.empty(
                 (x_2d.shape[0], weight.shape[0]),
                 dtype=torch.bfloat16,
