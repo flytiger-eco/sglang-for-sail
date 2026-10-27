@@ -2,7 +2,10 @@ name: Nightly Test (PPU)
 
 on:
   schedule:
-    - cron: '0 16 * * *'  # 0:00 AM Beijing Time (UTC+8) every day
+    # 16:00 UTC == 00:00 Beijing. GitHub evaluates cron only on the default
+    # branch, so on a version branch this stays dormant and the ladder is
+    # exercised by dispatch (or by a default-branch caller).
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       ref:
@@ -21,56 +24,62 @@ on:
 concurrency:
   group: nightly-test-ppu-${{ inputs.ref || github.ref }}
   # A cancelled run reports the levels it never reached as "no verdict" rather
-  # than as a failure, so a second dispatch queues behind the one on the boards
-  # instead of replacing it, as the Answer callees do.
+  # than as a failure, so a second dispatch queues behind the one on the boards.
   cancel-in-progress: false
 
 permissions:
   contents: read
 
-# The board is no longer reached from a self-hosted `ppu` runner: each job runs
-# on the CPU-only K8s runner group and submits a worker pod through
-# flytiger-eco/ppu-distributed-action onto a board-type=OAM-810E node, as
-# test-ppu-answer.yml and pr-test-ppu.yml do. The container setup lives in
-# scripts/ci/ppu/run_nightly_suite_board.sh; only per-partition values vary here.
+# Every job runs on the CPU-only K8s runner group and submits a worker pod
+# through flytiger-eco/ppu-distributed-action onto a board-type=OAM-810E node,
+# as pr-test-ppu.yml does. The container setup lives in
+# scripts/ci/ppu/run_nightly_suite_board.sh; only per-level values vary here.
+# The four levels are independent jobs -- one failing does not stop the rest --
+# and finish settles the ladder by reading every level's result.
 #
-# The five levels are independent jobs, as the seven stages of
-# nightly-test-nvidia.yml are: one level failing no longer stops the rest, and
-# the ladder's verdict is settled by finish, which reads every level. A level
-# claims a pod of its own, so the ladder no longer holds one board for most of a
-# day while the board sits idle between levels.
+# Device slices are a division of labour, not a pinning. nproc_per_node is a
+# card *count*: a pod sees every card of the node it lands on, and
+# NIGHTLY_DEVICE_OFFSET/NIGHTLY_DEVICE_COUNT only decide which of them its
+# CUDA_VISIBLE_DEVICES lists (1-ppu: 0, 2-ppu: 2-3, 4-ppu: 0-3, 8-ppu: 0-7).
+# Nothing co-schedules the levels onto the board their offsets were chosen for,
+# and nothing keeps a neighbour off those indices -- pr-test-ppu runs 1- and
+# 2-card pods on these same boards without offsets at all. So the slices stop
+# the levels from treading on each other and nothing more; nightly-4-ppu asks
+# for all eight cards while running on four because a whole-board request is the
+# only thing that actually excludes a neighbour. _wait_for_gpu_idle_in_ci waits
+# on this container's own processes and only warns about the rest, so a board
+# dirtied by someone else costs a warning rather than a red suite (run
+# 40482998667: a 20.84 GiB foreign process on device 4 failed every file of
+# nightly-4-ppu in setUpClass).
 #
-# The two one-PPU levels, the two-PPU one and the four-PPU one share a board
-# instead of taking four: together they ask for 88 cpus, one board's worth, and
-# each claims a device slice of its own (0, 1, 2-3, 4-7) via
-# NIGHTLY_DEVICE_OFFSET and NIGHTLY_DEVICE_COUNT, so the CUDA_VISIBLE_DEVICES a
-# pod exports lists only its own cards. That is what makes sharing safe:
-# nproc_per_node sizes the pod without pinning devices, and
-# _wait_for_gpu_idle_in_ci -- the guard that failed nightly-4-ppu on an 83GiB
-# neighbour -- inspects only the devices a pod lists. nightly-8-ppu needs all
-# eight, so it keeps a board to itself.
+# The sweep in front of each level removes worker pods a cancelled or crashed
+# run of the same level left behind -- the pod keeps a server on the card after
+# its run is gone. The action's `always()` cleanup is not enough: a job can be
+# torn down before that step runs.
 #
 # The action is pinned to the revision pr-test-ppu.yml uses, not @main, so the
-# nightly ladder does not change mid-series (`uses:` cannot read `env:`).
+# ladder does not change mid-series (`uses:` cannot read `env:`).
 #
-# Around the action each job body does what the Answer board jobs do: observe
-# the pod that is claimed, then carry the suite's log off the NAS and upload it
-# with the same two-attempt upload. The pod writes that copy under /mnt/wl_nas
-# and the runner reads the same bytes under /wl_nas.
-#
-# The caches are the /wl_nas ones every other lane on these boards uses; the
-# /nas_aisw tree this file used to name belongs to the retired docker runner,
-# which no longer exists on this path.
+# Results travel over the NAS both sides mount: the pod writes under
+# /mnt/wl_nas, the runner reads the same bytes under /wl_nas. JIT caches are the
+# /wl_nas ones the other lanes on these boards use; model checkpoints and the HF
+# cache stay on /nas_aisw, which every board lane reads.
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
-  nightly-1a-ppu:
+  nightly-1-ppu:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 155
+    # One job for the whole 1-PPU suite: 64 files, ~74min of in-source est_time.
+    # The two LPT partitions this used to be cut into bought ~37min of wall clock
+    # each and cost a second pod, a second dependency install and a second device
+    # slice to keep clear. The watchdog below covers the suite plus that install
+    # and the model warm-up; this adds the 30min every level allows for the pod to
+    # be scheduled.
+    timeout-minutes: 195
     steps:
       - name: Checkout code
         id: checkout
@@ -91,6 +100,15 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
+      # Never decides the level: without kubectl the sweep is skipped.
+      - name: Sweep worker pods left by earlier runs
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_SWEEP_NAMESPACE: ppu-sched
+          PPU_SWEEP_JOB: ${{ github.job }}
+          PPU_SWEEP_MAX_AGE_HOURS: "6"
+        run: bash scripts/ci/ppu/sweep_stale_worker_pods.sh
       - name: Resolve immutable image
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
@@ -103,7 +121,7 @@ jobs:
           PPU_ENV_EXPECTED_PODS: "1"
           PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results/environment-pods.tsv
         run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
-      - name: Run nightly-1-ppu partition 1/2 via K8s
+      - name: Run nightly-1-ppu via K8s
         uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
@@ -114,13 +132,13 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_DEVICE_OFFSET=0,NIGHTLY_PARTITION_ID=0,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_DEVICE_OFFSET=0,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 125
+          timeout_minutes: 165
           cleanup_policy: always
       - name: Collect nightly results
         if: always()
@@ -129,10 +147,8 @@ jobs:
           NIGHTLY_JOB: ${{ github.job }}
           NIGHTLY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results
         run: bash scripts/ci/ppu/collect_nightly_results.sh
-      # Best effort: the verdict has already left this job over the annotations
-      # the step above prints, so a reset on the github egress here must not turn
-      # a passing suite red. What a lost upload costs is the copy that exists
-      # nowhere else -- run.log with the per-file TIMINGS block.
+      # Best effort: the verdict has already left this job over the step above's
+      # annotations, and a lost upload only costs run.log and its TIMINGS block.
       - name: Upload nightly results
         id: upload_results
         if: always()
@@ -155,107 +171,8 @@ jobs:
           name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: nightly-artifacts/
           if-no-files-found: warn
-          # The first attempt can be reset after it has created the artifact,
-          # and v4 refuses a name it already holds.
-          overwrite: true
-          retention-days: 30
-
-  nightly-1b-ppu:
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    # Higher than the other 1-GPU job: this partition owns test_marlin_moe, whose
-    # JIT preload can cost ~18min on a cache miss; sized to fit the worst case
-    # (preload cap + the test's own 1200s watchdog).
-    timeout-minutes: 165
-    steps:
-      - name: Checkout code
-        id: checkout
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 2
-      - name: Wait out the git egress congestion
-        if: steps.checkout.outcome == 'failure'
-        shell: bash
-        run: sleep 90
-      - name: Checkout code (second attempt)
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-          fetch-depth: 2
-      - name: Resolve immutable image
-        shell: bash
-        run: bash scripts/ci/ppu/resolve_image_digest.sh
-      - name: Observe compute Pod environment
-        continue-on-error: true
-        shell: bash
-        env:
-          PPU_ENV_JOB: ${{ github.job }}
-          PPU_ENV_NAMESPACE: ppu-sched
-          PPU_ENV_EXPECTED_PODS: "1"
-          PPU_ENV_OUTPUT: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results/environment-pods.tsv
-        run: bash scripts/ci/ppu/observe_pod_environment.sh start "$PPU_ENV_OUTPUT"
-      # Two variants, not four: v0.5.18 keyed this module's cache on
-      # (dtype, is_ep, has_bias), so only the non-EP, no-bias variant that
-      # test_fused_marlin_moe compiles is preloaded -- that keeps the preload
-      # inside its 1500s cap. The EP variant is left to its own test budget.
-      - name: Run nightly-1-ppu partition 2/2 via K8s
-        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
-        with:
-          image: ${{ env.PPU_BASE_IMAGE_REF }}
-          nnodes: 0
-          nproc_per_node: 1
-          node_selector: "board-type=OAM-810E"
-          namespace: ppu-sched
-          job_suffix: ${{ github.job }}
-          command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
-          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-1-ppu,NIGHTLY_DEVICE_COUNT=1,NIGHTLY_DEVICE_OFFSET=1,NIGHTLY_PARTITION_ID=1,NIGHTLY_PARTITION_SIZE=2,NIGHTLY_MARLIN_PRELOAD=true,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B|/nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat|/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
-          container_options: |
-            privileged: true
-            host_ipc: true
-            host_network: true
-            shm_size: 8Gi
-          timeout_minutes: 135
-          cleanup_policy: always
-      - name: Collect nightly results
-        if: always()
-        shell: bash
-        env:
-          NIGHTLY_JOB: ${{ github.job }}
-          NIGHTLY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results
-        run: bash scripts/ci/ppu/collect_nightly_results.sh
-      # Best effort: the verdict has already left this job over the annotations
-      # the step above prints, so a reset on the github egress here must not turn
-      # a passing suite red. What a lost upload costs is the copy that exists
-      # nowhere else -- run.log with the per-file TIMINGS block.
-      - name: Upload nightly results
-        id: upload_results
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: nightly-artifacts/
-          if-no-files-found: warn
-          retention-days: 30
-      - name: Wait out the artifact egress congestion
-        if: always() && steps.upload_results.outcome == 'failure'
-        shell: bash
-        run: sleep 30
-      - name: Upload nightly results (second attempt)
-        if: always() && steps.upload_results.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: nightly-artifacts/
-          if-no-files-found: warn
-          # The first attempt can be reset after it has created the artifact,
-          # and v4 refuses a name it already holds.
+          # v4 refuses a name it already holds, and the first attempt can be
+          # reset after it has created the artifact.
           overwrite: true
           retention-days: 30
 
@@ -282,6 +199,15 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
+      # Never decides the level: without kubectl the sweep is skipped.
+      - name: Sweep worker pods left by earlier runs
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_SWEEP_NAMESPACE: ppu-sched
+          PPU_SWEEP_JOB: ${{ github.job }}
+          PPU_SWEEP_MAX_AGE_HOURS: "6"
+        run: bash scripts/ci/ppu/sweep_stale_worker_pods.sh
       - name: Resolve immutable image
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
@@ -305,7 +231,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-2-ppu,NIGHTLY_DEVICE_COUNT=2,NIGHTLY_DEVICE_OFFSET=2,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-2-ppu,NIGHTLY_DEVICE_COUNT=2,NIGHTLY_DEVICE_OFFSET=2,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct|/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -320,10 +246,8 @@ jobs:
           NIGHTLY_JOB: ${{ github.job }}
           NIGHTLY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results
         run: bash scripts/ci/ppu/collect_nightly_results.sh
-      # Best effort: the verdict has already left this job over the annotations
-      # the step above prints, so a reset on the github egress here must not turn
-      # a passing suite red. What a lost upload costs is the copy that exists
-      # nowhere else -- run.log with the per-file TIMINGS block.
+      # Best effort: the verdict has already left this job over the step above's
+      # annotations, and a lost upload only costs run.log and its TIMINGS block.
       - name: Upload nightly results
         id: upload_results
         if: always()
@@ -346,8 +270,8 @@ jobs:
           name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: nightly-artifacts/
           if-no-files-found: warn
-          # The first attempt can be reset after it has created the artifact,
-          # and v4 refuses a name it already holds.
+          # v4 refuses a name it already holds, and the first attempt can be
+          # reset after it has created the artifact.
           overwrite: true
           retention-days: 30
 
@@ -355,7 +279,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 205
+    timeout-minutes: 230
     steps:
       - name: Checkout code
         id: checkout
@@ -374,6 +298,15 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
+      # Never decides the level: without kubectl the sweep is skipped.
+      - name: Sweep worker pods left by earlier runs
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_SWEEP_NAMESPACE: ppu-sched
+          PPU_SWEEP_JOB: ${{ github.job }}
+          PPU_SWEEP_MAX_AGE_HOURS: "6"
+        run: bash scripts/ci/ppu/sweep_stale_worker_pods.sh
       - name: Resolve immutable image
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
@@ -391,19 +324,29 @@ jobs:
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
-          nproc_per_node: 4
+          # Eight, not four: the suite is graded on devices 0-3, and a
+          # whole-board request is what keeps a neighbour off the other half.
+          nproc_per_node: 8
           node_selector: "board-type=OAM-810E"
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-4-ppu,NIGHTLY_DEVICE_COUNT=4,NIGHTLY_DEVICE_OFFSET=4,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-4-ppu,NIGHTLY_DEVICE_COUNT=4,NIGHTLY_DEVICE_OFFSET=0,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 175
+            # Sized for the four cards the suite runs on, not the eight it
+            # reserves: the action would otherwise derive 88 cpus and 896Gi from
+            # the card count, which can leave the pod unschedulable on a board
+            # whose allocatable is already below that.
+            cpus: "44"
+            memory: "448Gi"
+          # A whole board is slower to come by than half of one, so the watchdog
+          # carries that queue time on top of the suite's own budget.
+          timeout_minutes: 200
           cleanup_policy: always
       - name: Collect nightly results
         if: always()
@@ -412,10 +355,8 @@ jobs:
           NIGHTLY_JOB: ${{ github.job }}
           NIGHTLY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results
         run: bash scripts/ci/ppu/collect_nightly_results.sh
-      # Best effort: the verdict has already left this job over the annotations
-      # the step above prints, so a reset on the github egress here must not turn
-      # a passing suite red. What a lost upload costs is the copy that exists
-      # nowhere else -- run.log with the per-file TIMINGS block.
+      # Best effort: the verdict has already left this job over the step above's
+      # annotations, and a lost upload only costs run.log and its TIMINGS block.
       - name: Upload nightly results
         id: upload_results
         if: always()
@@ -438,8 +379,8 @@ jobs:
           name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: nightly-artifacts/
           if-no-files-found: warn
-          # The first attempt can be reset after it has created the artifact,
-          # and v4 refuses a name it already holds.
+          # v4 refuses a name it already holds, and the first attempt can be
+          # reset after it has created the artifact.
           overwrite: true
           retention-days: 30
 
@@ -466,6 +407,15 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 2
+      # Never decides the level: without kubectl the sweep is skipped.
+      - name: Sweep worker pods left by earlier runs
+        continue-on-error: true
+        shell: bash
+        env:
+          PPU_SWEEP_NAMESPACE: ppu-sched
+          PPU_SWEEP_JOB: ${{ github.job }}
+          PPU_SWEEP_MAX_AGE_HOURS: "6"
+        run: bash scripts/ci/ppu/sweep_stale_worker_pods.sh
       - name: Resolve immutable image
         shell: bash
         run: bash scripts/ci/ppu/resolve_image_digest.sh
@@ -489,7 +439,7 @@ jobs:
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_nightly_suite_board.sh
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "NIGHTLY_SUITE=nightly-8-ppu,NIGHTLY_DEVICE_COUNT=8,NIGHTLY_MARLIN_PRELOAD=false,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
+          extra_env: "NIGHTLY_SUITE=nightly-8-ppu,NIGHTLY_DEVICE_COUNT=8,NIGHTLY_WARM_MODELS=/nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct,NIGHTLY_RESULTS_DIR=/mnt/wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results,NIGHTLY_TIMEOUT_PER_FILE=1200,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/,PIP_TRUSTED_HOST=mirrors.aliyun.com"
           container_options: |
             privileged: true
             host_ipc: true
@@ -504,10 +454,8 @@ jobs:
           NIGHTLY_JOB: ${{ github.job }}
           NIGHTLY_RESULTS_ON_RUNNER: /wl_nas/devops/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}/nightly-results
         run: bash scripts/ci/ppu/collect_nightly_results.sh
-      # Best effort: the verdict has already left this job over the annotations
-      # the step above prints, so a reset on the github egress here must not turn
-      # a passing suite red. What a lost upload costs is the copy that exists
-      # nowhere else -- run.log with the per-file TIMINGS block.
+      # Best effort: the verdict has already left this job over the step above's
+      # annotations, and a lost upload only costs run.log and its TIMINGS block.
       - name: Upload nightly results
         id: upload_results
         if: always()
@@ -530,20 +478,19 @@ jobs:
           name: ppu-nightly-k8s-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: nightly-artifacts/
           if-no-files-found: warn
-          # The first attempt can be reset after it has created the artifact,
-          # and v4 refuses a name it already holds.
+          # v4 refuses a name it already holds, and the first attempt can be
+          # reset after it has created the artifact.
           overwrite: true
           retention-days: 30
 
   nightly-test-ppu-finish:
-    needs: [nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu, nightly-8-ppu]
+    needs: [nightly-1-ppu, nightly-2-ppu, nightly-4-ppu, nightly-8-ppu]
     if: always()
-    # Board-free: this job only reads the `needs` verdicts and the artifacts the
-    # levels uploaded.
+    # Board-free: it only reads the `needs` verdicts and the levels' artifacts.
+    # It is also the only job whose $GITHUB_STEP_SUMMARY writes survive -- the
+    # level jobs' container hook drops them (see collect_answer_evidence.sh).
     runs-on: ubuntu-latest
-    # Rendered here, not in the level jobs: their container hook drops writes to
-    # $GITHUB_STEP_SUMMARY (see collect_answer_evidence.sh); this one keeps them.
-    # `actions: read` is for downloading the levels' artifacts.
+    # `actions: read` downloads the levels' artifacts.
     permissions:
       contents: read
       actions: read
@@ -553,7 +500,7 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 1
-      # Best effort, like the uploads: a lost upload just leaves that level unlisted.
+      # Best effort, like the uploads: a lost artifact leaves that level unlisted.
       - name: Download nightly results
         id: download
         if: always()
@@ -568,8 +515,8 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          # This table must never decide the ladder: a broken renderer leaves the
-          # verdict step below untouched.
+          # Never decides the ladder: a broken renderer leaves the verdict step
+          # below untouched.
           if python3 scripts/ci/ppu/nightly_failures.py nightly-artifacts > nightly-failures.md; then
             cat nightly-failures.md
             cat nightly-failures.md >> "$GITHUB_STEP_SUMMARY"

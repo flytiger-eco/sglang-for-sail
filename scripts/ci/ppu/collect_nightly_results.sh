@@ -1,5 +1,5 @@
 #!/bin/bash
-# Carry one nightly partition's suite log off the NAS onto the run page and into
+# Carry one nightly level's suite log off the NAS onto the run page and into
 # the artifact directory.
 #
 # Run by every job of nightly-test-ppu.yml in the orchestration shell. The
@@ -8,7 +8,7 @@
 # this shell reads the same bytes under /wl_nas.
 #
 # Reads:
-#   NIGHTLY_JOB                job id, and what keeps the five partitions'
+#   NIGHTLY_JOB                job id, and what keeps the levels'
 #                              annotations apart on one run page
 #   NIGHTLY_RESULTS_ON_RUNNER  this job's NAS result directory
 #
