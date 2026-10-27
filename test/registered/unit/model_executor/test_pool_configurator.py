@@ -918,6 +918,86 @@ class TestFactory(CustomTestCase):
 class TestDflashDraftKvBudget(CustomTestCase):
     """DFLASH draft KV pool as a flat bytes/token term on the target's budget."""
 
+    def _capped_pool(self, available, page_size, draft_bytes, algorithm="DFLASH"):
+        from sglang.srt.model_executor.pool_configurator import (
+            SWAChunkCapPoolConfigurator,
+            create_memory_pool_configurator,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(8)),
+            swa_attention_layer_ids=list(range(8, 32)),
+            page_size=page_size,
+            disable_radix_cache=True,
+            max_running_requests=32,
+            chunked_prefill_size=2048,
+            sliding_window_size=128,
+            speculative_algorithm=algorithm,
+            speculative_num_draft_tokens=8,
+        )
+        mr.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=draft_bytes,
+        )
+        with mock_cpu_env():
+            cfg = create_memory_pool_configurator(mr)
+            self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+            self.assertFalse(cfg._enable_unified_memory)
+            pools = cfg.calculate_pool_sizes(available, page_size)
+        return mr, pools
+
+    def test_capped_swa_includes_flat_draft_pool_in_total_budget(self):
+        available = 1 << 30
+        draft_bytes = 10_240
+        for algorithm in ("DFLASH", "DSPARK"):
+            for page_size in (1, 64):
+                with self.subTest(algorithm=algorithm, page_size=page_size):
+                    mr, pools = self._capped_pool(
+                        available, page_size, draft_bytes, algorithm
+                    )
+                    full = pools.full_max_total_num_tokens
+                    swa = pools.swa_max_total_num_tokens
+                    target_cell = _full_per_token(mr) * 8
+                    fixed_swa_bytes = swa * _swa_per_token(mr) * 24
+                    used = _actual_memory_used(mr, pools) + full * draft_bytes
+                    self.assertGreater(full, 0)
+                    self.assertEqual(full % page_size, 0)
+                    self.assertEqual(swa % page_size, 0)
+                    self.assertLessEqual(used, available)
+                    self.assertLess(
+                        available - used, page_size * (target_cell + draft_bytes)
+                    )
+                    # Before the fix, all remaining bytes went to target KV;
+                    # allocating the draft pool on top overflowed this budget.
+                    old_full = (
+                        (available - fixed_swa_bytes) // target_cell // page_size
+                    ) * page_size
+                    self.assertGreater(
+                        fixed_swa_bytes + old_full * (target_cell + draft_bytes),
+                        available,
+                    )
+
+    def test_capped_swa_zero_draft_preserves_original_sizing(self):
+        available = 1 << 30
+        for page_size in (1, 64):
+            with self.subTest(page_size=page_size):
+                mr, pools = self._capped_pool(available, page_size, 0)
+                fixed_swa_bytes = (
+                    pools.swa_max_total_num_tokens * _swa_per_token(mr) * 24
+                )
+                expected_full = (
+                    (available - fixed_swa_bytes)
+                    // (_full_per_token(mr) * 8)
+                    // page_size
+                ) * page_size
+                self.assertEqual(pools.full_max_total_num_tokens, expected_full)
+                self.assertLessEqual(_actual_memory_used(mr, pools), available)
+
     def test_bytes_per_token_from_draft_geometry(self):
         import torch
 
