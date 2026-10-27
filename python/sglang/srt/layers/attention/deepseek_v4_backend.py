@@ -1381,7 +1381,7 @@ class DeepseekV4AttnBackend(
             build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             q_fp8_shape=torch.Size(
                 (
-                    core_attn_metadata.c4_topk_lengths_raw.shape[0],
+                    c_seq_lens.shape[0],
                     1,
                     self.index_n_heads,
                     self.index_head_dim,
