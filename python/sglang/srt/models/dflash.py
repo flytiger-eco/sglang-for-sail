@@ -45,11 +45,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_npu, is_ppu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -249,8 +250,15 @@ class DFlashAttention(nn.Module):
         elif draft_cfg.attention_sink_bias:
             # Per-head sink bias; each TP rank owns its slice of the
             # all-heads checkpoint tensor.
+            # PPU FA3 requires BF16 sinks regardless of the draft model dtype.
+            # Keep FP32 for other backends (including trtllm_mha).
+            sink_dtype = (
+                torch.bfloat16
+                if _is_ppu and get_spec().speculative_draft_attention_backend == "fa3"
+                else torch.float32
+            )
             self.attention_sink_bias = nn.Parameter(
-                torch.empty(self.num_heads, dtype=torch.float32 if _is_npu else None),
+                torch.empty(self.num_heads, dtype=sink_dtype),
                 requires_grad=False,
             )
             set_weight_attrs(
