@@ -54,7 +54,7 @@ class TestPpuBf16DeepgemmWarmup(unittest.TestCase):
                 "deep_gemm_execution_hook",
                 return_value=nullcontext(),
             ) as hook,
-            patch.object(deep_gemm_entrypoint, "deep_gemm") as deep_gemm,
+            patch.object(deep_gemm_entrypoint, "deep_gemm", create=True) as deep_gemm,
         ):
             deep_gemm_entrypoint.gemm_nt_bf16bf16bf16(lhs, rhs, out)
 
