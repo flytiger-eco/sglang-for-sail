@@ -44,6 +44,51 @@ from sglang.srt.runtime_context import (
 )
 
 
+def needs_intermediate_states(
+    track_ssm: bool, track_ssm_h_src: Optional[torch.Tensor]
+) -> bool:
+    """Whether an extend batch must run a kernel that emits per-chunk states.
+
+    ``track_ssm_h_src`` carries one row per chunk-unaligned tracked sequence
+    (see ``MambaAttnBackendBase._init_track_ssm_indices``). Chunk-aligned
+    tracked sequences snapshot the final state from ``ssm_states`` instead, so
+    for them the intermediate states are never read and must not be requested
+    -- asking for them forces kernels that cannot emit ``h`` (e.g. the PPU PLA
+    FlashKDA path) onto the Triton fallback.
+    """
+    return bool(
+        track_ssm and track_ssm_h_src is not None and track_ssm_h_src.numel() > 0
+    )
+
+
+def ppu_pla_prefill_default(model_config) -> Optional[str]:
+    """This runner's PPU prefill default: the SAIL PLA kernel for KDA models.
+
+    Returned as a *per-runner default* (fed into
+    ``resolve_linear_attn_backends(prefill_default=...)``) rather than written
+    into the process-wide ``--linear-attn-prefill-backend`` value, because a
+    target and its speculative draft coexist in one process and can want
+    different prefill kernels. KDA target models opt in here; a draft runner
+    whose model is GDN keeps its own backend (GDNKernelDispatcher has no
+    FlashKDA prefill kernel and rejects it). An explicit
+    ``--linear-attn-prefill-backend`` still wins over this default.
+    """
+    if not is_ppu():
+        return None
+    # Both SAIL master gates guard the PLA kernels (same pair as decode).
+    if not (envs.SGLANG_SAIL_FLA_CUDA.get() and envs.SGLANG_SAIL_PLA_CUDA.get()):
+        return None
+    try:
+        hf_config = model_config.hf_config
+    except Exception:  # noqa: BLE001 - resolution must not fail on this probe
+        return None
+    from sglang.srt.configs.model_config import uses_kda_attention
+
+    if not uses_kda_attention(hf_config):
+        return None
+    return "flashkda"
+
+
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -218,10 +263,14 @@ class KDAKernelDispatcher:
             self.decode_kernel, "supports_packed_decode", False
         )
 
+        extend_name = self.extend_kernel.__class__.__name__
+        if is_ppu() and extend_name == "FlashKDAKernel":
+            # On PPU the FlashKDA backend interface is served by SAIL PLA.
+            extend_name += "(PLA)"
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__} "
+            f"extend={extend_name} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -366,9 +415,9 @@ class KDAKernelDispatcher:
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         kernel = self.effective_extend_kernel(kwargs.get("lower_bound"))
-        return kernel.extend(
+        result = kernel.extend(
             q,
             k,
             v,
@@ -379,6 +428,14 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
+        # Backends disagree on the "no intermediate states" contract: Triton and
+        # FlashKDA return a bare output tensor, while CuteDSL always returns
+        # ``(out, None)`` even when ``return_intermediate_states`` is False.
+        # Normalize here so callers never have to know which kernel ran (an
+        # un-normalized tuple used to leak into tensor ops on the CuteDSL path).
+        if isinstance(result, tuple):
+            return result
+        return result, None
 
 
 def ragged_verify_dense_scatter_indices(
@@ -912,7 +969,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
+        # Per-chunk states (h) are only consumed by chunk-unaligned tracked rows
+        # (track_ssm_h_src rows of h). Chunk-aligned tracked rows copy the final
+        # state from ssm_states and snapshot-buffer rows read h_track_buf, so
+        # neither needs h. Asking for it unconditionally forced every tracked
+        # prefill onto kernels that can emit per-chunk states, which kept the
+        # PPU PLA extend kernel out of the dense path entirely.
+        need_intermediate_states = needs_intermediate_states(
+            track_ssm, self.forward_metadata.track_ssm_h_src
+        )
+        core_attn_out, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -929,7 +995,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
+            return_intermediate_states=need_intermediate_states,
             # Which global chunk rows of h the track snapshot will read; lets
             # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
@@ -942,11 +1008,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
-            # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
+            # ping-pong track slots (see _init_track_ssm_indices). The
+            # dispatcher normalizes every kernel to ``(out, h)``; h is only
+            # meaningful when this batch asked for it (see
+            # need_intermediate_states), so drop it otherwise.
             self._track_mamba_state_extend(
                 forward_batch,
-                h,
+                h if need_intermediate_states else None,
                 ssm_states,
                 self.forward_metadata,
                 h_track_buf=h_track_buf,

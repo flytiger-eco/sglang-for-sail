@@ -1986,6 +1986,13 @@ class Envs:
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
+    # SAIL PLA CUDA: master switch for every SAIL PLA kernel on PPU -- the KDA
+    # decode / MTP fast paths and, since the KDA prefill integration, the KDA
+    # prefill/extend path (kda_flashkda.FlashKDAKernel ->
+    # pla.prefill.flashkdapro.flashkda_fwd). PPU defaults it to True in
+    # platform_hook, so PLA is on out of the box; set it to 0 to send decode
+    # and prefill back to the community Triton kernels together. An explicit
+    # --linear-attn-prefill-backend still wins for the prefill side alone.
     SGLANG_SAIL_PLA_CUDA = EnvBool(False)
     # SAIL FLA CUDA: top-level gate for SAIL-accelerated FLA (Flash Linear
     # Attention) paths on PPU. When False, all SAIL FLA dispatch (including

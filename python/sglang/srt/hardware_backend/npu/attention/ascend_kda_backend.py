@@ -281,7 +281,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         track_ssm = self.forward_metadata.has_mamba_track_mask
 
-        core_attn_out = self.kernel_dispatcher.extend(
+        core_attn_out, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -301,8 +301,11 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             ),
         )
 
+        # The dispatcher always returns ``(out, h-or-None)`` regardless of the
+        # kernel or the intermediate-state flag, so unpack unconditionally and
+        # only consume h for tracked batches. Unpacking inside ``if track_ssm``
+        # would leak the tuple into tensor ops for untracked prefill.
         if track_ssm:
-            core_attn_out, h = core_attn_out
             self._track_mamba_state_extend(
                 forward_batch, h, ssm_states, self.forward_metadata
             )
