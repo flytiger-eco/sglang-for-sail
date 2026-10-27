@@ -1394,7 +1394,16 @@ def mhc_pre(
     },
 )
 def mhc_post_tilelang(
-    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+    num_h_blocks: int = 1,
 ):
     n = T.dynamic("num_tokens")
     h = hidden
@@ -1407,7 +1416,7 @@ def mhc_post_tilelang(
     x: T.Tensor((n, hc, h), T.bfloat16)
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(n, threads=n_thr) as i_n:
+    with T.Kernel(n, num_h_blocks, threads=n_thr) as (i_n, i_h_block):
         if ENABLE_PDL:
             T.pdl_sync()
 
@@ -1424,7 +1433,8 @@ def mhc_post_tilelang(
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+        for i_h_iter in T.Pipelined(T.ceildiv(h, h_blk * num_h_blocks), num_stages=2):
+            i0_h = i_h_iter * num_h_blocks + i_h_block
             T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
             T.copy(d[i_n, i0_h * h_blk], d_shared)
 
@@ -1454,6 +1464,11 @@ def mhc_post(
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
+    hidden_size = residual.shape[-1]
+    # Small batches need more parallelism than one CTA per token.
+    num_h_blocks = (
+        hidden_size // math.gcd(hidden_size, 1024) if x.shape[0] <= 256 else 1
+    )
     mhc_post_tilelang(
         comb_res_mix,
         residual,
@@ -1461,7 +1476,8 @@ def mhc_post(
         x,
         out,
         residual.shape[-2],
-        residual.shape[-1],
+        hidden_size,
+        num_h_blocks=num_h_blocks,
     )
     return out
 
@@ -2299,6 +2315,32 @@ def _hc_combine_kernel(
 
 
 @triton.jit
+def _mhc_stream_mean_kernel(
+    x_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    x_stride_k,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    x_row = x_ptr + pid_m.to(tl.int64) * x_stride_m + offs_h
+    # Streams are added in order onto a +0 fp32 accumulator, as torch.mean's
+    # reduction does (so an all -0 row averages to +0).
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        acc += tl.load(x_row + k * x_stride_k, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        y_ptr + pid_m.to(tl.int64) * y_stride_m + offs_h, acc * (1.0 / HC), mask=mask
+    )
+
+
+@triton.jit
 def _hc_mix_stats_partial_kernel(
     x_ptr,
     w_ptr,
@@ -2831,6 +2873,7 @@ def hc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    assert x_flat.stride(1) == 1
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
@@ -2843,6 +2886,37 @@ def hc_combine(
         x_flat.stride(0),
         pre.stride(0),
         pre.stride(1),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
+
+
+def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
+    into ``out`` when given."""
+    m, hc, h = x.shape
+    # Bitwise equality with torch's CUDA mean holds for 4 streams (the mHC width)
+    # over whole 1024-element blocks; torch orders some other widths differently.
+    if (
+        _is_hip
+        or x.device.type != "cuda"
+        or hc != 4
+        or h % 1024
+        or x.stride(2) != 1
+        or (out is not None and (out.dtype != x.dtype or out.stride(1) != 1))
+    ):
+        y = x.mean(dim=1)
+        return y if out is None else out.copy_(y)
+    y = torch.empty((m, h), dtype=x.dtype, device=x.device) if out is None else out
+    block_h = 1024
+    _mhc_stream_mean_kernel[(m, triton.cdiv(h, block_h))](
+        x,
+        y,
+        h,
+        x.stride(0),
+        x.stride(1),
         y.stride(0),
         HC=hc,
         BLOCK_H=block_h,

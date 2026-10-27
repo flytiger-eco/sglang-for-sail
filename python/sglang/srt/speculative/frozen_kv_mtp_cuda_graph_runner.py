@@ -377,6 +377,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+                self.deepep_adapter.capture_complete()
         finally:
             self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
 

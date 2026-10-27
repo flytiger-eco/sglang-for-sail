@@ -12,8 +12,10 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 )
 from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
+from sglang.srt.utils import is_sail
 
 from .scoring import (
+    decode_score_chunks,
     decode_scores,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
@@ -22,6 +24,7 @@ from .scoring import (
     prefill_requests,
     quantize_index_q,
     select_decode,
+    write_decode,
     write_prefill,
 )
 from .types import (
@@ -65,7 +68,7 @@ class FullTopKIndexer:
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
@@ -78,7 +81,6 @@ class FullTopKIndexer:
         requests = prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         )
         for request, chunks in requests:
             for chunk in chunks:
@@ -92,12 +94,13 @@ class FullTopKIndexer:
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
             for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+                q, lens, table = data.paged_logits_args(metadata, rows)
                 logits = deep_gemm_fp4_paged_mqa_logits(
-                    (data.q_fp4[rows], data.q_sf[rows]),
+                    q,
                     data.k_cache,
                     data.weights[rows],
-                    metadata.compressed_seq_lens[rows],
-                    metadata.page_table[rows],
+                    lens,
+                    table,
                     plan,
                     metadata.max_compressed_seq_len,
                 )
@@ -112,12 +115,13 @@ class FullTopKIndexer:
                     ),
                 )
             return
+        q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            q,
             data.k_cache,
             data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
+            lens,
+            table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
@@ -127,6 +131,17 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
+        if is_sail():
+            for d in decode_score_chunks(
+                inputs=inputs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+            ):
+                k = min(inputs.indexer.index_topk, d.lmax)
+                idx = d.scores.topk(k, dim=-1, sorted=False).indices
+                write_decode(inputs, d, idx)
+                del d  # release this chunk's logits before the next chunk is scored
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,

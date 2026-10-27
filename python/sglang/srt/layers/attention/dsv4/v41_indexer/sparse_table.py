@@ -1,4 +1,4 @@
-"""The candidate scheme carried by a DeepGEMM sparse table (SM100): a source
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100 or PPU SM89+): a source
 publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` needs,
 a consumer scores only those blocks out of the index-K pool."""
 
@@ -24,11 +24,10 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_v2,
+    topk_transform_paged,
     topk_transform_ragged_v2,
     topk_transform_sparse,
 )
-from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.common import async_h2d
 
@@ -103,14 +102,12 @@ class SparseTableBackend:
         self,
         *,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        req_to_token: torch.Tensor,
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
         self.alt_stream = torch.cuda.Stream()
@@ -120,7 +117,7 @@ class SparseTableBackend:
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(
@@ -150,7 +147,7 @@ class SparseTableBackend:
         published: Optional[_SparsePrefillTable],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -174,12 +171,13 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
+        q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            q,
             data.k_cache,
             data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
+            lens,
+            table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
@@ -188,13 +186,13 @@ class SparseTableBackend:
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        topk_transform_paged_v2(
+        topk_transform_paged(
             logits,
             seq_lens,
             metadata.page_table,
             inputs.out_page_indices,
             metadata.compressed_page_size,
-            metadata.topk_metadata,
+            None,
         )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
@@ -239,33 +237,31 @@ class SparseTableBackend:
         block_chunks = []
         phys_block_chunks = []
         valid_len_chunks = []
-        topk_plans = metadata.topk_metadata_chunks
-        assert not metadata.use_topk_v2 or topk_plans is not None
-        for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+        for rows, plan in metadata.row_chunks():
+            q, lens, table = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
-                (data.q_fp4[rows], data.q_sf[rows]),
+                q,
                 data.k_cache,
                 data.weights[rows],
-                metadata.compressed_seq_lens[rows],
-                metadata.page_table[rows],
+                lens,
+                table,
                 plan,
                 metadata.max_compressed_seq_len,
             )
-            topk_transform_paged_from_metadata(
+            topk_transform_paged(
                 logits,
-                metadata,
-                inputs.out_page_indices,
+                seq_lens[rows],
+                metadata.page_table[rows],
+                inputs.out_page_indices[rows],
+                metadata.compressed_page_size,
                 None,
-                rows=rows,
-                topk_metadata=(
-                    topk_plans[chunk_idx] if topk_plans is not None else None
-                ),
             )
             chunk_seq_lens = seq_lens[rows]
             nblocks, row_valid_lens = candidate_row_lens(
                 chunk_seq_lens, self.topk_blocks
             )
             blocks = amax_topk_blocks(logits, chunk_seq_lens, nblocks, self.topk_blocks)
+            del logits  # last use; release it before scoring the next chunk
             phys_blocks = sort_candidate_blocks(
                 blocks,
                 chunk_seq_lens,
@@ -424,6 +420,7 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
+        del logits  # release this tile before the next one is scored
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,
