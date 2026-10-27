@@ -23,7 +23,7 @@ from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import numpy as np
@@ -2007,8 +2007,87 @@ def _visible_gpu_indices(pynvml) -> List[int]:
     return [int(entry) for entry in entries if int(entry) < num_gpus]
 
 
-def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
+def _own_container_cgroup() -> Optional[str]:
+    """The cgroup lines that identify this container, or None if unreadable."""
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _host_pid(pid: int) -> int:
+    """The outermost pid of `pid` -- the number NVML reports.
+
+    NSpid lists one pid per pid namespace, outermost first, so the pod's own
+    numbering is the last entry and the host's is the first. A process outside
+    any nested namespace has a single entry, which is the same number.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("NSpid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return pid
+
+
+def _this_pod_host_pids() -> Optional[Set[int]]:
+    """Host-side pids of this container's processes.
+
+    None when the pod shares the host's pid namespace, where /proc already
+    numbers pids the way NVML does and the cgroup is what separates containers.
+    """
+    if _host_pid(os.getpid()) == os.getpid():
+        return None
+    host_pids: Set[int] = set()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.isdigit():
+            host_pids.add(_host_pid(int(entry)))
+    return host_pids
+
+
+def _is_this_pod_process(
+    pid: int, own_host_pids: Optional[Set[int]], own_cgroup: Optional[str]
+) -> bool:
+    """Whether `pid` runs in the container this suite runs in.
+
+    NVML reports host pids while /proc here is the pod's own pid namespace, so
+    the pod's processes are matched through NSpid. The cgroup comparison covers
+    the other arrangement, where /proc shows every process on the node. A pid we
+    cannot place is treated as foreign.
+    """
+    if own_host_pids is not None and pid in own_host_pids:
+        return True
+    try:
+        with open(f"/proc/{pid}/cgroup", encoding="utf-8", errors="replace") as f:
+            other = f.read()
+    except OSError:
+        return False
+    return own_cgroup is not None and other == own_cgroup
+
+
+def _collect_busy_gpu_reports(
+    pynvml, gpu_indices: List[int], foreign: Dict[int, List[str]]
+) -> List[str]:
+    """Report the visible GPUs that this container's own processes still hold.
+
+    A card is not exclusive. nproc_per_node buys a card count while the pod
+    still sees every card of the node, and CUDA_VISIBLE_DEVICES is what picks
+    the slice -- so a level sharing the board, a tenant outside CI, or a worker
+    a cancelled run left behind can sit on a card this suite was handed. Those
+    processes are collected into `foreign` for the caller to warn about: they
+    are not waited on, because their memory never comes back on our clock.
+    """
     self_pid = os.getpid()
+    self_host_pid = _host_pid(self_pid)
+    own_cgroup = _own_container_cgroup()
+    own_host_pids = _this_pod_host_pids()
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
@@ -2019,27 +2098,33 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         except pynvml.NVMLError:
             procs = None
-        if procs is not None:
-            # Discount our own usage: the caching allocator retains memory
-            # across test classes, and waiting on ourselves never succeeds.
-            self_used = sum(
-                proc.usedGpuMemory or 0 for proc in procs if proc.pid == self_pid
+        if procs is None:
+            # The driver will not name the holders, so keep the strict reading
+            # rather than call a card idle on a guess.
+            reports.append(
+                f"GPU {index} uses {_format_gib(used_bytes)}"
+                f" (no process list from the driver)"
             )
-            if used_bytes - self_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
-                continue
-            proc_info = ", ".join(
-                f"pid={proc.pid} {_format_gib(proc.usedGpuMemory)}"
-                for proc in procs
-                if proc.pid != self_pid
-            ) or (
-                f"no other compute processes;"
-                f" self pid={self_pid} holds {_format_gib(self_used)}"
-            )
-        else:
-            proc_info = ""
+            continue
+        own_used = 0
+        own_info = []
+        for proc in procs:
+            used = proc.usedGpuMemory or 0
+            if proc.pid == self_host_pid:
+                # Discount our own usage: the caching allocator retains memory
+                # across test classes, and waiting on ourselves never succeeds.
+                own_info.append(f"pid={proc.pid} {_format_gib(used)} (self)")
+            elif _is_this_pod_process(proc.pid, own_host_pids, own_cgroup):
+                own_used += used
+                own_info.append(f"pid={proc.pid} {_format_gib(used)}")
+            else:
+                foreign.setdefault(index, []).append(
+                    f"pid={proc.pid} {_format_gib(used)}"
+                )
+        if own_used < _GPU_IDLE_USED_MEMORY_THRESHOLD:
+            continue
         reports.append(
-            f"GPU {index} uses {_format_gib(used_bytes)}"
-            f" ({proc_info or 'no compute processes found'})"
+            f"GPU {index} uses {_format_gib(used_bytes)} ({', '.join(own_info)})"
         )
     return reports
 
@@ -2048,11 +2133,17 @@ def _wait_for_gpu_idle_in_ci(
     timeout: float = _GPU_IDLE_TIMEOUT_SECS,
     poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
 ) -> None:
-    """Wait until visible GPUs release residual memory from earlier tests.
+    """Wait until this container's own processes release residual GPU memory.
 
     Killed server processes return GPU memory asynchronously; launching the
     next server too early makes memory profiling over-commit the KV cache and
     OOM. Abort with the offending processes if the memory is never returned.
+
+    Memory held by anything outside this container is warned about and then
+    ignored. The card is ours only by convention -- CUDA_VISIBLE_DEVICES names
+    the slice and nothing enforces it -- so a neighbour's server or a worker a
+    cancelled run left behind would otherwise fail every file of a suite that
+    has nothing to fix.
     """
     if not is_in_ci():
         return
@@ -2066,8 +2157,25 @@ def _wait_for_gpu_idle_in_ci(
     try:
         gpu_indices = _visible_gpu_indices(pynvml)
         deadline = time.monotonic() + timeout
+        announced: Set[str] = set()
         while True:
-            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices)
+            foreign: Dict[int, List[str]] = {}
+            busy_reports = _collect_busy_gpu_reports(pynvml, gpu_indices, foreign)
+            for index, entries in sorted(foreign.items()):
+                for entry in entries:
+                    # Keyed on the pid, not on its size: the holder's footprint
+                    # drifts and would otherwise be re-announced every poll.
+                    if entry.split()[0] in announced:
+                        continue
+                    announced.add(entry.split()[0])
+                    print(
+                        f"[CI GPU Idle] Ignoring memory this pod does not own:"
+                        f" GPU {index} {entry}. A different pid namespace and"
+                        f" cgroup say it is a neighbour on the board, a tenant"
+                        f" outside CI, or a worker a cancelled run left behind;"
+                        f" it is reported, never waited on.",
+                        flush=True,
+                    )
             if not busy_reports:
                 return
             if time.monotonic() >= deadline:
