@@ -1,11 +1,13 @@
+from numbers import Integral
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_ppu
+from sglang.srt.utils import is_ppu, logger
 
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
@@ -13,6 +15,48 @@ _FLASHKDA_CHUNK_SIZE = 64
 # FlashKDA's max sequence length, Batches whose longest sequence exceeds this
 # fall back to Triton for the whole batch.
 _FLASHKDA_MAX_SEQ_LEN = 2048
+
+
+def ppu_pla_prefill_gate_open() -> bool:
+    """Whether KDA prefill/extend may run on the PPU SAIL PLA kernel.
+
+    Same two gates as the decode fast-path: SGLANG_SAIL_FLA_CUDA (top-level SAIL
+    FLA gate) and SGLANG_SAIL_PLA_CUDA (PLA sub-gate); both default to True on
+    PPU. Off-PPU this is always False -- other platforms use the external
+    ``flash_kda`` package instead of PLA.
+    """
+    if not is_ppu():
+        return False
+    return envs.SGLANG_SAIL_FLA_CUDA.get() and envs.SGLANG_SAIL_PLA_CUDA.get()
+
+
+def _pla_host_offsets(
+    seq_lens_cpu: Optional[list],
+    query_start_loc: torch.Tensor,
+    num_tokens: int,
+) -> Optional[tuple[int, ...]]:
+    """Build trusted offsets only from the current packed batch's CPU lengths."""
+    # Captured graphs replay changing device offsets without re-running Python.
+    # Keep their metadata device-driven; eager graph breaks can rebuild this
+    # tuple on every call because their stream is not capturing.
+    if query_start_loc.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    if not isinstance(seq_lens_cpu, (list, tuple)) or not seq_lens_cpu:
+        return None
+    if len(seq_lens_cpu) + 1 != query_start_loc.numel():
+        return None
+
+    offsets = [0]
+    for length in seq_lens_cpu:
+        # Do not coerce tensor scalars (possibly on device) or fractional values.
+        if not isinstance(length, Integral) or isinstance(length, bool) or length < 0:
+            return None
+        offsets.append(offsets[-1] + int(length))
+    # KDAAttnBackend trims physical padding before calling this adapter. If CPU
+    # metadata describes another slice/batch, retain the device-only path.
+    if offsets[-1] != num_tokens:
+        return None
+    return tuple(offsets)
 
 
 def _load_flash_kda():
@@ -133,9 +177,17 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # radix extra_buffer track path needs; route tracked batches through
         # the Triton chunk_kda fallback instead of silently skipping the
         # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
-            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
-        ):
+        reason = self._fallback_reason(
+            lower_bound,
+            is_spec_decode,
+            query_start_loc,
+            extend_seq_lens_cpu,
+            return_intermediate_states,
+        )
+        if reason is not None:
+            logger.info_once(
+                "KDA extend uses the community Triton chunk kernel: " + reason + "."
+            )
             return _triton_fallback(
                 q,
                 k,
@@ -173,7 +225,37 @@ class FlashKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
+
+    def _fallback_reason(
+        self,
+        lower_bound: Optional[float],
+        is_spec_decode: bool,
+        query_start_loc: torch.Tensor,
+        extend_seq_lens_cpu: Optional[list],
+        return_intermediate_states: bool,
+    ) -> Optional[str]:
+        """Why this batch must stay on the Triton chunk kernel (None = fast path)."""
+        if return_intermediate_states:
+            return (
+                "the mamba track path needs per-chunk fp32 states "
+                "(why=intermediate-states), which the fused kernel does not emit"
+            )
+        if is_ppu() and not ppu_pla_prefill_gate_open():
+            return (
+                "the PPU SAIL PLA prefill gate is closed "
+                "(SGLANG_SAIL_FLA_CUDA / SGLANG_SAIL_PLA_CUDA)"
+            )
+        if not self._should_fall_back(
+            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+        ):
+            return None
+        if lower_bound is None:
+            return "the fused kernel requires the safe (lower-bounded) KDA gate"
+        if is_spec_decode:
+            return "draft-extend must stay rollback-able"
+        return "the batch's sequence lengths are outside the fused kernel window"
 
     @staticmethod
     def _should_fall_back(
@@ -228,6 +310,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
+        extend_seq_lens_cpu: Optional[list] = None,
     ) -> torch.Tensor:
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
@@ -269,6 +352,10 @@ class FlashKDAKernel(LinearAttnKernelBase):
         if is_ppu():
             from pla.prefill.flashkdapro import flashkda_fwd
 
+            logger.info_once(
+                "USE PPU SAIL CUDA PLA kernel: flashkda_fwd (KDA prefill/extend)"
+            )
+
             batch_size, seq_len, num_heads, head_dim = q.shape
             flashkda_fwd(
                 q=q.view(batch_size * seq_len, num_heads, head_dim),
@@ -284,6 +371,9 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 initial_state=initial_state,
                 final_state=final_state,
                 cu_seqlens=cu_seqlens,
+                raw_cu_seqlens=_pla_host_offsets(
+                    extend_seq_lens_cpu, query_start_loc, batch_size * seq_len
+                ),
             )
         else:
             flash_kda = _load_flash_kda()

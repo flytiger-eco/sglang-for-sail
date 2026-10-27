@@ -236,6 +236,25 @@ def handle_attention_backend_compatibility(server_args: Any):
     run_post_process_pass(server_args, _ppu_fa3_chunked_prefix_cache_threshold)
 
 
+def _ppu_pla_prefill_default_applies(server_args: Any) -> bool:
+    """Whether the PPU PLA prefill/extend default applies to this server.
+
+    KDA-only: GDN models share the linear-attention backend switch but have no
+    PLA FlashKDA kernel, so they must keep their own prefill backend. A model
+    config that cannot be resolved never opts in -- the default stays Triton.
+    """
+    from sglang.srt.utils import is_ppu
+
+    if not is_ppu():
+        return False
+    from sglang.srt.configs.model_config import uses_kda_attention
+
+    try:
+        return uses_kda_attention(model_config_of(server_args).hf_config)
+    except Exception:  # noqa: BLE001 - resolution must not fail on this probe
+        return False
+
+
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
     import torch
@@ -320,6 +339,36 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+
+    # PPU: route KDA prefill/extend to the SAIL PLA kernel by default. On PPU
+    # the "flashkda" backend is the FlashKDA-compatible interface and PLA is
+    # its platform implementation (kda_flashkda.FlashKDAKernel ->
+    # pla.prefill.flashkdapro.flashkda_fwd). Prefill shares the same master
+    # gates as the PLA decode/MTP fast paths (SGLANG_SAIL_FLA_CUDA and
+    # SGLANG_SAIL_PLA_CUDA, both defaulted True on PPU by platform_hook), so
+    # PLA is on out of the box and a single SGLANG_SAIL_PLA_CUDA=0 turns every
+    # PLA path back to Triton. An explicit --linear-attn-prefill-backend still
+    # wins for prefill alone, and only the KDA default ("triton") is
+    # redirected.
+    if (
+        cfg.linear_attn_prefill_backend is None
+        and cfg.linear_attn_backend == "triton"
+        and envs.SGLANG_SAIL_FLA_CUDA.get()
+        and envs.SGLANG_SAIL_PLA_CUDA.get()
+        and _ppu_pla_prefill_default_applies(server_args)
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_linear_attn_backend",
+            linear_attn_prefill_backend="flashkda",
+        )
+        prefill = "flashkda"
+        logger.info(
+            "PPU KDA prefill/extend defaults to the SAIL PLA kernel "
+            "(SGLANG_SAIL_PLA_CUDA=1, prefill backend=flashkda); pass "
+            "--linear-attn-prefill-backend triton or set "
+            "SGLANG_SAIL_PLA_CUDA=0 to force Triton."
+        )
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (
