@@ -73,5 +73,83 @@ class ResolveTagRunCiPermissionsTest(unittest.TestCase):
         self.assertNotIn("can_tag_run_ci_label", result)
 
 
+class RerunFailedCiTest(unittest.TestCase):
+    def run_record(
+        self,
+        run_id=1,
+        workflow_id=10,
+        conclusion="failure",
+        status="completed",
+        path=".github/workflows/pr-test.yml",
+    ):
+        run = Mock()
+        run.id = run_id
+        run.workflow_id = workflow_id
+        run.conclusion = conclusion
+        run.status = status
+        run.path = path
+        run.name = path.rsplit("/", 1)[-1]
+        return run
+
+    def invoke(self, runs):
+        repo = Mock()
+        repo.get_workflow_runs.return_value = runs
+        pr = Mock()
+        pr.head.sha = "head-sha"
+        pr.get_files.return_value = []
+        comment = Mock()
+        result = handler.handle_rerun_failed_ci(
+            repo,
+            pr,
+            comment,
+            {"can_rerun_failed_ci": True},
+        )
+        repo.get_workflow_runs.assert_called_once_with(head_sha="head-sha")
+        return result
+
+    def test_rerun_covers_all_unsuccessful_conclusions(self):
+        for conclusion in ("failure", "skipped", "cancelled", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                run = self.run_record(conclusion=conclusion)
+                self.assertTrue(self.invoke([run]))
+                if conclusion == "skipped":
+                    run.rerun.assert_called_once_with()
+                    run.rerun_failed_jobs.assert_not_called()
+                else:
+                    run.rerun_failed_jobs.assert_called_once_with()
+                    run.rerun.assert_not_called()
+
+    def test_only_latest_run_per_workflow_and_recoverable_states_are_used(self):
+        older = self.run_record(run_id=1, conclusion="failure")
+        newer = self.run_record(run_id=2, conclusion="success")
+        active = self.run_record(run_id=3, workflow_id=11, status="in_progress")
+        approval = self.run_record(
+            run_id=4, workflow_id=12, conclusion="action_required"
+        )
+
+        self.assertFalse(self.invoke([older, newer, active, approval]))
+        for run in (older, newer, active, approval):
+            run.rerun.assert_not_called()
+            run.rerun_failed_jobs.assert_not_called()
+
+    def test_selective_rerun_rejection_falls_back_to_full_rerun(self):
+        run = self.run_record(conclusion="cancelled")
+        run.rerun_failed_jobs.side_effect = RuntimeError("no failed jobs")
+
+        self.assertTrue(self.invoke([run]))
+        run.rerun_failed_jobs.assert_called_once_with()
+        run.rerun.assert_called_once_with()
+
+    def test_ppu_pipeline_always_requires_a_full_rerun(self):
+        for conclusion in ("failure", "skipped", "cancelled", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                run = self.run_record(
+                    conclusion=conclusion, path=".github/workflows/ci.yaml"
+                )
+                self.assertTrue(self.invoke([run]))
+                run.rerun.assert_called_once_with()
+                run.rerun_failed_jobs.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
