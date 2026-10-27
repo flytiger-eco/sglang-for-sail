@@ -56,9 +56,7 @@ class TestPpuBf16Linear(unittest.TestCase):
             patch.object(unquant, "use_intel_amx_backend", return_value=False),
             patch.object(unquant, "is_ppu", return_value=False),
             patch.object(unquant, "deep_gemm_wrapper") as wrapper,
-            patch.object(
-                unquant.F, "linear", wraps=unquant.F.linear
-            ) as torch_linear,
+            patch.object(unquant.F, "linear", wraps=unquant.F.linear) as torch_linear,
         ):
             self.method.apply(layer, x)
 
@@ -76,10 +74,51 @@ class TestPpuBf16Linear(unittest.TestCase):
             patch.object(unquant, "use_intel_amx_backend", return_value=False),
             patch.object(unquant, "is_ppu", return_value=True),
             patch.object(unquant, "deep_gemm_wrapper") as wrapper,
-            patch.object(
-                unquant.F, "linear", wraps=unquant.F.linear
-            ) as torch_linear,
+            patch.object(unquant.F, "linear", wraps=unquant.F.linear) as torch_linear,
         ):
+            self.method.apply(layer, x)
+
+        torch_linear.assert_called_once()
+        wrapper.gemm_nt_bf16bf16bf16.assert_not_called()
+
+    def test_ppu_without_deepgemm_keeps_torch_fallback(self):
+        x = torch.ones(2, 4, dtype=torch.bfloat16)
+        weight = torch.nn.Parameter(
+            torch.ones(3, 4, dtype=torch.bfloat16), requires_grad=False
+        )
+        layer = SimpleNamespace(weight=weight)
+
+        with (
+            patch.object(unquant, "use_intel_amx_backend", return_value=False),
+            patch.object(unquant, "is_ppu", return_value=True),
+            patch.object(unquant, "deep_gemm_wrapper") as wrapper,
+            patch.object(unquant.F, "linear", wraps=unquant.F.linear) as torch_linear,
+        ):
+            wrapper.ENABLE_JIT_DEEPGEMM = False
+            self.method.apply(layer, x)
+
+        torch_linear.assert_called_once()
+        wrapper.gemm_nt_bf16bf16bf16.assert_not_called()
+
+    def test_ppu_torch_backend_keeps_torch_selection(self):
+        x = torch.ones(2, 4, dtype=torch.bfloat16)
+        weight = torch.nn.Parameter(
+            torch.ones(3, 4, dtype=torch.bfloat16), requires_grad=False
+        )
+        layer = SimpleNamespace(weight=weight)
+
+        with (
+            patch.object(unquant, "use_intel_amx_backend", return_value=False),
+            patch.object(unquant, "is_ppu", return_value=True),
+            patch.object(unquant, "deep_gemm_wrapper") as wrapper,
+            patch.object(
+                unquant,
+                "get_bf16_gemm_backend",
+                return_value=unquant.Bf16GemmBackend.TORCH,
+            ),
+            patch.object(unquant.F, "linear", wraps=unquant.F.linear) as torch_linear,
+        ):
+            wrapper.ENABLE_JIT_DEEPGEMM = True
             self.method.apply(layer, x)
 
         torch_linear.assert_called_once()

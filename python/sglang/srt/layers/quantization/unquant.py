@@ -352,9 +352,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif (
             is_ppu()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
             and (bias is None or bias.dtype == torch.bfloat16)
+            and get_bf16_gemm_backend().is_auto()
         ):
             x_2d = x.reshape(-1, x.shape[-1]).contiguous()
             weight = layer.weight.contiguous()
