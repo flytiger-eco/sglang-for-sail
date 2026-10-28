@@ -16,11 +16,16 @@ from sglang.kernels.ops.attention.fla.kda import (
     kda_gate_chunk_cumsum,
 )
 from sglang.srt.utils.common import get_device
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
+register_ppu_ci(est_time=112, suite="nightly-1-ppu", nightly=True)
 
 
 @unittest.skipIf(

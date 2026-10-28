@@ -21,10 +21,11 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_ppu_ci(est_time=9, suite="nightly-1-ppu", nightly=True)
 
 HIDDEN_DIM = 4
 

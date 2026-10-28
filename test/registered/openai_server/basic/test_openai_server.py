@@ -18,7 +18,11 @@ import requests
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.kits.anthropic_messages_kit import AnthropicMessagesMixin
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
@@ -33,6 +37,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=280, suite="stage-b-test-1-gpu-small-amd")
+register_ppu_ci(est_time=200, suite="nightly-1-ppu", nightly=True)
 
 
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):

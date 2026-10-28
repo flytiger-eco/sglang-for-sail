@@ -13,10 +13,11 @@ Usage:
     python -m pytest test/registered/unit/lora/test_mem_pool_ep_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_ppu_ci(est_time=9, suite="nightly-1-ppu", nightly=True)
 
 import ast
 import types

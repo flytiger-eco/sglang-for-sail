@@ -18,9 +18,10 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_ppu_ci(est_time=8, suite="nightly-1-ppu", nightly=True)
 
 
 def _make_mock_req(
