@@ -1134,7 +1134,7 @@ class SetupContractTest(unittest.TestCase):
                 if contract:
                     self.assertLessEqual(set(inputs), set(contract["inputs"]))
                 self.assertEqual(inputs["image"], "${{ env.PPU_BASE_IMAGE_REF }}")
-                self.assertEqual(inputs["node_selector"], "board-type=ZW-810E")
+                self.assertEqual(inputs["node_selector"], "board-type=OAM-810E")
                 self.assertEqual(inputs["namespace"], "ppu-sched")
                 self.assertEqual(inputs["cleanup_policy"], "always")
                 self.assertEqual(inputs["job_suffix"], "${{ github.job }}")
