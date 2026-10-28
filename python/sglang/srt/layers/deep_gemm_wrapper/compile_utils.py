@@ -163,6 +163,10 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F4BF16_FUSED = auto()
 
+    # Dense BF16 GEMM (bf16 in / bf16 out, K-major). Appended last so that all
+    # existing IntEnum values stay unchanged.
+    GEMM_NT_BF16BF16BF16 = auto()
+
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
@@ -333,6 +337,25 @@ def check_and_skip_execute(func):
     return wrapper
 
 
+def check_and_skip_execute_when_exceeding_max_m(func):
+    """Same as `check_and_skip_execute`, but only skips `m > self.max_m`.
+
+    `max_m` is built from `max(m_list)`, so it is itself an element of the
+    warmup `m_list`; skipping `m == max_m` would leave the largest shape
+    uncompiled and make it JIT at serving time instead.
+    """
+
+    def wrapper(self, m):
+        if hasattr(self, "max_m") and m > getattr(self, "max_m"):
+            logger.warning(
+                f"WARN: NOT calling deepgemm function since {m=} > max_m={getattr(self, 'max_m')}."
+            )
+            return
+        return func(self, m)
+
+    return wrapper
+
+
 class _BaseWarmupExecutorMeta(type):
     """Metaclass that automatically decorates 'execute' methods"""
 
@@ -350,6 +373,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
+            DeepGemmKernelType.GEMM_NT_BF16BF16BF16: _NormalWarmupExecutor_bf16,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
             # <NOTE>
@@ -446,6 +470,9 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
+        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16BF16:
+            # bf16 lhs + bf16 rhs + bf16 out
+            return (max_m * k * 2 + n * k * 2 + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
             return (
                 num_groups * max_m * k * 2
@@ -749,6 +776,36 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
 
     def execute(self, m):
         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+
+
+class _NormalWarmupExecutor_bf16(_BaseWarmupExecutor):
+    """Warmup executor for the dense BF16 GEMM (bf16 in / bf16 out, K-major).
+
+    `execute` is installed right after the class body on purpose: the metaclass
+    wraps every `execute` it sees with `check_and_skip_execute`, which skips
+    `m >= max_m`, but `max_m` is a valid warmup size for this kernel (it is one
+    of the shapes in the warmup `m_list`) and skipping it would defeat the
+    warmup for the largest shape.
+    """
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def _warmup_dense_bf16(self, m):
+        deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+
+
+# See the class docstring: assigning `execute` outside the class body keeps the
+# metaclass from replacing this `m > max_m` skip condition with its `m >= max_m`
+# one.
+_NormalWarmupExecutor_bf16.execute = check_and_skip_execute_when_exceeding_max_m(
+    _NormalWarmupExecutor_bf16._warmup_dense_bf16
+)
 
 
 class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
