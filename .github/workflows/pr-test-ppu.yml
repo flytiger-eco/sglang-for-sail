@@ -363,7 +363,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=ZW-810E
+          node_selector: board-type=OAM-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh smoke
@@ -477,7 +477,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=ZW-810E
+          node_selector: board-type=OAM-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh body
@@ -592,7 +592,7 @@ jobs:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 2
-          node_selector: board-type=ZW-810E
+          node_selector: board-type=OAM-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh multi
