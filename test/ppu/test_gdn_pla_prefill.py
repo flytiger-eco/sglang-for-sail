@@ -124,7 +124,11 @@ class TestPPUPrefill(unittest.TestCase):
                     ):
                         results.append(
                             kernel.extend(
-                                q, k, v, g, beta,
+                                q,
+                                k,
+                                v,
+                                g,
+                                beta,
                                 ssm_states=pool,
                                 cache_indices=indices,
                                 query_start_loc=cu,
@@ -147,7 +151,11 @@ class TestPPUPrefill(unittest.TestCase):
                         return_value=(None, None, "h"),
                     ) as triton:
                         result = kernel.extend(
-                            q, k, v, g, beta,
+                            q,
+                            k,
+                            v,
+                            g,
+                            beta,
                             ssm_states=initial.clone(),
                             cache_indices=indices,
                             query_start_loc=cu,
