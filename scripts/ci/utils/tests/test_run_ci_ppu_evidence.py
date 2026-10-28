@@ -29,7 +29,7 @@ def load(name, relative):
 
 RUNNER = load("ppu_runner", "python/sglang/test/ci/pr_runner.py")
 REPORT = load("ppu_report", "scripts/ci/ppu/pr_report.py")
-ACTION_REVISION = "06c8ee7cadaae2086db4977e571b19f461653f16"
+ACTION_REVISION = "4692d51c552e8cdf4f267adfdef1e484ca685a6a"
 MODEL = load("ppu_model", "python/sglang/test/ppu_pr_utils.py")
 
 
@@ -1127,14 +1127,14 @@ class SetupContractTest(unittest.TestCase):
                 worker = next(s for s in job["steps"] if s.get("id") == "worker")
                 self.assertEqual(
                     worker["uses"],
-                    f"flytiger-eco/ppu-distributed-action@{ACTION_REVISION}",
+                    f"flytiger-eco/shared-workflows/cluster-task@{ACTION_REVISION}",
                 )
                 self.assertNotIn("continue-on-error", worker)
                 inputs = worker["with"]
                 if contract:
                     self.assertLessEqual(set(inputs), set(contract["inputs"]))
                 self.assertEqual(inputs["image"], "${{ env.PPU_BASE_IMAGE_REF }}")
-                self.assertEqual(inputs["node_selector"], "board-type=OAM-810E")
+                self.assertEqual(inputs["node_selector"], "board-type=ZW-810E")
                 self.assertEqual(inputs["namespace"], "ppu-sched")
                 self.assertEqual(inputs["cleanup_policy"], "always")
                 self.assertEqual(inputs["job_suffix"], "${{ github.job }}")

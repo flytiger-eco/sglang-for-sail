@@ -358,12 +358,12 @@ jobs:
           bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
       - name: Execute PPU smoke worker
         id: worker
-        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=OAM-810E
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh smoke
@@ -472,12 +472,12 @@ jobs:
           bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
       - name: Execute PPU body worker
         id: worker
-        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 1
-          node_selector: board-type=OAM-810E
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh body
@@ -587,12 +587,12 @@ jobs:
           bash scripts/ci/ppu/observe_pod_environment.sh start "$directory/environment-pods.tsv"
       - name: Execute two-PPU worker
         id: worker
-        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
           nproc_per_node: 2
-          node_selector: board-type=OAM-810E
+          node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           command: bash /workspace/source/scripts/ci/ppu/run_pr_suite.sh multi

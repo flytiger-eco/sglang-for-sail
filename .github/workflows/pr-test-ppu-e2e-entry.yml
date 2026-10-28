@@ -85,7 +85,7 @@ jobs:
           mkdir -p "$EVIDENCE_SOURCE"
       - name: Execute selected E2E worker gang
         id: worker
-        uses: flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: ${{ inputs.nodes > 1 && inputs.nodes || 0 }}
