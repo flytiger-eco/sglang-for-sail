@@ -1,14 +1,41 @@
-name: PR Test (PPU)
+name: PR Test (PPU, CUDA compatibility)
 
 on:
-  # No pull_request trigger: the PR path is orchestrated by ci.yaml, and a
-  # direct pull_request trigger here would double-run alongside that chain.
-  # The run-ci label gate below still applies to the inherited pull_request
-  # event on the workflow_call path. Manual verification keeps using
-  # workflow_dispatch, which bypasses the PR-event gate.
+  # PRs enter through ci.yaml and its existing run-ci gate.
+  push:
+    branches: [v0.5.21]
+    paths:
+      - "docker/ppu.Dockerfile"
+      - ".github/workflows/pr-test-ppu.yml"
+      - ".github/workflows/ci.yaml"
+      - ".dockerignore"
+      - ".gitignore"
+      - "python/pyproject_ppu.toml"
+      - "python/setup.py"
+      - "python/sglang/srt/rust_extensions/torch_build.py"
+      - "rust/**"
+      - "python/sglang/kernels/aot/**"
+      - "python/sglang/kernels/jit/include/**"
+      - "sgl-model-gateway/**"
   workflow_dispatch:
+    inputs:
+      runtime_image:
+        description: "Runtime image override for existing PPU CI"
+        required: false
+        type: string
+        default: ""
+      build_docker:
+        description: "Build and test a Docker candidate (never promote on dispatch)"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
+      runtime_image:
+        description: "Runtime image override for existing PPU CI"
+        required: false
+        type: string
+        default: ""
       ref:
         description: 'Git ref (branch, tag, or SHA) to test.'
         required: false
@@ -36,7 +63,7 @@ permissions:
   pull-requests: read
 
 env:
-  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_BASE_IMAGE: ${{ inputs.runtime_image || vars.PPU_CI_BASE_IMAGE || 'pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001' }}
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
@@ -50,12 +77,20 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changes_exist: ${{ steps.filter.outputs.ppu_code == 'true'
-        || steps.run-mode.outputs.run_all_tests == 'true' }}
+        || steps.run-mode.outputs.run_all_tests == 'true'
+        || steps.filter.outputs.ppu_docker == 'true'
+        || inputs.build_docker || inputs.runtime_image != '' }}
+      docker_changes: ${{ steps.filter.outputs.ppu_docker == 'true' || inputs.build_docker == true }}
+      test_commit: ${{ steps.revision.outputs.commit }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Record exact test commit
+        id: revision
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Determine run mode
         id: run-mode
@@ -69,9 +104,22 @@ jobs:
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          base: ${{ github.event_name == 'push' && github.event.before || '' }}
           filters: |
+            ppu_docker:
+              - "docker/ppu.Dockerfile"
+              - ".github/workflows/pr-test-ppu.yml"
+              - ".github/workflows/ci.yaml"
+              - ".dockerignore"
+              - ".gitignore"
+              - "python/pyproject_ppu.toml"
+              - "python/setup.py"
+              - "python/sglang/srt/rust_extensions/torch_build.py"
+              - "rust/**"
+              - "python/sglang/kernels/aot/**"
+              - "python/sglang/kernels/jit/include/**"
+              - "sgl-model-gateway/**"
             ppu_code:
               - ".github/workflows/pr-test-ppu.yml"
               - "python/pyproject_other.toml"
@@ -80,6 +128,66 @@ jobs:
               - "python/sglang/srt/platforms/ppu.py"
               - "test/registered/**"
               - "scripts/ci/ppu/**"
+
+  build-ppu-docker:
+    needs: check-changes
+    if: >-
+      needs.check-changes.outputs.docker_changes == 'true' &&
+      ((github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/v0.5.21') ||
+       github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: ${{ vars.PPU_DOCKER_ENVIRONMENT || 'ppu-docker' }}
+    env:
+      PPU_DOCKER_REPOSITORY: ${{ vars.PPU_DOCKER_REPOSITORY }}
+      TEST_COMMIT: ${{ needs.check-changes.outputs.test_commit }}
+    outputs:
+      candidate_tag: ${{ steps.prepare.outputs.tag }}
+      tested_image: ${{ steps.candidate.outputs.tested_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-changes.outputs.test_commit }}
+          persist-credentials: false
+      - name: Verify checkout and prepare candidate
+        id: prepare
+        shell: bash
+        run: |
+          : "${PPU_DOCKER_REPOSITORY:?Set PPU_DOCKER_REPOSITORY}"
+          test "$(git rev-parse HEAD)" = "$TEST_COMMIT"
+          echo "registry=${PPU_DOCKER_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+          echo "tag=${PPU_DOCKER_REPOSITORY}:ci-${TEST_COMMIT}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/ppu-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.prepare.outputs.registry }}
+          username: ${{ secrets.PPU_DOCKER_REGISTRY_USERNAME }}
+          password: ${{ secrets.PPU_DOCKER_REGISTRY_TOKEN }}
+      - name: Build and push runtime candidate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ppu.Dockerfile
+          target: runtime
+          push: true
+          tags: ${{ steps.prepare.outputs.tag }}
+          build-args: |
+            BRANCH_TYPE=local
+            SGLANG_BUILD_COMMIT=${{ needs.check-changes.outputs.test_commit }}
+      - name: Export immutable candidate
+        id: candidate
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+          echo "tested_image=${PPU_DOCKER_REPOSITORY}@${DIGEST}" >> "$GITHUB_OUTPUT"
 
   # ==================== Stage A: smoke gate (< 5 min test budget) ==================== #
   # test_ppu_basic.py exercises offline engine initialization and decoding.
@@ -92,8 +200,11 @@ jobs:
   # source and cached on /mnt/wl_nas by scripts/ci/ppu/ppu_build_kernel.sh
   # (invoked from ppu_install_dependency.sh) -- no prebuilt wheel artifact.
   stage-a-test-1-gpu-ppu:
-    needs: [check-changes]
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    needs: [check-changes, build-ppu-docker]
+    if: >-
+      !cancelled() && needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.check-changes.outputs.docker_changes != 'true' || needs.build-ppu-docker.result == 'success')
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -107,7 +218,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           # fetch-depth 2: ppu_install_dependency.sh detects sgl-kernel source
           # changes via `git diff HEAD~1`.
           fetch-depth: 2
@@ -119,11 +230,13 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           fetch-depth: 2
 
       - name: Run PPU smoke test (stage-a) via K8s
         uses: flytiger-eco/ppu-distributed-action@main
+        env:
+          PPU_BASE_IMAGE: ${{ needs.build-ppu-docker.outputs.tested_image || env.PPU_BASE_IMAGE }}
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -165,7 +278,7 @@ jobs:
   # each stage is its own GitHub job (not a matrix leg) and the dependency
   # graph already serializes them and carries the verdict forward.
   stage-b-test-1-gpu-ppu:
-    needs: [check-changes, stage-a-test-1-gpu-ppu]
+    needs: [check-changes, build-ppu-docker, stage-a-test-1-gpu-ppu]
     # `always()` overrides skip-on-skipped-dependency so this job still
     # evaluates when stage-a was skipped; !failure() fast-fails when stage-a
     # went red. That fast-fail is the point of the serial chain.
@@ -173,7 +286,8 @@ jobs:
       always() &&
       !failure() &&
       !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.check-changes.outputs.docker_changes != 'true' || needs.build-ppu-docker.result == 'success')
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -184,7 +298,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -194,11 +308,13 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           fetch-depth: 2
 
       - name: Run PPU 1-GPU tests (stage-b) via K8s
         uses: flytiger-eco/ppu-distributed-action@main
+        env:
+          PPU_BASE_IMAGE: ${{ needs.build-ppu-docker.outputs.tested_image || env.PPU_BASE_IMAGE }}
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -231,12 +347,13 @@ jobs:
   stage-c-test-2-gpu-ppu:
     # Same serial deviation as stage-b: stage-b is in needs directly so
     # !failure() fast-fails on every trigger.
-    needs: [check-changes, stage-b-test-1-gpu-ppu]
+    needs: [check-changes, build-ppu-docker, stage-b-test-1-gpu-ppu]
     if: |
       always() &&
       !failure() &&
       !cancelled() &&
-      needs.check-changes.outputs.changes_exist == 'true'
+      needs.check-changes.outputs.changes_exist == 'true' &&
+      (needs.check-changes.outputs.docker_changes != 'true' || needs.build-ppu-docker.result == 'success')
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -247,7 +364,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           fetch-depth: 2
       - name: Wait out the git egress congestion
         if: steps.checkout.outcome == 'failure'
@@ -257,11 +374,13 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.check-changes.outputs.test_commit }}
           fetch-depth: 2
 
       - name: Run PPU 2-GPU tests (stage-c) via K8s
         uses: flytiger-eco/ppu-distributed-action@main
+        env:
+          PPU_BASE_IMAGE: ${{ needs.build-ppu-docker.outputs.tested_image || env.PPU_BASE_IMAGE }}
         with:
           image: ${{ env.PPU_BASE_IMAGE }}
           nnodes: 0
@@ -295,6 +414,7 @@ jobs:
     needs:
       [
         check-changes,
+        build-ppu-docker,
         stage-a-test-1-gpu-ppu,
         stage-b-test-1-gpu-ppu,
         stage-c-test-2-gpu-ppu,
@@ -303,16 +423,58 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+          DOCKER_CHANGES: ${{ needs.check-changes.outputs.docker_changes }}
+          CANDIDATE_TAG: ${{ needs.build-ppu-docker.outputs.candidate_tag }}
+          TESTED_IMAGE: ${{ needs.build-ppu-docker.outputs.tested_image }}
         run: |
-          json_needs='${{ toJson(needs) }}'
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+          {
+            echo '## PPU CI — CUDA compatibility route'
+            echo "Candidate tag: ${CANDIDATE_TAG:-not built}"
+            echo "Tested image: ${TESTED_IMAGE:-ordinary PPU CI base}"
+            echo '| Job | Result |'
+            echo '| --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for job in $(jq -r 'keys_unsorted[]' <<< "$NEEDS_JSON"); do
+            result=$(jq -r --arg j "$job" '.[$j].result' <<< "$NEEDS_JSON")
             echo "$job: $result"
-            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
-              echo "Job $job did not succeed (result: $result)."
-              exit 1
+            echo "| $job | $result |" >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$result" != "success" && ( "$DOCKER_CHANGES" == "true" || "$result" != "skipped" ) ]]; then
+              failed=1
             fi
           done
-          echo "All jobs completed successfully"
+          exit "$failed"
+
+  promote-qualified-image:
+    needs: [check-changes, build-ppu-docker, pr-test-ppu-finish]
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/v0.5.21' &&
+      needs.check-changes.outputs.docker_changes == 'true' &&
+      needs.build-ppu-docker.result == 'success' &&
+      needs.pr-test-ppu-finish.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ vars.PPU_DOCKER_ENVIRONMENT || 'ppu-docker' }}
+    env:
+      PPU_DOCKER_REPOSITORY: ${{ vars.PPU_DOCKER_REPOSITORY }}
+      TESTED_IMAGE: ${{ needs.build-ppu-docker.outputs.tested_image }}
+    steps:
+      - name: Resolve registry
+        id: registry
+        run: |
+          echo "host=${PPU_DOCKER_REPOSITORY%%/*}" >> "$GITHUB_OUTPUT"
+          echo "DOCKER_CONFIG=${RUNNER_TEMP}/ppu-promote-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ secrets.PPU_DOCKER_REGISTRY_USERNAME }}
+          password: ${{ secrets.PPU_DOCKER_REGISTRY_TOKEN }}
+      - name: Promote exact tested digest
+        run: |
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${PPU_DOCKER_REPOSITORY}:qualified" \
+            "${TESTED_IMAGE}"
