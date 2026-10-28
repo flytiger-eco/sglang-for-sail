@@ -27,3 +27,69 @@ cd ../../../..
 rm -f python/pyproject.toml && mv python/pyproject_ppu.toml python/pyproject.toml
 pip install -e python --extra-index-url https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 ```
+
+## FP8 KV cache with PPU FlashMLA
+
+Use the PPU FlashMLA 2.1 interface and verify the installed SAIL, driver,
+operator library, and device before enabling `--kv-cache-dtype fp8_e4m3`.
+SGLang preserves this explicit dtype instead of falling back to `auto`.
+For dense decode, the installed binary must include FP8 kernels: the version string
+`2.1.0` alone does not establish this capability.
+
+| Backend | FP8 cache behavior |
+| --- | --- |
+| Dense `flashmla` decode | Unscaled E4M3 Q and KV, BF16 output; Q/K dimension 576, V dimension 512, page size 64 in SGLang, and no DCP. The current library requires SM89; SM80 and SM90 are rejected for this dense FP8 path. |
+| DSA `flashmla_sparse` prefill + `flashmla_kv` decode | Packed E4M3 NoPE + scales + BF16 RoPE. Prefill gathers and dequantizes prefix KV to BF16; sparse decode reads the packed cache directly with BF16 Q. |
+| DSA `flashmla_sparse` decode | Requires BF16 KV input; rejected with FP8 cache. Use `flashmla_kv` decode instead. |
+
+Dense Q uses the same raw E4M3 conversion as the MLA cache writer. The PPU
+library has no independent Q/K descale arguments, so checkpoint KV scales are
+not applied to this dense path. E5M2 is not supported by these FlashMLA FP8 paths.
+This describes the integration contract, not an accuracy or performance result
+for an unverified device/software combination.
+
+### Validate on a PPU server
+
+The opt-in regression requires explicit model paths and tensor-parallel size.
+Use a dense MLA model with the dimensions above for the first class and a
+DeepSeek V3.2-style DSA model for the second. Keep the original model weight
+precision; these tests change only KV storage and explicitly use BF16 compute.
+
+```bash
+export PPU_FP8_KV_TP_SIZE=<verified-tp-size>
+export PPU_FLASHMLA_MODEL_PATH=<dense-mla-model-path>
+export PPU_DSA_MODEL_PATH=<dsa-model-path>
+export GSM8K_DATA_PATH=<local-gsm8k-jsonl>
+python -m unittest discover -s test/ppu/e2e -p test_flashmla_fp8_kv.py -v
+```
+
+Each configured model runs generation with chunked prefill, repeated prefixes,
+and graph decode, followed by a 200-example GSM8K evaluation. Set
+`PPU_FP8_KV_GSM8K_THRESHOLD` to the acceptance threshold established for that
+checkpoint, and compare with its original BF16 KV evaluation before deployment.
+Model classes without a supplied path are skipped. CPU wrapper/configuration
+regressions run separately:
+
+```bash
+python -m unittest discover -s test/ppu/unit -p test_flashmla_fp8_kv.py -v
+```
+
+Device UTs require no model and compare outputs against attention computed from
+the quantized inputs. They also cover prefix-cache dequantization with repeated
+slots and non-unit scales, graph capture/replay, and real backend/config imports:
+
+```bash
+PYTHONPATH=python CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
+  -s test/ppu/unit -p 'test_flashmla_fp8_kv*.py' -v
+```
+
+Keep failures on an older operator binary visible; do not skip dense FP8 tests
+merely because the installed binary only accepts FP16/BF16.
+
+### Serial checkpoint loading
+
+If loader thread stacks remain inside concurrent H2D `copy_` calls in the SAIL
+runtime, `SGLANG_DISABLE_ASYNC_WEIGHT_LOADING=1` runs weight copies inline.
+This opt-in changes startup scheduling only and preserves weight/cache precision.
+The default retains asynchronous loading. Record the flag when comparing startup
+times or reproducing an E2E run.

@@ -343,6 +343,17 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        if (
+            _is_ppu
+            and model_runner.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and self.dsa_decode_impl == "flashmla_sparse"
+        ):
+            # Check the actual pool dtype too: auto can resolve to FP8 from
+            # checkpoint metadata after ServerArgs validation.
+            raise ValueError(
+                "PPU DSA flashmla_sparse decode requires BF16 KV input; "
+                "use flashmla_kv decode for FP8 KV cache."
+            )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )

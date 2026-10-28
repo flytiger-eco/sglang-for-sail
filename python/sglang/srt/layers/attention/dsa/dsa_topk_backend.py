@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_ppu
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -218,6 +219,10 @@ class DSATopKBackend(Enum):
                         "RAGGED topk_transform requires topk_indices_offset; "
                         "expected extend-without-speculative metadata."
                     )
+                # PPU indexer GEMMs can return BF16 scores, but the legacy
+                # ragged fused op reads float32. Widen without changing ranks.
+                if is_ppu() and logits.dtype == torch.bfloat16:
+                    logits = logits.float()
                 return fast_topk_transform_ragged_fused(
                     score=logits,
                     lengths=lengths,

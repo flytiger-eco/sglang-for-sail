@@ -2290,6 +2290,30 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 
 @register_post_process
+def _ppu_flashmla_kv_cache_checks(view: Any) -> dict:
+    """Validate resolved PPU backends without changing the requested cache dtype."""
+    if not is_ppu() or view.kv_cache_dtype not in ("fp8_e4m3", "fp8_e5m2"):
+        return {}
+    prefill, decode = attention_backends_of(view)
+    if "flashmla" in (prefill, decode):
+        if view.kv_cache_dtype != "fp8_e4m3":
+            raise ValueError("PPU FlashMLA dense FP8 only supports fp8_e4m3 KV cache.")
+        if view.dcp_size != 1:
+            raise ValueError("PPU FlashMLA FP8 KV cache does not support DCP.")
+    if view.dsa_decode_backend == "flashmla_sparse":
+        raise ValueError(
+            "PPU DSA decode backend flashmla_sparse requires BF16 KV input. "
+            "Use --dsa-decode-backend flashmla_kv for packed FP8 KV cache."
+        )
+    if view.kv_cache_dtype == "fp8_e5m2" and "flashmla_kv" in (
+        view.dsa_prefill_backend,
+        view.dsa_decode_backend,
+    ):
+        raise ValueError("PPU FlashMLA sparse FP8 only supports fp8_e4m3 KV cache.")
+    return {}
+
+
+@register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
     """Read-only validation pass in the attention-backend compatibility
     handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved

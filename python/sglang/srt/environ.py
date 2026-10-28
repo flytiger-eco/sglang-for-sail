@@ -303,6 +303,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Serialize host-to-device weight loading when a runtime cannot safely
+    # overlap copies from multiple Python loader threads (e.g. some SAIL builds).
+    SGLANG_DISABLE_ASYNC_WEIGHT_LOADING = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
