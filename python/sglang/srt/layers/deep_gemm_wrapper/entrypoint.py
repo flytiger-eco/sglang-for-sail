@@ -418,6 +418,31 @@ def gemm_nt_bf16bf16f32(
         deep_gemm.bf16_gemm_nt(lhs, rhs, out)
 
 
+def gemm_nt_bf16bf16bf16(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    configs: Tuple = None,
+):
+    # Dense BF16 GEMM with K-major (nt) operands only: both lhs [m, k] and
+    # rhs [n, k] must be contiguous bf16, and `out` must be bf16. The FP32-out
+    # variant is served by gemm_nt_bf16bf16f32 above.
+    assert _is_ppu, "only ppu deepgemm support gemm_nt_bf16bf16bf16"
+    assert out.dtype == torch.bfloat16, "bf16 dense deepgemm requires bf16 out"
+
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    if m == 0:
+        return
+
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16BF16
+    with compile_utils.deep_gemm_execution_hook(m, n, k, 1, kernel_type):
+        if configs is None:
+            deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+        else:
+            deep_gemm.bf16_gemm_nt(lhs, rhs, out, configs=configs)
+
+
 def tf32_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,

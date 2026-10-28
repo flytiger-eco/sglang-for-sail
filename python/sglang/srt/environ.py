@@ -1976,6 +1976,18 @@ class Envs:
     SGLANG_SAIL_USE_ACEXT_CUDA = EnvBool(False)
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
+    # Route unquantized (BF16) dense GEMM to PPU DeepGEMM. DEFAULT OFF on
+    # purpose: on 810E the DeepGEMM path is slower than the acblas/vendor GEMM
+    # it replaces (prefill large-N +4.4%~6.0%, small-M decode up to +53%; see
+    # the linked issue), so it stays opt-in pending DeepGEMM-side tuning.
+    # Enable per process with "=true"/"1"; unset (or "=0") restores the acblas
+    # path. lm-head BF16 GEMM is intentionally NOT routed (measured -7.3% on
+    # prefill). This switch is never auto-enabled by platform_hook.
+    # Rollback scope: the switch is read on every eager `apply()`, but CUDA
+    # graphs captured while it was enabled replay without re-entering
+    # `apply()`, so unsetting it only rolls back eager calls; those captured
+    # graphs need recapture or a process restart.
+    SGLANG_SAIL_DEEPGEMM_DENSE_BF16 = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.

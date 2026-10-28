@@ -41,6 +41,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -74,6 +75,139 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
+
+
+_is_ppu = is_ppu()
+# PPU1.0 (SM80, e.g. 810E) and later satisfy DeepGEMM's own configurer floor
+# (sm_version >= 80); the switch below is what actually gates the BF16 path.
+_PPU_BF16_DENSE_MIN_SM = 80
+# Cached at import (same pattern as deep_gemm_wrapper.compile_utils) so the
+# per-layer hot path does not re-query the device capability.
+_PPU_BF16_DENSE_DEVICE_SM = get_device_sm() if _is_ppu else 0
+
+
+def _ppu_bf16_dense_enabled() -> bool:
+    """Whether the unquantized BF16 dense GEMM may take the PPU DeepGEMM path.
+
+    OFF by default (see envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16): on 810E the
+    DeepGEMM path is slower than the acblas/vendor GEMM it replaces (see the
+    linked issue), so it stays opt-in pending DeepGEMM-side tuning. The env is
+    read per call so the value can also come from ServerArgs after import.
+    """
+    return (
+        _is_ppu
+        and envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get()
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and _PPU_BF16_DENSE_DEVICE_SM >= _PPU_BF16_DENSE_MIN_SM
+        # Batch-invariant mode replaces aten::mm/aten::addmm with deterministic
+        # kernels, but it cannot intercept this opaque kernel call, so routing
+        # here would silently opt the layer out of --enable-deterministic-
+        # inference. Keep the acblas path, same as `_can_accumulate_into_addend`.
+        and not is_batch_invariant_mode_enabled()
+        # Keep Dynamo/export graphs untouched: the tested scope of this patch
+        # is eager/CUDA-graph inference only.
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _is_k_major_bf16_dense(x, weight, bias) -> bool:
+    """Only K-major (nt) bf16 operands are supported and the DeepGEMM kernel
+    requires an even N plus a 16-element K alignment. Bias-carrying layers are
+    excluded as well, but for a precision reason rather than a shape one:
+    `F.linear` adds the bias inside the fp32 accumulator, while this path would
+    add it to the already rounded bf16 result, which is both less accurate and
+    slower. Every unsupported layer keeps the acblas path, so enabling the
+    switch never changes its behaviour.
+    """
+    if not (
+        x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and x.dim() >= 1
+        # A zero-length feature dim would divide by zero when the caller
+        # computes the flattened M.
+        and x.shape[-1] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and bias is None
+    ):
+        return False
+    n, k = weight.shape
+    return n % 2 == 0 and k % 16 == 0 and x.shape[-1] % 16 == 0
+
+
+def _ppu_gemm_nt_bf16_fake(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+    # Fake impl for export/tracing: C is mutated in place, nothing to return.
+    return None
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=_ppu_gemm_nt_bf16_fake)
+def _ppu_gemm_nt_bf16(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+    deep_gemm_wrapper.gemm_nt_bf16bf16bf16(A, B, C)
+
+
+# Counters used as evidence for the DeepGEMM bf16 dense route:
+#   hit      - the DeepGEMM kernel was called successfully
+#   fallback - the switch is on but the shape/dtype gate did not match; every
+#              bias-carrying layer lands here by construction
+#              (see _is_k_major_bf16_dense), behaviour is acblas
+#   error    - the kernel raised and we fell back; this is a DEFECT signal and
+#              must be 0 in a validation run
+_PPU_BF16_DENSE_STATS = {"hit": 0, "fallback": 0, "error": 0}
+
+
+def _ppu_bf16_dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # `bias` is deliberately not accepted: the gate only routes bias-free
+    # layers so the GEMM result is the final result.
+    x_shapes = x.shape
+    m = x.numel() // x_shapes[-1]
+    if m == 0:
+        return torch.empty(
+            (*x_shapes[:-1], weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+    out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device=x.device)
+    try:
+        _ppu_gemm_nt_bf16(x.view(-1, x_shapes[-1]), weight, out)
+    except Exception as exc:  # noqa: BLE001
+        # Never take the server down on an opt-in path: count it, log once with
+        # the failing shape, and serve this layer from acblas instead.
+        _PPU_BF16_DENSE_STATS["error"] += 1
+        if _PPU_BF16_DENSE_STATS["error"] == 1:
+            logger.warning(
+                "DeepGEMM bf16 dense fallback (M=%s N=%s K=%s): %s",
+                m,
+                weight.shape[0],
+                weight.shape[1],
+                exc,
+            )
+        # Release every strong reference to the routed (M, N) buffer before the
+        # fallback allocates its own, otherwise a large prefill needs two output
+        # buffers at once and can OOM where plain F.linear would have fitted.
+        # Three things can hold it: this local, the callee frame kept alive by
+        # the exception traceback (its output argument is the same buffer), and
+        # a chained exception's cause/context. The diagnostic text is already in
+        # the log line above, so dropping the traceback loses nothing. Rebinding
+        # to None rather than `del` keeps the following success-path reference
+        # analysable.
+        out = None
+        exc.with_traceback(None)
+        exc.__cause__ = None
+        exc.__context__ = None
+        return F.linear(x, weight)
+    _PPU_BF16_DENSE_STATS["hit"] += 1
+    # SAIL-DG-BF16-HIT is the kernel-hit evidence marker used by the 810E
+    # validation; keep the message and cadence stable.
+    if _PPU_BF16_DENSE_STATS["hit"] <= 20 or _PPU_BF16_DENSE_STATS["hit"] % 500 == 0:
+        logger.warning(
+            "SAIL-DG-BF16-HIT n=%s M=%s N=%s K=%s",
+            _PPU_BF16_DENSE_STATS["hit"],
+            m,
+            weight.shape[0],
+            weight.shape[1],
+        )
+    return out.view(*x_shapes[:-1], -1)
 
 
 class Bf16GemmBackend(Enum):
@@ -499,6 +633,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+
+        # PPU: route K-major BF16 dense GEMM to DeepGEMM only when the switch
+        # is explicitly enabled; everything else keeps the acblas path below.
+        if _ppu_bf16_dense_enabled():
+            if _is_k_major_bf16_dense(x, layer.weight, bias):
+                return _ppu_bf16_dense_linear(x, layer.weight)
+            _PPU_BF16_DENSE_STATS["fallback"] += 1
 
         return F.linear(x, layer.weight, bias)
 
