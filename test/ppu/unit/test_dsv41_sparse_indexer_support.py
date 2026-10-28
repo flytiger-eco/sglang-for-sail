@@ -9,7 +9,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 LAYERS = ROOT / "python/sglang/srt/layers"
@@ -186,6 +186,85 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
         result, sparse, dense = self.factory(sail=True, sm=89, int8=True)
         self.assertEqual(result, (dense.return_value, dense.return_value))
         sparse.assert_not_called()
+
+    def test_sm90_decode_respects_platform_and_cache_format(self):
+        """SAIL SM90 must use its INT8/DeepGEMM scorer, not Hopper's FP4 scorer."""
+        scoring_path = LAYERS / "attention/dsv4/v41_indexer/scoring.py"
+        for sail, int8, selected in (
+            (True, True, "int8"),
+            (True, False, "deep_gemm_fp4"),
+            (False, False, "hopper_fp4"),
+        ):
+            with self.subTest(sail=sail, int8=int8):
+                tensor = MagicMock(shape=(1, 64 * (132 if int8 else 68)))
+                metadata = MagicMock(max_compressed_seq_len=8, compressed_page_size=64)
+                metadata.row_chunks.return_value = [(slice(0, 1), Mock())]
+                inputs = MagicMock(
+                    compress_ratio=4,
+                    req_rows=tensor,
+                    positions=tensor,
+                    paged_metadata=metadata,
+                )
+                inputs.indexer.use_int8 = int8
+                inputs.indexer.queries.return_value = tensor
+                inputs.indexer.head_weights.return_value = tensor
+                pool = Mock()
+                pool.get_index_k_with_scale_buffer.return_value = tensor
+                kernels = {
+                    name: MagicMock(name=name)
+                    for name in ("int8", "deep_gemm_fp4", "hopper_fp4")
+                }
+                int8_module = ModuleType(
+                    "sglang.kernels.ops.attention.dsv4.int8_indexer"
+                )
+                fp4_module = ModuleType(
+                    "sglang.kernels.ops.attention.dsv4.index_logits"
+                )
+                int8_module.int8_paged_index_logits = kernels["int8"]
+                fp4_module.deep_gemm_fp4_paged_mqa_logits = kernels["deep_gemm_fp4"]
+                columns = MagicMock()
+                columns.__getitem__.return_value.__ge__.return_value = tensor
+                namespace = {
+                    "torch": MagicMock(
+                        arange=Mock(return_value=columns), inf=float("inf")
+                    ),
+                    "get_platform": lambda: SimpleNamespace(is_sm90=True),
+                    "is_sail": lambda: sail,
+                    "DecodeScores": SimpleNamespace,
+                    "PagedDecodeScores": SimpleNamespace,
+                    "plan_topk_v2": Mock(),
+                    "fp4_index_logits_paged": kernels["hopper_fp4"],
+                    "fp4_index_logits_decode": Mock(),
+                    "quantize_index_q": Mock(return_value=(tensor, tensor)),
+                    "get_index_k_cache": Mock(return_value=tensor),
+                }
+                decode = load_function(scoring_path, "decode_score_chunks", namespace)
+                with patch.dict(
+                    sys.modules,
+                    {
+                        int8_module.__name__: int8_module,
+                        fp4_module.__name__: fp4_module,
+                    },
+                ):
+                    outputs = list(
+                        decode(
+                            inputs=inputs,
+                            token_to_kv_pool=pool,
+                            req_to_token=tensor,
+                        )
+                    )
+
+                kernels[selected].assert_called_once()
+                for name, kernel in kernels.items():
+                    if name != selected:
+                        kernel.assert_not_called()
+                namespace["fp4_index_logits_decode"].assert_not_called()
+                self.assertEqual(len(outputs), 1)
+                self.assertEqual((outputs[0].bs, outputs[0].lmax), (1, 8))
+                scores = kernels[selected].return_value
+                if sail:
+                    scores = scores.__getitem__.return_value
+                self.assertIs(outputs[0].scores, scores)
 
 
 if __name__ == "__main__":
