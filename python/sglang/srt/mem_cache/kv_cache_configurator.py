@@ -2498,11 +2498,15 @@ class KVCacheConfigurator:
         # overstated and the decode server OOMs while building the pools.
         decode_pre_alloc_size = 0
         decode_slots_per_req = 1
-        is_pd_decode = get_disagg().disaggregation_mode == "decode"
+        # Mirror _build_req_to_token_pool's gate: a role-switch launch builds
+        # HybridMambaDecodeReqToTokenPool on the prefill server too, so it must
+        # carry the same decode-side deductions.
+        disagg = get_disagg()
+        is_pd_decode = (
+            disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        )
         if is_pd_decode:
-            decode_pre_alloc_size = (
-                get_disagg().disaggregation_decode_extra_slots or 0
-            )
+            decode_pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
             ping_pong = 2 if not get_schedule().disable_overlap_schedule else 1
             decode_slots_per_req = 1 + (
                 ping_pong if get_exec().mamba.enable_mamba_extra_buffer else 0
@@ -2511,10 +2515,13 @@ class KVCacheConfigurator:
         if is_pd_decode and has_spec_dec and all_mamba_layers:
             nextn_layers = len(getattr(config, "nextn_layer_ids", None) or [])
             if nextn_layers:
+                # _get_mamba_layer_ids_for_req_pool appends the full nextn layer
+                # list to every pipeline stage, so scale the per-stage layer
+                # share (max_stage_mamba_layers), not the global layer count.
                 decode_stage_per_req = int(
                     stage_per_req
-                    * (len(all_mamba_layers) + nextn_layers)
-                    / len(all_mamba_layers)
+                    * (max_stage_mamba_layers + nextn_layers)
+                    / max_stage_mamba_layers
                 )
 
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
@@ -2595,11 +2602,7 @@ class KVCacheConfigurator:
             if has_spec_dec and not replayssm_active:
                 intermediate_size = (
                     decode_stage_per_req
-                    * (
-                        get_schedule().max_mamba_cache_size
-                        + decode_pre_alloc_size
-                        + 1
-                    )
+                    * (get_schedule().max_mamba_cache_size + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -2668,17 +2671,27 @@ class KVCacheConfigurator:
         # +1 accounts for each pool's padding slot. PD decode charges the
         # effective pool size after HybridMambaDecodeReqToTokenPool's bump and
         # the nextn-inclusive per-slot bytes, matching the real allocation.
+        # The pool's request count is capped by the resolver at
+        # min(per-worker max_running_requests, K // ratio); bound the charge by
+        # the same cap instead of treating K as the request count, which would
+        # overcharge whenever the request count is below K.
         main_slots = get_schedule().max_mamba_cache_size
         main_per_slot = stage_per_req + replayssm_ring_per_slot
         if is_pd_decode:
+            decode_req_bound = main_slots // self._calculate_mamba_ratio()
+            if get_schedule().max_running_requests is not None:
+                decode_req_bound = min(
+                    decode_req_bound,
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                )
             main_slots = max(
                 main_slots,
-                (main_slots + decode_pre_alloc_size) * decode_slots_per_req,
+                (max(1, decode_req_bound) + decode_pre_alloc_size)
+                * decode_slots_per_req,
             )
             main_per_slot = decode_stage_per_req + replayssm_ring_per_slot
         mamba_state_memory = (
-            (main_slots + 1) * main_per_slot
-            + replayssm_fixed_bytes
+            (main_slots + 1) * main_per_slot + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
