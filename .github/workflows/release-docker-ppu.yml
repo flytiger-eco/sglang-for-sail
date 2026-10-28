@@ -1,0 +1,112 @@
+name: Build And Push Release Docker
+
+on:
+  push:
+    branches:
+      - 'feat/v0.5.18_release_docker'
+  workflow_dispatch:
+    inputs:
+      dockerfile:
+        description: 'Dockerfile path relative to the caller repository root'
+        required: false
+        type: string
+        default: docker/ppu.Dockerfile
+      build_context:
+        description: 'Local build context directory relative to the caller repository root'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Optional Docker ARG values, one KEY=VALUE per line; never include credentials'
+        required: false
+        type: string
+        default: ''
+      docker_name:
+        description: 'Lowercase image name, such as team/demo, without registry, repository prefix, or tag'
+        required: false
+        type: string
+        default: 'sglang'
+      docker_tag:
+        description: 'Release image tag, such as 1.0.0; use a distinct tag for each release'
+        required: false
+        type: string
+      os:
+        description: 'Image operating system metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: 'ubuntu24'
+      python:
+        description: 'Image Python version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: 'py312'
+      cuda:
+        description: 'Image CUDA version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '13.0'
+      sdk_version:
+        description: 'Image SDK version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '2.2.0'
+      torch:
+        description: 'Image PyTorch version metadata; does not affect the Docker build'
+        required: false
+        type: string
+        default: '2.13.0'
+      network:
+        description: 'Release network metadata; does not configure the build network'
+        required: false
+        type: choice
+        default: 'mellanox'
+        options:
+          - mellanox
+          - EIC
+          - mellanox/EIC
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Call release Docker build and push template
+    # For production, pin both @main and template_ref to the same full commit SHA from the template repository.
+    uses: flytiger-eco/shared-workflows/.github/workflows/build-and-push-docker.yml@main
+    with:
+      dockerfile: ${{ inputs.dockerfile || 'docker/ppu.Dockerfile' }}
+      build_context: ${{ inputs.build_context || '.' }}
+      build_args: ${{ inputs.build_args || '' }}
+      docker_name: ${{ inputs.docker_name || 'sglang' }}
+      docker_tag: ${{ inputs.docker_tag }}
+      # Update this release metadata to match the actual image environment; these fields do not alter the Docker build.
+      os: ${{ inputs.os || 'ubuntu24' }}
+      python: ${{ inputs.python || 'py312' }}
+      cuda: ${{ inputs.cuda || '13.0' }}
+      sdk_version: ${{ inputs.sdk_version || '2.2.0' }}
+      torch: ${{ inputs.torch || '2.13.0' }}
+      network: ${{ inputs.network || 'mellanox' }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      data_token: ${{ secrets.DATA_TOKEN }}
+      # Enable as needed for private templates, and allow cross-repository calls in the template repository Actions settings.
+      # template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show published image information
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          IMAGE: ${{ needs.publish.outputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SIZE: ${{ needs.publish.outputs.size }}
+        run: |
+          set -euo pipefail
+          printf 'Image address: %s\nImage digest: %s\nImage size (bytes): %s\n' "$IMAGE" "$DIGEST" "$SIZE" | tee -a "$GITHUB_STEP_SUMMARY"
