@@ -19,6 +19,9 @@ Registered hooks:
 4. ``DeepseekSparseAttnBackend.init_forward_metadata_replay_cuda_graph_from_precomputed``
    (AROUND) — Skips flashmla_metadata copy on PPU by temporarily clearing
    and restoring the precomputed metadata.
+
+5. ``DeepseekSparseAttnBackend._copy_replay_metadata_from_sibling`` (AROUND) —
+   Skips opaque FlashMLA metadata only for PPU flashmla_kv decode sibling replay.
 """
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
@@ -82,4 +85,24 @@ def _ppu_dsa_init_forward_metadata_replay_cuda_graph_from_precomputed(
     flashmla_metadata = precomputed.flashmla_metadata
     precomputed.flashmla_metadata = None
     original_fn(self, bs, precomputed, forward_mode)
+    precomputed.flashmla_metadata = flashmla_metadata
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend._copy_replay_metadata_from_sibling",
+    type=HookType.AROUND,
+)
+def _ppu_dsa_copy_replay_metadata_from_sibling(
+    original_fn, self, src_backend, bs, precomputed, forward_mode
+):
+    if (
+        self.dsa_decode_impl != "flashmla_kv"
+        or not forward_mode.is_decode_or_idle()
+        or precomputed.flashmla_metadata is None
+    ):
+        return original_fn(self, src_backend, bs, precomputed, forward_mode)
+
+    flashmla_metadata = precomputed.flashmla_metadata
+    precomputed.flashmla_metadata = None
+    original_fn(self, src_backend, bs, precomputed, forward_mode)
     precomputed.flashmla_metadata = flashmla_metadata
