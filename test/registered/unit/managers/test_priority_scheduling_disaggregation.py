@@ -16,9 +16,10 @@ from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_ppu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_ppu_ci(est_time=11, suite="nightly-1-ppu", nightly=True)
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
