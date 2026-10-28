@@ -1092,7 +1092,7 @@ class E2EWorkflowTest(unittest.TestCase):
         action = next(s for s in steps if s.get("id") == "worker")
         self.assertEqual(
             action["uses"],
-            "flytiger-eco/ppu-distributed-action@06c8ee7cadaae2086db4977e571b19f461653f16",
+            "flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a",
         )
         self.assertEqual(action["with"]["node_selector"], "board-type=ZW-M890P")
         self.assertEqual(action["with"]["nproc_per_node"], 8)

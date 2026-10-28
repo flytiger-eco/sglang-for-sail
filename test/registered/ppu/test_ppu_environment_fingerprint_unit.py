@@ -888,7 +888,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
             for job_name, job in data["jobs"].items():
                 for index, step in enumerate(job["steps"]):
                     if not step.get("uses", "").startswith(
-                        "flytiger-eco/ppu-distributed-action@"
+                        "flytiger-eco/shared-workflows/cluster-task@"
                     ):
                         continue
                     observer = job["steps"][index - 1]
@@ -994,7 +994,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
         for name in names:
             with self.subTest(workflow=name):
                 text = (ROOT / f".github/workflows/test-ppu-{name}.yml").read_text()
-                count = text.count("uses: flytiger-eco/ppu-distributed-action@")
+                count = text.count("uses: flytiger-eco/shared-workflows/cluster-task@")
                 self.assertGreater(count, 0)
                 # action 可使用 main；这里只检查来源信息注入，不限制版本。
                 self.assertEqual(text.count("observe_pod_environment.sh start"), count)
@@ -1009,7 +1009,7 @@ class TestEnvironmentIntegration(unittest.TestCase):
                 )
                 steps = re.split(r"(?m)^      - name: ", text)
                 for index, step in enumerate(steps):
-                    if "uses: flytiger-eco/ppu-distributed-action@" not in step:
+                    if "uses: flytiger-eco/shared-workflows/cluster-task@" not in step:
                         continue
                     observer = steps[index - 1]
                     expected = max(1, int(re.search(r"nnodes: (\d+)", step).group(1)))
