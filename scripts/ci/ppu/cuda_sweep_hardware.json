@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "board": "ZW-M890P",
+  "reserved_devices": 8,
+  "test_budget_seconds": 10800,
+  "worker_minutes": 300,
+  "job_minutes": 330,
+  "runner_configs": {
+    "1-gpu-small": 1,
+    "1-gpu-large": 1,
+    "1-gpu-b200": 1,
+    "2-gpu-large": 2,
+    "4-gpu-h100": 4,
+    "4-gpu-b200": 4,
+    "4-gpu-gb300": 4,
+    "8-gpu-h20": 8,
+    "8-gpu-h200": 8,
+    "8-gpu-b200": 8,
+    "8-gpu-b300": 8
+  }
+}

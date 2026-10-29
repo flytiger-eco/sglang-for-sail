@@ -1,418 +1,789 @@
-name: Nightly Test (PPU)
+name: PPU CUDA Sweep (890P, temporary nightly entry)
 
+# 临时借用已注册的 nightly 路径；验证完成后迁移 sweep 并恢复原 nightly，禁止直接合入。
 on:
-  schedule:
-    - cron: '0 16 * * *'  # 0:00 AM Beijing Time (UTC+8) every day
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
+        description: 'Full dispatched commit SHA; empty uses the dispatched commit'
         type: string
         default: ''
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
+      scope:
+        description: 'CUDA scope (kernel unit/benchmark, weekly/stress/native workflows excluded)'
+        type: choice
+        options: [base, extra, nightly, all]
+        default: base
+      suites:
+        description: 'Optional comma-separated exact CUDA suites, overrides scope'
         type: string
         default: ''
+      plan_only:
+        description: 'Inventory only: no PPU allocation'
+        type: boolean
+        default: true
+      max_parallel:
+        description: 'Concurrent whole 890P boards (1-2); not visible card count'
+        type: number
+        default: 1
+      timeout_per_file:
+        description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
+        type: number
+        default: 0
 
+# 跨 scope 串行；不要同时提交多批，GitHub concurrency 只保留一个待运行实例。
 concurrency:
-  group: nightly-test-ppu-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
+  group: ppu-cuda-sweep-890p
+  cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: read
 
-# Every test container passes PIP_INDEX_URL=https://pypi.org/simple: the
-# sdk2.2.0 base image ships a pip index pointing at the Artifactory PyPI repo,
-# which returns 401 for the CI credentials. The env var outranks every pip
-# config file and restores the pip default these jobs used before the upgrade.
+defaults:
+  run:
+    shell: bash
+
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
-  nightly-1a-ppu:
-    runs-on: ppu
-    timeout-minutes: 120
+  sweep-prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      sha: ${{ steps.plan.outputs.sha }}
+      parallel: ${{ steps.plan.outputs.parallel }}
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
-
-      - name: Run PPU nightly tests (1-GPU, partition 1/2)
-        timeout-minutes: 110
+      - name: Validate dispatch before checkout
+        id: dispatch
         env:
+          REQUESTED_SHA: ${{ inputs.ref }}
+        run: |
+          [[ "$GITHUB_REF" == refs/heads/feat/ppu-cuda-sweep-890p ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${REQUESTED_SHA:-$GITHUB_SHA}" == "$GITHUB_SHA" ]]
+          printf 'sha=%s\n' "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.dispatch.outputs.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build self-contained sweep driver
+        run: |
+          mkdir -p .ppu-sweep
+          cp scripts/ci/ppu/cuda_sweep_hardware.json .ppu-sweep/hardware.json
+          cat > .ppu-sweep/sweep.py <<'PY'
+          import argparse
+          import csv
+          import hashlib
+          import importlib.util
+          import json
+          import math
+          import os
+          import platform
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          BUNDLE = Path(__file__).resolve().parent
+          ROOT = Path.cwd().resolve()
+          # 首轮明确排除 base-b-kernel-unit/base-b-kernel-benchmark 注册。
+          STAGES = {'base': {'base-a', 'base-b', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
+          STAGES['all'] = set().union(*STAGES.values())
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def read(path):
+              return json.loads(Path(path).read_text())
+
+          def save(path, value):
+              path = Path(path)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(json.dumps(value, indent=2) + '\n')
+
+          def load(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[name] = module
+              spec.loader.exec_module(module)
+              return module
+
+          def fingerprint(value):
+              return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+          def output(name, value):
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+                  stream.write(f'{name}={value}\n')
+
+          def summary(text):
+              print(text)
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+                      stream.write(text + '\n')
+
+          def registry():
+              module = load('sweep_registry', ROOT / 'python/sglang/test/ci/ci_register.py')
+              paths = sorted(str(p.resolve()) for p in (ROOT / 'test/registered').rglob('*.py') if p.name not in {'conftest.py', '__init__.py'})
+              return module, module.collect_tests(paths, sanity_check=True)
+
+          def make_plan(scope, suites, timeout, parallel, hardware):
+              require(scope in STAGES, 'Unknown scope')
+              require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
+              require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
+              require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['reserved_devices'] == 8, 'Invalid board allocation')
+              require(hardware['test_budget_seconds'] == 10800 and hardware['worker_minutes'] == 300 and hardware['job_minutes'] == 330, 'Unexpected job budgets')
+              module, registrations = registry()
+              groups = defaultdict(list)
+              disabled = []
+              for reg in registrations:
+                  if reg.backend != module.HWBackend.CUDA:
+                      continue
+                  stage = reg.stage or reg.effective_suite.split('-test-', 1)[0]
+                  if stage not in STAGES['all']:
+                      continue
+                  require(not reg.nightly, 'Unexpected legacy nightly flag: ' + reg.effective_suite)
+                  groups[reg.effective_suite].append(reg)
+              selected = sorted(set(s.strip() for s in suites.split(',') if s.strip())) if suites.strip() else sorted(s for s in groups if s.split('-test-', 1)[0] in STAGES[scope])
+              require(selected and all(s in groups for s in selected), 'Empty selection or unknown suite')
+              entries = []
+              for suite in selected:
+                  require(re.fullmatch(r'[a-z0-9-]+', suite), 'Unsafe suite name')
+                  enabled = [r for r in groups[suite] if r.disabled is None]
+                  disabled.extend({'file': str(Path(r.filename).relative_to(ROOT)), 'cuda_suite': suite, 'reason': r.disabled} for r in groups[suite] if r.disabled is not None)
+                  require(enabled, 'Suite has no enabled files: ' + suite)
+                  configs = {r.runner_config or suite.split('-test-', 1)[1] for r in enabled}
+                  require(len(configs) == 1, 'Mixed runner configurations')
+                  config = configs.pop()
+                  require(config in hardware['runner_configs'], 'Unmapped CUDA runner: ' + config)
+                  devices = hardware['runner_configs'][config]
+                  require(type(devices) is int and devices in (1, 2, 4, 8), 'Invalid visible card count')
+                  require(len({r.filename for r in enabled}) == len(enabled), 'Duplicate registration in ' + suite)
+                  require(all(math.isfinite(r.est_time) and r.est_time >= 0 for r in enabled), 'Invalid time estimates')
+                  limit = timeout or math.ceil(min(max(3 * max(r.est_time for r in enabled), 600), 3600))
+                  # 按实际 runner 的 LPT 分片；最坏单文件超时总和必须装入测试预算。
+                  size = max(1, math.ceil(len(enabled) * limit / hardware['test_budget_seconds']))
+                  while True:
+                      partitions = [module.auto_partition(enabled, i, size) for i in range(size)]
+                      if all(part and len(part) * limit <= hardware['test_budget_seconds'] for part in partitions):
+                          break
+                      size += 1
+                      require(size <= len(enabled), 'Cannot form nonempty bounded partitions')
+                  for i, part in enumerate(partitions):
+                      entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'timeout': limit, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
+              require(0 < len(entries) <= 256, 'Matrix exceeds 256 entries; select one scope or fewer suites')
+              sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'parallel': parallel, 'hardware': hardware, 'entries': entries, 'disabled': disabled}
+              plan['plan_hash'] = fingerprint(plan)
+              return plan
+
+          def plan_command():
+              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'))
+              save(BUNDLE / 'plan.json', plan)
+              output('sha', plan['sha'])
+              output('parallel', plan['parallel'])
+              output('matrix', json.dumps({'include': [{'id': e['id'], 'suite': e['suite'], 'partition_id': e['partition_id']} for e in plan['entries']]}))
+              rows = ['# CUDA registration sweep on 890P', f"Tested SHA: `{plan['sha']}`", f"Workflow SHA: `{plan['workflow_sha']}`", '| Suite | Enabled files | Partitions | Visible / reserved cards |', '| --- | ---: | ---: | --- |']
+              for suite in sorted({e['suite'] for e in plan['entries']}):
+                  group = [e for e in plan['entries'] if e['suite'] == suite]
+                  rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['n_devices']} / 8 |")
+              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'No PASS claims in plan-only mode. Kernel unit/benchmark stages, weekly, stress and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
+              summary('\n'.join(rows))
+
+          def context():
+              plan = read(BUNDLE / 'plan.json')
+              stored = plan.pop('plan_hash')
+              require(fingerprint(plan) == stored, 'Plan hash mismatch')
+              plan['plan_hash'] = stored
+              require(plan['run_id'] == os.environ['GITHUB_RUN_ID'] and plan['attempt'] == os.environ['GITHUB_RUN_ATTEMPT'], 'Stale run/attempt plan')
+              return plan
+
+          def entry_for(plan, name):
+              matches = [e for e in plan['entries'] if e['id'] == name]
+              require(len(matches) == 1, 'Unknown matrix entry')
+              return matches[0]
+
+          def cluster_check(destination):
+              kubectl = shutil.which('kubectl') or ('/opt/bin/kubectl' if Path('/opt/bin/kubectl').is_file() else None)
+              require(kubectl, 'Cannot inspect cluster occupancy: kubectl unavailable')
+              def query(*args):
+                  return json.loads(subprocess.check_output([kubectl, *args, '--request-timeout=15s', '-o', 'json'], text=True, timeout=25))['items']
+              nodes = query('get', 'nodes', '-l', 'board-type=ZW-M890P')
+              pods = query('get', 'pods', '-A')
+              occupied = set()
+              pending = []
+              for pod in pods:
+                  if pod.get('status', {}).get('phase') in ('Succeeded', 'Failed'):
+                      continue
+                  spec = pod['spec']
+                  def requests(container):
+                      return int(container.get('resources', {}).get('requests', {}).get('alibabacloud.com/ppu', 0))
+                  cards = max(sum(map(requests, spec.get('containers', []))), max(map(requests, spec.get('initContainers', [])), default=0))
+                  if spec.get('nodeName'):
+                      if cards:
+                          occupied.add(spec['nodeName'])
+                  elif cards and spec.get('nodeSelector', {}).get('board-type', 'ZW-M890P') == 'ZW-M890P':
+                      pending.append(pod['metadata']['name'])
+              free = [n['metadata']['name'] for n in nodes if n['metadata']['name'] not in occupied and not n.get('spec', {}).get('unschedulable') and int(n['status'].get('allocatable', {}).get('alibabacloud.com/ppu', 0)) >= 8 and any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status'].get('conditions', []))]
+              save(destination, {'free_890p_nodes': free, 'occupied_nodes': sorted(occupied), 'pending_ppu_pods': pending})
+              require(free and not pending, 'No idle 890P board, or PPU jobs already queued; retry in an idle window')
+
+          def worker(entry_id):
+              plan = context()
+              entry = entry_for(plan, entry_id)
+              directory = Path(os.environ['PPU_EVIDENCE_DIR'])
+              directory.mkdir(parents=True, exist_ok=True)
+              state = {'id': entry_id, 'sha': plan['sha'], 'plan_hash': plan['plan_hash'], 'phase': 'setup', 'exit_code': None}
+              started = time.monotonic()
+              try:
+                  sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+                  require(sha == plan['sha'], 'Worker checkout SHA mismatch')
+                  require(re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['PPU_BASE_IMAGE_DIGEST']), 'Missing immutable image digest')
+                  require(os.environ['PPU_BASE_IMAGE_REF'].endswith('@' + os.environ['PPU_BASE_IMAGE_DIGEST']), 'Image reference/digest mismatch')
+                  os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, range(entry['n_devices'])))
+                  os.environ['SGLANG_JIT_KERNEL_RUN_FULL_TESTS'] = '1' if entry['suite'].startswith('nightly-test-') else '0'
+                  os.environ['SGLANG_ENABLE_ASYNC_ASSERT'] = 'false' if entry['suite'].startswith('base-a-test-') else 'true'
+                  import torch
+                  names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+                  require(len(names) == entry['n_devices'] and all('890' in name.upper() for name in names), 'Unexpected PPU model or visible device count: ' + repr(names))
+                  save(directory / 'environment.json', {'sha': sha, 'workflow_sha': plan['workflow_sha'], 'run_id': plan['run_id'], 'attempt': plan['attempt'], 'plan_hash': plan['plan_hash'], 'devices': names, 'reserved_devices': 8, 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST'], 'python': platform.python_version(), 'torch': torch.__version__})
+                  inventory = read(BUNDLE / 'models.json')['suites'].get(entry['suite'], {})
+                  cache = Path(os.environ['HF_HUB_CACHE'])
+                  availability = [{'model': model, 'cache_directory_exists': (cache / ('models--' + model.replace('/', '--'))).is_dir()} for model in inventory.get('models', [])]
+                  save(directory / 'model_availability.json', {'heuristic_only': True, 'models': availability, 'unresolved_files': inventory.get('unresolved_files', [])})
+                  # 只盘点、不下载；目录存在不代表权重完整，实际缺失由测试证据归类。
+                  with (directory / 'setup.log').open('w') as log:
+                      subprocess.run(['bash', str(BUNDLE / 'install.sh')], check=True, stdout=log, stderr=subprocess.STDOUT)
+                  state['setup_seconds'] = round(time.monotonic() - started, 3)
+                  state['phase'] = 'tests'
+                  save(directory / 'worker.json', state)
+                  command = [sys.executable, 'test/run_suite.py', '--hw', 'cuda', '--suite', entry['suite'], '--pytest', '--junit-dir', str(directory / 'pytest'), '--continue-on-error', '--timeout-per-file', str(entry['timeout']), '--auto-partition-id', str(entry['partition_id']), '--auto-partition-size', str(entry['partition_size'])]
+                  with (directory / 'suite.log').open('w') as log:
+                      state['exit_code'] = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)
+                  state['phase'] = 'complete'
+              except Exception as error:
+                  state['error'] = str(error)
+                  state['exit_code'] = 1
+              finally:
+                  state['elapsed'] = round(time.monotonic() - started, 3)
+                  save(directory / 'worker.json', state)
+              return state['exit_code']
+
+          def classify(record, directory, runner):
+              row = {'auto_status': 'NOT_EXECUTED', 'exit_code': None, 'wall_s': None, 'tests': 0, 'passed': 0, 'failed': 0, 'errors': 0, 'skipped': 0, 'skip_reasons': '', 'failure_signature': '', 'log_path': ''}
+              if record is None:
+                  return row
+              row.update(exit_code=record.get('returncode'), wall_s=record.get('elapsed'))
+              require(isinstance(row['wall_s'], (int, float)) and math.isfinite(row['wall_s']) and row['wall_s'] >= 0, 'Invalid elapsed time')
+              for key in ('junit', 'log'):
+                  require(isinstance(record.get(key), str) and Path(record[key]).name == record[key], 'Unsafe evidence path')
+              log_path = directory / record['log']
+              require(log_path.is_file(), 'Missing per-file log')
+              text = log_path.read_text(errors='replace')
+              row['log_path'] = 'evidence/pytest/' + record['log']
+              error = str(record.get('error', ''))
+              row['failure_signature'] = error[:200]
+              junit = directory / record['junit']
+              if junit.is_file():
+                  # 只读取一次受限 UTF-8 内容；解析器永远不会收到 DTD、实体或替代编码。
+                  with junit.open('rb') as stream:
+                      data = stream.read(16 * 1024 * 1024 + 1)
+                  require(len(data) <= 16 * 1024 * 1024, 'JUnit exceeds 16 MiB')
+                  xml = data.decode('utf-8')
+                  require('\x00' not in xml and not re.search(r'<!\s*(DOCTYPE|ENTITY)', xml, re.I), 'JUnit DTD/entities are forbidden')
+                  root = ET.fromstring(xml)
+                  require(root.tag in ('testsuite', 'testsuites'), 'Invalid JUnit root')
+                  cases = list(root.iter('testcase'))
+                  skipped = [c for c in cases if c.find('skipped') is not None]
+                  failed = [c for c in cases if c.find('failure') is not None]
+                  errors = [c for c in cases if c.find('error') is not None]
+                  row.update(tests=len(cases), skipped=len(skipped), failed=len(failed), errors=len(errors), passed=sum(c.find('skipped') is None and c.find('failure') is None and c.find('error') is None for c in cases))
+                  row['skip_reasons'] = ' | '.join(sorted({c.find('skipped').get('message', '') for c in skipped}))
+                  for case in failed + errors:
+                      problem = case.find('failure') if case.find('failure') is not None else case.find('error')
+                      row['failure_signature'] = (problem.get('type', '') + ': ' + problem.get('message', ''))[:200]
+                      break
+                  if not cases:
+                      status = 'ZERO_COLLECTED'
+                  elif len(skipped) == len(cases):
+                      status = 'ALL_SKIPPED'
+                  elif failed or errors or list(root.iter('failure')) or list(root.iter('error')):
+                      status = 'FAIL'
+                  elif row['exit_code'] == 0:
+                      status = 'PASS_WITH_SKIPS' if skipped else 'PASS'
+                      if not skipped:
+                          require(record.get('passed') is True and not error, 'Runner rejected apparently passing JUnit')
+                  else:
+                      status = 'FAIL'
+              else:
+                  status = 'CRASH'
+              if 'timed out after' in error or 'budget exhausted' in error:
+                  status = 'TIMEOUT'
+              elif status not in ('PASS', 'PASS_WITH_SKIPS'):
+                  signature = (row['failure_signature'] + '\n' + text).lower()
+                  if any(s in signature for s in ('localentrynotfounderror', 'offlinemodeisenabled', 'cannot find the requested files in the disk cache', 'outgoing traffic has been disabled')):
+                      status = 'INFRA_MODEL'
+                  elif 'out of memory' in signature or 'outofmemoryerror' in signature:
+                      status = 'OOM'
+              row['auto_status'] = status
+              return row
+
+          def gather(entry_id, source, destination):
+              plan = context()
+              entry = entry_for(plan, entry_id)
+              destination = Path(destination)
+              destination.mkdir(parents=True, exist_ok=True)
+              report = load('sweep_export', ROOT / 'scripts/ci/ppu/pr_report.py')
+              result = {'id': entry_id, 'sha': plan['sha'], 'plan_hash': plan['plan_hash'], 'run_id': plan['run_id'], 'attempt': plan['attempt'], 'success': False, 'rows': []}
+              issues = []
+              records = {}
+              try:
+                  exported = report.export_evidence(source, destination / 'evidence')
+                  state = read(exported / 'worker.json')
+                  environment = read(exported / 'environment.json')
+                  require(state['sha'] == environment['sha'] == plan['sha'] and state['plan_hash'] == environment['plan_hash'] == plan['plan_hash'], 'Worker provenance mismatch')
+                  require(state['id'] == entry_id and environment['workflow_sha'] == plan['workflow_sha'], 'Worker entry/workflow mismatch')
+                  require(environment['run_id'] == plan['run_id'] and environment['attempt'] == plan['attempt'], 'Worker run/attempt mismatch')
+                  require(len(environment['devices']) == entry['n_devices'] and all('890' in name.upper() for name in environment['devices']) and environment['reserved_devices'] == 8, 'Worker hardware mismatch')
+                  require(environment['digest'] == os.environ['PPU_BASE_IMAGE_DIGEST'] and environment['image'] == os.environ['PPU_BASE_IMAGE_REF'], 'Worker image mismatch')
+                  result['image_digest'] = environment['digest']
+                  data = read(exported / 'pytest/summary.json')
+                  expected = ['/workspace/source/' + f for f in entry['files']]
+                  require(data['selected'] == expected and not data.get('allowed_skips'), 'Selected files or skip policy differs from plan')
+                  require(len({r['file'] for r in data['files']}) == len(data['files']) and all(r['file'] in expected for r in data['files']), 'Unexpected or duplicate file results')
+                  records = {r['file']: r for r in data['files']}
+                  if state.get('phase') != 'complete' or state.get('exit_code') != 0 or data.get('success') is not True:
+                      issues.append('Worker or pytest runner did not finish successfully')
+              except Exception as error:
+                  issues.append(report.runner.sanitize(str(error)))
+              for filename in entry['files']:
+                  try:
+                      row = classify(records.get('/workspace/source/' + filename), destination / 'evidence/pytest', report.runner)
+                  except Exception as error:
+                      row = {'auto_status': 'INVALID_EVIDENCE', 'failure_signature': report.runner.sanitize(str(error))}
+                      issues.append(row['failure_signature'])
+                  row.update(file=filename, cuda_suite=entry['suite'], board='ZW-M890P', n_devices=entry['n_devices'], reserved_devices=8, entry_id=entry_id)
+                  result['rows'].append(row)
+              result['issues'] = issues
+              result['worker_outcome'] = os.environ.get('WORKER_OUTCOME', 'unknown')
+              result['success'] = not issues and result['worker_outcome'] == 'success' and all(r['auto_status'] == 'PASS' for r in result['rows'])
+              save(destination / 'result.json', result)
+              summary(f"{entry['suite']} / {entry_id}: {dict(Counter(r['auto_status'] for r in result['rows']))}")
+              return 0 if result['success'] else 1
+
+          def aggregate(source, destination):
+              plan = context()
+              destination = Path(destination)
+              destination.mkdir(parents=True, exist_ok=True)
+              paths = sorted(Path(source).rglob('result.json'))
+              results = defaultdict(list)
+              rows, issues = [], []
+              for path in paths:
+                  try:
+                      record = read(path)
+                      results[record['id']].append(record)
+                  except (ValueError, KeyError, TypeError, OSError):
+                      issues.append('Unreadable matrix result')
+              if not set(results) <= {e['id'] for e in plan['entries']}:
+                  issues.append('Unexpected matrix result')
+              for entry in plan['entries']:
+                  matches = results[entry['id']]
+                  valid = len(matches) == 1
+                  result = matches[0] if valid else {}
+                  valid = valid and all(result.get(k) == plan[k] for k in ('sha', 'plan_hash', 'run_id', 'attempt'))
+                  valid = valid and [(r.get('file'), r.get('cuda_suite')) for r in result.get('rows', [])] == [(f, entry['suite']) for f in entry['files']]
+                  if not valid:
+                      issues.append('Missing, duplicate or mismatched result: ' + entry['id'])
+                      rows.extend({'file': f, 'cuda_suite': entry['suite'], 'board': 'ZW-M890P', 'n_devices': entry['n_devices'], 'reserved_devices': 8, 'entry_id': entry['id'], 'auto_status': 'NOT_EXECUTED'} for f in entry['files'])
+                      continue
+                  if result.get('success') is not True or result.get('issues') or result.get('worker_outcome') != 'success':
+                      issues.append('Failed entry: ' + entry['id'])
+                  if result.get('image_digest') != os.environ.get('PPU_BASE_IMAGE_DIGEST'):
+                      issues.append('Image digest mismatch: ' + entry['id'])
+                  for row in result['rows']:
+                      rows.append({**row, 'image_digest': result.get('image_digest', ''), 'sha': plan['sha'], 'run_id': plan['run_id'], 'attempt': plan['attempt']})
+              columns = sorted(set().union(*(r.keys() for r in rows)))
+              with (destination / 'sweep_results.csv').open('w', newline='') as stream:
+                  writer = csv.DictWriter(stream, fieldnames=columns)
+                  writer.writeheader()
+                  writer.writerows(rows)
+              needs = json.loads(os.environ.get('NEEDS_JSON', '{}'))
+              if any(needs.get(job, {}).get('result') != 'success' for job in ('sweep-prepare', 'sweep-image', 'sweep-execute')):
+                  issues.append('Preparation or execution jobs did not succeed')
+              save(destination / 'summary.json', {'sha': plan['sha'], 'counts': dict(Counter(r['auto_status'] for r in rows)), 'issues': issues, 'rows': rows, 'disabled': plan['disabled']})
+              summary('# 890P sweep results\n' + json.dumps(dict(Counter(r['auto_status'] for r in rows))) + '\n' + '\n'.join(issues))
+              return 0 if not issues and all(r['auto_status'] == 'PASS' for r in rows) else 1
+
+          def selftest():
+              import ast
+              import contextlib
+              import io
+              import tempfile
+              import unittest
+              from unittest.mock import patch
+
+              hardware = read(ROOT / 'scripts/ci/ppu/cuda_sweep_hardware.json')
+              module, registrations = registry()
+              runner = load('sweep_test_runner', ROOT / 'python/sglang/test/ci/pr_runner.py')
+              env = {'WORKFLOW_SHA': 'f' * 40, 'GITHUB_RUN_ID': 'contract', 'GITHUB_RUN_ATTEMPT': '1', 'GITHUB_STEP_SUMMARY': '', 'WORKER_OUTCOME': 'success', 'PPU_BASE_IMAGE_DIGEST': 'sha256:' + 'a' * 64, 'PPU_BASE_IMAGE_REF': 'example/image@sha256:' + 'a' * 64, 'NEEDS_JSON': json.dumps({j: {'result': 'success'} for j in ('sweep-prepare', 'sweep-image', 'sweep-execute')})}
+
+              class Contracts(unittest.TestCase):
+                  def setUp(self):
+                      temporary = tempfile.TemporaryDirectory()
+                      self.addCleanup(temporary.cleanup)
+                      self.directory = Path(temporary.name)
+                      self.serial = 0
+
+                  def fixture(self, xml='<testsuite><testcase name="ok"/></testsuite>', code=0, error=''):
+                      self.serial += 1
+                      directory = self.directory / str(self.serial) / 'pytest'
+                      directory.mkdir(parents=True)
+                      (directory / 'test.log').write_text(error)
+                      if xml is not None:
+                          (directory / 'test.xml').write_bytes(xml.encode('utf-8'))
+                      record = {'file': '/workspace/source/test/registered/example.py', 'junit': 'test.xml', 'log': 'test.log', 'returncode': code, 'elapsed': 1.0, 'passed': code == 0, 'error': error}
+                      return record, directory
+
+                  def evidence(self):
+                      record, directory = self.fixture()
+                      entry = {'id': 'e000', 'suite': 'base-a-test-1-gpu-small', 'n_devices': 1, 'files': ['test/registered/example.py']}
+                      plan = {'sha': 'b' * 40, 'workflow_sha': env['WORKFLOW_SHA'], 'plan_hash': 'plan', 'run_id': 'contract', 'attempt': '1', 'entries': [entry], 'disabled': []}
+                      state = {'id': entry['id'], 'sha': plan['sha'], 'plan_hash': plan['plan_hash'], 'phase': 'complete', 'exit_code': 0}
+                      environment = {k: plan[k] for k in ('sha', 'workflow_sha', 'plan_hash', 'run_id', 'attempt')}
+                      environment.update(devices=['ZW-M890P'], reserved_devices=8, digest=env['PPU_BASE_IMAGE_DIGEST'], image=env['PPU_BASE_IMAGE_REF'])
+                      data = {'selected': [record['file']], 'files': [record], 'success': True, 'allowed_skips': []}
+                      save(directory / 'summary.json', data)
+                      save(directory.parent / 'environment.json', environment)
+                      save(directory.parent / 'worker.json', state)
+                      return plan, directory.parent, data, state
+
+                  def test_scope_coverage_and_partitions(self):
+                      tree = ast.parse((ROOT / 'test/run_suite.py').read_text())
+                      cuda_suites = {}
+                      for node in tree.body:
+                          if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id in ('PER_COMMIT_SUITES', 'NIGHTLY_SUITES'):
+                              for key, value in zip(node.value.keys, node.value.values):
+                                  if isinstance(key, ast.Attribute) and key.attr == 'CUDA':
+                                      cuda_suites[node.targets[0].id] = ast.literal_eval(value)
+                      expected_suites = {'base': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith(('base-a-test-', 'base-b-test-', 'base-c-test-'))}, 'extra': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('extra-')}, 'nightly': set(cuda_suites['NIGHTLY_SUITES'])}
+                      expected_suites['all'] = set().union(*expected_suites.values())
+                      for scope, suites in expected_suites.items():
+                          plan = make_plan(scope, '', 0, 1, hardware)
+                          expected = [r for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite in suites and not r.nightly]
+                          actual = [(e['suite'], f) for e in plan['entries'] for f in e['files']]
+                          self.assertEqual(Counter(actual), Counter((r.effective_suite, str(Path(r.filename).relative_to(ROOT))) for r in expected if r.disabled is None))
+                          self.assertEqual(len(plan['disabled']), sum(r.disabled is not None for r in expected))
+                          self.assertEqual({e['suite'] for e in plan['entries']}, {r.effective_suite for r in expected if r.disabled is None})
+                          for e in plan['entries']:
+                              self.assertTrue(e['files'])
+                              self.assertLessEqual(len(e['files']) * e['timeout'], hardware['test_budget_seconds'])
+                              selected = [r for r in expected if r.disabled is None and r.effective_suite == e['suite']]
+                              part = module.auto_partition(selected, e['partition_id'], e['partition_size'])
+                              self.assertEqual(e['files'], [str(Path(r.filename).relative_to(ROOT)) for r in part])
+                          print(f"{scope}: {len({e['suite'] for e in plan['entries']})} suites, {len(actual)} enabled registrations, {len(plan['disabled'])} disabled, {len(plan['entries'])} partitions")
+
+                  def test_inputs_and_zero_estimates(self):
+                      for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'base-b-kernel-unit-test-1-gpu-large', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 3), ('base', '', 0, True)]:
+                          with self.assertRaises(ValueError):
+                              make_plan(scope, suites, timeout, parallel, hardware)
+                      selected = make_plan('all', 'base-a-test-1-gpu-small', 600, 2, hardware)
+                      self.assertEqual({e['suite'] for e in selected['entries']}, {'base-a-test-1-gpu-small'})
+                      synthetic = [module.CIRegistry(module.HWBackend.CUDA, str(ROOT / f'test/registered/zero{i}.py'), 0, stage='base-a', runner_config='1-gpu-small') for i in range(20)]
+                      with patch.dict(globals(), registry=lambda: (module, synthetic)):
+                          with self.assertRaisesRegex(ValueError, 'nonempty bounded'):
+                              make_plan('base', '', 600, 1, hardware)
+
+                  def test_result_classes(self):
+                      cases = [('PASS', '<testcase/>', 0, ''), ('PASS_WITH_SKIPS', '<testcase/><testcase><skipped message="unsupported"/></testcase>', 0, ''), ('ALL_SKIPPED', '<testcase><skipped/></testcase>', 0, ''), ('ZERO_COLLECTED', '', 5, ''), ('FAIL', '<testcase><failure/></testcase>', 1, ''), ('FAIL', '<testcase><error/></testcase>', 1, ''), ('FAIL', '<testcase/><error/>', 1, ''), ('TIMEOUT', None, None, 'timed out after 600 seconds'), ('INFRA_MODEL', None, 1, 'LocalEntryNotFoundError'), ('OOM', None, 1, 'out of memory'), ('CRASH', None, 1, '')]
+                      for status, body, code, error in cases:
+                          record, directory = self.fixture(None if body is None else '<testsuite>' + body + '</testsuite>', code, error)
+                          self.assertEqual(classify(record, directory, runner)['auto_status'], status)
+                      self.assertEqual(classify(None, self.directory, runner)['auto_status'], 'NOT_EXECUTED')
+
+                  def test_reject_invalid_evidence(self):
+                      for xml in ['<!DOCTYPE x [<!ENTITY e "bad">]><testsuite/>', '\x00<testsuite/>', '<wrong/>', '<testsuite>', ' ' * (16 * 1024 * 1024 + 1)]:
+                          record, directory = self.fixture(xml)
+                          with self.assertRaises((ValueError, ET.ParseError)):
+                              classify(record, directory, runner)
+                      for mutation in [{'log': '../test.log'}, {'log': 'absent.log'}, {'elapsed': float('nan')}, {'passed': False}, {'error': 'interrupted'}]:
+                          record, directory = self.fixture()
+                          record.update(mutation)
+                          with self.assertRaises(ValueError):
+                              classify(record, directory, runner)
+
+                  def test_gather_and_aggregate(self):
+                      plan, source, data, state = self.evidence()
+                      with patch.dict(globals(), context=lambda: plan), contextlib.redirect_stdout(io.StringIO()):
+                          destination = self.directory / 'incoming' / 'good'
+                          self.assertEqual(gather('e000', source, destination), 0)
+                          self.assertEqual(aggregate(destination.parent, self.directory / 'summary'), 0)
+                          result = read(destination / 'result.json')
+                          for key, value in [('success', False), ('worker_outcome', 'failure'), ('image_digest', 'wrong'), ('attempt', '0'), ('rows', [])]:
+                              altered = {**result, key: value}
+                              save(destination / 'result.json', altered)
+                              self.assertEqual(aggregate(destination.parent, self.directory / 'summary'), 1)
+                          save(destination / 'result.json', result)
+                          save(destination.parent / 'duplicate/result.json', result)
+                          self.assertEqual(aggregate(destination.parent, self.directory / 'summary'), 1)
+                          self.assertEqual(aggregate(self.directory / 'missing', self.directory / 'summary'), 1)
+                          self.assertEqual(gather('e000', self.directory / 'absent', self.directory / 'absent-result'), 1)
+
+                  def test_worker_failures_and_selection_mismatch(self):
+                      for change in ('selected', 'duplicate', 'state', 'runner', 'image', 'skip'):
+                          plan, source, data, state = self.evidence()
+                          if change == 'selected':
+                              data['selected'] = []
+                          elif change == 'duplicate':
+                              data['files'] *= 2
+                          elif change == 'state':
+                              state['exit_code'] = 1
+                          elif change == 'runner':
+                              data['success'] = False
+                          elif change == 'image':
+                              environment = read(source / 'environment.json')
+                              environment['digest'] = 'wrong'
+                              save(source / 'environment.json', environment)
+                          else:
+                              (source / 'pytest/test.xml').write_text('<testsuite><testcase/><testcase><skipped/></testcase></testsuite>')
+                          save(source / 'pytest/summary.json', data)
+                          save(source / 'worker.json', state)
+                          with patch.dict(globals(), context=lambda: plan), contextlib.redirect_stdout(io.StringIO()):
+                              self.assertEqual(gather('e000', source, source.parent / 'result'), 1)
+
+                  def test_plan_identity(self):
+                      plan = make_plan('base', 'base-a-test-1-gpu-small', 600, 1, hardware)
+                      with patch.dict(globals(), BUNDLE=self.directory):
+                          save(BUNDLE / 'plan.json', plan)
+                          self.assertEqual(context(), plan)
+                          with patch.dict(os.environ, GITHUB_RUN_ATTEMPT='2'):
+                              with self.assertRaises(ValueError):
+                                  context()
+                          plan['parallel'] = 2
+                          save(BUNDLE / 'plan.json', plan)
+                          with self.assertRaises(ValueError):
+                              context()
+
+                  def test_cluster_capacity(self):
+                      node = {'metadata': {'name': 'board'}, 'status': {'allocatable': {'alibabacloud.com/ppu': '8'}, 'conditions': [{'type': 'Ready', 'status': 'True'}]}}
+                      pod = {'metadata': {'name': 'occupied'}, 'spec': {'nodeName': 'board', 'containers': [{'resources': {'requests': {'alibabacloud.com/ppu': '1'}}}]}}
+                      for pods, idle in [([], True), ([pod], False), ([{**pod, 'status': {'phase': 'Succeeded'}}], True)]:
+                          responses = [json.dumps({'items': [node]}), json.dumps({'items': pods})]
+                          with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=responses):
+                              if idle:
+                                  cluster_check(self.directory / 'cluster.json')
+                              else:
+                                  with self.assertRaises(ValueError):
+                                      cluster_check(self.directory / 'cluster.json')
+
+              with patch.dict(os.environ, env), patch.dict(globals(), registry=lambda: (module, registrations)):
+                  result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Contracts))
+              return 0 if result.wasSuccessful() else 1
+
+          if __name__ == '__main__':
+              parser = argparse.ArgumentParser()
+              parser.add_argument('mode', choices=['plan', 'cluster', 'worker', 'gather', 'aggregate', 'selftest'])
+              parser.add_argument('--entry')
+              parser.add_argument('--source')
+              parser.add_argument('--destination')
+              args = parser.parse_args()
+              if args.mode == 'selftest':
+                  sys.exit(selftest())
+              elif args.mode == 'plan':
+                  plan_command()
+              elif args.mode == 'cluster':
+                  cluster_check(args.destination)
+              elif args.mode == 'worker':
+                  sys.exit(worker(args.entry))
+              elif args.mode == 'gather':
+                  sys.exit(gather(args.entry, args.source, args.destination))
+              else:
+                  sys.exit(aggregate(args.source, args.destination))
+          PY
+          cat > .ppu-sweep/install.sh <<'SH'
+          set -euo pipefail
+          export GITHUB_WORKSPACE=/workspace/source
+          export PYTHONPATH="/workspace/source/python:/workspace/source/test${PYTHONPATH:+:$PYTHONPATH}"
+          export PPU_INSTALL_PROFILE=nightly
+          export PIP_CACHE_DIR=/ppu-sweep-cache/pip
+          export SGL_KERNEL_WHEEL_CACHE_DIR=/ppu-sweep-cache/aot/ZW-M890P
+          bash scripts/ci/ppu/ppu_install_dependency.sh
+          python3 -m pip install pytest==8.3.5 tabulate
+          SH
+          cat > .ppu-sweep/worker.sh <<'SH'
+          set -euo pipefail
+          cd /workspace/source
+          export PYTHONPATH="$PWD/python:$PWD/test${PYTHONPATH:+:$PYTHONPATH}"
+          export SGLANG_TEST_MAX_RETRY=0 SGLANG_IS_IN_CI=true
+          export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
+          export NCCL_NVLS_ENABLE=0 SGLANG_JIT_DEEPGEMM_FAST_WARMUP=true
+          export GLOO_SOCKET_IFNAME=lo
+          export PCCL_MNNVL_ENABLE=0 SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=0
+          export TVM_FFI_CACHE_DIR=/tmp/ppu-sweep-tvm-ffi
+          export SGLANG_JIT_CACHE_DIR=/tmp/ppu-sweep-jit
+          export DG_JIT_CACHE_DIR=/tmp/ppu-sweep-deep-gemm
+          export GITHUB_STEP_SUMMARY="$PPU_EVIDENCE_DIR/test-summary.log"
+          python3 .ppu-sweep/sweep.py worker --entry "$SWEEP_ENTRY"
+          SH
+      - name: Verify sweep contracts without PPU allocation
+        run: python3 .ppu-sweep/sweep.py selftest
+      - name: Generate expected files and bounded matrix
+        id: plan
+        env:
+          SCOPE: ${{ inputs.scope }}
+          SUITES: ${{ inputs.suites }}
+          FILE_TIMEOUT: ${{ inputs.timeout_per_file }}
+          PARALLEL: ${{ inputs.max_parallel }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: python3 .ppu-sweep/sweep.py plan
+      - name: Inventory model references without downloading
+        run: python3 scripts/ci/list_stage_models.py --backend cuda --commit "$(git rev-parse HEAD)" --output .ppu-sweep/models.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ppu-sweep/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+  sweep-image:
+    needs: sweep-prepare
+    if: ${{ !inputs.plan_only }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 10
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sweep-prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Resolve one immutable image for the entire run
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Require immutable image identity
+        id: image
+        run: |
+          [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$PPU_BASE_IMAGE_REF" == *"@$PPU_BASE_IMAGE_DIGEST" ]]
+          printf 'image=%s\ndigest=%s\n' "$PPU_BASE_IMAGE_REF" "$PPU_BASE_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+
+  sweep-execute:
+    needs: [sweep-prepare, sweep-image]
+    if: ${{ !inputs.plan_only }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.sweep-prepare.outputs.parallel) }}
+      matrix: ${{ fromJSON(needs.sweep-prepare.outputs.matrix) }}
+    name: sweep-890p-${{ matrix.id }}-${{ matrix.suite }}-p${{ matrix.partition_id }}
+    env:
+      SWEEP_ENTRY: ${{ matrix.id }}
+      PPU_BASE_IMAGE_REF: ${{ needs.sweep-image.outputs.image }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.sweep-image.outputs.digest }}
+      EVIDENCE_SOURCE: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}
+    steps:
+      - name: Set runner-local result directory
+        run: printf 'RESULT_DIR=%s/ppu-sweep/%s\n' "$RUNNER_TEMP" "$SWEEP_ENTRY" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sweep-prepare.outputs.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ppu-sweep
+      - name: Check idle capacity and prepare evidence
+        run: |
+          [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$PPU_BASE_IMAGE_REF" == *"@$PPU_BASE_IMAGE_DIGEST" ]]
+          mkdir -p "$RESULT_DIR"
+          python3 .ppu-sweep/sweep.py cluster --destination "$RESULT_DIR/cluster.json"
+          test ! -e "$EVIDENCE_SOURCE"
+          mkdir -p "$EVIDENCE_SOURCE"
+      - name: Execute CUDA registrations on an exclusive 890P board
+        id: worker
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: sweep-${{ matrix.id }}
+          command: bash /workspace/source/.ppu-sweep/worker.sh
+          host_volumes: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}:/ppu-evidence,/wl_nas/pr-ci/sweep-cache/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}:/ppu-sweep-cache
+          extra_env: "SWEEP_ENTRY=${{ matrix.id }},PPU_EVIDENCE_DIR=/ppu-evidence,GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_SUPPORTS_FP8=0,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PIP_INDEX_URL=https://pypi.org/simple"
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 300
+          cleanup_policy: always
+      - name: Export sanitized evidence and account for every selected file
+        if: always()
+        env:
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
           PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
           PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              git config --global --add safe.directory /workspace && \
-              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
-              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/kernels/jit -type f -exec touch -d @\$JIT_MTIME {} + && echo \"Pinned JIT source mtimes to HEAD commit @\$JIT_MTIME so ninja reuses the NAS-persisted JIT cache across runs (a fresh checkout otherwise resets mtimes and forces a full recompile every night)\" || echo 'Skipped JIT mtime pinning (git unavailable); JIT will recompile'; } && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 0 --auto-partition-size 2
-            "
-
-  nightly-1b-ppu:
-    needs: [nightly-1a-ppu]
-    if: always()
-    runs-on: ppu
-    # Higher than the other 1-GPU job: this partition owns test_marlin_moe, whose JIT
-    # preload can cost ~18min on a cache miss. Sized so that even the worst case
-    # (preload burns its 1500s cap AND marlin then hits its own 1200s watchdog) still
-    # fits, instead of overrunning the step and failing all 67 tests in the partition.
-    timeout-minutes: 135
-    steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
+        run: python3 .ppu-sweep/sweep.py gather --entry "$SWEEP_ENTRY" --source "$EVIDENCE_SOURCE" --destination "$RESULT_DIR"
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          name: ppu-sweep-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+          path: ${{ env.RESULT_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
-
-      - name: Run PPU nightly tests (1-GPU, partition 2/2)
-        # 125 rather than 110: observed 95min warm-cache, and the worst case (1500s
-        # preload cap + marlin's own 1200s watchdog) needs ~122min. See the job-level
-        # timeout comment above.
-        #
-        # The Marlin preload below asks for two module variants, not four: v0.5.18
-        # widened that module's cache key from dtype alone to
-        # (dtype, is_ep, has_bias), so the single variant per dtype this preload
-        # used to cover is now specifically the non-EP, no-bias one. That is the
-        # variant test_fused_marlin_moe compiles, and preloading only it keeps the
-        # step inside the 1500s cap that the ~16min two-dtype measurement above was
-        # taken against. The EP variant test_fused_marlin_moe_expert_parallelism
-        # needs is compilation work that did not exist when this preload was
-        # written, and is left to that test's own budget.
-        timeout-minutes: 125
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              git config --global --add safe.directory /workspace && \
-              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
-              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/kernels/jit -type f -exec touch -d @\$JIT_MTIME {} + && echo \"Pinned JIT source mtimes to HEAD commit @\$JIT_MTIME so ninja reuses the NAS-persisted JIT cache across runs (a fresh checkout otherwise resets mtimes and forces a full recompile every night)\" || echo 'Skipped JIT mtime pinning (git unavailable); JIT will recompile'; } && \
-              echo 'Preloading Marlin JIT outside the per-test watchdog (instant on a NAS cache hit; ~16min two-dtype ppu-llc compile on a miss, which would otherwise eat most of test_marlin_moe 1200s budget)...' && \
-              { timeout -k 30 1500 python3 -c 'import torch; from sglang.kernels.ops.moe.moe_wna16_marlin import _jit_moe_wna16_marlin_module; _jit_moe_wna16_marlin_module(torch.float16, False, False); _jit_moe_wna16_marlin_module(torch.bfloat16, False, False); print(\"Marlin JIT ready\")' || echo 'Marlin JIT preload did not finish; test_marlin_moe may hit its own 1200s timeout'; } && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --continue-on-error --auto-partition-id 1 --auto-partition-size 2
-            "
-
-  nightly-2-ppu:
-    needs: [nightly-1b-ppu]
-    if: always()
-    runs-on: ppu
-    timeout-minutes: 150
+  sweep-summarize:
+    needs: [sweep-prepare, sweep-image, sweep-execute]
+    if: always() && !inputs.plan_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
-
-      - name: Run 2-GPU PPU nightly tests
-        timeout-minutes: 140
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0,1 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --continue-on-error
-            "
-
-  nightly-4-ppu:
-    needs: [nightly-2-ppu]
-    if: always()
-    runs-on: ppu
-    timeout-minutes: 180
-    steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
-
-      - name: Run 4-GPU PPU nightly tests
-        timeout-minutes: 170
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --continue-on-error
-            "
-
-  nightly-8-ppu:
-    needs: [nightly-4-ppu]
-    if: always()
-    runs-on: ppu
-    timeout-minutes: 300
-    steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
+          name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ppu-sweep
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct
-
-      - name: Run 8-GPU PPU nightly tests
-        timeout-minutes: 280
+          pattern: ppu-sweep-result-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: incoming
+      - name: Reject missing or failed entries
+        if: always()
         env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-8-ppu --nightly --continue-on-error
-            "
-
-  nightly-test-ppu-finish:
-    needs: [nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu, nightly-8-ppu]
-    if: always()
-    runs-on: ppu
-    steps:
-      - name: Check all dependent job statuses
-        env:
-          NEEDS_JSON: ${{ toJson(needs) }}
-        run: |
-          python3 -c "
-          import json, sys, os
-          needs = json.loads(os.environ['NEEDS_JSON'])
-          failed = []
-          for job, info in needs.items():
-              result = info.get('result', 'unknown')
-              print(f'{job}: {result}')
-              if result not in ('success', 'skipped'):
-                  failed.append(f'{job} ({result})')
-          if failed:
-              sep = ','
-              print(f'Failed jobs: {sep.join(failed)}')
-              sys.exit(1)
-          print('All jobs completed successfully')
-          "
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          PPU_BASE_IMAGE_DIGEST: ${{ needs.sweep-image.outputs.digest }}
+        run: python3 .ppu-sweep/sweep.py aggregate --source incoming --destination sweep-summary
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-sweep-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sweep-summary/
+          if-no-files-found: error
+          retention-days: 30
