@@ -72,7 +72,7 @@ def _allocate_eager_plan_workspace(
     device: torch.device,
 ) -> torch.Tensor:
     """Allocate a persistent eager-plan workspace sized from real Q segments."""
-    import fmha_sm100.api as msa_api
+    import fmha_ppu.api as msa_api
 
     batch_size = qo_lens.numel()
     assert batch_size > 0
@@ -117,7 +117,7 @@ def _allocate_eager_plan_workspace(
 
 
 class _LockedJITEntry:
-    """fmha_sm100 JIT wrapper with per-process memo + cross-process file lock."""
+    """fmha_ppu JIT wrapper with per-process memo + cross-process file lock."""
 
     def __init__(
         self,
@@ -200,17 +200,17 @@ _JIT_MODULE_ENTRIES: Tuple[Tuple[str, str], ...] = (
 
 
 def install_msa_jit_cross_process_lock() -> bool:
-    """Serialize fmha_sm100 JIT builds across TP worker processes. Idempotent."""
+    """Serialize fmha_ppu JIT builds across TP worker processes. Idempotent."""
     global _jit_lock_installed
     if _jit_lock_installed:
         return True
     try:
-        import fmha_sm100.api as msa_api
-        import fmha_sm100.jit as msa_jit
+        import fmha_ppu.api as msa_api
+        import fmha_ppu.jit as msa_jit
     except Exception as err:
         logger.warning(
             "[MiniMaxSparse][SAIL MSA] cannot install the cross-process JIT lock "
-            "(fmha_sm100 import failed: %s).",
+            "(fmha_ppu import failed: %s).",
             err,
         )
         return False
@@ -264,37 +264,37 @@ def install_msa_jit_cross_process_lock() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def ppu_msa_available() -> bool:
-    """True iff the fmha_sm100 package (ppu_dev) exposes the graph-safe API.
+    """True if the fmha_ppu package (ppu_dev) exposes the graph-safe API.
 
-    Probes the *internal* planner signature (the public ``fmha_sm100_plan``
+    Probes the *internal* planner signature (the public ``fmha_ppu_plan``
     only forwards ``**kwargs``) for the graph-safe arguments this module
-    relies on, so a drifted fmha_sm100 build disables the path instead of
+    relies on, so a drifted fmha_ppu build disables the path instead of
     failing mid-serving.
     """
     if not _HAS_TRITON:
         return False
     try:
-        from fmha_sm100 import (
+        from fmha_ppu import (
             allocate_graph_workspace,
-            fmha_sm100,
-            fmha_sm100_plan,
+            fmha_ppu,
+            fmha_ppu_plan,
             sparse_topk_select,
         )
     except Exception:
         return False
     if not (
-        callable(fmha_sm100)
-        and callable(fmha_sm100_plan)
+        callable(fmha_ppu)
+        and callable(fmha_ppu_plan)
         and callable(sparse_topk_select)
         and callable(allocate_graph_workspace)
     ):
         return False
     try:
-        from fmha_sm100.api import (
+        from fmha_ppu.api import (
             _compute_pack_factor,
             _detect_paged_kv_layout,
-            _fmha_sm100,
-            _fmha_sm100_plan,
+            _fmha_ppu,
+            _fmha_ppu_plan,
             _get_fmha_qotile_and_occupancy,
             _get_indexer_qotile_and_occupancy,
             _get_num_cta,
@@ -311,7 +311,7 @@ def ppu_msa_available() -> bool:
         )
         if not all(callable(helper) for helper in required_helpers):
             return False
-        plan_params = set(inspect.signature(_fmha_sm100_plan).parameters)
+        plan_params = set(inspect.signature(_fmha_ppu_plan).parameters)
         need = {
             "graph_safe",
             "given_workspace",
@@ -324,7 +324,7 @@ def ppu_msa_available() -> bool:
         if not need <= plan_params:
             return False
         # Need fp8 Q/K OnlyScore and bf16 max_score support.
-        if "max_score_dtype" not in inspect.signature(_fmha_sm100).parameters:
+        if "max_score_dtype" not in inspect.signature(_fmha_ppu).parameters:
             return False
         select_params = set(inspect.signature(sparse_topk_select).parameters)
         if not {"num_valid_pages", "output"} <= select_params:
@@ -606,7 +606,7 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
     Plan-kernel count per forward: exactly one indexer (OnlyScore) plan and
     one attend (sparse) plan.
     """
-    from fmha_sm100 import fmha_sm100_plan
+    from fmha_ppu import fmha_ppu_plan
 
     device = st.kv_buf.device
     qo_lens = st.qo_buf[:bs]
@@ -638,7 +638,7 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
     )
 
     shared = backend._ppu_msa_shared
-    st.indexer_plan = fmha_sm100_plan(
+    st.indexer_plan = fmha_ppu_plan(
         qo_lens,
         kv_lens,
         backend._ppu_msa_num_idx_heads,
@@ -656,7 +656,7 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
         device=device,
     )
     if backend._ppu_msa_attend:
-        st.attend_plan = fmha_sm100_plan(
+        st.attend_plan = fmha_ppu_plan(
             qo_lens,
             kv_lens,
             backend._ppu_msa_num_q_heads,
@@ -701,7 +701,7 @@ def _decode_attend_triton(
 
 def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
     """Run one sparse layer's indexer and optional direct NHD attend."""
-    from fmha_sm100 import fmha_sm100, sparse_topk_select
+    from fmha_ppu import fmha_ppu, sparse_topk_select
 
     kv_indices = st.kv_indices
     max_score = st.max_score_active
@@ -710,7 +710,7 @@ def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
         # fp8 indexer: idx_k_cache is already an e4m3 pool; stage idx_q
         # through the fixed-address fp8 buffer (graph-safe cast).
         idx_q = st.idx_q_fp8[:bs].copy_(idx_q)
-    fmha_sm100(
+    fmha_ppu(
         idx_q,
         idx_k_paged,
         idx_k_paged,
@@ -736,7 +736,7 @@ def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
     if backend._ppu_msa_use_fp8_kvcache:
         attend_q = st.attend_q_fp8[:bs].copy_(q)
     out = st.out_buf[:bs].contiguous()
-    fmha_sm100(
+    fmha_ppu(
         attend_q,
         _paged_nhd_view(k_cache),
         _paged_nhd_view(v_cache),
@@ -805,7 +805,7 @@ def _extend_build(
     if bs == 0:
         raise ValueError("SAIL MSA prefill planning requires a non-empty batch")
 
-    from fmha_sm100 import fmha_sm100_plan
+    from fmha_ppu import fmha_ppu_plan
 
     if extend_seq_lens_cpu is not None:
         ext_list = [int(x) for x in extend_seq_lens_cpu]
@@ -904,7 +904,7 @@ def _extend_build(
             use_fp8_kvcache=False,
             device=device,
         )
-        chunk["plan"] = fmha_sm100_plan(
+        chunk["plan"] = fmha_ppu_plan(
             chunk["qo_lens_cpu"],
             chunk["kv_lens_cpu"],
             h_idx,
@@ -936,7 +936,7 @@ def _extend_build(
             use_fp8_kvcache=backend._ppu_msa_use_fp8_kvcache,
             device=device,
         )
-        attend_plan = fmha_sm100_plan(
+        attend_plan = fmha_ppu_plan(
             attend_qo_lens,
             torch.tensor(kv_list, dtype=torch.int32),
             backend._ppu_msa_num_q_heads,
@@ -1041,7 +1041,7 @@ def msa_ppu_forward_extend(
     layer_id: int,
 ):
     """SAIL MSA prefill entry. Returns (None, out)."""
-    from fmha_sm100 import fmha_sm100, sparse_topk_select
+    from fmha_ppu import fmha_ppu, sparse_topk_select
 
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
@@ -1088,7 +1088,7 @@ def msa_ppu_forward_extend(
         if backend._ppu_msa_indexer_fp8:
             # Eager prefill fp8 cast (MSA fp8 OnlyScore uses scale 1.0).
             idx_q_ch = idx_q_ch.to(torch.float8_e4m3fn)
-        fmha_sm100(
+        fmha_ppu(
             idx_q_ch,
             idx_k_paged,
             idx_k_paged,
@@ -1129,7 +1129,7 @@ def msa_ppu_forward_extend(
     if backend._ppu_msa_use_fp8_kvcache:
         attend_q = state["attend_q_fp8"].copy_(q)
     out = state["out_buf"]
-    fmha_sm100(
+    fmha_ppu(
         attend_q,
         _paged_nhd_view(k_cache),
         _paged_nhd_view(v_cache),
@@ -1196,7 +1196,7 @@ def _msa_ppu_config_reason(
     if not envs.SGLANG_SAIL_MINIMAX_M3_MSA.get():
         return "SGLANG_SAIL_MINIMAX_M3_MSA=0"
     if not ppu_msa_available():
-        return "fmha_sm100 unavailable or API drifted"
+        return "fmha_ppu unavailable or API drifted"
     if block_size_k != _PAGE_SIZE:
         return "block_size_k!=128"
     if page_size != _PAGE_SIZE:
@@ -1328,7 +1328,7 @@ class _PpuMsaSharedState:
     """Backend-level buffers shared by decode (graph + eager) and prefill."""
 
     def __init__(self, backend):
-        from fmha_sm100 import allocate_graph_workspace
+        from fmha_ppu import allocate_graph_workspace
 
         device = backend.kv_pool.main_pool.device
         max_bs = backend._ppu_msa_max_bs
@@ -1379,7 +1379,7 @@ def msa_ppu_warmup(backend) -> None:
     """Pre-capture warmup: JIT-compile MSA variants and pre-grow workspaces."""
     from types import SimpleNamespace
 
-    from fmha_sm100 import sparse_topk_select
+    from fmha_ppu import sparse_topk_select
 
     device = backend.kv_pool.main_pool.device
     q_dtype = backend._ppu_msa_q_dtype

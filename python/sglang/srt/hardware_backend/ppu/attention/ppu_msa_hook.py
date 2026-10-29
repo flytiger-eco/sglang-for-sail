@@ -1,7 +1,7 @@
 """PPU MiniMax-M3 SAIL MSA backend hooks.
 
 Uses ``@plugin_hook`` to inject the PPU SAIL MSA sparse-attention path
-(fmha_sm100 OnlyScore indexer + sparse top-k selection + optional direct
+(fmha_ppu OnlyScore indexer + sparse top-k selection + optional direct
 paged-NHD attend, implemented in ``minimax_sparse_ops.msa_ppu``) into the
 MiniMax-M3 sparse attention stack without modifying the community source
 code in ``minimax_sparse_backend.py`` / ``minimax_sparse.py``.
@@ -9,7 +9,7 @@ code in ``minimax_sparse_backend.py`` / ``minimax_sparse.py``.
 Registered hooks:
 
 1. ``MiniMaxSparseAttnBackend.__init__`` (AROUND) — Rejects HND KV caches,
-   evaluates the SAIL MSA routing gate, installs the cross-process fmha_sm100
+   evaluates the SAIL MSA routing gate, installs the cross-process fmha_ppu
    JIT lock, allocates the shared decode/prefill state, runs the pre-capture
    warmup, enforces the fp8 index-cache consistency guard, and registers the
    backend (keyed by its ``req_to_token`` tensor) for the module-level
@@ -90,7 +90,7 @@ def _reject_fp8_index_cache(idx_k_cache, path: str) -> None:
 
 
 def _init_ppu_msa(backend, runner) -> None:
-    """Attach the SAIL MSA (PPU fmha_sm100) state to a sparse backend."""
+    """Attach the SAIL MSA (PPU fmha_ppu) state to a sparse backend."""
     if backend.kv_pool.main_pool.use_hnd:
         raise NotImplementedError(
             "MiniMax-M3 sparse attention does not support HND KV cache. "
@@ -116,7 +116,7 @@ def _init_ppu_msa(backend, runner) -> None:
     backend.num_kv_heads = backend.kv_pool.main_pool.head_num
 
     # PPU (SM80) MSA path: indexer + selection (+ optional direct NHD attend)
-    # via the ppu_dev fmha_sm100 kernels. Independent of the B200 gate in the
+    # via the ppu_dev fmha_ppu kernels. Independent of the B200 gate in the
     # backend (msa_available() requires SM100); the Triton path remains the
     # fallback.
     try:
