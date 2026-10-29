@@ -43,6 +43,25 @@ if SGLANG_PROFILE_NVTX:
         SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
 
 
+def validate_dense_fp8_config(
+    dtype, head_dim, head_dim_v, page_size, device, dcp_size=1
+):
+    """Check the actual PPU library's dense Q8KV8 contract, including auto dtype."""
+    if dtype != torch.float8_e4m3fn:
+        raise ValueError("PPU FlashMLA dense FP8 requires E4M3 Q and KV cache.")
+    major, minor = torch.cuda.get_device_capability(device)
+    # The library checks major == 8 even though its FP8 helper is named
+    # is_sm89_or_newer. Do not assume V900/SM90 support.
+    if major != 8 or minor < 9:
+        raise ValueError("PPU FlashMLA dense FP8 requires an SM89 device.")
+    if head_dim != 576 or head_dim_v != 512:
+        raise ValueError("PPU FlashMLA dense FP8 requires Q/K dim 576 and V dim 512.")
+    if page_size % 64:
+        raise ValueError("PPU FlashMLA dense FP8 requires page size divisible by 64.")
+    if dcp_size != 1:
+        raise ValueError("PPU FlashMLA FP8 KV cache does not support DCP.")
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,
@@ -65,11 +84,6 @@ def get_mla_metadata(
 
     assert num_q_tokens_per_head_k is not None
     assert num_heads_k is not None
-
-    if is_fp8_kvcache and topk is None:
-        raise NotImplementedError(
-            "FlashMLA dense FP8 get_mla_metadata is not supported on PPU."
-        )
 
     return _flashmla.get_mla_metadata(
         cache_seqlens,
@@ -103,10 +117,9 @@ def flash_mla_with_kvcache(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run FlashMLA decode attention on PPU.
 
-    Dense FP8 (``indices is None and q.element_size() == 1``) is not
-    supported on PPU and will raise ``NotImplementedError``.
-
-    All other cases delegate to ``flash_mla.flash_mla_with_kvcache``.
+    Dense FP8 uses unscaled E4M3 Q and KV, with BF16 output. Sparse FP8
+    uses BF16 Q and the library's packed KV layout. Metadata is generated
+    lazily by FlashMLA 2.1+.
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
@@ -115,9 +128,18 @@ def flash_mla_with_kvcache(
         softmax_scale = q.shape[-1] ** (-0.5)
 
     if indices is None and q.element_size() == 1:
-        raise NotImplementedError(
-            "FlashMLA dense FP8 with kvcache is not supported on PPU."
+        if k_cache.dtype != q.dtype or k_cache.shape[-1] != q.shape[-1]:
+            raise ValueError(
+                "PPU FlashMLA dense FP8 requires matching Q/KV dtype and dim."
+            )
+        validate_dense_fp8_config(
+            q.dtype, q.shape[-1], head_dim_v, k_cache.shape[1], q.device
         )
+        if descale_q is not None or descale_k is not None:
+            raise ValueError(
+                "PPU FlashMLA dense FP8 requires unscaled Q/KV; "
+                "descale_q/descale_k are not supported."
+            )
 
     nvtx_pushed = SGLANG_PROFILE_NVTX and num_splits is not None
     if nvtx_pushed:

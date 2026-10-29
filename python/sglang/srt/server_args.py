@@ -6148,27 +6148,12 @@ class ServerArgs:
                 )
                 self.prefill_attention_backend = "flashmla"
 
-        # [fp8-kv-cache fallback] On PPU, flashmla/flashmla_sparse do not support
-        # fp8_e4m3 kv-cache; disable fp8 kv-cache and keep backend unchanged.
-        if is_ppu() and self.kv_cache_dtype == "fp8_e4m3":
-            if (
-                self.decode_attention_backend == "flashmla"
-                or self.dsa_prefill_backend == "flashmla_sparse"
-            ):
-                _incompatible = []
-                if self.decode_attention_backend == "flashmla":
-                    _incompatible.append("--decode-attention-backend flashmla")
-                if self.dsa_prefill_backend == "flashmla_sparse":
-                    _incompatible.append("--dsa-prefill-backend flashmla_sparse")
-                logger.warning(
-                    f"On PPU, {' and '.join(_incompatible)} does not support "
-                    "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
-                    "(falling back to --kv-cache-dtype auto)."
-                )
-                self.kv_cache_dtype = "auto"
-
-        # Split-backend override + default fill.
+        # Resolve backends before validating the PPU FP8 cache contract. Dense
+        # FlashMLA supports Q8KV8; sparse prefill can dequantize a packed cache.
         run_post_process_pass(self, _attention_backend_default)
+        from sglang.srt.arg_groups.overrides import _ppu_flashmla_kv_cache_checks
+
+        run_post_process_pass(self, _ppu_flashmla_kv_cache_checks)
 
         # Torch native and flex attention backends
         attention_backend = resolved_view(self).attention_backend

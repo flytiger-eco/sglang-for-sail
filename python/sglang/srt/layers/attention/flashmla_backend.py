@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttn
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.utils import is_ppu
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         # get dcp info
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+
+        if is_ppu() and self.is_fp8_kvcache:
+            from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+                validate_dense_fp8_config,
+            )
+
+            validate_dense_fp8_config(
+                self.data_type,
+                self.kv_cache_dim,
+                self.kv_lora_rank,
+                PAGE_SIZE,
+                model_runner.device,
+                self.dcp_world_size,
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -401,6 +416,18 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _prepare_fp8_query(self, q, layer):
+        if is_ppu():
+            # MLA pool writes raw E4M3 (including RoPE). PPU FlashMLA has no
+            # descale arguments: use the same unit scale for Q and KV.
+            return q.to(torch.float8_e4m3fn), None, None
+        if layer.k_scale is not None:
+            q_scale = layer.k_scale
+        else:
+            q_scale = torch.ones((1,), dtype=torch.float32, device=q.device)
+        q_fp8, _ = scaled_fp8_quant(q.reshape(-1, q.shape[-1]), q_scale)
+        return q_fp8.reshape(q.shape), q_scale.reshape(1), q_scale.reshape(1)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -466,23 +493,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             assert (
                 self.dcp_world_size == 1
             ), "FlashMLA does not support DCP for FP8 kv cache"
-            if layer.k_scale is not None:
-                q_scale = layer.k_scale
-                descale_q = layer.k_scale.reshape(1)
-                descale_k = layer.k_scale.reshape(1)
-            else:
-                q_scale = torch.ones((1,), dtype=torch.float32, device=reshape_q.device)
-                descale_q = torch.ones(
-                    (1,), dtype=torch.float32, device=reshape_q.device
-                )
-                descale_k = torch.ones(
-                    (1,), dtype=torch.float32, device=reshape_q.device
-                )
-
-            q_shape = reshape_q.shape
-            reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
-            reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
-            reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
+            reshape_q_fp8, descale_q, descale_k = self._prepare_fp8_query(
+                reshape_q, layer
+            )
             o, _ = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
@@ -617,25 +630,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 cache_seqlens = forward_batch.seq_lens[:eff_bs].to(torch.int32)
 
             if self.is_fp8_kvcache:
-                if layer.k_scale is not None:
-                    q_scale = layer.k_scale
-                    descale_q = layer.k_scale.reshape(1)
-                    descale_k = layer.k_scale.reshape(1)
-                else:
-                    q_scale = torch.ones(
-                        (1,), dtype=torch.float32, device=reshape_q.device
-                    )
-                    descale_q = torch.ones(
-                        (1,), dtype=torch.float32, device=reshape_q.device
-                    )
-                    descale_k = torch.ones(
-                        (1,), dtype=torch.float32, device=reshape_q.device
-                    )
-
-                q_shape = reshape_q.shape
-                reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
-                reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
-                reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
+                reshape_q_fp8, descale_q, descale_k = self._prepare_fp8_query(
+                    reshape_q, layer
+                )
                 o, _ = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
