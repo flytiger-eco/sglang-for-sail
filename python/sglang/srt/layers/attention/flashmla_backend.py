@@ -563,7 +563,16 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         k_rope: Optional[torch.Tensor] = None,
     ):
         if forward_batch.forward_mode == ForwardMode.EXTEND:
-            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+            )
         else:
             # target_verify / draft_extend_v2: fixed-q decode-style kernel.
             cache_loc = forward_batch.out_cache_loc
