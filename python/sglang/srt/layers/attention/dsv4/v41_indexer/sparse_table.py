@@ -102,14 +102,12 @@ class SparseTableBackend:
         self,
         *,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        req_to_token: torch.Tensor,
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
         self.alt_stream = torch.cuda.Stream()
@@ -119,7 +117,7 @@ class SparseTableBackend:
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(
@@ -149,7 +147,7 @@ class SparseTableBackend:
         published: Optional[_SparsePrefillTable],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -173,12 +171,13 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
+        q, lens, table = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
+            q,
             data.k_cache,
             data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
+            lens,
+            table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
         )
@@ -239,12 +238,13 @@ class SparseTableBackend:
         phys_block_chunks = []
         valid_len_chunks = []
         for rows, plan in metadata.row_chunks():
+            q, lens, table = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
-                (data.q_fp4[rows], data.q_sf[rows]),
+                q,
                 data.k_cache,
                 data.weights[rows],
-                metadata.compressed_seq_lens[rows],
-                metadata.page_table[rows],
+                lens,
+                table,
                 plan,
                 metadata.max_compressed_seq_len,
             )
