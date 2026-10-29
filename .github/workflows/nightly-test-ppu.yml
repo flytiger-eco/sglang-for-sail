@@ -218,7 +218,7 @@ jobs:
               kubectl = shutil.which('kubectl') or ('/opt/bin/kubectl' if Path('/opt/bin/kubectl').is_file() else None)
               require(kubectl, 'Cannot inspect cluster occupancy: kubectl unavailable')
               def query(*args):
-                  return json.loads(subprocess.check_output([kubectl, *args, '--request-timeout=15s', '-o', 'json'], text=True, timeout=25))['items']
+                  return json.loads(subprocess.check_output([kubectl, *args, '-o', 'json'], text=True, timeout=25))['items']
               nodes = query('get', 'nodes', '-l', 'board-type=ZW-M890P')
               pods = query('get', 'pods', '-A')
               occupied = set()
@@ -588,12 +588,16 @@ jobs:
                       pod = {'metadata': {'name': 'occupied'}, 'spec': {'nodeName': 'board', 'containers': [{'resources': {'requests': {'alibabacloud.com/ppu': '1'}}}]}}
                       for pods, idle in [([], True), ([pod], False), ([{**pod, 'status': {'phase': 'Succeeded'}}], True)]:
                           responses = [json.dumps({'items': [node]}), json.dumps({'items': pods})]
-                          with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=responses):
+                          with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=responses) as query:
                               if idle:
                                   cluster_check(self.directory / 'cluster.json')
                               else:
                                   with self.assertRaises(ValueError):
                                       cluster_check(self.directory / 'cluster.json')
+                              self.assertEqual(query.call_count, 2)
+                              for call in query.call_args_list:
+                                  self.assertFalse(any(arg.startswith('--request-timeout') for arg in call.args[0]))
+                                  self.assertEqual(call.kwargs['timeout'], 25)
 
               with patch.dict(os.environ, env), patch.dict(globals(), registry=lambda: (module, registrations)):
                   result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Contracts))
