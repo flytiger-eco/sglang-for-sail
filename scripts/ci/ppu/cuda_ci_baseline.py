@@ -1342,7 +1342,8 @@ def probe_model_cache(model, cache_root):
         if broken or any(name.endswith((".incomplete", ".lock")) for name in files):
             raise ValueError("dangling, partial or non-regular snapshot payload")
         weights = [name for name in files if name.endswith((".safetensors", ".bin", ".pt", ".pth"))
-                   and not name.startswith(("optimizer", "training_args"))]
+                   and not name.startswith(("optimizer", "training_args"))
+                   and not re.fullmatch(r"rng_state(?:_\d+)?\.pth|scheduler\.pt", name)]
         weight_ok = bool(weights) and all(payload(name) for name in weights)
         for name in weights:
             match = re.search(r"-(\d+)-of-(\d+)(\.[^.]+)$", name)

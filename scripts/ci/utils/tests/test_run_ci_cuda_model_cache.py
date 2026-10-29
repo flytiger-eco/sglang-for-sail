@@ -127,6 +127,17 @@ class ModelCacheTests(unittest.TestCase):
                 config.write_text(json.dumps(value))
                 self.assertEqual(self.probe()["cache_status"], "incomplete")
 
+    def test_complete_adapter_ignores_trainer_state_payloads(self):
+        path = self.snapshot()
+        (path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "base_model_name_or_path": "Org/base"}))
+        (path / "adapter_model.safetensors").write_bytes(b"adapter")
+        for name in ("rng_state.pth", "rng_state_0.pth", "scheduler.pt"):
+            with self.subTest(training_state=name):
+                (path / name).write_bytes(b"training state")
+                self.assertEqual(self.probe()["cache_status"], "present")
+        (path / "model.safetensors").write_bytes(b"base")
+        self.assertEqual(self.probe()["cache_status"], "incomplete")
+
     def test_adapter_missing_shards_remain_incomplete(self):
         path = self.snapshot()
         (path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "base_model_name_or_path": "Org/base"}))
