@@ -1,0 +1,232 @@
+name: PPU CUDA sweep (manual evidence only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: Comma-separated CUDA suites; start with the four-file dry-run
+        type: string
+        required: true
+        default: base-a-test-1-gpu-small
+      partition_size:
+        description: LPT partitions per suite (use file count to isolate missing models)
+        type: number
+        required: true
+        default: 1
+      board:
+        description: Auto uses 890P; explicit 810E is for calibration or phase two
+        type: choice
+        options: [auto, 810E, 890P]
+        default: auto
+      timeout_per_file:
+        description: Seconds per file; 0 uses min(max(3 * max_est_time, 600), 3600)
+        type: number
+        default: 0
+      ref:
+        description: Full 40-character source commit SHA containing the sweep tools
+        type: string
+        required: true
+      max_parallel:
+        description: Maximum simultaneously requested PPU cards, not worker count
+        type: number
+        default: 24
+
+concurrency:
+  group: ppu-cuda-sweep
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
+
+jobs:
+  prepare:
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      max_jobs: ${{ steps.plan.outputs.max_jobs }}
+      has_workers: ${{ steps.plan.outputs.has_workers }}
+      plan_artifact: ${{ steps.plan.outputs.artifact_name }}
+      image_ref: ${{ env.PPU_BASE_IMAGE_REF }}
+      image_digest: ${{ env.PPU_BASE_IMAGE_DIGEST }}
+    steps:
+      - name: Validate frozen source
+        env:
+          SOURCE_SHA: ${{ inputs.ref }}
+        shell: bash
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo 'A full source SHA is required.' >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU report dependency
+        run: python3 -m pip install PyYAML==6.0.3
+      - name: Resolve immutable worker image
+        shell: bash
+        run: |
+          bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Check pinned image and cluster occupancy
+        shell: bash
+        run: |
+          [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ && "$PPU_BASE_IMAGE_REF" == *@"$PPU_BASE_IMAGE_DIGEST" ]]
+          if [[ -x /opt/bin/kubectl ]]; then
+            export PATH="/opt/bin:$PATH"
+          fi
+          command -v kubectl >/dev/null || { echo 'Mounted kubectl is unavailable.' >&2; exit 1; }
+          mkdir -p sweep-plan
+          kubectl get pods -n ppu-sched -o json | python3 -c '
+          import json, sys
+          from pathlib import Path
+          pods = json.load(sys.stdin)["items"]
+          busy = [p["metadata"]["name"] for p in pods
+                  if p.get("status", {}).get("phase") not in ("Succeeded", "Failed")
+                  and any(int(c.get("resources", {}).get("requests", {}).get("alibabacloud.com/ppu", 0))
+                          for c in p["spec"].get("containers", []))]
+          Path("sweep-plan/occupancy.json").write_text(json.dumps({"active_ppu_jobs": busy}))
+          if busy:
+              raise SystemExit("PPU jobs already active; defer sweep: " + ", ".join(busy))
+          '
+      - name: Plan partitions and read-only model preflight
+        id: plan
+        env:
+          SWEEP_SUITES: ${{ inputs.suites }}
+          SWEEP_PARTITIONS: ${{ inputs.partition_size }}
+          SWEEP_BOARD: ${{ inputs.board }}
+          SWEEP_TIMEOUT: ${{ inputs.timeout_per_file }}
+          SWEEP_MAX_PARALLEL: ${{ inputs.max_parallel }}
+          SWEEP_SHA: ${{ inputs.ref }}
+        shell: bash
+        run: |
+          python3 scripts/ci/ppu/cuda_ci_baseline.py --out-dir sweep-plan \
+            --sweep-plan --suites "$SWEEP_SUITES" --partition-size "$SWEEP_PARTITIONS" \
+            --board "$SWEEP_BOARD" --timeout-per-file "$SWEEP_TIMEOUT" \
+            --max-parallel "$SWEEP_MAX_PARALLEL" --ref "$SWEEP_SHA" \
+            --cache-root /nas_aisw/datasets/hf_cache/hub
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          plan = json.loads(Path('sweep-plan/sweep_plan.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(plan['matrix'], separators=(',', ':')) + '\n')
+              output.write('max_jobs=' + str(plan['max_jobs']) + '\n')
+              output.write('has_workers=' + str(bool(plan['matrix']['include'])).lower() + '\n')
+              output.write('artifact_name=ppu-cuda-sweep-plan-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT'] + '\n')
+          PY
+      - name: Upload preflight plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-cuda-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sweep-plan
+          if-no-files-found: error
+          retention-days: 14
+
+  sweep:
+    needs: prepare
+    if: needs.prepare.outputs.has_workers == 'true'
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.prepare.outputs.max_jobs) }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    timeout-minutes: ${{ matrix.job_minutes }}
+    env:
+      PPU_BASE_IMAGE_REF: ${{ needs.prepare.outputs.image_ref }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.prepare.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.plan_artifact }}
+          path: sweep-plan
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare isolated worker evidence
+        env:
+          SWEEP_KEY: ${{ matrix.key }}
+        shell: bash
+        run: |
+          mkdir -p "/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/sweep-$SWEEP_KEY"
+      - name: Execute CUDA registrations on PPU
+        id: worker
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: ${{ matrix.n_devices }}
+          node_selector: board-type=${{ matrix.node_selector }}
+          namespace: ppu-sched
+          job_suffix: sweep-${{ matrix.key }}
+          command: bash /workspace/source/scripts/ci/ppu/run_cuda_sweep.sh
+          host_volumes: /wl_nas/pr-ci/evidence/${{ github.run_id }}/${{ github.run_attempt }}/sweep-${{ matrix.key }}:/ppu-evidence,/wl_nas/pr-ci/cache/${{ github.run_id }}/sweep-${{ matrix.key }}:/ppu-pr-cache
+          extra_env: "PPU_EVIDENCE_DIR=/ppu-evidence,PPU_SWEEP_KEY=${{ matrix.key }},PPU_SWEEP_SUITE=${{ matrix.suite }},PPU_SWEEP_BOARD=${{ matrix.board }},PPU_SWEEP_N_DEVICES=${{ matrix.n_devices }},PPU_SWEEP_PARTITION_ID=${{ matrix.partition_id }},PPU_SWEEP_PARTITION_SIZE=${{ matrix.partition_size }},PPU_SWEEP_TIMEOUT=${{ matrix.timeout_per_file }},PPU_SWEEP_SHA=${{ inputs.ref }},PPU_SWEEP_RUN_ID=${{ github.run_id }},PPU_SWEEP_ATTEMPT=${{ github.run_attempt }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,HF_DATASETS_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_SUPPORTS_FP8=${{ matrix.ppu_supports_fp8 }}"
+          container_options: |
+            host_ipc: true
+            shm_size: 8Gi
+          timeout_minutes: ${{ matrix.timeout_minutes }}
+          cleanup_policy: always
+      - name: Export sanitized evidence
+        id: export
+        if: always()
+        env:
+          SWEEP_KEY: ${{ matrix.key }}
+        shell: bash
+        run: |
+          source="/wl_nas/pr-ci/evidence/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/sweep-$SWEEP_KEY"
+          directory="$(mktemp -d "$RUNNER_TEMP/ppu-sweep.XXXXXX")/sanitized"
+          python3 scripts/ci/ppu/pr_report.py export --directory "$source" --destination "$directory"
+          echo "artifact_directory=$directory" >> "$GITHUB_OUTPUT"
+          echo 'sanitized=true' >> "$GITHUB_OUTPUT"
+      - name: Upload per-file evidence
+        if: always() && steps.export.outputs.sanitized == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-cuda-sweep-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
+          path: ${{ steps.export.outputs.artifact_directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  report:
+    needs: [prepare, sweep]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install PyYAML==6.0.3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-cuda-sweep-*
+          path: sweep-artifacts
+      - name: Parse JUnit and join CUDA inventory
+        run: |
+          python3 scripts/ci/ppu/cuda_ci_baseline.py --out-dir sweep-report --sweep-results sweep-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ppu-cuda-parity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sweep-report
+          if-no-files-found: error
+          retention-days: 14

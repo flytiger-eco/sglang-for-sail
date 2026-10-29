@@ -254,6 +254,44 @@ class BaselineFixtures(unittest.TestCase):
                 self.assertEqual(entries[0]["reachable_from"], ["pr-test-ppu.yml"])
                 self.assertIn("run_pr_suite.sh", entries[0].get("script", ""))
 
+    def test_finite_matrix_lanes_expand_each_invocation(self):
+        self.workflow(
+            "pr-test-ppu.yml",
+            """
+            on: pull_request
+            jobs:
+              test:
+                runs-on: ppu
+                strategy:
+                  matrix:
+                    lane: [smoke, body]
+                steps:
+                  - run: bash scripts/ci/ppu/run_pr_suite.sh ${{ matrix.lane }}
+            """,
+        )
+        entries = [e for e in self.entries() if e["hw"] == "ppu"]
+        self.assertEqual(
+            {e["suite"] for e in entries},
+            {"stage-a-test-1-gpu-ppu", "stage-b-test-1-gpu-ppu"},
+        )
+
+    def test_unknown_pr_lane_is_reported_as_unresolved(self):
+        self.workflow(
+            "pr-test-ppu.yml",
+            """
+            on: workflow_dispatch
+            jobs:
+              test:
+                runs-on: ppu
+                steps:
+                  - run: bash scripts/ci/ppu/run_pr_suite.sh ${{ inputs.lane }}
+            """,
+        )
+        entries = [e for e in self.entries() if e["kind"] == "unresolved_registered"]
+        self.assertEqual(len(entries), 1)
+        self.assertIn("inputs.lane", entries[0]["invocation"])
+        self.assertEqual(entries[0]["reachable_from"], ["pr-test-ppu.yml"])
+
     def test_action_command_resolves_optional_kernel_as_conditional(self):
         self.workflow(
             "pr-test-ppu.yml",
@@ -412,6 +450,16 @@ class BaselineFixtures(unittest.TestCase):
 
 
 class RepositoryWorkflowContract(unittest.TestCase):
+    def test_actual_nightly_command_chains_retain_all_five_invocations(self):
+        workflows = {"nightly-test-ppu.yml": baseline.load_workflows()["nightly-test-ppu.yml"]}
+        entries = [e for e in baseline.scan_workflows(workflows, baseline.runner_configs()) if e["hw"] == "ppu"]
+        self.assertEqual(len(entries), 5)
+        self.assertEqual(
+            [e["suite"] for e in entries],
+            ["nightly-1-ppu", "nightly-1-ppu", "nightly-2-ppu", "nightly-4-ppu", "nightly-8-ppu"],
+        )
+        self.assertTrue(all(e["reachable_from"] == ["nightly-test-ppu.yml"] for e in entries))
+
     def test_all_five_nightly_ppu_calls_require_nonempty(self):
         with mock.patch.object(
             baseline, "WORKFLOW_DIR", str(ROOT / ".github/workflows")
