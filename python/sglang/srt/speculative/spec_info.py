@@ -141,6 +141,8 @@ class SpeculativeAlgorithm(Enum):
         The backend must still declare a pre-replay read end. Other algorithms
         must stage their draft's shared reads before publishing the target event.
         """
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
         return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
