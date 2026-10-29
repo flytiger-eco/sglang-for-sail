@@ -75,6 +75,7 @@ jobs:
           python-version: '3.12'
       - name: Build self-contained sweep driver
         run: |
+          python3 -m pip install PyYAML==6.0.3
           mkdir -p .ppu-sweep
           cp scripts/ci/ppu/cuda_sweep_hardware.json .ppu-sweep/hardware.json
           cat > .ppu-sweep/sweep.py <<'PY'
@@ -133,14 +134,51 @@ jobs:
                   with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
                       stream.write(text + '\n')
 
+          def cuda_partitioning():
+              name = 'sweep_cuda_partitioning'
+              if name not in sys.modules:
+                  load(name, ROOT / 'scripts/ci/utils/compute_partitions.py')
+              return sys.modules[name]
+
+          def native_layout(registrations, model):
+              import yaml
+              planner = cuda_partitioning()
+              timeouts = {}
+              for filename in ('pr-test.yml', 'pr-test-extra.yml', 'nightly-test-nvidia.yml'):
+                  timeouts.update(planner.load_run_timeouts(ROOT / '.github/workflows' / filename))
+              kernel = yaml.safe_load((ROOT / '.github/workflows/pr-test-jit-kernel.yml').read_text())
+              whole_suites = set()
+              for job in kernel['jobs'].values():
+                  for step in job.get('steps', []):
+                      command = step.get('run', '')
+                      suites = re.findall(r'--suite\s+(base-b-kernel-[a-z0-9-]+)', command)
+                      if suites:
+                          require('--auto-partition' not in command and 'matrix' not in job.get('strategy', {}), 'CUDA kernel dispatch changed; update whole-suite handling')
+                          whole_suites.update(suites)
+              sizes = planner.compute_partitions(registrations, str(ROOT), timeouts, partition_model=model)
+              return sizes, timeouts, whole_suites
+
+          def resolve_partition_model():
+              try:
+                  sha = subprocess.check_output(['gh', 'api', 'repos/sgl-project/sglang-ci-stats/commits/main', '--jq', '.sha'], text=True, stderr=subprocess.DEVNULL, timeout=25).strip()
+              except (OSError, subprocess.SubprocessError):
+                  sha = ''
+              if not re.fullmatch(r'[0-9a-f]{40}', sha):
+                  summary('CUDA partition model unavailable; using the native static est_time fallback.')
+                  return None, ''
+              model = json.loads(subprocess.check_output(['gh', 'api', f'repos/sgl-project/sglang-ci-stats/contents/model.json?ref={sha}', '-H', 'Accept: application/vnd.github.raw+json'], text=True, timeout=60))
+              require(isinstance(model, dict), 'Invalid CUDA partition model')
+              return model, sha
+
           def registry():
-              module = load('sweep_registry', ROOT / 'python/sglang/test/ci/ci_register.py')
+              module = cuda_partitioning()._ci_register
               paths = sorted(str(p.resolve()) for p in (ROOT / 'test/registered').rglob('*.py') if p.name not in {'conftest.py', '__init__.py'})
               return module, module.collect_tests(paths, sanity_check=True)
 
-          def make_plan(scope, suites, timeout, parallel, hardware, *, plan_only=True):
+          def make_plan(scope, suites, timeout, parallel, hardware, *, plan_only=True, partition_model=None, partition_model_sha=''):
               require(scope in STAGES, 'Unknown scope')
               require(type(plan_only) is bool, 'plan_only must be boolean')
+              require((partition_model is None and partition_model_sha == '') or (isinstance(partition_model, dict) and re.fullmatch(r'[0-9a-f]{40}', partition_model_sha)), 'Partition model must have an immutable identity')
               require(plan_only or scope != 'all', 'scope=all is only allowed in plan-only mode')
               require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
               require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
@@ -160,6 +198,7 @@ jobs:
               selected = sorted(set(s.strip() for s in suites.split(',') if s.strip())) if suites.strip() else sorted(s for s in groups if s.split('-test-', 1)[0] in STAGES[scope])
               require(selected and all(s in groups for s in selected), 'Empty selection or unknown suite')
               require(all(s.split('-test-', 1)[0] in STAGES[scope] for s in selected), 'Requested suites must belong to the selected scope')
+              sizes, native_timeouts, whole_suites = native_layout([r for s in selected for r in groups[s]], partition_model)
               entries = []
               for suite in selected:
                   require(re.fullmatch(r'[a-z0-9-]+', suite), 'Unsafe suite name')
@@ -175,34 +214,42 @@ jobs:
                   require(len({r.filename for r in enabled}) == len(enabled), 'Duplicate registration in ' + suite)
                   require(all(math.isfinite(r.est_time) and r.est_time >= 0 for r in enabled), 'Invalid time estimates')
                   limit = timeout or math.ceil(min(max(3 * max(r.est_time for r in enabled), 600), 3600))
-                  # Use the runner's LPT partitioning; the sum of per-file timeouts must fit within the test budget.
-                  size = max(1, math.ceil(len(enabled) * limit / hardware['test_budget_seconds']))
-                  while True:
-                      partitions = [module.auto_partition(enabled, i, size) for i in range(size)]
-                      if all(part and len(part) * limit <= hardware['test_budget_seconds'] for part in partitions):
-                          break
-                      size += 1
-                      require(size <= len(enabled), 'Cannot form nonempty bounded partitions')
+                  require(suite in sizes or suite.startswith('base-b-kernel-'), 'No native CUDA dispatch policy for ' + suite)
+                  size = sizes[suite]['size'] if suite in sizes else 1
+                  policy = 'cuda' if suite in sizes else ('whole-suite' if suite in whole_suites else 'registered-only whole-suite')
+                  run_minutes = native_timeouts.get(suite, hardware['test_budget_seconds'] // 60)
+                  require(0 < run_minutes <= 360, 'Unsupported native CUDA run budget')
+                  test_budget = max(hardware['test_budget_seconds'], run_minutes * 60)
+                  worker_minutes = hardware['worker_minutes'] + (test_budget - hardware['test_budget_seconds']) // 60
+                  job_minutes = worker_minutes + hardware['job_minutes'] - hardware['worker_minutes']
+                  estimates = (partition_model or {}).get('est', {}).get(suite, {})
+                  live_est = {str(ROOT / key): float(value) for key, value in estimates.items()} or None
+                  require(all(math.isfinite(v) and v >= 0 for v in (live_est or {}).values()), 'Invalid live time estimates')
+                  partitions = [module.auto_partition(enabled, i, size, live_est=live_est) for i in range(size)] if policy == 'cuda' else [enabled]
+                  require(all(partitions), 'Native CUDA partition is empty')
                   for i, part in enumerate(partitions):
-                      entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'timeout': limit, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
+                      entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'partition_policy': policy, 'timeout': limit, 'test_budget_seconds': test_budget, 'worker_minutes': worker_minutes, 'job_minutes': job_minutes, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
               require(0 < len(entries) <= 256, 'Matrix exceeds 256 entries; select one scope or fewer suites')
               sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'plan_only': plan_only, 'parallel': parallel, 'hardware': hardware, 'entries': entries, 'disabled': disabled}
+              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'plan_only': plan_only, 'parallel': parallel, 'hardware': hardware, 'partition_model': partition_model, 'partition_model_sha': partition_model_sha, 'entries': entries, 'disabled': disabled}
               plan['plan_hash'] = fingerprint(plan)
               return plan
 
           def plan_command():
               require(os.environ['PLAN_ONLY'] in ('true', 'false'), 'Invalid plan_only input')
-              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), plan_only=os.environ['PLAN_ONLY'] == 'true')
+              require(os.environ['PLAN_ONLY'] == 'true' or os.environ['SCOPE'] != 'all', 'scope=all is only allowed in plan-only mode')
+              model, model_sha = resolve_partition_model()
+              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), plan_only=os.environ['PLAN_ONLY'] == 'true', partition_model=model, partition_model_sha=model_sha)
               save(BUNDLE / 'plan.json', plan)
               output('sha', plan['sha'])
               output('parallel', plan['parallel'])
-              output('matrix', json.dumps({'include': [{'id': e['id'], 'suite': e['suite'], 'partition_id': e['partition_id']} for e in plan['entries']]}))
-              rows = ['# CUDA registration sweep on 890P', f"Tested SHA: `{plan['sha']}`", f"Workflow SHA: `{plan['workflow_sha']}`", '| Suite | Enabled files | Partitions | Visible / reserved cards |', '| --- | ---: | ---: | --- |']
+              output('matrix', json.dumps({'include': [{k: e[k] for k in ('id', 'suite', 'partition_id', 'worker_minutes', 'job_minutes')} for e in plan['entries']]}))
+              rows = ['# CUDA registration sweep on 890P', f"Tested SHA: `{plan['sha']}`", f"Workflow SHA: `{plan['workflow_sha']}`", f"CUDA partition model: `{plan['partition_model_sha'] or 'static est_time fallback'}`", '| Suite | Enabled files | Partitions | Policy | Visible / reserved cards | Test budget (min) |', '| --- | ---: | ---: | --- | --- | ---: |']
               for suite in sorted({e['suite'] for e in plan['entries']}):
                   group = [e for e in plan['entries'] if e['suite'] == suite]
-                  rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['n_devices']} / 8 |")
+                  rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['partition_policy']} | {group[0]['n_devices']} / 8 | {group[0]['test_budget_seconds'] // 60} |")
               rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'No PASS claims in plan-only mode. Base includes kernel unit/benchmark stages. Weekly, stress and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
+              rows.append('Native CUDA sizing and LPT share one pinned model. Whole-suite entries use one task. PPU test budgets are at least 180 minutes and never smaller than the native CUDA run budget; budget expiry remains a failure.')
               summary('\n'.join(rows))
 
           def context():
@@ -244,6 +291,17 @@ jobs:
               save(destination, {'eligible_890p_nodes': eligible, 'free_890p_nodes': free, 'occupied_nodes': sorted(occupied), 'pending_ppu_pods': pending})
               require(eligible, 'No schedulable 890P board with eight devices')
 
+          def worker_command(entry, directory):
+              command = [sys.executable, 'test/run_suite.py', '--hw', 'cuda', '--suite', entry['suite'], '--pytest', '--junit-dir', str(directory / 'pytest'), '--continue-on-error', '--timeout-per-file', str(entry['timeout']), '--suite-timeout', str(entry['test_budget_seconds'])]
+              if entry['partition_policy'] == 'cuda':
+                  command += ['--auto-partition-id', str(entry['partition_id']), '--auto-partition-size', str(entry['partition_size']), '--partition-model-file', str(BUNDLE / 'partition-model.json')]
+              return command
+
+          def matches_selection(entry, selected, expected):
+              if entry['partition_policy'] == 'cuda':
+                  return selected == expected
+              return Counter(selected) == Counter(expected)
+
           def worker(entry_id):
               plan = context()
               entry = entry_for(plan, entry_id)
@@ -273,7 +331,8 @@ jobs:
                   state['setup_seconds'] = round(time.monotonic() - started, 3)
                   state['phase'] = 'tests'
                   save(directory / 'worker.json', state)
-                  command = [sys.executable, 'test/run_suite.py', '--hw', 'cuda', '--suite', entry['suite'], '--pytest', '--junit-dir', str(directory / 'pytest'), '--continue-on-error', '--timeout-per-file', str(entry['timeout']), '--auto-partition-id', str(entry['partition_id']), '--auto-partition-size', str(entry['partition_size'])]
+                  save(BUNDLE / 'partition-model.json', plan['partition_model'] or {})
+                  command = worker_command(entry, directory)
                   with (directory / 'suite.log').open('w') as log:
                       state['exit_code'] = subprocess.call(command, stdout=log, stderr=subprocess.STDOUT)
                   state['phase'] = 'complete'
@@ -365,7 +424,7 @@ jobs:
                   result['image_digest'] = environment['digest']
                   data = read(exported / 'pytest/summary.json')
                   expected = ['/workspace/source/' + f for f in entry['files']]
-                  require(data['selected'] == expected and not data.get('allowed_skips'), 'Selected files or skip policy differs from plan')
+                  require(matches_selection(entry, data['selected'], expected) and not data.get('allowed_skips'), 'Selected files or skip policy differs from plan')
                   require(len({r['file'] for r in data['files']}) == len(data['files']) and all(r['file'] in expected for r in data['files']), 'Unexpected or duplicate file results')
                   records = {r['file']: r for r in data['files']}
                   if state.get('phase') != 'complete' or state.get('exit_code') != 0 or data.get('success') is not True:
@@ -462,7 +521,7 @@ jobs:
 
                   def evidence(self):
                       record, directory = self.fixture()
-                      entry = {'id': 'e000', 'suite': 'base-a-test-1-gpu-small', 'n_devices': 1, 'files': ['test/registered/example.py']}
+                      entry = {'id': 'e000', 'suite': 'base-a-test-1-gpu-small', 'partition_policy': 'cuda', 'n_devices': 1, 'files': ['test/registered/example.py']}
                       plan = {'sha': 'b' * 40, 'workflow_sha': env['WORKFLOW_SHA'], 'plan_hash': 'plan', 'run_id': 'contract', 'attempt': '1', 'entries': [entry], 'disabled': []}
                       state = {'id': entry['id'], 'sha': plan['sha'], 'plan_hash': plan['plan_hash'], 'phase': 'complete', 'exit_code': 0}
                       environment = {k: plan[k] for k in ('sha', 'workflow_sha', 'plan_hash', 'run_id', 'attempt')}
@@ -499,9 +558,12 @@ jobs:
                           self.assertEqual({e['suite'] for e in plan['entries']}, {r.effective_suite for r in expected if r.disabled is None})
                           for e in plan['entries']:
                               self.assertTrue(e['files'])
-                              self.assertLessEqual(len(e['files']) * e['timeout'], hardware['test_budget_seconds'])
+                              self.assertGreaterEqual(e['test_budget_seconds'], hardware['test_budget_seconds'])
+                              self.assertLessEqual(e['test_budget_seconds'], 21600)
+                              self.assertGreaterEqual(e['worker_minutes'] * 60 - e['test_budget_seconds'], 7200)
+                              self.assertEqual(e['job_minutes'] - e['worker_minutes'], 30)
                               selected = [r for r in expected if r.disabled is None and r.effective_suite == e['suite']]
-                              part = module.auto_partition(selected, e['partition_id'], e['partition_size'])
+                              part = module.auto_partition(selected, e['partition_id'], e['partition_size']) if e['partition_policy'] == 'cuda' else selected
                               self.assertEqual(e['files'], [str(Path(r.filename).relative_to(ROOT)) for r in part])
                           print(f"{scope}: {len({e['suite'] for e in plan['entries']})} suites, {len(actual)} enabled registrations, {len(plan['disabled'])} disabled, {len(plan['entries'])} partitions")
 
@@ -515,8 +577,67 @@ jobs:
                       self.assertEqual({e['suite'] for e in kernel['entries']}, {'base-b-kernel-unit-test-1-gpu-b200'})
                       synthetic = [module.CIRegistry(module.HWBackend.CUDA, str(ROOT / f'test/registered/zero{i}.py'), 0, stage='base-a', runner_config='1-gpu-small') for i in range(20)]
                       with patch.dict(globals(), registry=lambda: (module, synthetic)):
-                          with self.assertRaisesRegex(ValueError, 'nonempty bounded'):
-                              make_plan('base', '', 600, 1, hardware)
+                          zero = make_plan('base', '', 600, 1, hardware)
+                          self.assertEqual(len(zero['entries']), 1)
+                          self.assertEqual(len(zero['entries'][0]['files']), 20)
+
+                  def test_native_cuda_partitions(self):
+                      planner = cuda_partitioning()
+                      cases = [('base', 'pr-test.yml'), ('extra', 'pr-test-extra.yml'), ('nightly', 'nightly-test-nvidia.yml')]
+                      for scope, workflow in cases:
+                          native = planner.compute_partitions(registrations, str(ROOT), planner.load_run_timeouts(ROOT / '.github/workflows' / workflow))
+                          plan = make_plan(scope, '', 0, 2, hardware)
+                          for entry in plan['entries']:
+                              suite = entry['suite']
+                              self.assertEqual(entry['partition_size'], native[suite]['size'] if suite in native else 1)
+                              if suite.startswith('base-b-kernel-'):
+                                  self.assertEqual(entry['partition_size'], 1)
+                                  command = worker_command(entry, self.directory)
+                                  self.assertFalse(any(arg.startswith('--auto-partition') for arg in command))
+                                  self.assertNotIn('--partition-model-file', command)
+                                  expected = entry['files']
+                                  self.assertTrue(matches_selection(entry, list(reversed(expected)), expected))
+                                  self.assertFalse(matches_selection(entry, expected + expected[:1], expected))
+                                  self.assertFalse(matches_selection(entry, expected[1:], expected))
+                              else:
+                                  self.assertEqual(entry['partition_policy'], 'cuda')
+                                  self.assertIn('--auto-partition-size', worker_command(entry, self.directory))
+                      suite = 'extra-a-test-1-gpu-large'
+                      files = [r for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite == suite and r.disabled is None]
+                      estimates = {str(Path(r.filename).relative_to(ROOT)): max(r.est_time * 1.5, 1) for r in files}
+                      model = {'est': {suite: estimates}, 'fit': {suite: {'coeff': 1.0, 'bias': 120}}}
+                      plan = make_plan('extra', suite, 0, 2, hardware, partition_model=model, partition_model_sha='c' * 40)
+                      expected = planner.compute_partitions(files, str(ROOT), planner.load_run_timeouts(ROOT / '.github/workflows/pr-test-extra.yml'), partition_model=model)[suite]['size']
+                      self.assertEqual(len(plan['entries']), expected)
+                      live = {str(ROOT / name): value for name, value in estimates.items()}
+                      for entry in plan['entries']:
+                          selected = module.auto_partition(files, entry['partition_id'], expected, live_est=live)
+                          self.assertEqual(entry['files'], [str(Path(r.filename).relative_to(ROOT)) for r in selected])
+                          command = worker_command(entry, self.directory)
+                          self.assertEqual(command[command.index('--suite-timeout') + 1], str(entry['test_budget_seconds']))
+                          self.assertEqual(command[command.index('--partition-model-file') + 1], str(BUNDLE / 'partition-model.json'))
+                      with patch.dict(globals(), BUNDLE=self.directory):
+                          save(BUNDLE / 'plan.json', plan)
+                          self.assertEqual(context()['partition_model'], model)
+                          plan['partition_model']['fit'][suite]['bias'] = 0
+                          save(BUNDLE / 'plan.json', plan)
+                          with self.assertRaisesRegex(ValueError, 'Plan hash mismatch'):
+                              context()
+
+                  def test_partition_model_resolution(self):
+                      with patch.object(subprocess, 'check_output', side_effect=OSError), contextlib.redirect_stdout(io.StringIO()):
+                          self.assertEqual(resolve_partition_model(), (None, ''))
+                      with patch.object(subprocess, 'check_output', side_effect=['c' * 40, '{"est": {}}']) as query:
+                          model, sha = resolve_partition_model()
+                          self.assertEqual(sha, 'c' * 40)
+                          self.assertEqual(model, {'est': {}})
+                          self.assertIn('ref=' + sha, query.call_args.args[0][2])
+                      with patch.object(subprocess, 'check_output', side_effect=['c' * 40, subprocess.CalledProcessError(1, ['gh'])]):
+                          with self.assertRaises(subprocess.CalledProcessError):
+                              resolve_partition_model()
+                      with patch.object(subprocess, 'check_output', side_effect=['c' * 40, '[]']):
+                          with self.assertRaisesRegex(ValueError, 'Invalid CUDA partition model'):
+                              resolve_partition_model()
 
                   def test_parallel_scope_contracts(self):
                       for scope in ('base', 'extra', 'nightly'):
@@ -688,7 +809,7 @@ jobs:
           SH
       - name: Verify sweep contracts without PPU allocation
         run: python3 .ppu-sweep/sweep.py selftest
-      - name: Generate expected files and bounded matrix
+      - name: Generate expected files and native CUDA partitions
         id: plan
         env:
           SCOPE: ${{ inputs.scope }}
@@ -697,6 +818,7 @@ jobs:
           PARALLEL: ${{ inputs.max_parallel }}
           PLAN_ONLY: ${{ inputs.plan_only }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
         run: python3 .ppu-sweep/sweep.py plan
       - name: Inventory model references without downloading
         run: python3 scripts/ci/list_stage_models.py --backend cuda --commit "$(git rev-parse HEAD)" --output .ppu-sweep/models.json
@@ -738,7 +860,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 330
+    timeout-minutes: ${{ matrix.job_minutes }}
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(needs.sweep-prepare.outputs.parallel) }}
@@ -790,7 +912,7 @@ jobs:
             host_ipc: true
             host_network: true
             shm_size: 8Gi
-          timeout_minutes: 300
+          timeout_minutes: ${{ matrix.worker_minutes }}
           cleanup_policy: always
       - name: Export sanitized evidence and account for every selected file
         if: always()
