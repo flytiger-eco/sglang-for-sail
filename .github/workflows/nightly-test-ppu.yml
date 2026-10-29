@@ -1,6 +1,6 @@
 name: PPU CUDA Sweep (890P, temporary nightly entry)
 
-# 临时借用已注册的 nightly 路径；验证完成后迁移 sweep 并恢复原 nightly，禁止直接合入。
+# Temporarily reuse the registered nightly path. Move the sweep and restore nightly after validation; do not merge.
 on:
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ on:
         type: number
         default: 0
 
-# 跨 scope 串行；不要同时提交多批，GitHub concurrency 只保留一个待运行实例。
+# Serialize scopes. Dispatch batches sequentially; GitHub concurrency retains only one pending run.
 concurrency:
   group: ppu-cuda-sweep-890p
   cancel-in-progress: false
@@ -97,7 +97,7 @@ jobs:
 
           BUNDLE = Path(__file__).resolve().parent
           ROOT = Path.cwd().resolve()
-          # base 包含 CUDA 原有的 kernel unit/benchmark 注册，保持三批完整覆盖。
+          # Base includes the original CUDA kernel unit/benchmark registrations for complete coverage across all three scopes.
           STAGES = {'base': {'base-a', 'base-b', 'base-b-kernel-unit', 'base-b-kernel-benchmark', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
           STAGES['all'] = set().union(*STAGES.values())
 
@@ -172,7 +172,7 @@ jobs:
                   require(len({r.filename for r in enabled}) == len(enabled), 'Duplicate registration in ' + suite)
                   require(all(math.isfinite(r.est_time) and r.est_time >= 0 for r in enabled), 'Invalid time estimates')
                   limit = timeout or math.ceil(min(max(3 * max(r.est_time for r in enabled), 600), 3600))
-                  # 按实际 runner 的 LPT 分片；最坏单文件超时总和必须装入测试预算。
+                  # Use the runner's LPT partitioning; the sum of per-file timeouts must fit within the test budget.
                   size = max(1, math.ceil(len(enabled) * limit / hardware['test_budget_seconds']))
                   while True:
                       partitions = [module.auto_partition(enabled, i, size) for i in range(size)]
@@ -262,7 +262,7 @@ jobs:
                   cache = Path(os.environ['HF_HUB_CACHE'])
                   availability = [{'model': model, 'cache_directory_exists': (cache / ('models--' + model.replace('/', '--'))).is_dir()} for model in inventory.get('models', [])]
                   save(directory / 'model_availability.json', {'heuristic_only': True, 'models': availability, 'unresolved_files': inventory.get('unresolved_files', [])})
-                  # 只盘点、不下载；目录存在不代表权重完整，实际缺失由测试证据归类。
+                  # Inventory only, never download. Directory presence does not prove complete weights; classify missing assets from test evidence.
                   with (directory / 'setup.log').open('w') as log:
                       subprocess.run(['bash', str(BUNDLE / 'install.sh')], check=True, stdout=log, stderr=subprocess.STDOUT)
                   state['setup_seconds'] = round(time.monotonic() - started, 3)
@@ -296,7 +296,7 @@ jobs:
               row['failure_signature'] = error[:200]
               junit = directory / record['junit']
               if junit.is_file():
-                  # 只读取一次受限 UTF-8 内容；解析器永远不会收到 DTD、实体或替代编码。
+                  # Read bounded UTF-8 input once; never pass DTDs, entities or alternative encodings to the parser.
                   with junit.open('rb') as stream:
                       data = stream.read(16 * 1024 * 1024 + 1)
                   require(len(data) <= 16 * 1024 * 1024, 'JUnit exceeds 16 MiB')
