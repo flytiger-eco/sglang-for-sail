@@ -29,7 +29,7 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     quantize_k_cache_v41,
 )
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sail
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
 from sglang.test.test_utils import CustomTestCase
@@ -119,7 +119,7 @@ def _v41_store_kernels_available() -> bool:
         return False
     if is_hip():
         return is_gfx95_supported()
-    return torch.cuda.get_device_capability()[0] >= 10
+    return is_sail() or torch.cuda.get_device_capability()[0] >= 10
 
 
 @unittest.skipUnless(
@@ -279,8 +279,14 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
 
+        # 300 tokens take the block-per-token kernel, 4096 the warp-per-token one.
+        for n, num_pages in ((300, 3), (4096, 20)):
+            with self.subTest(tokens=n):
+                self._check_fused_k_norm_rope_store(n, num_pages)
+
+    def _check_fused_k_norm_rope_store(self, n, num_pages):
         g = torch.Generator(device="cuda").manual_seed(2)
-        page_size, num_pages, n = 256, 3, 300
+        page_size = 256
         angles = torch.randn(1024, 32, generator=g, device="cuda")
         freqs_table = torch.polar(torch.ones_like(angles), angles)
         pos = torch.randint(

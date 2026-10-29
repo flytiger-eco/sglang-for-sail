@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillKVBuffer,
 )
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -486,6 +487,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         layout = window_layout(
             torch.ones(rows, dtype=torch.int64),
             torch.arange(rows),
+            zero_row=pool.request_window.zero_row,
             capacity=pool.request_window.capacity,
             num_groups=1,
         )
@@ -493,6 +495,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         backend.token_to_kv_pool = pool
         backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int32)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(torch.device("cpu"))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             seq_lens=torch.tensor([rows]),
