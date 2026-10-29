@@ -11,9 +11,10 @@ from sglang.kernels.ops.attention.fast_topk import (
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_ppu_ci(est_time=60, suite="stage-b-test-1-gpu-ppu")
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
@@ -137,6 +138,38 @@ def test_fast_topk_negative_and_zero(topk):
 
     indices = fast_topk(score, lengths, topk)
     _check_topk_values(score, lengths, indices, topk, None)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("pattern", ["mixed", "dense"])
+@pytest.mark.parametrize("length", [8192, 32768])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_coarse_bin_overflow(topk, pattern, length, dtype):
+    """A coarse (fp16 high-byte) threshold bin holding more scores than the
+    4096-entry candidate buffer. The bin mixes distinct values, so clipping it
+    would drop strictly larger scores; the selection must stay exact."""
+    torch.manual_seed(0)
+    batch = 4
+    if pattern == "mixed":
+        # 1.0 and 1.0078125 share a coarse bin; the larger one is 1/4 of the row.
+        row = torch.tensor([1.0, 1.0, 1.0, 1.0078125]).repeat(length // 4)
+        window = row.expand(batch, -1).contiguous()
+    else:
+        # distinct fp32 values that all round into one coarse bin (bf16 keeps
+        # three of them: 1.0, 1.0078125 and 1.015625)
+        window = 1.0 + torch.rand(batch, length) * (15 * 2**-10)
+    # Unaligned windows inside a wider row; outside scores would win if read.
+    row_starts = torch.tensor([0, 1, 2, 7], dtype=torch.int32)
+    score = torch.full((batch, length + 8), 100.0, dtype=dtype)
+    for b in range(batch):
+        start = int(row_starts[b])
+        score[b, start : start + length] = window[b]
+    score = score.cuda()
+    row_starts = row_starts.cuda()
+    lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
+
+    indices = fast_topk(score, lengths, topk, row_starts=row_starts)
+    _check_topk_values(score, lengths, indices, topk, row_starts)
 
 
 def test_fast_topk_unsupported_k():

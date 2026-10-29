@@ -201,7 +201,9 @@ struct TopKConfig {
   // filled from them (above_count can be 0, e.g. heavily tied or all-inf
   // scores). A smaller cap leaves slots that handle_tie can only pad, and
   // padded slots inside the first min(seq_len, topk) entries are dereferenced
-  // by downstream sparse attention.
+  // by downstream sparse attention. A bin holding MORE than kMaxNumTie
+  // candidates (distinct values included) is not clipped: the register and
+  // streaming paths resolve it with TopKRadixBase::select_overflow_bin.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
@@ -564,6 +566,94 @@ struct TopKRadixBase : TopKConfig {
 
     __syncthreads();
   }
+
+  /// Exact selection for a threshold bin whose collect overflowed tie_values
+  /// (num_ties > kMaxNumTie): the buffer then holds an arbitrary subset of the
+  /// bin, which may miss strictly larger scores. Instead rescan the row from
+  /// global memory and radix-select the bin on the exact fp32 key, 8 bits per
+  /// round with histogram-only passes, then emit once. `base` / `topk` are as
+  /// in handle_tie; requires 0 < topk <= num_ties. Must be called by the whole
+  /// block after the collect pass has been published by a barrier.
+  template <typename DType>
+  SGL_DEVICE static void select_overflow_bin(  //
+      const TopKProblemT<DType>& problem,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t base,
+      const uint32_t num_ties,
+      const uint32_t topk,
+      Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    // Only the coarse histogram and tie_values are dead here; the 256-bin
+    // scratch lives in tie_handle, which overlaps neither of them.
+    const auto scratch = &smem->tie_handle;
+    const auto histogram = scratch->histogram[0];
+    // Visit exactly the elements the collect pass classified as ties; scores
+    // go through the same DType -> float cast, and padding (NaN) never ties.
+    const auto for_each_tie = [&](auto&& fn) {
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (!(val >= v_hi) && val >= v_lo) fn(val, idx);
+      });
+    };
+
+    uint32_t prefix = 0;        // decided high bits of the threshold key
+    uint32_t prefix_mask = 0;   // which bits of `prefix` are decided
+    uint32_t total = num_ties;  // ties whose key matches `prefix`
+    uint32_t remain = topk;     // slots still owed to those ties
+    if (tx == kRadixSize) scratch->counter = scratch->counter_final = 0;
+#pragma unroll 1
+    for (uint32_t round = 0; round < 4; ++round) {
+      const uint32_t shift = 24 - round * 8;
+      if (tx < kRadixSize) histogram[tx] = 0;
+      __syncthreads();
+      for_each_tie([&](float val, uint32_t) {
+        const auto key = extract_exact_bin(val);
+        if ((key & prefix_mask) == prefix) atomicAdd(&histogram[(key >> shift) & 0xFFu], 1);
+      });
+      __syncthreads();
+
+      uint32_t hist_val = 0;
+      uint32_t warp_inc = 0;
+      if (tx < kRadixSize) {
+        hist_val = histogram[tx];
+        warp_inc = warp::inclusive_sum(hist_val, lane_id);
+        if (lane_id == kWarpSize - 1) scratch->warp_sum[warp_id] = warp_inc;
+      }
+      __syncthreads();
+      if (tx < kRadixSize) {
+        const auto inter = warp::reduce_sum(lane_id < warp_id ? scratch->warp_sum[lane_id] : 0);
+        const auto above = total - (inter + warp_inc);  // matching keys in higher digits
+        if (above < remain && above + hist_val >= remain) {
+          scratch->match = {tx, above, hist_val};
+        }
+      }
+      __syncthreads();
+
+      // 0 < remain <= total holds every round, so exactly one digit matched.
+      const auto [digit, above_count, equal_count] = scratch->match;
+      prefix |= digit << shift;
+      prefix_mask |= 0xFFu << shift;
+      remain -= above_count;
+      total = equal_count;
+      if (remain == total) break;  // the whole digit bin is selected
+    }
+
+    // Keys above the decided prefix are selected outright; `remain` of the keys
+    // equal to it fill the trailing slots. Once all 32 bits are decided those
+    // are bit-identical scores. The counters were published by the first round.
+    const auto num_above = topk - remain;
+    for_each_tie([&](float val, uint32_t idx) {
+      const auto key = extract_exact_bin(val) & prefix_mask;
+      if (key > prefix) {
+        problem.emit(base + atomicAdd(&scratch->counter, 1), idx);
+      } else if (key == prefix) {
+        const auto pos = atomicAdd(&scratch->counter_final, 1);
+        if (pos < remain) problem.emit(base + num_above + pos, idx);
+      }
+    });
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -667,6 +757,10 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      // The registers are not kept live for this rare path; rescan global memory.
+      return select_overflow_bin(problem, v_lo, v_hi, count_gt, count_eq, remain_topk, smem);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -744,6 +838,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      return select_overflow_bin(problem, v_lo, v_hi, count_gt, count_eq, remain_topk, smem);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }

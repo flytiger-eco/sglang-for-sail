@@ -41,10 +41,15 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_ragged_v2,
 )
 from sglang.srt.utils import is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
+register_ppu_ci(est_time=120, suite="stage-b-test-1-gpu-ppu")
 
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
@@ -468,6 +473,126 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     implicit = _run_ragged(scores.clone(), lengths, None, offsets, k)
     for i in range(len(rows)):
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
+
+
+# --- coarse threshold bin overflowing the tie buffer --------------------------
+# A 12-bit fp16 coarse bin holding more than kMaxNumTie (2048) scores. The bin
+# mixes distinct values, so clipping it to the first 2048 collected can drop
+# strictly larger scores; the selection must stay exact. 1.0 and 1.0078125 both
+# land in coarse bin 3008 and are exact in bf16, so "mixed" overflows for both
+# dtypes; "dense" needs fp32 (bf16 rounds part of it into the next bin). Lengths
+# cover Register2 / Register4 / Streaming; the streaming one stays below every
+# arch's cluster floor (cluster is not covered).
+OVERFLOW_LENGTHS = [8192, 16384, 20000]
+OVERFLOW_CASES = [
+    ("mixed", torch.float32),
+    ("dense", torch.float32),
+    ("mixed", torch.bfloat16),
+]
+
+
+def _coarse_overflow_window(pattern, length, device, dtype):
+    if pattern == "mixed":
+        row = torch.tensor([1.0, 1.0, 1.0, 1.0078125], device=device)
+        return row.repeat((length + 3) // 4)[:length].to(dtype)
+    # distinct fp32 values that all round into one coarse bin
+    return (1.0 + torch.rand(length, device=device) * (15 * 2**-10)).to(dtype)
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("pattern,dtype", OVERFLOW_CASES)
+@pytest.mark.parametrize("page_mode", ["none", "perm"])
+@pytest.mark.parametrize("seq", OVERFLOW_LENGTHS)
+@torch.inference_mode()
+def test_topk_v2_coarse_bin_overflow(
+    seq: int, page_mode: str, pattern: str, dtype: torch.dtype, k: int
+) -> None:
+    torch.manual_seed(seq + k)
+    device = "cuda"
+    batch = 2
+    width = (seq + 3) & ~3
+    scores = torch.zeros(batch, width, dtype=dtype, device=device)
+    for i in range(batch):
+        scores[i, :seq] = _coarse_overflow_window(pattern, seq, device, dtype)
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    if page_mode == "none":
+        our_raw = _run_raw(scores, seq_lens, k)
+    else:
+        num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+        page_table, inv_cpu = _make_page_table(batch, num_pages, "perm", device)
+        our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+    for i in range(batch):
+        _assert_topk_values(scores[i, :seq], torch.tensor(our_raw[i]), k)
+
+
+# (row_start, length): unaligned starts whose widened lengths land exactly on
+# Register2 (8192) / Register4 (16384) and on Streaming.
+OVERFLOW_WINDOWS = [(1, 8191), (2, 16382), (3, 20000)]
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("pattern,dtype", OVERFLOW_CASES)
+@torch.inference_mode()
+def test_topk_v2_ragged_coarse_bin_overflow(
+    pattern: str, dtype: torch.dtype, k: int
+) -> None:
+    """Same overflow through the ragged entry, with unaligned window starts."""
+    torch.manual_seed(k)
+    device = "cuda"
+    rows = OVERFLOW_WINDOWS
+    width = ((max(s + n for s, n in rows)) + 3) & ~3
+    scores = torch.full((len(rows), width), OUTSIDE_SCORE, dtype=dtype, device=device)
+    for i, (start, length) in enumerate(rows):
+        scores[i, start : start + length] = _coarse_overflow_window(
+            pattern, length, device, dtype
+        )
+    starts = torch.tensor([s for s, _ in rows], dtype=torch.int32, device=device)
+    lengths = torch.tensor([n for _, n in rows], dtype=torch.int32, device=device)
+    before = scores.clone()
+
+    our_raw = _run_ragged(scores, lengths, starts, starts + 4321, k)
+    for i, (start, length) in enumerate(rows):
+        _assert_topk_values(
+            before[i, start : start + length], torch.tensor(our_raw[i]), k
+        )
+
+
+@pytest.mark.skipif(is_xpu(), reason="packed v2 is not supported on XPU")
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("pattern,dtype", OVERFLOW_CASES)
+@torch.inference_mode()
+def test_topk_v2_packed_coarse_bin_overflow(
+    pattern: str, dtype: torch.dtype, k: int
+) -> None:
+    """Same overflow through the packed entry: unaligned windows, page-table output."""
+    torch.manual_seed(k + 1)
+    device = "cuda"
+    rows = OVERFLOW_WINDOWS
+    width = ((max(s + n for s, n in rows)) + 3) & ~3
+    scores = torch.full((len(rows), width), OUTSIDE_SCORE, dtype=dtype, device=device)
+    for i, (start, length) in enumerate(rows):
+        scores[i, start : start + length] = _coarse_overflow_window(
+            pattern, length, device, dtype
+        )
+    starts = torch.tensor([s for s, _ in rows], dtype=torch.int32, device=device)
+    lengths = torch.tensor([n for _, n in rows], dtype=torch.int32, device=device)
+    num_pages = (max(n for _, n in rows) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(rows), num_pages, "perm", device, per_row=True
+    )
+    out = torch.full((len(rows), k), -1, dtype=torch.int32, device=device)
+    # The kernel masks in place, so reference values must be read before the call.
+    before = scores.clone()
+
+    topk_transform_packed_v2(
+        scores, lengths, page_table, out, PAGE_SIZE, row_starts=starts
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    for i, (start, length) in enumerate(rows):
+        our = _invert(out_cpu[i], inv_cpu[i])
+        _assert_topk_values(before[i, start : start + length], torch.tensor(our), k)
 
 
 @pytest.mark.skipif(is_xpu(), reason="packed v2 is not supported on XPU")

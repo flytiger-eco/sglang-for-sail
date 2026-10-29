@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import os
 import sys
 import unittest
@@ -11,9 +12,42 @@ from unittest.mock import Mock, patch
 import torch
 
 
-REPO = Path(
-    os.environ.get("SGLANG_MIGRATION_REPO", str(Path(__file__).resolve().parents[3]))
-)
+def _find_repo_root():
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "python/sglang/srt/layers/attention/dsa").is_dir():
+            return parent
+    raise RuntimeError(f"Cannot locate the sglang repository root from {__file__}")
+
+
+def _load_ci_register(root):
+    # ci_register.py is stdlib-only; loading it by path keeps this test free of
+    # the sglang package import (and its runtime dependencies) on CPU hosts.
+    name = "_bf16_topk_dispatch_ci_register"
+    spec = importlib.util.spec_from_file_location(
+        name, root / "python/sglang/test/ci/ci_register.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+TEST_REPO = _find_repo_root()
+_ci_register = _load_ci_register(TEST_REPO)
+register_cpu_ci = _ci_register.register_cpu_ci
+register_ppu_ci = _ci_register.register_ppu_ci
+
+# Hardware-free source-level dispatch checks, so the CPU suite owns them. Also
+# registered on the PPU per-commit chain: PR CI for this repository dispatches
+# only pr-test-ppu.yml, and this file is the only guard for the BF16/v2 top-k
+# dispatch order that the PPU kernel tests rely on.
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_ppu_ci(est_time=10, suite="stage-b-test-1-gpu-ppu")
+
+# Production sources are parsed from this checkout by default. The optional
+# override points the same checks at another tree (e.g. a BASE checkout in a
+# manual A/B comparison); it is never required.
+REPO = Path(os.environ.get("SGLANG_MIGRATION_REPO") or TEST_REPO)
 DSA = REPO / "python/sglang/srt/layers/attention/dsa"
 
 
@@ -442,7 +476,7 @@ class BF16TopKDispatchTest(unittest.TestCase):
                 with patch.object(
                     torch,
                     "searchsorted",
-                    side_effect=AssertionError("重建了 interleave 映射"),
+                    side_effect=AssertionError("Unexpected interleaved map rebuild"),
                 ):
                     self.assertEqual(
                         self.call(

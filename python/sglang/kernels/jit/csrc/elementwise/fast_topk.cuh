@@ -16,6 +16,9 @@ namespace sglang {
 namespace fast_topk_detail {
 
 constexpr uint32_t kThreadsPerBlock = 1024;
+// Candidate buffer for the refine passes: 4K entries per round (2 rounds = 8K
+// entries = 32KB). A coarse threshold bin holding more candidates than that
+// takes the exact rescan fallback in radix_select_topk instead of being clipped.
 constexpr size_t kSmemBytes = 8 * 1024 * sizeof(uint32_t);
 
 template <typename DType>
@@ -150,6 +153,61 @@ radix_select_topk(const DType* __restrict__ input, int32_t* __restrict__ indices
     }
   }
   __syncthreads();
+
+  // Exact fallback for a coarse threshold bin that overflowed the candidate
+  // buffer: the buffer (and its fused sub-histogram) then holds an arbitrary
+  // subset of the bin, so refining it could drop true winners. Instead refine
+  // the whole bin with histogram-only rescans of the row, 8 bits of the fp32
+  // key per round, then emit once. The fast path only pays this branch.
+  if (num_input[0] > kSmemInputSize) [[unlikely]] {
+    __shared__ int overflow_remain;
+    uint32_t prefix = 0;       // decided high bits of the fp32 threshold key
+    uint32_t prefix_mask = 0;  // which bits of `prefix` are decided
+#pragma unroll 1
+    for (int round = 0; round < 4 && topk > 0; ++round) {
+      const auto offset = 24 - round * 8;
+      if (tid < kRadix + 1) histogram[tid] = 0;
+      __syncthreads();
+      for (int idx = tid; idx < length; idx += kThreadsPerBlock) {
+        const auto value = load_score(input, idx + row_start);
+        if (static_cast<int>(convert_to_uint8(value)) != threshold_bin) continue;
+        const auto key = convert_to_uint32(value);
+        if ((key & prefix_mask) == prefix) ::atomicAdd(&histogram[(key >> offset) & 0xFF], 1);
+      }
+      __syncthreads();
+      run_cumsum();
+      if (tid < kRadix && histogram[tid] > topk && histogram[tid + 1] <= topk) {
+        threshold_bin_id = tid;
+      }
+      __syncthreads();
+      const auto sub_bin = threshold_bin_id;
+      topk -= histogram[sub_bin + 1];
+      prefix |= static_cast<uint32_t>(sub_bin) << offset;
+      prefix_mask |= 0xFFu << offset;
+      // every thread must read the histogram before the next round clears it
+      __syncthreads();
+    }
+
+    // Keys above the decided prefix are selected outright (appended after the
+    // bins above the coarse threshold); `topk` of the keys equal to it fill the
+    // trailing slots. Once all 32 bits are decided those are identical scores.
+    if (tid == 0) overflow_remain = topk;
+    __syncthreads();
+    for (int idx = tid; idx < length; idx += kThreadsPerBlock) {
+      const auto value = load_score(input, idx + row_start);
+      if (static_cast<int>(convert_to_uint8(value)) != threshold_bin) continue;
+      const auto key = convert_to_uint32(value) & prefix_mask;
+      if (key > prefix) {
+        const auto pos = ::atomicAdd(&counter, 1);
+        indices[pos] = idx;
+      } else if (key == prefix) {
+        const auto pos = ::atomicAdd(&overflow_remain, -1);
+        if (pos > 0) indices[kTopK - pos] = idx;
+      }
+    }
+    __syncthreads();
+    return;
+  }
 
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
