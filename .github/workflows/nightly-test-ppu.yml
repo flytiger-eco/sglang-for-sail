@@ -9,7 +9,7 @@ on:
         type: string
         default: ''
       scope:
-        description: 'CUDA scope (kernel unit/benchmark, weekly/stress/native workflows excluded)'
+        description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
         type: choice
         options: [base, extra, nightly, all]
         default: base
@@ -97,8 +97,8 @@ jobs:
 
           BUNDLE = Path(__file__).resolve().parent
           ROOT = Path.cwd().resolve()
-          # 首轮明确排除 base-b-kernel-unit/base-b-kernel-benchmark 注册。
-          STAGES = {'base': {'base-a', 'base-b', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
+          # base 包含 CUDA 原有的 kernel unit/benchmark 注册，保持三批完整覆盖。
+          STAGES = {'base': {'base-a', 'base-b', 'base-b-kernel-unit', 'base-b-kernel-benchmark', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
           STAGES['all'] = set().union(*STAGES.values())
 
           def require(condition, message):
@@ -198,7 +198,7 @@ jobs:
               for suite in sorted({e['suite'] for e in plan['entries']}):
                   group = [e for e in plan['entries'] if e['suite'] == suite]
                   rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['n_devices']} / 8 |")
-              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'No PASS claims in plan-only mode. Kernel unit/benchmark stages, weekly, stress and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
+              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'No PASS claims in plan-only mode. Base includes kernel unit/benchmark stages. Weekly, stress and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
               summary('\n'.join(rows))
 
           def context():
@@ -476,10 +476,17 @@ jobs:
                               for key, value in zip(node.value.keys, node.value.values):
                                   if isinstance(key, ast.Attribute) and key.attr == 'CUDA':
                                       cuda_suites[node.targets[0].id] = ast.literal_eval(value)
-                      expected_suites = {'base': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith(('base-a-test-', 'base-b-test-', 'base-c-test-'))}, 'extra': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('extra-')}, 'nightly': set(cuda_suites['NIGHTLY_SUITES'])}
+                      expected_suites = {'base': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('base-')}, 'extra': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('extra-')}, 'nightly': set(cuda_suites['NIGHTLY_SUITES'])}
                       expected_suites['all'] = set().union(*expected_suites.values())
+                      partition_counts = {}
                       for scope, suites in expected_suites.items():
+                          if scope == 'all' and sum(partition_counts.values()) > 256:
+                              with self.assertRaisesRegex(ValueError, 'Matrix exceeds 256'):
+                                  make_plan(scope, '', 0, 1, hardware)
+                              print(f"all: {sum(partition_counts.values())} partitions exceeds GitHub's 256-entry limit; dispatch base/extra/nightly separately")
+                              continue
                           plan = make_plan(scope, '', 0, 1, hardware)
+                          partition_counts[scope] = len(plan['entries'])
                           expected = [r for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite in suites and not r.nightly]
                           actual = [(e['suite'], f) for e in plan['entries'] for f in e['files']]
                           self.assertEqual(Counter(actual), Counter((r.effective_suite, str(Path(r.filename).relative_to(ROOT))) for r in expected if r.disabled is None))
@@ -494,11 +501,13 @@ jobs:
                           print(f"{scope}: {len({e['suite'] for e in plan['entries']})} suites, {len(actual)} enabled registrations, {len(plan['disabled'])} disabled, {len(plan['entries'])} partitions")
 
                   def test_inputs_and_zero_estimates(self):
-                      for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'base-b-kernel-unit-test-1-gpu-large', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 3), ('base', '', 0, True)]:
+                      for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'weekly-test-8-gpu-h200', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 3), ('base', '', 0, True)]:
                           with self.assertRaises(ValueError):
                               make_plan(scope, suites, timeout, parallel, hardware)
                       selected = make_plan('all', 'base-a-test-1-gpu-small', 600, 2, hardware)
                       self.assertEqual({e['suite'] for e in selected['entries']}, {'base-a-test-1-gpu-small'})
+                      kernel = make_plan('base', 'base-b-kernel-unit-test-1-gpu-b200', 600, 1, hardware)
+                      self.assertEqual({e['suite'] for e in kernel['entries']}, {'base-b-kernel-unit-test-1-gpu-b200'})
                       synthetic = [module.CIRegistry(module.HWBackend.CUDA, str(ROOT / f'test/registered/zero{i}.py'), 0, stage='base-a', runner_config='1-gpu-small') for i in range(20)]
                       with patch.dict(globals(), registry=lambda: (module, synthetic)):
                           with self.assertRaisesRegex(ValueError, 'nonempty bounded'):
