@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-_is_hip = is_hip()
+_is_xpu = is_xpu()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -97,18 +97,20 @@ class DSATopKBackend(Enum):
         self,
         logits: torch.Tensor,
         seq_lens_topk: torch.Tensor,
-        page_table_size_1: torch.Tensor,
-        cu_seqlens_q_topk: torch.Tensor,
+        page_table_size_1: Optional[torch.Tensor],
+        cu_seqlens_q_topk: Optional[torch.Tensor],
         topk: int,
         ks: Optional[torch.Tensor],
+        row_to_page: Optional[torch.Tensor] = None,
+        topk_indices_offset: Optional[torch.Tensor] = None,
+        page_size: int = 1,
     ) -> torch.Tensor:
-        """PAGED topk via dsv4's bf16 per-row prefill kernel.
+        """Select directly from BF16 scores and return physical KV slots for
+        PAGED mode or local indices plus output offsets for RAGGED mode.
 
-        Expands NSA per-request page table to dsv4's per-query layout and
-        performs topk-select plus page-table gather in a single kernel.
-
-        NOTE(perf): expanding to per-query [B, P] costs B*P*4 bytes extra.
-        Gated behind SGLANG_DSA_USE_DSV4_BF16_TOPK (default on).
+        row_to_page reuses request-level page tables without per-query expansion.
+        Slots beyond the valid top-k count are padded with -1. The caller routes
+        decode-shaped PAGED inputs to v2 first when v2 is enabled.
         """
         from sglang.kernels.ops.attention.dsv4 import top_k_per_row_prefill_bf16
 
@@ -126,29 +128,34 @@ class DSATopKBackend(Enum):
         )
         row_ends = row_starts + seq_lens_topk.to(torch.int32)
 
-        # Expand the per-request page table to per-query rows. Each query block bid
-        # belongs to request r where cu_seqlens_q_topk[r] <= bid < cu_seqlens_q_topk[r+1],
-        # mirroring topk_transform_prefill_kernel's cu_seqlens_q scan.
-        q_ids = torch.arange(num_q, device=device)
-        req_idx = torch.searchsorted(
-            cu_seqlens_q_topk[1:].contiguous(), q_ids, right=True
-        )
-        page_table_per_query = page_table_size_1.index_select(
-            0, req_idx.to(torch.long)
-        ).contiguous()
+        req_idx = None
+        if page_table_size_1 is not None:
+            if row_to_page is not None:
+                req_idx = row_to_page
+            elif cu_seqlens_q_topk is not None:
+                q_ids = torch.arange(num_q, device=device)
+                req_idx = torch.searchsorted(
+                    cu_seqlens_q_topk[1:],
+                    q_ids,
+                    right=True,
+                    out_int32=True,
+                )
+            else:
+                assert page_table_size_1.shape[0] == num_q
+        else:
+            assert topk_indices_offset is not None
 
         # Use new_full(-1) so unfilled slots are safe when logits has fewer positions than topk.
         page_indices = logits.new_full((num_q, topk), -1, dtype=torch.int32)
-        # page_size = 1 (NSA PAGED uses page_table_1); page_bits = 0 so the dsv4
-        # built-in transform reduces to a plain gather, matching the fused kernel.
         top_k_per_row_prefill_bf16(
             logits,
             row_starts,
             row_ends,
-            page_table_per_query,
+            page_table_size_1,
             page_indices,
-            1,
-            None,
+            page_size,
+            row_to_page=req_idx,
+            out_offsets=topk_indices_offset,
         )
         return page_indices
 
@@ -162,7 +169,7 @@ class DSATopKBackend(Enum):
         cu_seqlens_q_topk: Optional[torch.Tensor] = None,
         topk_indices_offset: Optional[torch.Tensor] = None,
         row_starts: Optional[torch.Tensor] = None,
-        batch_idx_list: Optional[List[int]] = None,
+        batch_idx_list: Optional[Union[List[int], torch.Tensor]] = None,
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
@@ -210,43 +217,100 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
-        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
-        # The row -> request map is `token_to_batch_idx` for a whole-forward call
-        # and the chunk's own `batch_idx_list` when the indexer split the logits.
-        if batch_idx_list is None:
-            row_to_batch = attn_metadata.token_to_batch_idx
-        elif isinstance(batch_idx_list, torch.Tensor):
-            row_to_batch = batch_idx_list
-        else:
-            # The prefill-CP list selects requests, not rows: leave it on legacy.
-            row_to_batch = None
+        # CUDA/PPU/ROCm PAGED prefill: select within packed windows, then map
+        # each query through its request's compact page table. CP request lists
+        # expand only the row map, not the table; explicit interleaved/chunk maps
+        # take precedence.
         if (
-            _is_hip
+            not _is_xpu
             and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0]
-            and logits.dtype == torch.float32
+            and logits.dtype in (torch.float32, torch.bfloat16)
             and logits.stride(1) == 1
             and logits.stride(0) % 4 == 0
+            and logits.stride(0) >= logits.shape[1]
             and row_starts is not None
-            and row_to_batch is not None
-            and row_to_batch.shape[0] == logits.shape[0]
+            and row_starts.shape[0] == logits.shape[0]
         ):
-            return _topk_transform_v2_packed(
-                logits,
-                lengths,
-                topk,
+            row_to_batch = _build_packed_row_to_batch(
                 attn_metadata,
-                row_starts=row_starts,
-                row_to_batch=row_to_batch,
+                batch_idx_list,
+                cu_seqlens_q_topk,
+                logits.shape[0],
+                logits.device,
+            )
+            if row_to_batch is not None:
+                return _topk_transform_v2_packed(
+                    logits,
+                    lengths,
+                    topk,
+                    attn_metadata,
+                    row_starts=row_starts,
+                    row_to_batch=row_to_batch,
+                )
+
+        use_bf16_topk = (
+            self.is_sgl_kernel()
+            and envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
+            and logits.dtype == torch.bfloat16
+        )
+        if use_bf16_topk:
+            row_to_page = None
+            page_size = 1
+            if topk_transform_method == TopkTransformMethod.PAGED:
+                topk_indices_offset = None
+                if (
+                    row_starts is None
+                    and batch_idx_list is None
+                    and lengths.shape[0]
+                    == logits.shape[0]
+                    == attn_metadata.real_page_table.shape[0]
+                ):
+                    page_table_size_1 = attn_metadata.real_page_table
+                    page_size = attn_metadata.page_size
+                    cu_seqlens_q_topk = None
+                else:
+                    assert attn_metadata.page_table_1 is not None
+                    if (
+                        isinstance(batch_idx_list, torch.Tensor)
+                        and batch_idx_list.ndim == 1
+                        and batch_idx_list.shape[0] == logits.shape[0]
+                    ):
+                        row_to_page = batch_idx_list
+                    page_table_size_1 = (
+                        attn_metadata.page_table_1[batch_idx_list]
+                        if batch_idx_list is not None and row_to_page is None
+                        else attn_metadata.page_table_1
+                    )
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
+                if topk_indices_offset is None:
+                    raise RuntimeError(
+                        "RAGGED topk_transform requires topk_indices_offset; "
+                        "expected extend-without-speculative metadata."
+                    )
+                page_table_size_1 = None
+                cu_seqlens_q_topk = None
+            else:
+                raise RuntimeError(f"Unsupported {topk_transform_method = }.")
+            return self._topk_transform_dsv4_bf16(
+                logits=logits,
+                seq_lens_topk=lengths,
+                page_table_size_1=page_table_size_1,
+                cu_seqlens_q_topk=cu_seqlens_q_topk,
+                topk=topk,
+                ks=row_starts,
+                row_to_page=row_to_page,
+                topk_indices_offset=topk_indices_offset,
+                page_size=page_size,
             )
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
         # dispatched to v2 above.
-        assert attn_metadata.page_table_1 is not None
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            assert attn_metadata.page_table_1 is not None
 
         if self.is_sgl_kernel():
             from sglang.kernels.ops.attention.fast_topk import (
@@ -255,25 +319,23 @@ class DSATopKBackend(Enum):
             )
 
             if topk_transform_method == TopkTransformMethod.PAGED:
+                # A full-forward call already maps rows through cu_seqlens_q_topk;
+                # reuse its request-level page table without gathering a copy.
+                # Chunk slices are distinct objects and still require remapping.
+                if batch_idx_list is attn_metadata.token_to_batch_idx:
+                    batch_idx_list = None
+                per_query_page_map = (
+                    isinstance(batch_idx_list, torch.Tensor)
+                    and batch_idx_list.ndim == 1
+                    and batch_idx_list.shape[0] == logits.shape[0]
+                )
+                if per_query_page_map:
+                    batch_idx_list = batch_idx_list[cu_seqlens_q_topk[:-1]]
                 page_table_size_1 = (
                     attn_metadata.page_table_1[batch_idx_list]
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
-                # Route PAGED path through dsv4's bf16 topk kernel when gate is on
-                # and logits are bf16; falls back to fast_topk_transform_fused otherwise.
-                if (
-                    envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
-                    and logits.dtype == torch.bfloat16
-                ):
-                    return self._topk_transform_dsv4_bf16(
-                        logits=logits,
-                        seq_lens_topk=lengths,
-                        page_table_size_1=page_table_size_1,
-                        cu_seqlens_q_topk=cu_seqlens_q_topk,
-                        topk=topk,
-                        ks=row_starts,
-                    )
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
@@ -422,17 +484,14 @@ def _topk_transform_v2_paged(
 
     num_rows = logits.shape[0]
 
-    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
-    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
-    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
-    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
-    # real requirement rather than force a contiguous copy of the wide score buffer.
+    # Row strides count input elements: four FP32 values occupy 16B, while
+    # four BF16 values occupy 8B. The column stride must remain one.
     assert (
-        logits.dtype == torch.float32
+        logits.dtype in (torch.float32, torch.bfloat16)
         and logits.stride(1) == 1
         and logits.stride(0) % 4 == 0
     ), (
-        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+        f"v2 top-k expects fp32/bf16 scores with unit column stride and a row stride divisible by 4, got {logits.dtype=} {logits.stride()=}"
     )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
@@ -451,6 +510,46 @@ def _topk_transform_v2_paged(
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
     return out
+
+
+def _build_packed_row_to_batch(
+    attn_metadata,
+    batch_idx_list: Optional[Union[List[int], torch.Tensor]],
+    cu_seqlens_q: Optional[torch.Tensor],
+    num_rows: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Map CP request lists or contiguous query segments to page-table rows."""
+    if isinstance(batch_idx_list, torch.Tensor):
+        # A tensor maps individual queries; do not rebuild interleaved ordering
+        # from cu_seqlens.
+        if batch_idx_list.ndim != 1 or batch_idx_list.shape[0] != num_rows:
+            raise RuntimeError("packed top-k requires one row_to_batch entry per query")
+        return batch_idx_list
+
+    if batch_idx_list is None:
+        row_map = attn_metadata.token_to_batch_idx
+        if row_map is not None and row_map.ndim == 1 and row_map.shape[0] == num_rows:
+            return row_map
+    elif cu_seqlens_q is None or cu_seqlens_q.numel() != len(batch_idx_list) + 1:
+        raise RuntimeError("CP request list requires matching cu_seqlens_q metadata")
+
+    if cu_seqlens_q is None:
+        if attn_metadata.real_page_table.shape[0] == num_rows:
+            return torch.arange(num_rows, dtype=torch.int32, device=device)
+        return None
+
+    # right=True skips empty query segments, including trailing empty requests.
+    segment_ids = torch.searchsorted(
+        cu_seqlens_q[1:],
+        torch.arange(num_rows, device=device),
+        right=True,
+        out_int32=True,
+    )
+    if batch_idx_list is None:
+        return segment_ids
+    requests = torch.tensor(batch_idx_list, dtype=torch.int32, device=device)
+    return requests[segment_ids]
 
 
 def _topk_transform_v2_packed(
@@ -480,11 +579,12 @@ def _topk_transform_v2_packed(
 
     num_rows = logits.shape[0]
     assert (
-        logits.dtype == torch.float32
+        logits.dtype in (torch.float32, torch.bfloat16)
         and logits.stride(1) == 1
         and logits.stride(0) % 4 == 0
+        and logits.stride(0) >= logits.shape[1]
     ), (
-        f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+        f"packed v2 top-k expects non-overlapping fp32/bf16 rows with unit column stride and row stride divisible by 4, got {logits.dtype=} {logits.stride()=}"
     )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
@@ -514,10 +614,6 @@ def _topk_transform_v2_ragged(
     and masks the <= 3 columns that pulls in ahead of the window. Those columns
     belong to a preceding request of the same row, and the score buffer is dead
     after the top-k (see ``DSAIndexer._get_topk_ragged``).
-
-    Preconditions match the paged helper: fp32 scores with unit row stride and a
-    16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
-    construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 

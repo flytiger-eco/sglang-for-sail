@@ -32,6 +32,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -829,8 +830,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_start,
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
-                # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
+                logits_dtype=torch.bfloat16,
             )
 
         assert isinstance(q, torch.Tensor)
@@ -905,6 +905,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
+                logits_dtype=torch.bfloat16,
             )
 
         if self.bf16_indexer:
@@ -1838,7 +1839,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # [NaN-GUARD] Gated by SGLANG_BF16_TOPK_DEBUG (default off).
             if _enable_logits_nan_check:
                 _check_logits_nan_in_valid_range(logits, ks, ke)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            raw_topk_result = metadata.topk_transform(
+                logits,
+                self.index_topk,
+                ks=ks,
+                batch_idx_list=(
+                    token_to_batch_idx
+                    if metadata.topk_transform_method == TopkTransformMethod.PAGED
+                    else None
+                ),
+            )
             topk_result[:q_offset] = raw_topk_result
             return topk_result
 

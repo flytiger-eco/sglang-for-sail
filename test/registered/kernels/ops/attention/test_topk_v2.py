@@ -40,7 +40,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -470,9 +470,8 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
+@pytest.mark.skipif(is_xpu(), reason="packed v2 is not supported on XPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
@@ -483,7 +482,9 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
     ],
 )
 @torch.inference_mode()
-def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
+def test_topk_v2_packed_rows(
+    extend_lens: list[int], k: int, dtype: torch.dtype
+) -> None:
     """DSA extend layout: batch-global packed scores + shared page-table rows.
 
     Rows are causal within a request; a distinct page-table permutation per request
@@ -510,7 +511,7 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
     rows = len(lengths)
 
     width = (total_kv + 3) & ~3
-    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    scores = torch.randn(rows, width, dtype=dtype, device=device)[:, :total_kv]
     lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
     row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
     row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
@@ -543,13 +544,14 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
+@pytest.mark.skipif(is_xpu(), reason="packed v2 is not supported on XPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("residue", [1, 2, 3])
 @pytest.mark.parametrize("boundary", [8192, 16384])
 @torch.inference_mode()
-def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
+def test_topk_v2_packed_level_boundary(
+    boundary: int, residue: int, dtype: torch.dtype
+) -> None:
     """Rows whose length sits on an implementation's max_seq_len boundary.
 
     The masked head widens the problem by ``residue``, so a row of exactly
@@ -571,7 +573,7 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
     total_kv = sum(kv_lens)
 
     width = (total_kv + 3) & ~3
-    scores = torch.randn(rows, width, dtype=torch.float32, device=device)[:, :total_kv]
+    scores = torch.randn(rows, width, dtype=dtype, device=device)[:, :total_kv]
     lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
     row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
     row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
