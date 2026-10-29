@@ -1,4 +1,5 @@
 name: PPU CUDA Sweep (890P, temporary nightly entry)
+run-name: PPU CUDA sweep | ${{ inputs.scope }} | parallel=${{ inputs.max_parallel }} | plan-only=${{ inputs.plan_only }}
 
 # Temporarily reuse the registered nightly path. Move the sweep and restore nightly after validation; do not merge.
 on:
@@ -9,12 +10,12 @@ on:
         type: string
         default: ''
       scope:
-        description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
+        description: 'CUDA scope including kernel unit/benchmark; all is plan-only (weekly/stress/native workflows excluded)'
         type: choice
         options: [base, extra, nightly, all]
         default: base
       suites:
-        description: 'Optional comma-separated exact CUDA suites, overrides scope'
+        description: 'Optional comma-separated exact CUDA suites within the selected scope'
         type: string
         default: ''
       plan_only:
@@ -30,9 +31,8 @@ on:
         type: number
         default: 0
 
-# Serialize scopes. Dispatch batches sequentially; GitHub concurrency retains only one pending run.
 concurrency:
-  group: ppu-cuda-sweep-890p
+  group: ppu-cuda-sweep-890p-${{ inputs.scope }}
   cancel-in-progress: false
 
 permissions:
@@ -138,8 +138,10 @@ jobs:
               paths = sorted(str(p.resolve()) for p in (ROOT / 'test/registered').rglob('*.py') if p.name not in {'conftest.py', '__init__.py'})
               return module, module.collect_tests(paths, sanity_check=True)
 
-          def make_plan(scope, suites, timeout, parallel, hardware):
+          def make_plan(scope, suites, timeout, parallel, hardware, *, plan_only=True):
               require(scope in STAGES, 'Unknown scope')
+              require(type(plan_only) is bool, 'plan_only must be boolean')
+              require(plan_only or scope != 'all', 'scope=all is only allowed in plan-only mode')
               require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
               require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
               require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['reserved_devices'] == 8, 'Invalid board allocation')
@@ -157,6 +159,7 @@ jobs:
                   groups[reg.effective_suite].append(reg)
               selected = sorted(set(s.strip() for s in suites.split(',') if s.strip())) if suites.strip() else sorted(s for s in groups if s.split('-test-', 1)[0] in STAGES[scope])
               require(selected and all(s in groups for s in selected), 'Empty selection or unknown suite')
+              require(all(s.split('-test-', 1)[0] in STAGES[scope] for s in selected), 'Requested suites must belong to the selected scope')
               entries = []
               for suite in selected:
                   require(re.fullmatch(r'[a-z0-9-]+', suite), 'Unsafe suite name')
@@ -184,12 +187,13 @@ jobs:
                       entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'timeout': limit, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
               require(0 < len(entries) <= 256, 'Matrix exceeds 256 entries; select one scope or fewer suites')
               sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'parallel': parallel, 'hardware': hardware, 'entries': entries, 'disabled': disabled}
+              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'plan_only': plan_only, 'parallel': parallel, 'hardware': hardware, 'entries': entries, 'disabled': disabled}
               plan['plan_hash'] = fingerprint(plan)
               return plan
 
           def plan_command():
-              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'))
+              require(os.environ['PLAN_ONLY'] in ('true', 'false'), 'Invalid plan_only input')
+              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), plan_only=os.environ['PLAN_ONLY'] == 'true')
               save(BUNDLE / 'plan.json', plan)
               output('sha', plan['sha'])
               output('parallel', plan['parallel'])
@@ -235,9 +239,10 @@ jobs:
                           occupied.add(spec['nodeName'])
                   elif cards and spec.get('nodeSelector', {}).get('board-type', 'ZW-M890P') == 'ZW-M890P':
                       pending.append(pod['metadata']['name'])
-              free = [n['metadata']['name'] for n in nodes if n['metadata']['name'] not in occupied and not n.get('spec', {}).get('unschedulable') and int(n['status'].get('allocatable', {}).get('alibabacloud.com/ppu', 0)) >= 8 and any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status'].get('conditions', []))]
-              save(destination, {'free_890p_nodes': free, 'occupied_nodes': sorted(occupied), 'pending_ppu_pods': pending})
-              require(free and not pending, 'No idle 890P board, or PPU jobs already queued; retry in an idle window')
+              eligible = [n['metadata']['name'] for n in nodes if not n.get('spec', {}).get('unschedulable') and int(n['status'].get('allocatable', {}).get('alibabacloud.com/ppu', 0)) >= 8 and any(c['type'] == 'Ready' and c['status'] == 'True' for c in n['status'].get('conditions', []))]
+              free = [name for name in eligible if name not in occupied]
+              save(destination, {'eligible_890p_nodes': eligible, 'free_890p_nodes': free, 'occupied_nodes': sorted(occupied), 'pending_ppu_pods': pending})
+              require(eligible, 'No schedulable 890P board with eight devices')
 
           def worker(entry_id):
               plan = context()
@@ -513,6 +518,27 @@ jobs:
                           with self.assertRaisesRegex(ValueError, 'nonempty bounded'):
                               make_plan('base', '', 600, 1, hardware)
 
+                  def test_parallel_scope_contracts(self):
+                      for scope in ('base', 'extra', 'nightly'):
+                          plan = make_plan(scope, '', 0, 2, hardware, plan_only=False)
+                          self.assertEqual(plan['parallel'], 2)
+                          self.assertFalse(plan['plan_only'])
+                          self.assertEqual(plan['hardware']['reserved_devices'], 8)
+                          self.assertTrue(all(e['suite'].split('-test-', 1)[0] in STAGES[scope] for e in plan['entries']))
+                      with self.assertRaisesRegex(ValueError, 'only allowed in plan-only'):
+                          make_plan('all', '', 0, 2, hardware, plan_only=False)
+                      with self.assertRaisesRegex(ValueError, 'boolean'):
+                          make_plan('base', '', 0, 2, hardware, plan_only='false')
+                      extra = next(r.effective_suite for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite.startswith('extra-') and r.disabled is None)
+                      with self.assertRaisesRegex(ValueError, 'selected scope'):
+                          make_plan('base', extra, 0, 2, hardware, plan_only=False)
+                      save(self.directory / 'hardware.json', hardware)
+                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2', 'PLAN_ONLY': 'false'}
+                      with patch.dict(globals(), BUNDLE=self.directory), patch.dict(os.environ, inputs):
+                          with self.assertRaisesRegex(ValueError, 'only allowed in plan-only'):
+                              plan_command()
+                          self.assertFalse((self.directory / 'plan.json').exists())
+
                   def test_result_classes(self):
                       cases = [('PASS', '<testcase/>', 0, ''), ('PASS_WITH_SKIPS', '<testcase/><testcase><skipped message="unsupported"/></testcase>', 0, ''), ('ALL_SKIPPED', '<testcase><skipped/></testcase>', 0, ''), ('ZERO_COLLECTED', '', 5, ''), ('FAIL', '<testcase><failure/></testcase>', 1, ''), ('FAIL', '<testcase><error/></testcase>', 1, ''), ('FAIL', '<testcase/><error/>', 1, ''), ('TIMEOUT', None, None, 'timed out after 600 seconds'), ('INFRA_MODEL', None, 1, 'LocalEntryNotFoundError'), ('OOM', None, 1, 'out of memory'), ('CRASH', None, 1, '')]
                       for status, body, code, error in cases:
@@ -586,18 +612,29 @@ jobs:
                   def test_cluster_capacity(self):
                       node = {'metadata': {'name': 'board'}, 'status': {'allocatable': {'alibabacloud.com/ppu': '8'}, 'conditions': [{'type': 'Ready', 'status': 'True'}]}}
                       pod = {'metadata': {'name': 'occupied'}, 'spec': {'nodeName': 'board', 'containers': [{'resources': {'requests': {'alibabacloud.com/ppu': '1'}}}]}}
-                      for pods, idle in [([], True), ([pod], False), ([{**pod, 'status': {'phase': 'Succeeded'}}], True)]:
+                      queued = {'metadata': {'name': 'queued'}, 'spec': {'containers': pod['spec']['containers'], 'nodeSelector': {'board-type': 'ZW-M890P'}}}
+                      for pods, free, pending in [([], ['board'], []), ([pod], [], []), ([{**pod, 'status': {'phase': 'Succeeded'}}], ['board'], []), ([queued], ['board'], ['queued']), ([pod, queued], [], ['queued'])]:
                           responses = [json.dumps({'items': [node]}), json.dumps({'items': pods})]
                           with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=responses) as query:
-                              if idle:
-                                  cluster_check(self.directory / 'cluster.json')
-                              else:
-                                  with self.assertRaises(ValueError):
-                                      cluster_check(self.directory / 'cluster.json')
+                              cluster_check(self.directory / 'cluster.json')
+                              capacity = read(self.directory / 'cluster.json')
+                              self.assertEqual(capacity['eligible_890p_nodes'], ['board'])
+                              self.assertEqual(capacity['free_890p_nodes'], free)
+                              self.assertEqual(capacity['pending_ppu_pods'], pending)
                               self.assertEqual(query.call_count, 2)
                               for call in query.call_args_list:
                                   self.assertFalse(any(arg.startswith('--request-timeout') for arg in call.args[0]))
                                   self.assertEqual(call.kwargs['timeout'], 25)
+                      invalid = [[], [{**node, 'spec': {'unschedulable': True}}], [{**node, 'status': {**node['status'], 'conditions': [{'type': 'Ready', 'status': 'False'}]}}], [{**node, 'status': {**node['status'], 'allocatable': {'alibabacloud.com/ppu': '7'}}}]]
+                      for nodes in invalid:
+                          responses = [json.dumps({'items': nodes}), json.dumps({'items': []})]
+                          with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=responses):
+                              with self.assertRaisesRegex(ValueError, 'No schedulable 890P'):
+                                  cluster_check(self.directory / 'cluster.json')
+                      for error in (subprocess.TimeoutExpired('/kubectl', 25), subprocess.CalledProcessError(1, ['/kubectl'])):
+                          with patch.object(shutil, 'which', return_value='/kubectl'), patch.object(subprocess, 'check_output', side_effect=error):
+                              with self.assertRaises(type(error)):
+                                  cluster_check(self.directory / 'cluster.json')
 
               with patch.dict(os.environ, env), patch.dict(globals(), registry=lambda: (module, registrations)):
                   result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Contracts))
@@ -658,6 +695,7 @@ jobs:
           SUITES: ${{ inputs.suites }}
           FILE_TIMEOUT: ${{ inputs.timeout_per_file }}
           PARALLEL: ${{ inputs.max_parallel }}
+          PLAN_ONLY: ${{ inputs.plan_only }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: python3 .ppu-sweep/sweep.py plan
       - name: Inventory model references without downloading
@@ -726,7 +764,7 @@ jobs:
         with:
           name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-sweep
-      - name: Check idle capacity and prepare evidence
+      - name: Check schedulable capacity and prepare evidence
         run: |
           [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           [[ "$PPU_BASE_IMAGE_REF" == *"@$PPU_BASE_IMAGE_DIGEST" ]]
