@@ -28,6 +28,15 @@ Registered hooks:
    disables it for non-V4.1 models. PPU builds the CP-aware per-rank query
    layout in ``_build_sparse_prefill_chunk_cache`` through
    ``interleave_rows_per_request``, so the sparse prefill kernels stay usable.
+
+7. ``DeepseekV4AttnBackend._use_sparse_prefill`` (AROUND) — the community gate
+   excludes any batch with active CP, so CP prefill attention runs the paged
+   (decode-style) FlashMLA kernel instead of the sparse prefill one: 2.58ms vs
+   1.77ms per call at seqlen_q=2496, +4.8pp of an iteration. The sparse chunk
+   cache already builds its per-rank query layout through
+   ``interleave_rows_per_request`` when CP is active. Only the CP clause is
+   relaxed: the trtllm, request-window and late-layer-tail exclusions stay, so
+   a tailed batch keeps the paged fallback the community gate picks.
 """
 
 import logging
@@ -179,4 +188,39 @@ def _ppu_keep_sparse_prefill_under_cp(original_fn, server_args):
         cfg.tp_size,
         cfg.cp_strategy,
         cfg.dsv4_prefill_backend,
+    )
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend"
+    "._use_sparse_prefill",
+    type=HookType.AROUND,
+)
+def _ppu_sparse_prefill_with_cp(original_fn, self, forward_batch, *, num_qo_tokens):
+    """Allow FlashMLA sparse prefill under CP prefill."""
+    if original_fn(self, forward_batch, num_qo_tokens=num_qo_tokens):
+        return True
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _LARGE_INDEXER_QUERY_THRESHOLD,
+    )
+    from sglang.srt.layers.cp.utils import is_cp_active
+    from sglang.srt.runtime_context import get_platform
+
+    if not is_cp_active(forward_batch):
+        return False
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return False
+    if get_platform().is_sm120:
+        return False
+    # Every non-CP clause of the community gate still applies: with a late-layer
+    # tail the chunk cache demands global query rows, which CP shards.
+    if self.trtllm_attn or self.token_to_kv_pool.request_window is not None:
+        return False
+    if self.forward_metadata.late_layer_tail is not None:
+        return False
+    return (
+        num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
     )
