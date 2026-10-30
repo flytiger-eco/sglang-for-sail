@@ -22,6 +22,13 @@ Registered hooks:
 
 5. ``DeepseekSparseAttnBackend._copy_replay_metadata_from_sibling`` (AROUND) —
    Skips opaque FlashMLA metadata only for PPU flashmla_kv decode sibling replay.
+
+6. ``DeepseekV4AttnBackend._use_sparse_prefill`` (AROUND) — the community gate
+   excludes any batch with active CP, so CP prefill attention runs the paged
+   (decode-style) FlashMLA kernel instead of the sparse prefill one: 2.58ms vs
+   1.77ms per call at seqlen_q=2496, +4.8pp of an iteration. The sparse chunk
+   cache already builds its per-rank query layout through
+   ``interleave_rows_per_request`` when CP is active.
 """
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook
@@ -106,3 +113,32 @@ def _ppu_dsa_copy_replay_metadata_from_sibling(
     precomputed.flashmla_metadata = None
     original_fn(self, src_backend, bs, precomputed, forward_mode)
     precomputed.flashmla_metadata = flashmla_metadata
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend"
+    "._use_sparse_prefill",
+    type=HookType.AROUND,
+)
+def _ppu_sparse_prefill_with_cp(original_fn, self, forward_batch, *, num_qo_tokens):
+    """Allow FlashMLA sparse prefill under CP prefill."""
+    if original_fn(self, forward_batch, num_qo_tokens=num_qo_tokens):
+        return True
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _LARGE_INDEXER_QUERY_THRESHOLD,
+    )
+    from sglang.srt.layers.cp.utils import is_cp_active
+    from sglang.srt.runtime_context import get_platform
+
+    if not is_cp_active(forward_batch):
+        return False
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return False
+    if get_platform().is_sm120:
+        return False
+    return (
+        num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    )
