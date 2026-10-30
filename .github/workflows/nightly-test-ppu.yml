@@ -309,13 +309,14 @@ jobs:
                       return result
               return result
 
-          def model_preflight(plan, inventory, cache):
+          def model_preflight(plan, inventory, cache, check_cache=True):
               require(inventory['generated_at_commit'] == plan['sha'] and inventory['backend'] == 'cuda', 'Model inventory identity mismatch')
               require(not inventory['parse_failures'], 'Model inventory has parse failures')
-              require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), 'HF cache is not readable on the CPU runner: ' + str(cache))
-              # Force a directory read so an inaccessible mount cannot masquerade as missing models.
-              with os.scandir(cache) as items:
-                  next(items, None)
+              if check_cache:
+                  require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), 'HF cache is not readable on the CPU runner: ' + str(cache))
+                  # Force a directory read so an inaccessible mount cannot masquerade as missing models.
+                  with os.scandir(cache) as items:
+                      next(items, None)
               references = defaultdict(set)
               dependencies, unresolved = {}, set()
               for entry in plan['entries']:
@@ -328,12 +329,13 @@ jobs:
                           unresolved.add(filename)
                       for model in models:
                           references[model].add(filename)
-              rows = [{'model': model, 'reference_file_count': len(files), **cached_model(cache, model), 'files': sorted(files)} for model, files in sorted(references.items())]
-              missing = {row['model'] for row in rows if not row['exists']}
+              unchecked = {'exists': None, 'size_bytes': None, 'reason': 'not_checked'}
+              rows = [{'model': model, 'reference_file_count': len(files), **(cached_model(cache, model) if check_cache else unchecked), 'files': sorted(files)} for model, files in sorted(references.items())]
+              missing = {row['model'] for row in rows if row['exists'] is False}
               blocked = {entry_id: {filename: sorted(models & missing) for filename, models in files.items() if models & missing} for entry_id, files in dependencies.items()}
               gate = {key: plan[key] for key in ('sha', 'plan_hash', 'run_id', 'attempt')}
               # Config/tokenizer-only repositories are valid. This stat/index check is not a full weights checksum or a revision-aware dependency resolver.
-              gate.update(cache=str(cache), heuristic_only=True, models=rows, blocked=blocked, unresolved_files=sorted(unresolved))
+              gate.update(cache=str(cache), availability_checked=check_cache, heuristic_only=True, models=rows, blocked=blocked, unresolved_files=sorted(unresolved))
               gate['preflight_hash'] = fingerprint(gate)
               return gate
 
@@ -348,51 +350,27 @@ jobs:
                   require(set(gate['blocked'][entry['id']]) <= set(entry['files']), 'Model preflight file mismatch')
               return gate
 
-          def model_preflight_in_pod(plan, inventory, cache):
-              kubectl = shutil.which('kubectl') or ('/opt/bin/kubectl' if Path('/opt/bin/kubectl').is_file() else None)
-              require(kubectl, 'Cannot run NAS preflight: kubectl unavailable')
-              name = 'sweep-models-' + fingerprint({k: plan[k] for k in ('sha', 'run_id', 'attempt')})[:24]
-              command = [kubectl, '-n', 'ppu-sched']
-              # 仅借用计算节点的 NAS 挂载；不申请 PPU、不挂载设备、不传入凭证。
-              pod = {'apiVersion': 'v1', 'kind': 'Pod', 'metadata': {'name': name}, 'spec': {
-                  'restartPolicy': 'Never', 'activeDeadlineSeconds': 900,
-                  'automountServiceAccountToken': False, 'enableServiceLinks': False,
-                  'nodeSelector': {'board-type': 'ZW-M890P'},
-                  'containers': [{'name': 'probe', 'image': os.environ['PPU_BASE_IMAGE'], 'imagePullPolicy': 'IfNotPresent',
-                      'command': ['python3', '-c', 'import time; time.sleep(900)'],
-                      'resources': {'requests': {'cpu': '100m', 'memory': '128Mi'}, 'limits': {'cpu': '1', 'memory': '512Mi'}},
-                      'securityContext': {'allowPrivilegeEscalation': False, 'capabilities': {'drop': ['ALL']}},
-                      'volumeMounts': [{'name': 'models', 'mountPath': '/nas_aisw', 'readOnly': True}]}],
-                  'volumes': [{'name': 'models', 'hostPath': {'path': '/nas_aisw', 'type': 'Directory'}}]}}
-              payload = json.dumps({'driver': (BUNDLE / 'sweep.py').read_text(), 'plan': plan, 'inventory': inventory, 'cache': str(cache)})
-              bootstrap = "import json,sys; from pathlib import Path; data=json.load(sys.stdin); ns={'__file__':'/tmp/sweep.py','__name__':'sweep_probe'}; exec(data['driver'],ns); print(json.dumps(ns['model_preflight'](data['plan'],data['inventory'],Path(data['cache']))))"
-              subprocess.run(command + ['create', '-f', '-'], input=json.dumps(pod), text=True, check=True, timeout=30)
-              try:
-                  subprocess.run(command + ['wait', '--for=condition=Ready', 'pod/' + name, '--timeout=180s'], check=True, timeout=210)
-                  result = subprocess.run(command + ['exec', '-i', name, '-c', 'probe', '--', 'python3', '-c', bootstrap], input=payload, stdout=subprocess.PIPE, text=True, check=True, timeout=600)
-                  return json.loads(result.stdout)
-              finally:
-                  subprocess.run(command + ['delete', 'pod', name, '--ignore-not-found', '--wait=false'], check=True, timeout=30)
-
           def models_command():
               directory = BUNDLE / 'preflight'
               try:
-                  probe = model_preflight_in_pod if os.environ.get('PPU_MODEL_PREFLIGHT_POD') == '1' else model_preflight
                   plan = context()
-                  gate = probe(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']))
+                  gate = model_preflight(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']), check_cache=os.environ.get('PPU_MODEL_INVENTORY_ONLY') != '1')
                   save(directory / 'model_preflight.json', gate)
                   read_preflight(plan)
               except Exception as error:
                   save(directory / 'error.json', {'error': str(error)})
                   summary('Model preflight failed; no PPU will be allocated: ' + str(error))
                   raise
-              for name, rows in [('model_availability', gate['models']), ('missing_models', [r for r in gate['models'] if not r['exists']])]:
+              for name, rows in [('model_availability', gate['models']), ('missing_models', [r for r in gate['models'] if r['exists'] is False])]:
                   with (directory / (name + '.csv')).open('w', newline='') as stream:
                       writer = csv.DictWriter(stream, fieldnames=['model', 'reference_file_count', 'exists', 'size_bytes', 'reason', 'files'])
                       writer.writeheader()
                       writer.writerows({**row, 'files': ';'.join(row['files'])} for row in rows)
-              missing = [r['model'] for r in gate['models'] if not r['exists']]
-              summary('# Model preflight (CPU only)\n' + f"Models: {len(gate['models'])}; missing/incomplete: {len(missing)}; blocked file/suite registrations: {sum(len(v) for v in gate['blocked'].values())}.\n" + 'No downloads. Blocked files will not execute; see missing_models.csv.\n' + 'Heuristic only: dynamic IDs, datasets and requested revisions may remain unresolved; an available snapshot is not proof of complete weights.\n' + '\n'.join('- `' + model + '`' for model in missing))
+              missing = [r['model'] for r in gate['models'] if r['exists'] is False]
+              if not gate['availability_checked']:
+                  summary('# Model inventory only\n' + f"Referenced models: {len(gate['models'])}; NAS availability and sizes: NOT CHECKED.\n" + 'No downloads or model-based exclusions. All planned files will execute; missing-model failures will be classified from test evidence. An empty missing_models.csv does not mean the cache is complete.')
+              else:
+                  summary('# Model preflight (CPU only)\n' + f"Models: {len(gate['models'])}; missing/incomplete: {len(missing)}; blocked file/suite registrations: {sum(len(v) for v in gate['blocked'].values())}.\n" + 'No downloads. Blocked files will not execute; see missing_models.csv.\n' + 'Heuristic only: dynamic IDs, datasets and requested revisions may remain unresolved; an available snapshot is not proof of complete weights.\n' + '\n'.join('- `' + model + '`' for model in missing))
 
           def gate_command(entry_id):
               plan = context()
@@ -838,40 +816,26 @@ jobs:
                       self.assertEqual(command[-2:], ['--exclude-file', 'test/registered/missing.py'])
                       self.assertEqual(command[command.index('--auto-partition-id') + 1], '2')
 
-                  def test_cpu_pod_preflight_and_cleanup(self):
+                  def test_inventory_only_does_not_probe_or_block(self):
                       plan, _, _, _ = self.evidence()
-                      gate = self.gate(plan)
-                      (self.directory / 'sweep.py').write_text('def model_preflight(plan, inventory, cache):\n    return {"cache": str(cache), **plan}\n')
-                      ok = subprocess.CompletedProcess([], 0, stdout=json.dumps(gate))
-                      for failure in (None, 'wait', 'exec', 'create'):
-                          calls = []
-                          def execute(command, **kwargs):
-                              calls.append((command, kwargs))
-                              if command[3] == failure:
-                                  raise subprocess.TimeoutExpired(command, 1)
-                              return ok
-                          with patch.dict(globals(), BUNDLE=self.directory), patch.dict(os.environ, PPU_BASE_IMAGE='example/image'), patch.object(shutil, 'which', return_value='kubectl'), patch.object(subprocess, 'run', side_effect=execute):
-                              if failure:
-                                  with self.assertRaises(subprocess.TimeoutExpired):
-                                      model_preflight_in_pod(plan, {}, Path('/nas_aisw/datasets/hf_cache/hub'))
-                              else:
-                                  self.assertEqual(model_preflight_in_pod(plan, {}, Path('/nas_aisw/datasets/hf_cache/hub')), gate)
-                          pod = json.loads(calls[0][1]['input'])['spec']
-                          self.assertFalse(pod['automountServiceAccountToken'])
-                          self.assertEqual(pod['activeDeadlineSeconds'], 900)
-                          self.assertEqual(pod['nodeSelector'], {'board-type': 'ZW-M890P'})
-                          self.assertEqual(pod['volumes'][0]['hostPath'], {'path': '/nas_aisw', 'type': 'Directory'})
-                          container = pod['containers'][0]
-                          self.assertTrue(container['volumeMounts'][0]['readOnly'])
-                          self.assertNotIn('alibabacloud.com/ppu', json.dumps(pod))
-                          self.assertNotIn('env', container)
-                          self.assertEqual(calls[-1][0][3], 'create' if failure == 'create' else 'delete')
-                          if failure is None:
-                              payload = json.loads(calls[2][1]['input'])
-                              self.assertEqual(payload['plan'], plan)
-                              self.assertEqual(payload['cache'], '/nas_aisw/datasets/hf_cache/hub')
-                              result = subprocess.run([sys.executable, '-c', calls[2][0][-1]], input=calls[2][1]['input'], capture_output=True, text=True, check=True)
-                              self.assertEqual(json.loads(result.stdout), {'cache': payload['cache'], **plan})
+                      filename = plan['entries'][0]['files'][0]
+                      inventory = {'generated_at_commit': plan['sha'], 'backend': 'cuda', 'parse_failures': {}, 'file_models': {filename: ['org/missing']}, 'suite_model_overrides': {}}
+                      with patch.dict(globals(), BUNDLE=self.directory, context=lambda: plan), patch.dict(os.environ, PPU_MODEL_INVENTORY_ONLY='1', HF_HUB_CACHE='/unmounted/cache'), patch.object(os, 'scandir', side_effect=AssertionError('NAS must not be probed')), patch.object(subprocess, 'run', side_effect=AssertionError('No preflight Pod')), contextlib.redirect_stdout(io.StringIO()):
+                          save(BUNDLE / 'models.json', inventory)
+                          models_command()
+                          gate = read_preflight(plan)
+                          self.assertFalse(gate['availability_checked'])
+                          self.assertEqual(gate['blocked'], {'e000': {}})
+                          self.assertEqual(gate['models'][0]['reason'], 'not_checked')
+                          self.assertIsNone(gate['models'][0]['exists'])
+                          self.assertIsNone(gate['models'][0]['size_bytes'])
+                          with patch.dict(globals(), output=lambda k, v: self.assertEqual((k, v), ('runnable', 'true'))):
+                              gate_command('e000')
+                          with (BUNDLE / 'preflight/model_availability.csv').open() as stream:
+                              row = next(csv.DictReader(stream))
+                              self.assertEqual((row['exists'], row['size_bytes'], row['reason']), ('', '', 'not_checked'))
+                          with (BUNDLE / 'preflight/missing_models.csv').open() as stream:
+                              self.assertEqual(list(csv.DictReader(stream)), [])
 
                   def test_aggregate_without_valid_preflight(self):
                       plan, source, _, _ = self.evidence()
@@ -890,9 +854,9 @@ jobs:
                   def test_workflow_model_gate_order(self):
                       import yaml
                       jobs = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())['jobs']
-                      self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
-                      probe = next(s for s in jobs['sweep-models']['steps'] if s.get('name') == 'Check NAS models before allocating any PPU')
-                      self.assertEqual(probe['env']['PPU_MODEL_PREFLIGHT_POD'], '1')
+                      self.assertEqual(jobs['sweep-models']['runs-on'], 'ubuntu-latest')
+                      probe = next(s for s in jobs['sweep-models']['steps'] if s.get('name') == 'Record model inventory without NAS checks')
+                      self.assertEqual(probe['env']['PPU_MODEL_INVENTORY_ONLY'], '1')
                       for name in ('sweep-image', 'sweep-execute', 'sweep-summarize'):
                           self.assertIn('sweep-models', jobs[name]['needs'])
                       execute = jobs['sweep-execute']['steps']
@@ -1204,9 +1168,7 @@ jobs:
 
   sweep-models:
     needs: sweep-prepare
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/setup-python@v5
@@ -1216,9 +1178,9 @@ jobs:
         with:
           name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-sweep
-      - name: Check NAS models before allocating any PPU
+      - name: Record model inventory without NAS checks
         env:
-          PPU_MODEL_PREFLIGHT_POD: '1'
+          PPU_MODEL_INVENTORY_ONLY: '1'
           HF_HUB_CACHE: /nas_aisw/datasets/hf_cache/hub
         run: python3 .ppu-sweep/sweep.py models
       - uses: actions/upload-artifact@v4
