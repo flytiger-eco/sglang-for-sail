@@ -549,6 +549,30 @@ def capture_prefill_graph(
         )
         return result(eager_runner)
 
+    # PPU SAIL MSA with an fp8 index-K cache: the MSA prefill path is
+    # eager-only, and the Triton fallback under capture cannot read the
+    # fp8 index bytes (ppu_msa_hook rejects them outright). Captured
+    # prefill graphs are impossible in that mode; route prefill to the
+    # eager runner. Unsetting SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8
+    # keeps prefill graphs on the bf16-index Triton path.
+    msa_backend = getattr(model_runner, "attn_backend", None)
+    # MiniMax models wrap the sparse backend inside MiniMaxHybridAttnBackend.
+    msa_sparse = getattr(msa_backend, "sparse", msa_backend)
+    if getattr(msa_sparse, "use_msa_ppu", False):
+        msa_kv_pool = getattr(msa_sparse, "kv_pool", None)
+        msa_index_pool = getattr(msa_kv_pool, "index_k_pool", None) or getattr(
+            msa_kv_pool, "index_kv_pool", None
+        )
+        if msa_index_pool is not None and msa_index_pool.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            logger.warning(
+                "Disable prefill CUDA graph: the PPU SAIL MSA fp8 index-K "
+                "cache only supports the eager MSA prefill path."
+            )
+            return result(eager_runner)
+
     # Resolve the decoder once. Some VLM wrappers (for example Kimi-VL)
     # expose it as ``language_model`` rather than ``model``.
     try:
