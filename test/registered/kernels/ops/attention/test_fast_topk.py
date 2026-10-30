@@ -303,7 +303,9 @@ def test_fast_topk_empty_batch(topk):
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fast_topk_transform_decode(topk, dtype):
-    # page rows == batch and no row_starts -> decode kernel
+    # page rows == batch and no row_starts -> decode kernel. The matching row
+    # counts no longer guarantee an identity row -> page mapping on their own,
+    # so this case passes a cu_seqlens_q that is identity by construction.
     torch.manual_seed(0)
     lens = [0, 1, topk - 1, topk, topk + 1, 17, 4096, 5000]
     batch, width = len(lens), 8192
@@ -424,21 +426,86 @@ def test_fast_topk_transform_trailing_empty_requests(topk, dtype):
 
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fast_topk_transform_empty_segment_with_equal_rows(topk, dtype):
-    # Page rows == score rows, yet an empty middle request breaks the identity
-    # row -> page mapping. row_starts is passed explicitly to force the prefill
-    # kernel, the only one that honours cu_seqlens_q.
+@pytest.mark.parametrize("use_starts", [False, True])
+@pytest.mark.parametrize("cu_list", [[0, 2, 2, 3], [0, 1, 3, 3]])
+def test_fast_topk_transform_empty_segment_with_equal_rows(
+    topk, dtype, use_starts, cu_list
+):
+    # Page rows == score rows, yet an empty request breaks the identity
+    # row -> page mapping: [0, 2, 2, 3] empties the middle request, [0, 1, 3, 3]
+    # the trailing one. With row_starts this is the prefill kernel; without it
+    # the decode kernel runs and has to resolve the owning request itself, so
+    # both entries must gather the physical pages of that request.
     torch.manual_seed(0)
-    batch, width = 3, 16384
-    cu = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
-    lengths = torch.tensor([topk + 7, 2048, topk], dtype=torch.int32, device="cuda")
-    row_starts = torch.tensor([0, 7, 512], dtype=torch.int32, device="cuda")
+    batch, width = 3, 8192
+    cu = torch.tensor(cu_list, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 7, 17, topk + 1], dtype=torch.int32, device="cuda")
+    row_starts = (
+        torch.tensor([0, 7, 512], dtype=torch.int32, device="cuda")
+        if use_starts
+        else None
+    )
     score = torch.randn(batch, width, dtype=dtype, device="cuda")
     page = _make_unique_page(cu.shape[0] - 1, width, seed=37 + topk)
+    # Equal page and score rows plus absent row_starts are exactly the
+    # conditions that select the decode kernel, so the use_starts=False case
+    # really reaches that entry rather than falling back to prefill.
+    assert page.shape[0] == batch
     out = fast_topk_transform_fused(
         score, lengths, page, cu, topk, row_starts=row_starts
     )
     _check_transform_output(score, lengths, page, cu, topk, row_starts, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_transform_kernel_api_equal_rows_empty_segment(topk, dtype):
+    """The decode kernel is reachable through the C++ entry on its own: equal
+    page and score rows with a non-identity cu_seqlens_q must still gather the
+    page row of the request that owns each score row."""
+    torch.manual_seed(0)
+    batch, width = 3, 8192
+    cu = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 5, 9, topk + 3], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=dtype, device="cuda")
+    page = _make_unique_page(cu.shape[0] - 1, width, seed=43 + topk)
+    out = torch.empty((batch, topk), dtype=torch.int32, device="cuda")
+
+    module = _jit_fast_topk_module(topk, score.dtype)
+    module.fast_topk_transform_fused(score, lengths, out, page, cu, None)
+    _check_transform_output(score, lengths, page, cu, topk, None, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_transform_decode_cuda_graph_replay(monkeypatch, topk, dtype):
+    """One captured decode launch has to reload cu_seqlens_q from the metadata
+    buffer on every replay: the same graph must follow an identity mapping, an
+    empty middle request and an empty trailing request as the buffer is
+    updated in place."""
+    torch.manual_seed(0)
+    batch, width = 3, 8192
+    cu = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 7, 17, topk + 1], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=dtype, device="cuda")
+    page = _make_unique_page(batch, width, seed=61 + topk)
+
+    for _ in range(2):
+        fast_topk_transform_fused(score, lengths, page, cu, topk)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = fast_topk_transform_fused(score, lengths, page, cu, topk)
+    # A replay must not need the wrapper again, so the guard goes up only after
+    # the capture, which still has to go through it.
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.fast_topk._jit_fast_topk_module",
+        lambda *args: pytest.fail("a replay must not re-enter the wrapper"),
+    )
+
+    for layout in ([0, 1, 2, 3], [0, 2, 2, 3], [0, 1, 3, 3]):
+        cu.copy_(torch.tensor(layout, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        _check_transform_output(score, lengths, page, cu, topk, None, out)
 
 
 @pytest.mark.parametrize("topk", [512, 2048])

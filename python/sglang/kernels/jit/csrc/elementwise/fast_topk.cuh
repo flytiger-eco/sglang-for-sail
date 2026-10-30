@@ -287,17 +287,37 @@ __launch_bounds__(kThreadsPerBlock) void fast_topk_kernel(const FastTopKParams<D
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+SGL_DEVICE auto find_request_row(const int32_t* cu_seqlens_q, int64_t row, int64_t num_requests) -> int64_t {
+  // Identity decode needs only its own interval. Equal table/query row counts
+  // can also contain empty segments, so fall back to the first end > row.
+  if (cu_seqlens_q[row] <= row && row < cu_seqlens_q[row + 1]) return row;
+  int64_t lo = 0;
+  int64_t hi = num_requests;
+  while (lo < hi) {
+    const int64_t mid = lo + (hi - lo) / 2;
+    if (cu_seqlens_q[mid + 1] <= row) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 template <int kTopK, bool kUsePDL, typename DType>
 __global__ __launch_bounds__(kThreadsPerBlock) void topk_transform_decode_kernel(
     const FastTopKParams<DType> __grid_constant__ params,
     int32_t* __restrict__ dst_page_table,
     const int32_t* __restrict__ src_page_table,
-    int64_t src_stride) {
+    int64_t src_stride,
+    const int32_t* __restrict__ cu_seqlens_q) {
   device::PDLWaitPrimary<kUsePDL>();
   const auto row = static_cast<uint64_t>(blockIdx.x);
   const int32_t length = params.lengths[row];
   const auto* score = params.input + row * params.input_stride;
-  const auto* src = src_page_table + row * src_stride;
+  // This entry is launched only when request rows equal query rows.
+  const auto request = find_request_row(cu_seqlens_q, row, gridDim.x);
+  const auto* src = src_page_table + request * src_stride;
   auto* dst = dst_page_table + row * kTopK;
   if (length <= kTopK) {
     naive_topk_transform<kTopK>(length, dst, src);
@@ -459,6 +479,8 @@ struct FastTopKKernel {
 
     const auto params =
         fast_topk_detail::make_params<DType>(score, lengths, row_starts, nullptr, score_stride.unwrap());
+    // The equal-row kernel still resolves request intervals on device; this
+    // launch choice must not imply that cumulative query lengths are identity.
     const bool is_decode = !row_starts.has_value() && prefill_batch.unwrap() == batch.unwrap();
     if (is_decode) {
       const auto kernel = fast_topk_detail::topk_transform_decode_kernel<kTopK, kUsePDL, DType>;
@@ -472,7 +494,8 @@ struct FastTopKKernel {
               params,
               static_cast<int32_t*>(dst_page_table.data_ptr()),
               static_cast<const int32_t*>(src_page_table.data_ptr()),
-              src_stride.unwrap());
+              src_stride.unwrap(),
+              static_cast<const int32_t*>(cu_seqlens_q.data_ptr()));
     } else {
       const auto kernel = fast_topk_detail::topk_transform_prefill_kernel<kTopK, kUsePDL, DType>;
       LaunchKernel(
