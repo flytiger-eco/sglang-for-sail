@@ -1,5 +1,5 @@
 name: PPU CUDA Sweep (890P, temporary nightly entry)
-run-name: PPU CUDA sweep | ${{ inputs.scope }} | parallel=${{ inputs.max_parallel }} | plan-only=${{ inputs.plan_only }}
+run-name: PPU CUDA sweep | ${{ inputs.scope }} | parallel=${{ inputs.max_parallel }}
 
 # Temporarily reuse the registered nightly path. Move the sweep and restore nightly after validation; do not merge.
 on:
@@ -10,18 +10,14 @@ on:
         type: string
         default: ''
       scope:
-        description: 'CUDA scope including kernel unit/benchmark; all is plan-only (weekly/stress/native workflows excluded)'
+        description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
         type: choice
-        options: [base, extra, nightly, all]
+        options: [base, extra, nightly]
         default: base
       suites:
         description: 'Optional comma-separated exact CUDA suites within the selected scope'
         type: string
         default: ''
-      plan_only:
-        description: 'Inventory only: no PPU allocation'
-        type: boolean
-        default: true
       max_parallel:
         description: 'Concurrent whole 890P boards (1-2); not visible card count'
         type: number
@@ -100,7 +96,6 @@ jobs:
           ROOT = Path.cwd().resolve()
           # Base includes the original CUDA kernel unit/benchmark registrations for complete coverage across all three scopes.
           STAGES = {'base': {'base-a', 'base-b', 'base-b-kernel-unit', 'base-b-kernel-benchmark', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
-          STAGES['all'] = set().union(*STAGES.values())
 
           def require(condition, message):
               if not condition:
@@ -175,11 +170,9 @@ jobs:
               paths = sorted(str(p.resolve()) for p in (ROOT / 'test/registered').rglob('*.py') if p.name not in {'conftest.py', '__init__.py'})
               return module, module.collect_tests(paths, sanity_check=True)
 
-          def make_plan(scope, suites, timeout, parallel, hardware, *, plan_only=True, partition_model=None, partition_model_sha=''):
+          def make_plan(scope, suites, timeout, parallel, hardware, *, partition_model=None, partition_model_sha=''):
               require(scope in STAGES, 'Unknown scope')
-              require(type(plan_only) is bool, 'plan_only must be boolean')
               require((partition_model is None and partition_model_sha == '') or (isinstance(partition_model, dict) and re.fullmatch(r'[0-9a-f]{40}', partition_model_sha)), 'Partition model must have an immutable identity')
-              require(plan_only or scope != 'all', 'scope=all is only allowed in plan-only mode')
               require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
               require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
               require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['reserved_devices'] == 8, 'Invalid board allocation')
@@ -187,11 +180,12 @@ jobs:
               module, registrations = registry()
               groups = defaultdict(list)
               disabled = []
+              stages = set().union(*STAGES.values())
               for reg in registrations:
                   if reg.backend != module.HWBackend.CUDA:
                       continue
                   stage = reg.stage or reg.effective_suite.split('-test-', 1)[0]
-                  if stage not in STAGES['all']:
+                  if stage not in stages:
                       continue
                   require(not reg.nightly, 'Unexpected legacy nightly flag: ' + reg.effective_suite)
                   groups[reg.effective_suite].append(reg)
@@ -231,15 +225,14 @@ jobs:
                       entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'partition_policy': policy, 'timeout': limit, 'test_budget_seconds': test_budget, 'worker_minutes': worker_minutes, 'job_minutes': job_minutes, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
               require(0 < len(entries) <= 256, 'Matrix exceeds 256 entries; select one scope or fewer suites')
               sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'plan_only': plan_only, 'parallel': parallel, 'hardware': hardware, 'partition_model': partition_model, 'partition_model_sha': partition_model_sha, 'entries': entries, 'disabled': disabled}
+              plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'parallel': parallel, 'hardware': hardware, 'partition_model': partition_model, 'partition_model_sha': partition_model_sha, 'entries': entries, 'disabled': disabled}
               plan['plan_hash'] = fingerprint(plan)
               return plan
 
           def plan_command():
-              require(os.environ['PLAN_ONLY'] in ('true', 'false'), 'Invalid plan_only input')
-              require(os.environ['PLAN_ONLY'] == 'true' or os.environ['SCOPE'] != 'all', 'scope=all is only allowed in plan-only mode')
+              require(os.environ['SCOPE'] in STAGES, 'Unknown scope')
               model, model_sha = resolve_partition_model()
-              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), plan_only=os.environ['PLAN_ONLY'] == 'true', partition_model=model, partition_model_sha=model_sha)
+              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), partition_model=model, partition_model_sha=model_sha)
               save(BUNDLE / 'plan.json', plan)
               output('sha', plan['sha'])
               output('parallel', plan['parallel'])
@@ -248,7 +241,7 @@ jobs:
               for suite in sorted({e['suite'] for e in plan['entries']}):
                   group = [e for e in plan['entries'] if e['suite'] == suite]
                   rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['partition_policy']} | {group[0]['n_devices']} / 8 | {group[0]['test_budget_seconds'] // 60} |")
-              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'No PASS claims in plan-only mode. Base includes kernel unit/benchmark stages. Weekly, stress and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
+              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", '计划不代表测试通过。Base 包含 kernel unit/benchmark 阶段；不包含 weekly、stress 和 workflow-native 条目。', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
               rows.append('Native CUDA sizing and LPT share one pinned model. Whole-suite entries use one task. PPU test budgets are at least 180 minutes and never smaller than the native CUDA run budget; budget expiry remains a failure.')
               summary('\n'.join(rows))
 
@@ -313,7 +306,7 @@ jobs:
               require(inventory['generated_at_commit'] == plan['sha'] and inventory['backend'] == 'cuda', 'Model inventory identity mismatch')
               require(not inventory['parse_failures'], 'Model inventory has parse failures')
               if check_cache:
-                  require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), 'HF cache is not readable on the CPU runner: ' + str(cache))
+                  require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), '预检环境无法读取 HF 缓存：' + str(cache))
                   # Force a directory read so an inaccessible mount cannot masquerade as missing models.
                   with os.scandir(cache) as items:
                       next(items, None)
@@ -339,8 +332,8 @@ jobs:
               gate['preflight_hash'] = fingerprint(gate)
               return gate
 
-          def read_preflight(plan):
-              gate = read(BUNDLE / 'preflight/model_preflight.json')
+          def read_preflight(plan, directory=None):
+              gate = read((Path(directory) if directory is not None else BUNDLE / 'preflight') / 'model_preflight.json')
               stored = gate.pop('preflight_hash')
               require(fingerprint(gate) == stored, 'Model preflight hash mismatch')
               gate['preflight_hash'] = stored
@@ -350,27 +343,73 @@ jobs:
                   require(set(gate['blocked'][entry['id']]) <= set(entry['files']), 'Model preflight file mismatch')
               return gate
 
-          def models_command():
-              directory = BUNDLE / 'preflight'
+          def models_command(destination=None, worker=False):
+              directory = Path(destination) if destination is not None else BUNDLE / 'preflight'
               try:
                   plan = context()
-                  gate = model_preflight(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']), check_cache=os.environ.get('PPU_MODEL_INVENTORY_ONLY') != '1')
-                  save(directory / 'model_preflight.json', gate)
-                  read_preflight(plan)
+                  execution = None
+                  if worker:
+                      sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+                      require(sha == plan['sha'], '预检 worker 的源码 SHA 不匹配')
+                      require(re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['PPU_BASE_IMAGE_DIGEST']), '预检镜像缺少固定 digest')
+                      require(os.environ['PPU_BASE_IMAGE_REF'].endswith('@' + os.environ['PPU_BASE_IMAGE_DIGEST']), '预检镜像身份不匹配')
+                      import torch
+                      names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+                      require(len(names) == 8 and all('890' in name.upper() for name in names), '预检需要独占 890P 整板')
+                      execution = {'workflow_sha': plan['workflow_sha'], 'devices': names, 'reserved_devices': 8, 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST']}
+                  gate = model_preflight(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']))
+                  if execution is not None:
+                      gate.pop('preflight_hash')
+                      gate['worker'] = execution
+                      gate['preflight_hash'] = fingerprint(gate)
+                  write_model_report(gate, directory)
+                  read_preflight(plan, directory)
               except Exception as error:
                   save(directory / 'error.json', {'error': str(error)})
-                  summary('Model preflight failed; no PPU will be allocated: ' + str(error))
+                  summary('模型预检失败，后续测试不得发车：' + str(error))
                   raise
+
+          def write_model_report(gate, directory):
+              save(directory / 'model_preflight.json', gate)
               for name, rows in [('model_availability', gate['models']), ('missing_models', [r for r in gate['models'] if r['exists'] is False])]:
                   with (directory / (name + '.csv')).open('w', newline='') as stream:
                       writer = csv.DictWriter(stream, fieldnames=['model', 'reference_file_count', 'exists', 'size_bytes', 'reason', 'files'])
                       writer.writeheader()
                       writer.writerows({**row, 'files': ';'.join(row['files'])} for row in rows)
               missing = [r['model'] for r in gate['models'] if r['exists'] is False]
-              if not gate['availability_checked']:
-                  summary('# Model inventory only\n' + f"Referenced models: {len(gate['models'])}; NAS availability and sizes: NOT CHECKED.\n" + 'No downloads or model-based exclusions. All planned files will execute; missing-model failures will be classified from test evidence. An empty missing_models.csv does not mean the cache is complete.')
-              else:
-                  summary('# Model preflight (CPU only)\n' + f"Models: {len(gate['models'])}; missing/incomplete: {len(missing)}; blocked file/suite registrations: {sum(len(v) for v in gate['blocked'].values())}.\n" + 'No downloads. Blocked files will not execute; see missing_models.csv.\n' + 'Heuristic only: dynamic IDs, datasets and requested revisions may remain unresolved; an available snapshot is not proof of complete weights.\n' + '\n'.join('- `' + model + '`' for model in missing))
+              summary('# 模型预检\n' + f"模型数：{len(gate['models'])}；缺失或不完整：{len(missing)}；阻断文件/suite 注册数：{sum(len(v) for v in gate['blocked'].values())}。\n" + '未下载模型。被阻断文件不会执行，详见 missing_models.csv。\n' + '启发式检查：动态 ID、数据集和指定 revision 可能未解析；存在快照不等于权重齐全，也不代表测试通过。\n' + '\n'.join('- `' + model + '`' for model in missing))
+
+          def collect_models(source):
+              directory = BUNDLE / 'preflight'
+              directory.mkdir(parents=True, exist_ok=True)
+              report = load('sweep_model_export', ROOT / 'scripts/ci/ppu/pr_report.py')
+              try:
+                  plan = context()
+                  exported = report.export_evidence(source, directory / 'worker-evidence')
+                  require(os.environ.get('WORKER_OUTCOME') == 'success', 'PPU 预检 worker 未成功完成')
+                  require(not (exported / 'error.json').exists(), 'PPU 预检产生错误报告')
+                  gate = read_preflight(plan, exported)
+                  require(gate['availability_checked'] is True, '模型可用性尚未检查')
+                  require(gate['cache'] == os.environ['HF_HUB_CACHE'], '预检 HF 缓存路径不匹配')
+                  execution = gate['worker']
+                  require(execution['workflow_sha'] == plan['workflow_sha'], '预检 workflow 身份不匹配')
+                  require(execution['image'] == os.environ['PPU_BASE_IMAGE_REF'] and execution['digest'] == os.environ['PPU_BASE_IMAGE_DIGEST'], '预检镜像身份不匹配')
+                  require(execution['reserved_devices'] == 8 and len(execution['devices']) == 8 and all('890' in n.upper() for n in execution['devices']), '预检板卡身份不匹配')
+                  inventory = read(BUNDLE / 'models.json')
+                  expected = model_preflight(plan, inventory, Path(gate['cache']), check_cache=False)
+                  projection = lambda rows: [(r['model'], r['reference_file_count'], r['files']) for r in rows]
+                  require(projection(gate['models']) == projection(expected['models']) and gate['unresolved_files'] == expected['unresolved_files'], '预检模型清单与计划不匹配')
+                  require(all(type(r['exists']) is bool and type(r['size_bytes']) is int and r['size_bytes'] >= 0 for r in gate['models']), '预检模型状态或大小无效')
+                  missing = {r['model'] for r in gate['models'] if not r['exists']}
+                  blocked = {}
+                  for entry in plan['entries']:
+                      dependencies = {f: set(inventory['file_models'][f]) | set(inventory['suite_model_overrides'].get(entry['suite'], [])) for f in entry['files']}
+                      blocked[entry['id']] = {f: sorted(models & missing) for f, models in dependencies.items() if models & missing}
+                  require(gate['blocked'] == blocked, '预检阻断列表与缺失模型不匹配')
+                  write_model_report(gate, directory)
+              except Exception as error:
+                  save(directory / 'error.json', {'error': report.runner.sanitize(str(error))})
+                  raise
 
           def gate_command(entry_id):
               plan = context()
@@ -749,7 +788,7 @@ jobs:
                       with patch.object(os, 'scandir', side_effect=PermissionError('denied')):
                           with self.assertRaises(PermissionError):
                               model_preflight(plan, inventory, self.directory / 'cache')
-                      with self.assertRaisesRegex(ValueError, 'not readable'):
+                      with self.assertRaisesRegex(ValueError, '无法读取'):
                           model_preflight(plan, inventory, self.directory / 'no-mount')
                       inventory['parse_failures'] = {'test.py': 'SyntaxError'}
                       with self.assertRaisesRegex(ValueError, 'parse failures'):
@@ -816,26 +855,50 @@ jobs:
                       self.assertEqual(command[-2:], ['--exclude-file', 'test/registered/missing.py'])
                       self.assertEqual(command[command.index('--auto-partition-id') + 1], '2')
 
-                  def test_inventory_only_does_not_probe_or_block(self):
+                  def test_ppu_model_worker_and_collection(self):
+                      from types import SimpleNamespace
+                      self.snapshot()
                       plan, _, _, _ = self.evidence()
-                      filename = plan['entries'][0]['files'][0]
-                      inventory = {'generated_at_commit': plan['sha'], 'backend': 'cuda', 'parse_failures': {}, 'file_models': {filename: ['org/missing']}, 'suite_model_overrides': {}}
-                      with patch.dict(globals(), BUNDLE=self.directory, context=lambda: plan), patch.dict(os.environ, PPU_MODEL_INVENTORY_ONLY='1', HF_HUB_CACHE='/unmounted/cache'), patch.object(os, 'scandir', side_effect=AssertionError('NAS must not be probed')), patch.object(subprocess, 'run', side_effect=AssertionError('No preflight Pod')), contextlib.redirect_stdout(io.StringIO()):
+                      plan['entries'][0]['files'] = ['cached.py', 'missing.py']
+                      inventory = {'generated_at_commit': plan['sha'], 'backend': 'cuda', 'parse_failures': {}, 'file_models': {'cached.py': ['org/cached'], 'missing.py': ['org/missing']}, 'suite_model_overrides': {}}
+                      fake_torch = SimpleNamespace(cuda=SimpleNamespace(get_device_name=lambda i: 'ZW-M890P', device_count=lambda: 8))
+                      source = self.directory / 'nas-report'
+                      with patch.dict(globals(), BUNDLE=self.directory, context=lambda: plan), patch.dict(os.environ, HF_HUB_CACHE=str(self.directory / 'cache')), patch.dict(sys.modules, torch=fake_torch), patch.object(subprocess, 'check_output', return_value=plan['sha']), contextlib.redirect_stdout(io.StringIO()):
                           save(BUNDLE / 'models.json', inventory)
-                          models_command()
+                          models_command(source, worker=True)
+                          with patch.dict(globals(), cached_model=lambda *a: self.fail('编排侧不得探测 NAS 模型缓存')), patch.object(os, 'access', side_effect=AssertionError('编排侧不得检查模型缓存权限')):
+                              collect_models(source)
                           gate = read_preflight(plan)
-                          self.assertFalse(gate['availability_checked'])
-                          self.assertEqual(gate['blocked'], {'e000': {}})
-                          self.assertEqual(gate['models'][0]['reason'], 'not_checked')
-                          self.assertIsNone(gate['models'][0]['exists'])
-                          self.assertIsNone(gate['models'][0]['size_bytes'])
-                          with patch.dict(globals(), output=lambda k, v: self.assertEqual((k, v), ('runnable', 'true'))):
-                              gate_command('e000')
-                          with (BUNDLE / 'preflight/model_availability.csv').open() as stream:
-                              row = next(csv.DictReader(stream))
-                              self.assertEqual((row['exists'], row['size_bytes'], row['reason']), ('', '', 'not_checked'))
+                          self.assertTrue(gate['availability_checked'])
+                          self.assertEqual(gate['worker']['devices'], ['ZW-M890P'] * 8)
+                          self.assertEqual(gate['blocked'], {'e000': {'missing.py': ['org/missing']}})
                           with (BUNDLE / 'preflight/missing_models.csv').open() as stream:
-                              self.assertEqual(list(csv.DictReader(stream)), [])
+                              self.assertEqual([r['model'] for r in csv.DictReader(stream)], ['org/missing'])
+                          original = read(source / 'model_preflight.json')
+                          cases = [('failed', None), ('missing', None), ('stale', ('attempt', 'old')), ('unchecked', ('availability_checked', False)), ('wrong-models', ('models', [])), ('wrong-blocks', ('blocked', {'e000': {}})), ('wrong-worker', ('worker', {**original['worker'], 'digest': 'bad'}))]
+                          for name, change in cases:
+                              bundle = self.directory / name
+                              save(bundle / 'models.json', inventory)
+                              changed = {**original}
+                              if change:
+                                  changed[change[0]] = change[1]
+                                  changed.pop('preflight_hash')
+                                  changed['preflight_hash'] = fingerprint(changed)
+                              save(source / 'model_preflight.json', changed)
+                              with patch.dict(globals(), BUNDLE=bundle), patch.dict(os.environ, WORKER_OUTCOME='failure' if name == 'failed' else 'success'):
+                                  with self.assertRaises((ValueError, OSError)):
+                                      collect_models(self.directory / 'absent' if name == 'missing' else source)
+                                  self.assertFalse((bundle / 'preflight/model_preflight.json').exists())
+                                  self.assertTrue((bundle / 'preflight/error.json').is_file())
+                          with patch.dict(os.environ, HF_HUB_CACHE=str(self.directory / 'unmounted')):
+                              with self.assertRaisesRegex(ValueError, '无法读取'):
+                                  models_command(self.directory / 'failed-worker', worker=True)
+                          self.assertFalse((self.directory / 'failed-worker/model_preflight.json').exists())
+                          for name, target, attribute, value in [('sha', subprocess, 'check_output', 'wrong'), ('hardware', fake_torch.cuda, 'get_device_name', 'NVIDIA'), ('devices', fake_torch.cuda, 'device_count', 1)]:
+                              with patch.object(target, attribute, return_value=value):
+                                  with self.assertRaises(ValueError):
+                                      models_command(self.directory / name, worker=True)
+                              self.assertFalse((self.directory / name / 'model_preflight.json').exists())
 
                   def test_aggregate_without_valid_preflight(self):
                       plan, source, _, _ = self.evidence()
@@ -853,16 +916,31 @@ jobs:
 
                   def test_workflow_model_gate_order(self):
                       import yaml
-                      jobs = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())['jobs']
-                      self.assertEqual(jobs['sweep-models']['runs-on'], 'ubuntu-latest')
-                      probe = next(s for s in jobs['sweep-models']['steps'] if s.get('name') == 'Record model inventory without NAS checks')
-                      self.assertEqual(probe['env']['PPU_MODEL_INVENTORY_ONLY'], '1')
-                      for name in ('sweep-image', 'sweep-execute', 'sweep-summarize'):
+                      workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
+                      jobs = workflow['jobs']
+                      inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
+                      for name in ('sweep-image', 'sweep-execute'):
+                          self.assertNotIn('if', jobs[name])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
+                      self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
+                      self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
+                      probe = next(s for s in jobs['sweep-models']['steps'] if s.get('id') == 'model-worker')
+                      self.assertEqual(probe['with']['nnodes'], 0)
+                      self.assertEqual(probe['with']['nproc_per_node'], 8)
+                      self.assertEqual(probe['with']['node_selector'], 'board-type=ZW-M890P')
+                      self.assertEqual(probe['with']['timeout_minutes'], 20)
+                      self.assertNotIn('secrets.', probe['with']['extra_env'])
+                      collector = next(s for s in jobs['sweep-models']['steps'] if s.get('name') == 'Validate and publish PPU model preflight')
+                      self.assertEqual(collector['if'], 'always()')
+                      for name in ('sweep-execute', 'sweep-summarize'):
                           self.assertIn('sweep-models', jobs[name]['needs'])
                       execute = jobs['sweep-execute']['steps']
                       worker = next(s for s in execute if s.get('id') == 'worker')
                       self.assertEqual(worker['if'], "steps.gate.outputs.runnable == 'true'")
-                      self.assertFalse(any('cluster-task' in s.get('uses', '') for s in jobs['sweep-models']['steps']))
+                      self.assertEqual(probe['uses'], worker['uses'])
 
                   def test_scope_coverage_and_partitions(self):
                       tree = ast.parse((ROOT / 'test/run_suite.py').read_text())
@@ -873,16 +951,8 @@ jobs:
                                   if isinstance(key, ast.Attribute) and key.attr == 'CUDA':
                                       cuda_suites[node.targets[0].id] = ast.literal_eval(value)
                       expected_suites = {'base': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('base-')}, 'extra': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('extra-')}, 'nightly': set(cuda_suites['NIGHTLY_SUITES'])}
-                      expected_suites['all'] = set().union(*expected_suites.values())
-                      partition_counts = {}
                       for scope, suites in expected_suites.items():
-                          if scope == 'all' and sum(partition_counts.values()) > 256:
-                              with self.assertRaisesRegex(ValueError, 'Matrix exceeds 256'):
-                                  make_plan(scope, '', 0, 1, hardware)
-                              print(f"all: {sum(partition_counts.values())} partitions exceeds GitHub's 256-entry limit; dispatch base/extra/nightly separately")
-                              continue
                           plan = make_plan(scope, '', 0, 1, hardware)
-                          partition_counts[scope] = len(plan['entries'])
                           expected = [r for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite in suites and not r.nightly]
                           actual = [(e['suite'], f) for e in plan['entries'] for f in e['files']]
                           self.assertEqual(Counter(actual), Counter((r.effective_suite, str(Path(r.filename).relative_to(ROOT))) for r in expected if r.disabled is None))
@@ -903,7 +973,7 @@ jobs:
                       for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'weekly-test-8-gpu-h200', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 3), ('base', '', 0, True)]:
                           with self.assertRaises(ValueError):
                               make_plan(scope, suites, timeout, parallel, hardware)
-                      selected = make_plan('all', 'base-a-test-1-gpu-small', 600, 2, hardware)
+                      selected = make_plan('base', 'base-a-test-1-gpu-small', 600, 2, hardware)
                       self.assertEqual({e['suite'] for e in selected['entries']}, {'base-a-test-1-gpu-small'})
                       kernel = make_plan('base', 'base-b-kernel-unit-test-1-gpu-b200', 600, 1, hardware)
                       self.assertEqual({e['suite'] for e in kernel['entries']}, {'base-b-kernel-unit-test-1-gpu-b200'})
@@ -973,24 +1043,29 @@ jobs:
 
                   def test_parallel_scope_contracts(self):
                       for scope in ('base', 'extra', 'nightly'):
-                          plan = make_plan(scope, '', 0, 2, hardware, plan_only=False)
+                          plan = make_plan(scope, '', 0, 2, hardware)
                           self.assertEqual(plan['parallel'], 2)
-                          self.assertFalse(plan['plan_only'])
+                          self.assertNotIn('plan_only', plan)
                           self.assertEqual(plan['hardware']['reserved_devices'], 8)
                           self.assertTrue(all(e['suite'].split('-test-', 1)[0] in STAGES[scope] for e in plan['entries']))
-                      with self.assertRaisesRegex(ValueError, 'only allowed in plan-only'):
-                          make_plan('all', '', 0, 2, hardware, plan_only=False)
-                      with self.assertRaisesRegex(ValueError, 'boolean'):
-                          make_plan('base', '', 0, 2, hardware, plan_only='false')
+                      with self.assertRaisesRegex(ValueError, 'Unknown scope'):
+                          make_plan('all', '', 0, 2, hardware)
                       extra = next(r.effective_suite for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite.startswith('extra-') and r.disabled is None)
                       with self.assertRaisesRegex(ValueError, 'selected scope'):
-                          make_plan('base', extra, 0, 2, hardware, plan_only=False)
+                          make_plan('base', extra, 0, 2, hardware)
                       save(self.directory / 'hardware.json', hardware)
-                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2', 'PLAN_ONLY': 'false'}
-                      with patch.dict(globals(), BUNDLE=self.directory), patch.dict(os.environ, inputs):
-                          with self.assertRaisesRegex(ValueError, 'only allowed in plan-only'):
+                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2'}
+                      outputs = {}
+                      with patch.dict(globals(), BUNDLE=self.directory, resolve_partition_model=lambda: (None, ''), output=lambda k, v: outputs.update({k: v})), patch.dict(os.environ, inputs):
+                          with self.assertRaisesRegex(ValueError, 'Unknown scope'):
                               plan_command()
                           self.assertFalse((self.directory / 'plan.json').exists())
+                          with patch.dict(os.environ, SCOPE='base', SUITES='base-a-test-1-gpu-small'), contextlib.redirect_stdout(io.StringIO()):
+                              plan_command()
+                          plan = context()
+                          self.assertTrue(plan['entries'])
+                          self.assertEqual(outputs['sha'], plan['sha'])
+                          self.assertEqual(len(json.loads(outputs['matrix'])['include']), len(plan['entries']))
 
                   def test_result_classes(self):
                       cases = [('PASS', '<testcase/>', 0, ''), ('PASS_WITH_SKIPS', '<testcase/><testcase><skipped message="unsupported"/></testcase>', 0, ''), ('ALL_SKIPPED', '<testcase><skipped/></testcase>', 0, ''), ('ZERO_COLLECTED', '', 5, ''), ('FAIL', '<testcase><failure/></testcase>', 1, ''), ('FAIL', '<testcase><error/></testcase>', 1, ''), ('FAIL', '<testcase/><error/>', 1, ''), ('TIMEOUT', None, None, 'timed out after 600 seconds'), ('INFRA_MODEL', None, 1, 'LocalEntryNotFoundError'), ('OOM', None, 1, 'out of memory'), ('CRASH', None, 1, '')]
@@ -1095,7 +1170,7 @@ jobs:
 
           if __name__ == '__main__':
               parser = argparse.ArgumentParser()
-              parser.add_argument('mode', choices=['plan', 'models', 'gate', 'cluster', 'worker', 'gather', 'aggregate', 'selftest'])
+              parser.add_argument('mode', choices=['plan', 'models', 'models-worker', 'collect-models', 'gate', 'cluster', 'worker', 'gather', 'aggregate', 'selftest'])
               parser.add_argument('--entry')
               parser.add_argument('--source')
               parser.add_argument('--destination')
@@ -1104,8 +1179,10 @@ jobs:
                   sys.exit(selftest())
               elif args.mode == 'plan':
                   plan_command()
-              elif args.mode == 'models':
-                  models_command()
+              elif args.mode in ('models', 'models-worker'):
+                  models_command(args.destination, worker=args.mode == 'models-worker')
+              elif args.mode == 'collect-models':
+                  collect_models(args.source)
               elif args.mode == 'gate':
                   gate_command(args.entry)
               elif args.mode == 'cluster':
@@ -1126,6 +1203,16 @@ jobs:
           export SGL_KERNEL_WHEEL_CACHE_DIR=/ppu-sweep-cache/aot/ZW-M890P
           bash scripts/ci/ppu/ppu_install_dependency.sh
           python3 -m pip install pytest==8.3.5 tabulate
+          SH
+          cat > .ppu-sweep/models.sh <<'SH'
+          set -euo pipefail
+          umask 022
+          cd /workspace/source
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
+          export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+          export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
+          export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
           set -euo pipefail
@@ -1152,7 +1239,6 @@ jobs:
           SUITES: ${{ inputs.suites }}
           FILE_TIMEOUT: ${{ inputs.timeout_per_file }}
           PARALLEL: ${{ inputs.max_parallel }}
-          PLAN_ONLY: ${{ inputs.plan_only }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
           GH_TOKEN: ${{ github.token }}
         run: python3 .ppu-sweep/sweep.py plan
@@ -1167,10 +1253,22 @@ jobs:
           retention-days: 30
 
   sweep-models:
-    needs: sweep-prepare
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    needs: [sweep-prepare, sweep-image]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 30
+    env:
+      PPU_BASE_IMAGE_REF: ${{ needs.sweep-image.outputs.image }}
+      PPU_BASE_IMAGE_DIGEST: ${{ needs.sweep-image.outputs.digest }}
+      HF_HUB_CACHE: /nas_aisw/datasets/hf_cache/hub
+      MODEL_EVIDENCE_SOURCE: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/models
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sweep-prepare.outputs.sha }}
+          fetch-depth: 2
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -1178,11 +1276,38 @@ jobs:
         with:
           name: ppu-sweep-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-sweep
-      - name: Record model inventory without NAS checks
+      - name: Prepare isolated model evidence directory
+        run: |
+          [[ "$PPU_BASE_IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$PPU_BASE_IMAGE_REF" == *"@$PPU_BASE_IMAGE_DIGEST" ]]
+          python3 .ppu-sweep/sweep.py cluster --destination .ppu-sweep/preflight/cluster.json
+          test ! -e "$MODEL_EVIDENCE_SOURCE"
+          mkdir -p "$MODEL_EVIDENCE_SOURCE"
+      - name: Check NAS model availability on an exclusive 890P board
+        id: model-worker
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF }}
+          nnodes: 0
+          nproc_per_node: 8
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: sweep-models
+          command: bash /workspace/source/.ppu-sweep/models.sh
+          host_volumes: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/models:/ppu-models
+          extra_env: "GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub"
+          container_options: |
+            privileged: true
+            cpus: '2'
+            memory: 8Gi
+            shm_size: 64Mi
+          timeout_minutes: 20
+          cleanup_policy: always
+      - name: Validate and publish PPU model preflight
+        if: always()
         env:
-          PPU_MODEL_INVENTORY_ONLY: '1'
-          HF_HUB_CACHE: /nas_aisw/datasets/hf_cache/hub
-        run: python3 .ppu-sweep/sweep.py models
+          WORKER_OUTCOME: ${{ steps.model-worker.outcome }}
+        run: python3 .ppu-sweep/sweep.py collect-models --source "$MODEL_EVIDENCE_SOURCE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -1193,8 +1318,7 @@ jobs:
           retention-days: 30
 
   sweep-image:
-    needs: [sweep-prepare, sweep-models]
-    if: ${{ !inputs.plan_only }}
+    needs: sweep-prepare
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1218,7 +1342,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: ${{ !inputs.plan_only }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1304,7 +1427,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && !inputs.plan_only
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
