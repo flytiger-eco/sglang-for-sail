@@ -452,7 +452,7 @@ struct FastTopKKernel {
     TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(cu_seqlens_q);
     RuntimeCheck(
         cu_seqlens_q.size(0) == prefill_batch.unwrap() + 1, "cu_seqlens_q length must equal page-table rows + 1");
-    RuntimeCheck(prefill_batch.unwrap() <= batch.unwrap(), "page-table rows must not exceed score rows");
+    // Empty query segments may leave more request table rows than score rows.
     if (row_starts.has_value()) {
       TensorMatcher({batch}).with_dtype<int32_t>().with_device(device).verify(row_starts.value());
     }

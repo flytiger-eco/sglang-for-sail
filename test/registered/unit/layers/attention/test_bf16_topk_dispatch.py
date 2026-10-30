@@ -599,6 +599,46 @@ class BF16TopKDispatchTest(unittest.TestCase):
                 self.assertIs(kwargs["row_starts"], self.starts)
                 self.assertIs(kwargs["row_to_batch"], self.mapping)
 
+    def test_indexer_paged_mapping_tolerates_metadata_without_method(self):
+        # The non-chunked indexer call site reads the transform method off the
+        # metadata object, which BaseIndexerMetadata does not declare. Evaluate
+        # the production expression itself: PAGED keeps the original per-token
+        # map, RAGGED drops it, and a metadata object without the attribute must
+        # degrade to "no map" instead of raising.
+        source = DSA / "dsa_indexer.py"
+        nodes = [
+            n
+            for n in ast.walk(ast.parse(source.read_text()))
+            if isinstance(n, ast.keyword)
+            and n.arg == "batch_idx_list"
+            and isinstance(n.value, ast.IfExp)
+        ]
+        self.assertEqual(len(nodes), 1)
+        code = compile(
+            ast.fix_missing_locations(ast.Expression(body=nodes[0].value)),
+            str(source),
+            "eval",
+        )
+
+        def mapping_for(metadata):
+            return eval(
+                code,
+                dict(
+                    token_to_batch_idx=self.mapping,
+                    metadata=metadata,
+                    TopkTransformMethod=self.method,
+                ),
+            )
+
+        self.assertIs(
+            mapping_for(SimpleNamespace(topk_transform_method=self.method.PAGED)),
+            self.mapping,
+        )
+        self.assertIsNone(
+            mapping_for(SimpleNamespace(topk_transform_method=self.method.RAGGED))
+        )
+        self.assertIsNone(mapping_for(SimpleNamespace()))
+
     def test_paged_metadata_does_not_build_ragged_offsets(self):
         ns = load_definitions(
             DSA / "dsa_indexer_metadata.py",
@@ -634,6 +674,59 @@ class BF16TopKDispatchTest(unittest.TestCase):
         self.assertIsNone(
             backend.topk_transform.call_args.kwargs["topk_indices_offset"]
         )
+
+
+class FastTopKTransformWrapperTest(unittest.TestCase):
+    """Shape-contract checks on the production fused-transform wrapper. The real
+    input validator needs CUDA tensors, so only that helper is replaced; every
+    other line comes from the production source and runs on CPU tensors."""
+
+    def setUp(self):
+        self.kernel = Mock()
+        self.factory = Mock(
+            return_value=SimpleNamespace(fast_topk_transform_fused=self.kernel)
+        )
+        self.transform = load_definitions(
+            REPO / "python/sglang/kernels/ops/attention/fast_topk.py",
+            {"fast_topk_transform_fused"},
+            dict(
+                torch=torch,
+                _validate_topk_inputs=Mock(),
+                _jit_fast_topk_module=self.factory,
+            ),
+        )["fast_topk_transform_fused"]
+
+    def call(self, batch, page_rows, cu, **kwargs):
+        score = torch.randn(batch, 32, dtype=torch.bfloat16)
+        lengths = torch.full((batch,), 8, dtype=torch.int32)
+        page = torch.arange(page_rows * 32, dtype=torch.int32).view(page_rows, 32)
+        return self.transform(score, lengths, page, cu, 512, **kwargs)
+
+    def test_more_page_rows_than_query_rows_is_accepted(self):
+        # cu_seqlens_q = [0, 1, 1, 2]: the middle request owns no query row, so
+        # two score rows come with three page-table rows.
+        cu = torch.tensor([0, 1, 1, 2], dtype=torch.int32)
+        out = self.call(2, 3, cu)
+        self.assertEqual(out.shape, (2, 512))
+        args = self.kernel.call_args.args
+        self.assertEqual(args[3].shape[0], 3)
+        self.assertIs(args[4], cu)
+
+    def test_cu_seqlens_q_shape_mismatch_is_still_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "cu_seqlens_q"):
+            self.call(2, 3, torch.tensor([0, 1, 2], dtype=torch.int32))
+        self.kernel.assert_not_called()
+
+    def test_empty_batch_with_pages_does_not_reach_the_kernel(self):
+        self.assertEqual(
+            self.call(0, 3, torch.zeros(4, dtype=torch.int32)).shape, (0, 512)
+        )
+        self.factory.assert_not_called()
+
+    def test_non_empty_scores_still_require_a_page_row(self):
+        with self.assertRaisesRegex(RuntimeError, "page-table row"):
+            self.call(2, 0, torch.zeros(1, dtype=torch.int32))
+        self.factory.assert_not_called()
 
 
 class V2WrapperTest(unittest.TestCase):

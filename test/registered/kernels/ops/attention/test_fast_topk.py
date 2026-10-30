@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.fast_topk import (
+    _jit_fast_topk_module,
     fast_topk,
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
@@ -393,6 +394,108 @@ def test_fast_topk_transform_prefill_batch_over_block(topk, dtype):
 
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_transform_pages_outnumber_queries(topk, dtype):
+    # cu_seqlens_q = [0, 1, 1, 2]: the middle request owns no query row, so
+    # three page-table rows serve two score rows. Row 1 must read page row 2.
+    torch.manual_seed(0)
+    batch, width = 2, 8192
+    cu = torch.tensor([0, 1, 1, 2], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 64, 17], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=dtype, device="cuda")
+    page = _make_unique_page(cu.shape[0] - 1, width, seed=11 + topk)
+    out = fast_topk_transform_fused(score, lengths, page, cu, topk)
+    _check_transform_output(score, lengths, page, cu, topk, None, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_transform_trailing_empty_requests(topk, dtype):
+    # Several trailing requests own no query row at all: four page-table rows,
+    # three score rows, and a row that takes the radix path.
+    torch.manual_seed(0)
+    batch, width = 3, 8192
+    cu = torch.tensor([0, 2, 3, 3, 3], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 1, width, 1], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=dtype, device="cuda")
+    page = _make_unique_page(cu.shape[0] - 1, width, seed=23 + topk)
+    out = fast_topk_transform_fused(score, lengths, page, cu, topk)
+    _check_transform_output(score, lengths, page, cu, topk, None, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fast_topk_transform_empty_segment_with_equal_rows(topk, dtype):
+    # Page rows == score rows, yet an empty middle request breaks the identity
+    # row -> page mapping. row_starts is passed explicitly to force the prefill
+    # kernel, the only one that honours cu_seqlens_q.
+    torch.manual_seed(0)
+    batch, width = 3, 16384
+    cu = torch.tensor([0, 2, 2, 3], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 7, 2048, topk], dtype=torch.int32, device="cuda")
+    row_starts = torch.tensor([0, 7, 512], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=dtype, device="cuda")
+    page = _make_unique_page(cu.shape[0] - 1, width, seed=37 + topk)
+    out = fast_topk_transform_fused(
+        score, lengths, page, cu, topk, row_starts=row_starts
+    )
+    _check_transform_output(score, lengths, page, cu, topk, row_starts, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_transform_sparse_pages_over_block(topk):
+    # 1025 page-table rows (> threads per block) with only two non-empty
+    # requests: the strided sequence lookup must land on rows 1023 and 1024.
+    torch.manual_seed(0)
+    batch, width, pages = 2, 4096, 1025
+    cu = torch.zeros(pages + 1, dtype=torch.int32, device="cuda")
+    cu[pages - 1] = 1
+    cu[pages] = 2
+    lengths = torch.tensor([topk + 64, 100], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=torch.float32, device="cuda")
+    page = _make_unique_page(pages, width, seed=15 + topk)
+    out = fast_topk_transform_fused(score, lengths, page, cu, topk)
+    _check_transform_output(score, lengths, page, cu, topk, None, out)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_transform_kernel_api_pages_outnumber_queries(topk):
+    """The C++ entry point must accept more page-table rows than score rows on
+    its own; the Python wrapper is not the only gate. Its cu_seqlens_q length
+    check still has to reject a table that is not fully described."""
+    torch.manual_seed(0)
+    batch, width = 2, 8192
+    cu = torch.tensor([0, 1, 1, 2], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([topk + 33, 5], dtype=torch.int32, device="cuda")
+    score = torch.randn(batch, width, dtype=torch.float32, device="cuda")
+    page = _make_unique_page(cu.shape[0] - 1, width, seed=71 + topk)
+    out = torch.empty((batch, topk), dtype=torch.int32, device="cuda")
+
+    module = _jit_fast_topk_module(topk, score.dtype)
+    module.fast_topk_transform_fused(score, lengths, out, page, cu, None)
+    _check_transform_output(score, lengths, page, cu, topk, None, out)
+
+    with pytest.raises(Exception, match="cu_seqlens_q length"):
+        module.fast_topk_transform_fused(score, lengths, out, page, cu[:-1], None)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_transform_empty_batch_keeps_pages(monkeypatch, topk):
+    # Zero score rows with a non-empty page table and an all-zero cu_seqlens_q:
+    # the wrapper returns the empty result without launching a kernel.
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.fast_topk._jit_fast_topk_module",
+        lambda *args: pytest.fail("an empty batch must not launch a kernel"),
+    )
+    score = torch.randn(0, 4096, dtype=torch.float32, device="cuda")
+    lengths = torch.zeros(0, dtype=torch.int32, device="cuda")
+    page = torch.zeros(3, 4096, dtype=torch.int32, device="cuda")
+    cu = torch.zeros(4, dtype=torch.int32, device="cuda")
+    out = fast_topk_transform_fused(score, lengths, page, cu, topk)
+    assert out.shape == (0, topk)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("use_starts", [False, True])
 def test_fast_topk_transform_ragged(topk, dtype, use_starts):
     torch.manual_seed(0)
@@ -435,12 +538,14 @@ def test_fast_topk_input_validation():
     with pytest.raises(RuntimeError, match="row_starts"):
         fast_topk(good, lengths, 512, row_starts=starts.float())
 
-    with pytest.raises(RuntimeError, match="must not exceed"):
+    # More page-table rows than score rows is legal (requests can own no query
+    # row), but cu_seqlens_q must still describe every page-table row.
+    with pytest.raises(RuntimeError, match="cu_seqlens_q"):
         fast_topk_transform_fused(
             good,
             lengths,
             torch.zeros(5, 4096, dtype=torch.int32, device="cuda"),
-            torch.arange(6, dtype=torch.int32, device="cuda"),
+            torch.arange(5, dtype=torch.int32, device="cuda"),
             512,
         )
     with pytest.raises(RuntimeError, match="cu_seqlens_q"):

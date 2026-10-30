@@ -1845,7 +1845,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 ks=ks,
                 batch_idx_list=(
                     token_to_batch_idx
-                    if metadata.topk_transform_method == TopkTransformMethod.PAGED
+                    if getattr(metadata, "topk_transform_method", None)
+                    == TopkTransformMethod.PAGED
                     else None
                 ),
             )

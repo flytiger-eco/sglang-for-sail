@@ -157,9 +157,8 @@ def fast_topk_transform_fused(
             "cu_seqlens_q must be contiguous CUDA int32 with one more entry "
             "than page-table rows"
         )
-    if page_table_size_1.shape[0] > batch:
-        raise RuntimeError("page-table rows must not exceed score rows")
-
+    # Empty query segments can make request rows outnumber score rows.
+    # cu_seqlens_q describes their mapping; its length must still match the table.
     output = torch.empty((batch, topk), dtype=torch.int32, device=score.device)
     if batch == 0:
         return output
