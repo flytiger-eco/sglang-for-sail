@@ -315,6 +315,14 @@ class BuildInventory(unittest.TestCase):
             self.assertEqual(suite["unresolved_files"], ["test/registered/b/test_b.py"])
             self.assertEqual(inv["model_count"], 1)
             self.assertEqual(inv["parse_failures"], {})
+            self.assertEqual(
+                inv["file_models"],
+                {
+                    "test/registered/a/test_a.py": ["meta-llama/Llama-3.1-8B"],
+                    "test/registered/b/test_b.py": [],
+                },
+            )
+            self.assertEqual(inv["suite_model_overrides"], {})
 
     def test_by_file_override_adds_and_clears_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,6 +337,9 @@ class BuildInventory(unittest.TestCase):
             self.assertIn("org/extra-model", suite["models"])
             # by_file supplied a model for test_b -> no longer unresolved.
             self.assertEqual(suite["unresolved_files"], [])
+            self.assertEqual(
+                inv["file_models"]["test/registered/b/test_b.py"], ["org/extra-model"]
+            )
 
     def test_by_suite_override_adds_model(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,6 +353,8 @@ class BuildInventory(unittest.TestCase):
             self.assertIn(
                 "org/suite-model", inv["suites"]["base-x-test-1-gpu"]["models"]
             )
+            self.assertEqual(inv["suite_model_overrides"], overrides["by_suite"])
+            self.assertEqual(inv["file_models"]["test/registered/b/test_b.py"], [])
 
 
 class RenderMarkdown(unittest.TestCase):

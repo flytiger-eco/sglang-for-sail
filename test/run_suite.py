@@ -401,6 +401,16 @@ def load_live_est(
     }
 
 
+def exclude_selected_files(ci_tests, filenames, repo_root):
+    excluded = {os.path.abspath(os.path.join(repo_root, name)) for name in filenames}
+    selected = {t.filename for t in ci_tests}
+    if not excluded <= selected:
+        raise ValueError(
+            f"Excluded files outside selected partition: {sorted(excluded - selected)}"
+        )
+    return [t for t in ci_tests if t.filename not in excluded]
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     suite = args.suite
@@ -447,6 +457,12 @@ def run_a_suite(args):
         ci_tests = auto_partition(
             ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
         )
+
+    exclusions = getattr(args, "exclude_file", [])
+    if exclusions:
+        if not getattr(args, "pytest", False):
+            raise ValueError("File exclusions require --pytest")
+        ci_tests = exclude_selected_files(ci_tests, exclusions, repo_root)
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -565,6 +581,12 @@ def main():
         help="Strict per-file pytest/JUnit execution (no retries).",
     )
     parser.add_argument("--require-nonempty", action="store_true")
+    parser.add_argument(
+        "--exclude-file",
+        action="append",
+        default=[],
+        help="Preflight-blocked repo-relative file; applied after partitioning (pytest only).",
+    )
     parser.add_argument("--junit-dir")
     parser.add_argument("--suite-timeout", type=float)
     parser.add_argument(
