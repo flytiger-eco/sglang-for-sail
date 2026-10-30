@@ -330,6 +330,7 @@ class BF16TopKDispatchTest(unittest.TestCase):
                 logits=scores,
                 lengths=self.lengths[:3],
                 row_starts=None,
+                cu_seqlens_q_topk=None,
             ),
             "paged-v2",
         )
@@ -353,6 +354,7 @@ class BF16TopKDispatchTest(unittest.TestCase):
             logits=self.scores[:3],
             lengths=self.lengths[:3],
             row_starts=None,
+            cu_seqlens_q_topk=None,
         )
         self.assertIs(self.kernel.call_args.args[3], self.metadata.real_page_table)
         self.assertEqual(self.kernel.call_args.args[5], 64)
@@ -598,6 +600,77 @@ class BF16TopKDispatchTest(unittest.TestCase):
                 self.assertEqual(result.shape, (6, 512))
                 self.assertIs(kwargs["row_starts"], self.starts)
                 self.assertIs(kwargs["row_to_batch"], self.mapping)
+
+    def test_equal_row_counts_preserve_request_cumulative_map(self):
+        # Repeated cumulative lengths invalidate identity even when table and
+        # query row counts agree. Unknown metadata must also preserve the map.
+        self.metadata.page_table_1 = None
+        for v2 in (False, True):
+            for max_q in (None, 2):
+                for cu_values, expected in (
+                    ([0, 2, 2, 3], [0, 0, 2]),
+                    ([0, 1, 3, 3], [0, 1, 1]),
+                ):
+                    with self.subTest(v2=v2, max_q=max_q, cu=cu_values):
+                        self.envs.SGLANG_OPT_USE_TOPK_V2 = flag(v2)
+                        if max_q is None:
+                            self.metadata.__dict__.pop("max_seq_len_q", None)
+                        else:
+                            self.metadata.max_seq_len_q = max_q
+                        self.call(
+                            self.method.PAGED,
+                            logits=self.scores[:3],
+                            lengths=self.lengths[:3],
+                            row_starts=None,
+                            cu_seqlens_q_topk=torch.tensor(
+                                cu_values, dtype=torch.int32
+                            ),
+                        )
+                        args, kwargs = self.kernel.call_args
+                        self.assertIs(args[3], self.metadata.real_page_table)
+                        self.assertEqual(args[5], self.metadata.page_size)
+                        self.assertTrue(
+                            torch.equal(
+                                kwargs["row_to_page"],
+                                torch.tensor(expected, dtype=torch.int32),
+                            )
+                        )
+        self.v2_paged.assert_not_called()
+        self.v2_packed.assert_not_called()
+        self.legacy.fast_topk_transform_fused.assert_not_called()
+
+    def test_marked_decode_and_verify_keep_identity_without_rebuilding_map(self):
+        # Production decode/verify metadata marks one query per expanded table
+        # row. Use that scalar contract without inspecting device tensor values.
+        self.metadata.max_seq_len_q = 1
+        self.metadata.page_table_1 = None
+        for v2 in (False, True):
+            for rows in (3, 6):
+                with self.subTest(v2=v2, rows=rows):
+                    self.kernel.reset_mock()
+                    self.v2_paged.reset_mock()
+                    self.envs.SGLANG_OPT_USE_TOPK_V2 = flag(v2)
+                    self.metadata.real_page_table = torch.zeros(
+                        rows, 32, dtype=torch.int32
+                    )
+                    with patch.object(
+                        torch,
+                        "searchsorted",
+                        side_effect=AssertionError("Unexpected map rebuild"),
+                    ):
+                        result = self.call(
+                            self.method.PAGED,
+                            logits=self.scores[:rows],
+                            lengths=self.lengths[:rows],
+                            row_starts=None,
+                            cu_seqlens_q_topk=torch.arange(rows + 1, dtype=torch.int32),
+                        )
+                    if v2:
+                        self.assertEqual(result, "paged-v2")
+                        self.kernel.assert_not_called()
+                    else:
+                        self.assertIsNone(self.kernel.call_args.kwargs["row_to_page"])
+                        self.v2_paged.assert_not_called()
 
     def test_indexer_paged_mapping_tolerates_metadata_without_method(self):
         # The non-chunked indexer call site reads the transform method off the

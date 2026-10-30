@@ -175,6 +175,15 @@ class DSATopKBackend(Enum):
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
+        # A supplied cumulative query map is request-level unless the metadata
+        # explicitly marks one query per table row (including expanded verify
+        # and draft-extend tables). Equal row counts alone do not prove identity:
+        # [0, 2, 2, 3] maps three queries to request rows [0, 0, 2].
+        paged_rows_are_queries = (
+            cu_seqlens_q_topk is None
+            or getattr(attn_metadata, "max_seq_len_q", None) == 1
+        )
+
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
         # to the DeepSeek-V4 top-k v2 JIT kernel. It fuses top-k selection and the
@@ -191,6 +200,7 @@ class DSATopKBackend(Enum):
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
+            and paged_rows_are_queries
             and 0 < topk <= 2048
             and lengths.shape[0]
             == logits.shape[0]
@@ -270,7 +280,10 @@ class DSATopKBackend(Enum):
                 ):
                     page_table_size_1 = attn_metadata.real_page_table
                     page_size = attn_metadata.page_size
-                    cu_seqlens_q_topk = None
+                    # Compact tables can be request-level even when their row
+                    # count matches the query count. Preserve that mapping.
+                    if paged_rows_are_queries:
+                        cu_seqlens_q_topk = None
                 else:
                     assert attn_metadata.page_table_1 is not None
                     if (

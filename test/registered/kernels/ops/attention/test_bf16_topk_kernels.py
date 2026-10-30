@@ -1,5 +1,6 @@
 import importlib
 import unittest
+from itertools import product
 from types import SimpleNamespace
 
 import torch
@@ -701,6 +702,104 @@ class V2TopKKernelTest(unittest.TestCase):
                     row_starts=starts,
                     row_to_batch=row_map,
                 )
+
+    def assert_disjoint_request_pages(self, pages):
+        # Physical pages must be unique across request rows, so recover_raw
+        # cannot accept a query that was mapped through another request.
+        flat = pages.reshape(-1)
+        self.assertEqual(flat.unique().numel(), flat.numel())
+
+    def test_compact_table_keeps_request_level_cu_map(self):
+        # PR187 comment 4419850010: three queries over a three-row compact
+        # table must keep the request-level cu_seqlens_q map. Equal row counts
+        # alone do not prove one query per table row.
+        envs = self.backend_module.envs
+        method = self.backend_module.TopkTransformMethod.PAGED
+        layouts = (
+            ([0, 2, 2, 3], [0, 0, 2]),
+            # Trailing empty request.
+            ([0, 1, 3, 3], [0, 1, 1]),
+        )
+        identity = torch.arange(3, dtype=torch.int32, device="cuda")
+        for topk, page_size, use_v2, marker, layout, long_rows in product(
+            (512, 2048), (1, 64), (False, True), (2, None), layouts, (False, True)
+        ):
+            cu_list, map_list = layout
+            with self.subTest(
+                topk=topk,
+                page_size=page_size,
+                use_v2=use_v2,
+                max_seq_len_q=marker,
+                cu=cu_list,
+                long_rows=long_rows,
+            ):
+                if long_rows:
+                    lengths_list = [topk + 1, topk + 63, 2 * topk + 65]
+                else:
+                    lengths_list = [1, topk // 4 + 1, topk]
+                scores, starts, lengths = self.make_matrix(
+                    max(lengths_list), [0] * 3, lengths_list, torch.bfloat16
+                )
+                reference = scores.clone()
+                pages, _, _, _ = self.make_v2_transform(
+                    scores, "paged1" if page_size == 1 else "paged64"
+                )
+                self.assertEqual(pages.shape[0], 3)
+                self.assert_disjoint_request_pages(pages)
+                mapping = torch.tensor(map_list, dtype=torch.int32, device="cuda")
+                # No page_table_1 and no topk_v2_plan: the legacy transform and
+                # the decode-shaped v2 paged entry must both stay unreachable.
+                metadata = SimpleNamespace(
+                    real_page_table=pages, page_size=page_size, page_table_1=None
+                )
+                if marker is not None:
+                    metadata.max_seq_len_q = marker
+                with (
+                    envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                    envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.override(True),
+                    envs.SGLANG_OPT_USE_TOPK_V2.override(use_v2),
+                ):
+                    out = self.backend.topk_transform(
+                        scores,
+                        lengths,
+                        topk,
+                        method,
+                        metadata,
+                        cu_seqlens_q_topk=torch.tensor(
+                            cu_list, dtype=torch.int32, device="cuda"
+                        ),
+                    )
+                torch.cuda.synchronize()
+                self.assertEqual(tuple(out.shape), (3, topk))
+                self.assertEqual(out.dtype, torch.int32)
+                raw = self.recover_raw(out, pages, mapping, None, page_size)
+                self.check_output(
+                    reference,
+                    starts,
+                    lengths,
+                    out,
+                    raw,
+                    topk,
+                    pages,
+                    mapping,
+                    None,
+                    page_size,
+                )
+                if not long_rows:
+                    expected = torch.full_like(out, -1)
+                    for row, (request, length) in enumerate(
+                        zip(map_list, lengths_list)
+                    ):
+                        positions = torch.arange(length, device="cuda")
+                        expected[row, :length] = pages[
+                            request, positions // page_size
+                        ] * page_size + (positions % page_size).to(torch.int32)
+                    self.assertTrue(torch.equal(out, expected))
+                # Identity row mapping differs from the request map in one row;
+                # the disjoint page tables must reject it.
+                self.assertFalse(torch.equal(mapping, identity))
+                with self.assertRaises(AssertionError):
+                    self.recover_raw(out, pages, identity, None, page_size)
 
     def make_v2_transform(self, scores, mode):
         rows, width = scores.shape
