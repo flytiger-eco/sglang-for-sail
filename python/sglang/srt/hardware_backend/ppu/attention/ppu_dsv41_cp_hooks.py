@@ -10,8 +10,18 @@ Registered hooks:
    drops the mHC boundary back onto the separate ``hc_mix_stats`` /
    ``mhc_post`` kernels. Measured on 890P tp8/cp8 prefill (con1, in100k) the
    fallback costs ~5x the GPU time of the fused DeepGEMM ``mega_mhc`` kernel,
-   +10.5pp of an iteration. The hook re-runs the gate with the CP clause
-   removed and keeps every other condition intact.
+   +10.5pp of an iteration.
+
+2. ``DeepseekV4AttnBackend._use_sparse_prefill`` (AROUND) — the community gate
+   excludes any batch with active CP, so CP prefill attention runs the paged
+   (decode-style) FlashMLA kernel instead of the sparse prefill one: 2.58ms vs
+   1.77ms per call at seqlen_q=2496, +4.8pp of an iteration. The sparse chunk
+   cache already builds its per-rank query layout through
+   ``interleave_rows_per_request`` when CP is active.
+
+Both hooks re-run the community gate with only the CP clause removed, so every
+other condition (forward mode, batch-invariant mode, SM120, tail /
+request-window paths, env switches) still applies.
 
 ``SGLANG_OPT_DSV41_MEGA_MHC_PREFILL`` still opts out explicitly; an unset
 value is treated as enabled so the fused boundary is the default.
@@ -53,3 +63,34 @@ def _ppu_mega_mhc_with_cp_prefill(original_fn, cfg):
     if is_batch_invariant_mode_enabled():
         return False
     return mega_mhc_supported()
+
+
+@plugin_hook(
+    "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend"
+    "._use_sparse_prefill",
+    type=HookType.AROUND,
+)
+def _ppu_sparse_prefill_with_cp(
+    original_fn, self, forward_batch, *, num_qo_tokens
+):
+    """Allow FlashMLA sparse prefill under CP prefill."""
+    if original_fn(self, forward_batch, num_qo_tokens=num_qo_tokens):
+        return True
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _LARGE_INDEXER_QUERY_THRESHOLD,
+    )
+    from sglang.srt.layers.cp.utils import is_cp_active
+    from sglang.srt.runtime_context import get_platform
+
+    if not is_cp_active(forward_batch):
+        return False
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return False
+    if get_platform().is_sm120:
+        return False
+    return (
+        num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    )
