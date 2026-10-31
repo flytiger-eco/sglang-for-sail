@@ -68,6 +68,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    select_index: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
@@ -99,6 +100,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        # Narrow the draft-extend lm_head output to [batch, vocab] via a
+        # captured select_index gather (same strategy as the multi-layer EAGLE
+        # draft-extend runner), unless DP gathered-buffer sizing requires
+        # all-row logits.
+        self.prune_draft_extend_logits = not self.require_gathered_buffer
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
@@ -186,6 +192,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens = torch.full(
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
+            # Static row-index table consumed by the captured pre-gemm gather
+            # (logits_processor draft_extend_select_index). Zeros are in-range
+            # for every bucket (row 0), matching the multi-layer runner.
+            select_index = torch.zeros((self.max_bs,), dtype=torch.int64)
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -258,6 +268,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
+            select_index=select_index,
         )
         self.buffers.share_buffers()
 
@@ -337,7 +348,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        if self.prune_draft_extend_logits:
+            # lm_head narrows to [batch, vocab]; the buffer slice follows the
+            # computed row count.
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
+        else:
+            next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
 
         # pruned_states = num_tokens (all tokens)
         num_tokens_for_logprob = num_tokens
@@ -375,6 +391,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.captured_req_width,
         )
+        if self.prune_draft_extend_logits:
+            # The captured gather reads this static table; the replay path
+            # refreshes its contents per iteration (device-side).
+            spec_info.select_index = buffers.select_index[:bs]
 
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -522,6 +542,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
+        if self.prune_draft_extend_logits:
+            # Refresh the captured gather table. Padded rows point at row
+            # 0 of the current bucket (in-range; values discarded downstream).
+            if bs != raw_bs:
+                buffers.select_index[raw_bs:bs].zero_()
+            _sel = getattr(forward_batch.spec_info, "select_index", None)
+            if _sel is not None:
+                buffers.select_index[:raw_bs].copy_(_sel)
+
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
@@ -601,7 +630,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out = self._replay_graph(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
+            next_token_logits=out.next_token_logits[
+                : self.raw_bs if self.prune_draft_extend_logits else num_tokens
+            ],
             hidden_states=out.hidden_states[:num_tokens],
         )
         return out

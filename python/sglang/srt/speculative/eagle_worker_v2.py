@@ -145,6 +145,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -1107,6 +1108,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
 
+        # Prune the draft-extend lm_head output to the accepted rows (same
+        # strategy as the multi-layer EAGLE worker). The graph path prunes only
+        # when the runner captured the static select_index gather; the eager
+        # path follows the DP gathered-buffer guard.
+        if can_run_decode_cuda_graph:
+            prune_draft_extend_logits = getattr(
+                self.cuda_graph_runner_for_draft_extend,
+                "prune_draft_extend_logits",
+                False,
+            )
+        else:
+            prune_draft_extend_logits = not require_gathered_buffer(self.server_args)
+        if prune_draft_extend_logits:
+            forward_batch.spec_info.select_index = select_index
+
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
         if self.seed_dsa_topk_from_draft_extend and not can_run_decode_cuda_graph:
@@ -1157,10 +1173,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        # Reorganize the spec info for the next batch. When pruning was active
+        # the logits are already narrowed to [batch, vocab], so skip the gather
+        # to avoid double indexing. FULL-capture hidden stays unpruned and is
+        # always gathered.
+        if not prune_draft_extend_logits:
+            draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+                select_index
+            ]
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
