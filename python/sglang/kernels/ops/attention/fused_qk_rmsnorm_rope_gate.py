@@ -76,11 +76,34 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         w_ptr = q_weight_ptr
         out_base = q_out_ptr + token * stride_qo_t + local_head * HEAD_DIM
 
-    # Full load -> RMSNorm variance
     head_offs = tl.arange(0, HEAD_BLOCK)
     head_mask = head_offs < HEAD_DIM
-    x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
+    rot_offs = tl.arange(0, ROT_HALF_BLOCK)
+    rot_mask = rot_offs < HALF_ROTARY
+
+    # Issue independent loads before consuming their values. Keep coefficients
+    # in their storage dtype until RoPE so conversions do not consume them early.
+    x_raw = tl.load(in_base + head_offs, mask=head_mask, other=0.0)
+    w_raw = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0)
+    if HAS_GATE:
+        gate_mask = head_mask & ~is_k
+        g = tl.load(in_base + HEAD_DIM + head_offs, mask=gate_mask, other=0.0)
+
+    pos = tl.load(positions_ptr + token)
+    cache_off = pos.to(tl.int64) * stride_cos_t
+    cos_raw = tl.load(
+        cos_sin_cache_ptr + cache_off + rot_offs, mask=rot_mask, other=0.0
+    )
+    sin_raw = tl.load(
+        cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot_offs,
+        mask=rot_mask,
+        other=0.0,
+    )
+
+    # Coefficient/gate loads are independent of the RMSNorm computation below.
+    # The final instruction scheduling still depends on the Triton/CUDA compiler.
+    x = x_raw.to(tl.float32)
+    w = w_raw.to(tl.float32)
     var = tl.sum(x * x, axis=0) / HEAD_DIM
     inv_rms = tl.rsqrt(var + EPS)
     x_norm = (x * inv_rms * (w + 1.0)).to(out_dtype).to(tl.float32)
@@ -91,8 +114,6 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
         tl.store(out_base + head_offs, x_norm, mask=pass_mask)
 
     # Reload rotary portion from L1 -> re-norm -> RoPE
-    rot_offs = tl.arange(0, ROT_HALF_BLOCK)
-    rot_mask = rot_offs < HALF_ROTARY
     xr1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
     xr2 = tl.load(in_base + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
@@ -104,23 +125,15 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     xr1 = (xr1 * inv_rms * (wr1 + 1.0)).to(out_dtype).to(tl.float32)
     xr2 = (xr2 * inv_rms * (wr2 + 1.0)).to(out_dtype).to(tl.float32)
 
-    pos = tl.load(positions_ptr + token).to(tl.int64)
-    cache_off = pos * stride_cos_t
-    cos = tl.load(
-        cos_sin_cache_ptr + cache_off + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
-    sin = tl.load(
-        cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
+    cos = cos_raw.to(tl.float32)
+    sin = sin_raw.to(tl.float32)
     tl.store(out_base + rot_offs, (xr1 * cos - xr2 * sin), mask=rot_mask)
     tl.store(out_base + HALF_ROTARY + rot_offs, (xr2 * cos + xr1 * sin), mask=rot_mask)
 
     # Gate copy (Q heads only)
-    if HAS_GATE and not is_k:
-        gate_in = in_base + HEAD_DIM
+    if HAS_GATE:
         gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
-        g = tl.load(gate_in + head_offs, mask=head_mask, other=0.0)
-        tl.store(gate_out + head_offs, g, mask=head_mask)
+        tl.store(gate_out + head_offs, g, mask=gate_mask)
 
     # PDL: signal dependent kernels (attention/allreduce) can start early.
     # Only available on NVIDIA Hopper+ (sm_90+); guarded for AMD/other backends.
