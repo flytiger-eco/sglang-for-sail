@@ -24,6 +24,18 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+
+# Triton widening cast for the bf16->fp32 logits leg (aten direct_copy is far
+# off memcpy bandwidth at large vocab). Import failure or unsupported layouts
+# degrade to the aten path; values are bit-identical either way (exact
+# bf16->fp32 widening), so this is a perf-only dependency.
+try:
+    from sglang.kernels.ops.logits_cast import (
+        cast_bf16_to_fp32 as _triton_cast_into,
+        cast_bf16_to_fp32_new as _triton_cast_new,
+    )
+except Exception:  # noqa: BLE001
+    _triton_cast_into = _triton_cast_new = None
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -930,10 +942,21 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits)
+            # Cast into the shared buffer with the Triton flat kernel (replaces
+            # the in-graph pinned copy_).
+            if _triton_cast_into is not None:
+                _triton_cast_into(logits, logits_buffer)
+            else:
+                logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
-            logits = logits.float()
+            # Eager `.float()` path: fresh fp32 allocation via the Triton cast
+            # kernel (bit-identical, allocation semantics unchanged).
+            logits = (
+                _triton_cast_new(logits)
+                if _triton_cast_new is not None
+                else logits.float()
+            )
         return logits
 
     def _get_dllm_logits(
