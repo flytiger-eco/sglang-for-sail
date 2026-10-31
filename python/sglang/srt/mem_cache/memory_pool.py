@@ -4136,6 +4136,19 @@ class MLATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_layer_ids(self):
+        """Global layer IDs in exported tensor-group order."""
+        count = len(self.get_contiguous_buf_infos()[0])
+        if not count:
+            return []
+        if self.layer_num <= 0 or count % self.layer_num:
+            raise ValueError("MLA transfer buffers must contain complete layer groups")
+        # Some subclasses export separate K/V (and index) groups instead of one
+        # latent KV group. Preserve their entry count and group ordering too.
+        return list(range(self.start_layer, self.start_layer + self.layer_num)) * (
+            count // self.layer_num
+        )
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
