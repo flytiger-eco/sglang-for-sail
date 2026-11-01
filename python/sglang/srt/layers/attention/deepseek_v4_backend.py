@@ -263,7 +263,9 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
+def _low_ratio_source_projections(
+    layer, x, q_lora, positions, bufs, run_compressor, run_indexer
+):
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
         get_tc_piecewise_forward_context,
     )
@@ -288,12 +290,14 @@ def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
             buf.zero_()
         return
 
-    if layer.compressor is not None:
+    if run_compressor and layer.compressor is not None:
         kv, score = layer.compressor.project(x[:real])
         put("kv", kv)
         if score is not None:
             put("score", score)
-    if layer.indexer is not None:
+    if run_indexer and layer.indexer is not None:
+        # Only the captured consumers read these; a full top-k layer projects
+        # once inside its eager break, so skip them there.
         indexer = layer.indexer
         put("q", indexer.queries(q_lora[:real], layer.freqs_cis[positions[:real]]))
         put("w", indexer.head_weights(x[:real]))
@@ -313,6 +317,32 @@ def _bcg_low_ratio_source_projections(*args):
 
 
 _bcg_low_ratio_source_projections_fn = None
+
+
+def _prefill_graph_full_topk(layer, x, q_lora, pos, table):
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        get_tc_piecewise_forward_context,
+    )
+
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    get_attn_backend()._prefill_graph_full_topk_break(
+        layer, x, q_lora, pos, forward_batch, table
+    )
+
+
+def _bcg_prefill_graph_full_topk(*args):
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+
+    global _bcg_prefill_graph_full_topk_fn
+    if _bcg_prefill_graph_full_topk_fn is None:
+        _bcg_prefill_graph_full_topk_fn = eager_on_graph(True)(_prefill_graph_full_topk)
+    return _bcg_prefill_graph_full_topk_fn(*args)
+
+
+_bcg_prefill_graph_full_topk_fn = None
 
 
 def _as_int_list(values) -> Optional[List[int]]:
@@ -1983,7 +2013,42 @@ class DeepseekV4AttnBackend(
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
     def prefill_graph_enter_late_layer_tail(self, forward_batch: ForwardBatch) -> None:
+        full_metadata = self.forward_metadata
         self.prefill_graph_late_layer_saved = self.enter_late_layer_tail(forward_batch)
+        self._prefill_graph_publish_tail_candidates(full_metadata)
+
+    def _prefill_graph_publish_tail_candidates(self, full_metadata) -> None:
+        """Carries the candidate table onto the late-layer tail's rows: the source
+        layer runs before the tail switch here, so its table is indexed by extend
+        rows while the tail's rows are a subset with their own schedule. Refreshed
+        at every replay, since the captured consumers read its address."""
+        if not (self.low_ratio_prefill_graph and self._prefill_capture_consume()):
+            return
+        tail_metadata = self.forward_metadata
+        if tail_metadata is full_metadata or full_metadata.candidate_metadata is None:
+            return
+        tail = tail_metadata.late_layer_tail
+        if tail is None:
+            return
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+            _current_capture_var,
+        )
+
+        candidates = self.prefill_candidates
+        rows = tail.token_indices
+        table = candidates.prefill_graph_tail_table(rows.shape[0])
+        assert table is not None or _current_capture_var.get() is None, (
+            "candidate tail table not allocated before capture"
+        )
+        table = candidates.publish_prefill_graph_tail(rows, table)
+        tail_metadata.candidate_metadata = candidates.bind_prefill_graph_table(table)
+
+    def _prefill_capture_consume(self) -> bool:
+        """Whether captured consumers read the source's published table. The dense
+        candidate backend has no sparse table, so it keeps the dense capture."""
+        return envs.SGLANG_OPT_DSV41_PREFILL_CAPTURE_CONSUME.get() and isinstance(
+            self.prefill_candidates, SparseTableBackend
+        )
 
     def prefill_graph_exit_late_layer_tail(self, forward_batch: ForwardBatch) -> None:
         saved = self.prefill_graph_late_layer_saved
@@ -3226,13 +3291,49 @@ class DeepseekV4AttnBackend(
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
-            _bcg_low_ratio_source_projections(layer, x, q_lora, pos, bufs)
+            # With the publish/consume path on, only a captured consumer projects
+            # q/w here: the source and plain layers score in their eager break.
+            consume_captured = self._prefill_capture_consume()
+            has_indexer = run_indexer and layer.indexer is not None
+            captured_index = has_indexer and (
+                layer.indexer.uses_candidates if consume_captured else True
+            )
+            _bcg_low_ratio_source_projections(
+                layer, x, q_lora, pos, bufs, run_compressor, captured_index
+            )
             if run_compressor and layer.compressor is not None:
                 self._low_ratio_compress_torch(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
                 )
-            if run_indexer and layer.indexer is not None:
-                self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+            if has_indexer:
+                if captured_index:
+                    # Captured: sparse scores of the published blocks only, so
+                    # nothing here depends on the context length.
+                    self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+                elif not layer.indexer.is_candidate_source:
+                    # Eager break: dense scoring over the live context.
+                    _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, None)
+                else:
+                    # Eager break: dense scoring, plus the block table the
+                    # captured consumers read.
+                    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                        _current_capture_var,
+                    )
+
+                    candidates = self.prefill_candidates
+                    rows = x.shape[0]
+                    table = candidates.prefill_graph_table(layer.layer_id, rows)
+                    # A capture records the table it is given; the warmup before
+                    # it allocates one.
+                    assert table is not None or _current_capture_var.get() is None, (
+                        "candidate table not allocated before capture"
+                    )
+                    _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
+                    if table is None:  # first run: the break allocated the buffers
+                        table = candidates.prefill_graph_table(layer.layer_id, rows)
+                    self.forward_metadata.candidate_metadata = (
+                        candidates.bind_prefill_graph_table(table)
+                    )
             return
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
@@ -3686,28 +3787,74 @@ class DeepseekV4AttnBackend(
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
-        metadata = (
-            self.forward_metadata.c1_indexer_metadata
-            if ratio == 1
-            else self.forward_metadata.c2_indexer_metadata
-        )
-        assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
-        if indexer.uses_candidates or indexer.is_candidate_source:
-            # Inside the window every block is a candidate: the full top-k applies.
-            width = metadata.max_compressed_seq_len
-            assert (
-                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
-            ), f"prefill graph indexer width {width} exceeds the candidate window"
+        consume_captured = self._prefill_capture_consume()
+        metadata = None
+        if not consume_captured:
+            metadata = (
+                self.forward_metadata.c1_indexer_metadata
+                if ratio == 1
+                else self.forward_metadata.c2_indexer_metadata
+            )
+            assert metadata is not None, (
+                f"no prefill graph indexer metadata for {ratio = }"
+            )
+            if indexer.uses_candidates or indexer.is_candidate_source:
+                # Inside the window every block is a candidate: the full top-k applies.
+                width = metadata.max_compressed_seq_len
+                assert (
+                    width
+                    <= indexer.candidate_topk_blocks * indexer.candidate_block_size
+                ), f"prefill graph indexer width {width} exceeds the candidate window"
         inputs = CapturedPrefillInputs(
             indexer=indexer,
             layer_id=layer.layer_id,
             q=projected_q,
             weights=projected_w,
-            paged_metadata=metadata,
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
+            index_page_size=self.token_to_kv_pool.get_index_k_page_size(ratio),
+            paged_metadata=metadata,
         )
-        self.full_topk_indexer.topk_prefill_captured(inputs)
+        if consume_captured:
+            # At any width: the consumer scores only the blocks the source
+            # published, whatever the context length.
+            self.prefill_candidates.consume_prefill_captured(
+                inputs, self.forward_metadata.candidate_metadata
+            )
+        else:
+            self.full_topk_indexer.topk_prefill_captured(inputs)
+
+    def _prefill_graph_full_topk_break(
+        self, layer, x, q_lora, pos, forward_batch, table
+    ) -> None:
+        """One full top-k layer at an eager break of the prefill graph, over the
+        live batch at any context length: writes the sparse indices the attention
+        break reads and, for the candidate source, the table the captured
+        consumers read."""
+        indexer = layer.indexer
+        real = forward_batch.global_num_token_non_padded_cpu
+        if real is None:
+            real = x.shape[0]
+        if real == 0:
+            # An idle DP-attention rank replays on one fabricated request of the
+            # padded token count; nothing reads it.
+            real = forward_batch.extend_num_tokens
+        # The metadata in use holds the rows x has: the late-layer tail's when the
+        # source is the tail's first layer, which are not the extend's leading rows.
+        req = self.forward_metadata.low_ratio_req_indices[:real]
+        inputs = self._make_low_ratio_prefill_indexer_inputs(
+            layer,
+            x[:real],
+            q_lora[:real],
+            req,
+            pos[:real],
+            forward_batch,
+            None,
+        )
+        if not indexer.is_candidate_source:
+            self.full_topk_indexer.topk_prefill(inputs)
+            return
+        self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0], table)
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
         ratio = layer.compress_ratio

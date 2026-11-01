@@ -1738,6 +1738,11 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Prefill CUDA graph candidates: the source layer publishes its block table
+    # at an eager break and the consumers score only those blocks inside the
+    # graph, so the captured indexer no longer needs every block to be a
+    # candidate (the 2048 x 8 window). 0 keeps the dense captured path.
+    SGLANG_OPT_DSV41_PREFILL_CAPTURE_CONSUME = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16

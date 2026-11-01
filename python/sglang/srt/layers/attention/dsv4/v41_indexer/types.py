@@ -104,10 +104,14 @@ class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int
     q: torch.Tensor  # [rows, heads, 128] bf16, roped
     weights: torch.Tensor  # [rows, heads] bf16 head weights
-    paged_metadata: PagedIndexerMetadata
     # The selection as pool slots and as request-local compressed positions.
     out_page_indices: torch.Tensor
     out_raw_indices: torch.Tensor
+    # The index-K pool page size at this ratio; the captured consume path reads
+    # the pool through it, with no need for the paged metadata.
+    index_page_size: Optional[int] = None
+    # The static paged metadata of the dense captured path (env switch off).
+    paged_metadata: Optional[PagedIndexerMetadata] = None
 
 
 Metadata = TypeVar("Metadata", bound=CandidateMetadata)
