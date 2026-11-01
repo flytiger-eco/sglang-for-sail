@@ -571,38 +571,24 @@ def gather_fp4_index_k(
 
 
 @triton.jit
-def _index_k_rope_pack_kernel(
-    X,
-    F,
-    Pos,
+def _index_k_fp4_pack_store(
+    value,
     Payload,
     Scale,
     Cache,
     Loc,
-    F_STRIDE: tl.constexpr,
-    HEADS: tl.constexpr,
-    RD: tl.constexpr,
-    INDEXED: tl.constexpr,
+    row,
+    token,
     STORE_CACHE: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     CACHE_STRIDE: tl.constexpr,
-    AMAX_FLOOR: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    token = row // HEADS
-    frow = tl.load(Pos + token) if INDEXED else token
-    offsets = tl.arange(0, 128)
-    value = tl.load(X + row * 128 + offsets).to(tl.float32)
-    tail = offsets >= 128 - RD
-    pair = (offsets - (128 - RD)) // 2
-    imaginary = (offsets % 2) == 1
-    real = tl.load(X + row * 128 + 128 - RD + 2 * pair, tail, 0).to(tl.float32)
-    imag = tl.load(X + row * 128 + 128 - RD + 2 * pair + 1, tail, 0).to(tl.float32)
-    fr = tl.load(F + frow * F_STRIDE + 2 * pair, tail, 1.0)
-    fi = tl.load(F + frow * F_STRIDE + 2 * pair + 1, tail, 0.0)
-    rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
-    value = tl.where(tail, rotated.to(tl.bfloat16).to(tl.float32), value)
+    """Two fp4 stages and the index-K slot write for one fp32 [128] row.
 
+    Both stages stay: the indexer packer has a different scale floor from
+    fake_quant_fp4, so packing the first stage directly is not equivalent.
+    """
     blocks = tl.reshape(value, (4, 32))
     amax = tl.maximum(tl.max(tl.abs(blocks), 1), AMAX_FLOOR) * (1.0 / 6.0)
     bits = amax.to(tl.int32, bitcast=True)
@@ -636,6 +622,114 @@ def _index_k_rope_pack_kernel(
     else:
         tl.store(Payload + row * 64 + byte_offsets, payload)
         tl.store(Scale + row, sf)
+
+
+@triton.jit
+def _index_k_rope_pack_kernel(
+    X,
+    F,
+    Pos,
+    Payload,
+    Scale,
+    Cache,
+    Loc,
+    F_STRIDE: tl.constexpr,
+    HEADS: tl.constexpr,
+    RD: tl.constexpr,
+    INDEXED: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    row = tl.program_id(0)
+    token = row // HEADS
+    frow = tl.load(Pos + token) if INDEXED else token
+    offsets = tl.arange(0, 128)
+    value = tl.load(X + row * 128 + offsets).to(tl.float32)
+    tail = offsets >= 128 - RD
+    pair = (offsets - (128 - RD)) // 2
+    imaginary = (offsets % 2) == 1
+    real = tl.load(X + row * 128 + 128 - RD + 2 * pair, tail, 0).to(tl.float32)
+    imag = tl.load(X + row * 128 + 128 - RD + 2 * pair + 1, tail, 0).to(tl.float32)
+    fr = tl.load(F + frow * F_STRIDE + 2 * pair, tail, 1.0)
+    fi = tl.load(F + frow * F_STRIDE + 2 * pair + 1, tail, 0.0)
+    rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
+    value = tl.where(tail, rotated.to(tl.bfloat16).to(tl.float32), value)
+    _index_k_fp4_pack_store(
+        value,
+        Payload,
+        Scale,
+        Cache,
+        Loc,
+        row,
+        token,
+        STORE_CACHE=STORE_CACHE,
+        AMAX_FLOOR=AMAX_FLOOR,
+        PAGE_SIZE=PAGE_SIZE,
+        CACHE_STRIDE=CACHE_STRIDE,
+    )
+
+
+@triton.jit
+def _store_index_k_norm_rope_fp4_kernel(
+    X,
+    W,
+    F,
+    Payload,
+    Scale,
+    Cache,
+    Loc,
+    EPS,
+    F_STRIDE: tl.constexpr,
+    RD: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    CACHE_STRIDE: tl.constexpr,
+    AMAX_FLOOR: tl.constexpr,
+):
+    """``_index_k_rope_pack_kernel`` with the index-K RMSNorm folded in.
+
+    One 128-wide row per token, so the frequency row is the token row.
+    """
+    row = tl.program_id(0)
+    offsets = tl.arange(0, 128)
+    value = tl.load(X + row * 128 + offsets).to(tl.float32)
+    # The same reduction as _rmsnorm_fp32_kernel, so the fused row matches the
+    # separate launch bit for bit. k_norm materializes a bf16 tensor, and RoPE
+    # below reads that rounded value, so round here too.
+    weight = tl.load(W + offsets).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(value * value, axis=0) / 128 + EPS)
+    value = ((value * inv_rms) * weight).to(tl.bfloat16).to(tl.float32)
+
+    tail = offsets >= 128 - RD
+    pair = (offsets - (128 - RD)) // 2
+    imaginary = (offsets % 2) == 1
+    real = tl.load(X + row * 128 + 128 - RD + 2 * pair, tail, 0).to(tl.float32)
+    imag = tl.load(X + row * 128 + 128 - RD + 2 * pair + 1, tail, 0).to(tl.float32)
+    # RoPE rotates the normalized row, so the pair is normalized here with the
+    # same rounding the whole-row pass above applied.
+    w_real = tl.load(W + 128 - RD + 2 * pair, tail, 0.0).to(tl.float32)
+    w_imag = tl.load(W + 128 - RD + 2 * pair + 1, tail, 0.0).to(tl.float32)
+    real = ((real * inv_rms) * w_real).to(tl.bfloat16).to(tl.float32)
+    imag = ((imag * inv_rms) * w_imag).to(tl.bfloat16).to(tl.float32)
+    fr = tl.load(F + row * F_STRIDE + 2 * pair, tail, 1.0)
+    fi = tl.load(F + row * F_STRIDE + 2 * pair + 1, tail, 0.0)
+    rotated = tl.where(imaginary, real * fi + imag * fr, real * fr - imag * fi)
+    value = tl.where(tail, rotated.to(tl.bfloat16).to(tl.float32), value)
+    _index_k_fp4_pack_store(
+        value,
+        Payload,
+        Scale,
+        Cache,
+        Loc,
+        row,
+        row,
+        STORE_CACHE=STORE_CACHE,
+        AMAX_FLOOR=AMAX_FLOOR,
+        PAGE_SIZE=PAGE_SIZE,
+        CACHE_STRIDE=CACHE_STRIDE,
+    )
 
 
 def index_k_rope_pack(
@@ -688,6 +782,62 @@ def index_k_rope_pack(
             CACHE_STRIDE=cache_stride,
             AMAX_FLOOR=FP4_AMAX_FLOOR,
             num_warps=4,
+        )
+    return (payload, scale) if cache is None else None
+
+
+def store_index_k_norm_rope_fp4(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    freqs: torch.Tensor,
+    rope_dim: int,
+    *,
+    loc: torch.Tensor | None = None,
+    cache: torch.Tensor | None = None,
+    num_warps: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The index-K write for one 128-wide row per token: RMSNorm, RoPE, both fp4
+    stages and the paged slot, one launch.
+
+    ``x`` is ``wk(latent)`` *before* the norm; ``freqs`` is that token's frequency
+    already gathered by the caller. With ``cache`` the row is packed into its slot;
+    otherwise ``(payload, scale)`` is returned. One warp per row is the fast launch
+    geometry: 128 elements are four per lane, and the norm's reduction then stays
+    inside the warp.
+    """
+    assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
+    assert 0 <= rope_dim <= 128 and rope_dim % 2 == 0
+    assert norm_weight.shape == (128,) and norm_weight.is_contiguous()
+    x = x.contiguous()
+    rows = x.numel() // 128
+    f = torch.view_as_real(freqs.contiguous())
+    if cache is None:
+        payload = torch.empty((rows, 64), dtype=torch.int8, device=x.device)
+        scale = torch.empty((rows,), dtype=torch.int32, device=x.device)
+        page_size = cache_stride = 0
+    else:
+        assert loc is not None and loc.numel() == rows
+        assert cache.ndim == 2 and cache.shape[1] % INDEX_K_SLOT_BYTES == 0
+        payload = scale = None
+        page_size, cache_stride = cache.shape[1] // INDEX_K_SLOT_BYTES, cache.stride(0)
+    if rows:
+        _store_index_k_norm_rope_fp4_kernel[(rows,)](
+            x,
+            norm_weight,
+            f,
+            payload,
+            scale,
+            cache,
+            loc,
+            eps,
+            F_STRIDE=f.stride(0),
+            RD=rope_dim,
+            STORE_CACHE=cache is not None,
+            PAGE_SIZE=page_size,
+            CACHE_STRIDE=cache_stride,
+            AMAX_FLOOR=FP4_AMAX_FLOOR,
+            num_warps=num_warps,
         )
     return (payload, scale) if cache is None else None
 
