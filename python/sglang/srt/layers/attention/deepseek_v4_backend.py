@@ -144,6 +144,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_sail = is_sail()
 
 logger = logging.getLogger(__name__)
 
@@ -3567,18 +3568,44 @@ class DeepseekV4AttnBackend(
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
         if layer.indexer is not None and layer.indexer.owns_k:
+            indexer = layer.indexer
             if (
+                _is_sail
+                and latent.is_cuda
+                and latent.dtype == torch.bfloat16
+                and indexer.index_head_dim == 128
+                and 0 < indexer.rope_head_dim <= 128
+                and indexer.rope_head_dim % 2 == 0
+                and slots.dtype == torch.int64
+                and not pool.low_ratio_index_k_is_split(layer.layer_id)
+            ):
+                # PPU has no fused compressor, so this is where the index-K chain
+                # collapses to one launch: k_norm, RoPE, both fp4 stages and the
+                # paged write, as DeepInfer's fused_transform does.
+                from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                    store_index_k_norm_rope_fp4,
+                )
+
+                store_index_k_norm_rope_fp4(
+                    indexer.forward_wk(latent),
+                    indexer.k_norm.weight,
+                    indexer.k_norm.eps,
+                    freqs,
+                    indexer.rope_head_dim,
+                    cache=pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    loc=slots,
+                )
+            elif (
                 fuse_index_store
                 and latent.is_cuda
                 and torch.version.cuda is not None
                 and latent.dtype == torch.bfloat16
-                and layer.indexer.index_head_dim == 128
+                and indexer.index_head_dim == 128
             ):
                 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
                     index_k_rope_pack,
                 )
 
-                indexer = layer.indexer
                 k = indexer.k_norm(indexer.forward_wk(latent))
                 index_k_rope_pack(
                     k,
@@ -3591,7 +3618,7 @@ class DeepseekV4AttnBackend(
                 pool.set_index_k_fp4(
                     layer_id=layer.layer_id,
                     loc=slots,
-                    cache_k=layer.indexer.index_keys(latent, freqs),
+                    cache_k=indexer.index_keys(latent, freqs),
                 )
         if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
