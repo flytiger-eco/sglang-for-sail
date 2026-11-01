@@ -71,3 +71,4 @@ if is_sail_available():
     import sglang.srt.hardware_backend.ppu.attention.ppu_flashmla_hooks  # noqa: F401
     import sglang.srt.hardware_backend.ppu.attention.ppu_msa_hook  # noqa: F401
     import sglang.srt.hardware_backend.ppu.moe.ppu_deepep_hooks  # noqa: F401
+    import sglang.srt.hardware_backend.ppu.moe.ppu_mega_moe_hooks  # noqa: F401
