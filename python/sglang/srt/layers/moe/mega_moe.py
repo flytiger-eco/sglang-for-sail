@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import is_hip, is_sail, is_sm100_supported
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_sail = is_sail()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -56,13 +57,17 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts) -> str:
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
+    if _is_sail and experts is not None:
+        mma_type = getattr(experts, "_mega_moe_mma_type", None)
+        if mma_type is not None:
+            return mma_type
     # Per layer: a draft may differ from the target (draft_model_build_scope).
     return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
+    if not _is_sail and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
         return None
@@ -161,6 +166,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_sail:
+        return _device_sm >= 89
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -460,18 +467,28 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
+    kernel_kwargs = {
+        "activation": "swiglu",
+        "activation_clamp": activation_clamp,
+        "fast_math": True,
+        **mega_kwargs,
+    }
+    if not _is_sail:
+        # PPU's fp4_fp4_mega_moe takes the shared experts outside the kernel.
+        kernel_kwargs["shared_l1_weights"] = shared_l1_weights
+        kernel_kwargs["shared_l2_weights"] = shared_l2_weights
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+        mega_moe_kernel = (
+            deep_gemm.fp4_fp4_mega_moe
+            if _is_sail and mma_type == "mxf4xmxf4"
+            else deep_gemm.fp8_fp4_mega_moe
+        )
+        mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
-            shared_l1_weights=shared_l1_weights,
-            shared_l2_weights=shared_l2_weights,
-            activation="swiglu",
-            activation_clamp=activation_clamp,
-            fast_math=True,
-            **mega_kwargs,
+            **kernel_kwargs,
         )
     return y[:num_tokens]
 
