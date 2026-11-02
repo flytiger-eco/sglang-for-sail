@@ -354,9 +354,7 @@ class ExpertLocationUpdater:
         for (
             tensor,
             layer_dim,
-        ) in (
-            get_global_expert_distribution_recorder().get_async_runtime_reset_tensor_specs()
-        ):
+        ) in get_global_expert_distribution_recorder().get_async_runtime_reset_tensor_specs():
             spec = create_reset_tensor_spec(tensor, layer_dim)
             if tensor.is_cuda:
                 gpu_reset_tensors.append(spec)
@@ -379,9 +377,9 @@ def _update_expert_weights(**kwargs):
     enable_async = kwargs.pop("enable_async", False)
     if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
         if enable_async:
-            assert (
-                False
-            ), "SGLANG_EXPERT_LOCATION_UPDATER_CANARY is not compatible with EPLB Async"
+            assert False, (
+                "SGLANG_EXPERT_LOCATION_UPDATER_CANARY is not compatible with EPLB Async"
+            )
         return _update_expert_weights_with_canary(**kwargs)
     elif enable_async:
         return _update_expert_weights_raw_async(**kwargs)

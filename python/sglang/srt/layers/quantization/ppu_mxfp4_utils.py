@@ -20,8 +20,7 @@ def preprocess_mxfp4_w4a16_mma_scales(scales: torch.Tensor) -> torch.Tensor:
     k = k_groups * 32
     if n % 64 != 0 or k % 64 != 0:
         raise ValueError(
-            "PPU W4A16 MMA requires N and K to be multiples of 64, "
-            f"got N={n}, K={k}."
+            f"PPU W4A16 MMA requires N and K to be multiples of 64, got N={n}, K={k}."
         )
 
     scale_perm = torch.tensor(

@@ -661,7 +661,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         moe_a2a_backend = get_moe_a2a_backend()
         if not (moe_a2a_backend.is_none() or moe_a2a_backend.is_deepep()):
             raise ValueError(
-                f"{selector}=1 only supports " "--moe-a2a-backend none or deepep."
+                f"{selector}=1 only supports --moe-a2a-backend none or deepep."
             )
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(

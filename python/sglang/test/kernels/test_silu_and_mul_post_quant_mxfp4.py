@@ -81,9 +81,9 @@ def test_determinism() -> None:
         a_q, a_s = silu_and_mul_post_quant_mxfp4(gateup, swiglu_limit=swiglu)
         b_q, b_s = silu_and_mul_post_quant_mxfp4(gateup, swiglu_limit=swiglu)
         assert torch.equal(a_q, b_q), f"quant determinism fail swiglu={swiglu}"
-        assert torch.equal(
-            a_s.contiguous(), b_s.contiguous()
-        ), f"scale determinism fail swiglu={swiglu}"
+        assert torch.equal(a_s.contiguous(), b_s.contiguous()), (
+            f"scale determinism fail swiglu={swiglu}"
+        )
 
 
 def test_clamp_no_op() -> None:

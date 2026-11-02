@@ -104,9 +104,9 @@ def test_chat_and_recycled_slots(endpoint):
         expected = {0: 323, 1: 53}.get(record["prompt_index"])
         if expected is not None:
             assert record["meta_info"]["finish_reason"]["type"] == "stop", record
-            assert (
-                get_answer_value(record["text"].split("</think>")[-1]) == expected
-            ), record
+            assert get_answer_value(record["text"].split("</think>")[-1]) == expected, (
+                record
+            )
 
 
 @pytest.mark.parametrize("mixed_prefix", [False, True], ids=["gsm8k", "mixed-prefix"])
@@ -128,9 +128,9 @@ def test_gsm8k_measurement(endpoint, mixed_prefix):
         evaluation = MixedPrefixGSM8KEval(**kwargs, secondary_pool_size=15, seed=37)
     else:
         evaluation = GSM8KEval(**kwargs)
-    assert (
-        len(evaluation._lines) == count
-    ), "dataset must contain all requested questions"
+    assert len(evaluation._lines) == count, (
+        "dataset must contain all requested questions"
+    )
     args = SimpleNamespace(
         api="completion",
         model=os.environ["MODEL_PATH"],

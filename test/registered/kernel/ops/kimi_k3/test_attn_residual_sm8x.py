@@ -153,12 +153,13 @@ class TestKimiK3AttentionResidualSM8x(CustomTestCase):
 
         hidden_states, _ = _make_inputs(17, seed=7)
         residual = AttnResidual(hidden_states, block_num=2)
-        with patch(
-            "sglang.srt.layers.attn_residual._use_sm8x_fused", return_value=True
-        ), patch.object(
-            residual,
-            "write",
-            side_effect=AssertionError("initial snapshot must be fused"),
+        with (
+            patch("sglang.srt.layers.attn_residual._use_sm8x_fused", return_value=True),
+            patch.object(
+                residual,
+                "write",
+                side_effect=AssertionError("initial snapshot must be fused"),
+            ),
         ):
             out, prefix = residual.forward(
                 hidden_states,
@@ -177,19 +178,25 @@ class TestKimiK3AttentionResidualSM8x(CustomTestCase):
         self.assertTrue(torch.equal(residual.block_residual[:, 0], hidden_states))
 
     def test_sm8x_dispatch_is_ppu_only(self):
-        with patch("sglang.srt.layers.attn_residual.is_ppu", return_value=False), patch(
-            "sglang.srt.layers.attn_residual.torch.cuda.get_device_capability",
-            return_value=(8, 9),
-        ), patch.object(torch.version, "hip", None), patch(
-            "sglang.srt.layers.attn_residual._SM8X_FUSED_SUPPORTED", None
+        with (
+            patch("sglang.srt.layers.attn_residual.is_ppu", return_value=False),
+            patch(
+                "sglang.srt.layers.attn_residual.torch.cuda.get_device_capability",
+                return_value=(8, 9),
+            ),
+            patch.object(torch.version, "hip", None),
+            patch("sglang.srt.layers.attn_residual._SM8X_FUSED_SUPPORTED", None),
         ):
             self.assertFalse(_use_sm8x_fused(_H))
 
-        with patch("sglang.srt.layers.attn_residual.is_ppu", return_value=True), patch(
-            "sglang.srt.layers.attn_residual.torch.cuda.get_device_capability",
-            return_value=(8, 9),
-        ), patch.object(torch.version, "hip", None), patch(
-            "sglang.srt.layers.attn_residual._SM8X_FUSED_SUPPORTED", None
+        with (
+            patch("sglang.srt.layers.attn_residual.is_ppu", return_value=True),
+            patch(
+                "sglang.srt.layers.attn_residual.torch.cuda.get_device_capability",
+                return_value=(8, 9),
+            ),
+            patch.object(torch.version, "hip", None),
+            patch("sglang.srt.layers.attn_residual._SM8X_FUSED_SUPPORTED", None),
         ):
             self.assertTrue(_use_sm8x_fused(_H))
             self.assertFalse(_use_sm8x_fused(4096))

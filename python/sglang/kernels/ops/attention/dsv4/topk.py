@@ -199,7 +199,7 @@ def topk_transform_paged_v2(
     """
     if is_xpu():
         if out_raw_indices is not None:
-            topk_transform_paged(
+            topk_transform_512(
                 scores,
                 seq_lens,
                 page_tables,

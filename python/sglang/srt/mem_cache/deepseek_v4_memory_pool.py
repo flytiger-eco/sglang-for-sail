@@ -511,8 +511,7 @@ class DeepSeekV4IndexerPool(KVCache):
             # (seq_len_sum, max_seq_len) calling convention — the legacy
             # single-sequence form is unused on the FP4 path.
             assert seq_len_sum is not None and max_seq_len is not None, (
-                "FP4 indexer cache requires the (seq_len_sum, max_seq_len) "
-                "gather form"
+                "FP4 indexer cache requires the (seq_len_sum, max_seq_len) gather form"
             )
             from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
                 _get_k_and_s_triton,
@@ -1759,8 +1758,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         del mamba_indices
         if self._unified_kv:
             raise NotImplementedError(
-                "DeepSeekV4TokenToKVPool.get_cpu_copy is not implemented "
-                "for unified_kv"
+                "DeepSeekV4TokenToKVPool.get_cpu_copy is not implemented for unified_kv"
             )
         if not torch.is_tensor(indices):
             indices = torch.as_tensor(indices, dtype=torch.int64, device=self.device)
