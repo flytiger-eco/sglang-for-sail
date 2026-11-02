@@ -23,9 +23,9 @@ from sglang.test.ci.ci_register import (
     register_ppu_ci,
 )
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-gb300")
-register_cuda_ci(est_time=10, stage="base-c", runner_config="4-gpu-b200")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=7, stage="base-c", runner_config="4-gpu-b200")
 register_ppu_ci(est_time=10, suite="nightly-4-ppu", nightly=True)
 
 

@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import (
 )
 
 # Keep consistent with other openai_server/basic unit tests.
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 register_ppu_ci(est_time=10, suite="nightly-1-ppu", nightly=True)
 

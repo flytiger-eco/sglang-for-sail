@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=38, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 register_ppu_ci(est_time=112, suite="nightly-1-ppu", nightly=True)
 
