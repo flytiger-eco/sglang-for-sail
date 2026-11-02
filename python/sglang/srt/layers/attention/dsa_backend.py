@@ -524,7 +524,6 @@ class DeepseekSparseAttnBackend(
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self._ppu_q8_prefill_num_heads = self.flashmla_padding
         self._ppu_q8_topk_capacity = self.dsa_index_topk
-        self._q8_num_cu_cached: Optional[int] = None
         # Allocate fixed-capacity buffers per layout/stream without rebinding graph pointers.
         self._ppu_q8_buffers: dict[tuple, torch.Tensor] = {}
         self._ppu_q8_max_num_tokens = 0
@@ -2861,6 +2860,13 @@ class DeepseekSparseAttnBackend(
         if not (prefill_uses_q8 or decode_uses_q8):
             return
         if _is_ppu:
+            # Reject even an inactive PD phase before local backend rebinding.
+            if "trtllm" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+                raise ValueError(
+                    "PPU flashmla_sparse_q8 cannot be mixed with trtllm, including "
+                    "an inactive PD phase. Set both --dsa-prefill-backend and "
+                    "--dsa-decode-backend to flashmla_sparse_q8."
+                )
             self._configure_ppu_q8()
             return
 
@@ -3145,10 +3151,10 @@ class DeepseekSparseAttnBackend(
             topk_length = self._normalize_ppu_q8_topk_lengths(topk_length, indices)
 
         from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
-            flash_mla_sparse_fp8_fwd,
+            flash_mla_sparse_quantized_fwd,
         )
 
-        result = flash_mla_sparse_fp8_fwd(
+        result = flash_mla_sparse_quantized_fwd(
             q=self._build_ppu_q8_query(
                 q_nope,
                 q_rope,
@@ -3158,8 +3164,6 @@ class DeepseekSparseAttnBackend(
             kv=kv_cache,
             indices=indices.unsqueeze(1),
             sm_scale=sm_scale,
-            q_scale=1.0,
-            kv_scale=1.0,
             d_v=v_head_dim,
             topk_length=topk_length,
             compute_aux=False,
@@ -3179,9 +3183,8 @@ class DeepseekSparseAttnBackend(
         reuse_buffers: bool = False,
     ) -> torch.Tensor:
         """PPU native FP8 sparse decode over the raw e4m3 KV pool."""
-        # The decode kernel only implements 576-wide QK and top-k <= 2048. The
-        # sparse prefill kernel also covers GLM's 512-wide zero-RoPE geometry
-        # and the padded KPool tail.
+        # Keep the established QK576 decode route; PR17 decode still caps top-k
+        # at 2048. GLM's QK512/KPool tail uses the quantized prefill route.
         head_dim = q_nope.shape[-1] + q_rope.shape[-1]
         if head_dim != 576 or page_table_1.shape[-1] > _PPU_Q8_DECODE_MAX_TOPK:
             print_info_once(
@@ -3209,40 +3212,24 @@ class DeepseekSparseAttnBackend(
             reuse_buffer=reuse_buffers,
             num_tokens=num_tokens,
         )
-        topk = indices.shape[-1]
+        if topk_length is not None:
+            topk_length = self._normalize_ppu_q8_topk_lengths(topk_length, indices)
 
         from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
-            flash_mla_sparse_decode_fp8_fwd,
+            flash_mla_sparse_quantized_decode_fwd,
         )
 
-        output, _ = flash_mla_sparse_decode_fp8_fwd(
+        output, _ = flash_mla_sparse_quantized_decode_fwd(
             q=self._build_ppu_q8_query(
                 q_nope, q_rope, self.flashmla_padding, reuse_buffer=reuse_buffers
             ),
             kv=kv_cache,
             indices=indices.unsqueeze(1),
             sm_scale=sm_scale,
-            q_scale=1.0,
-            kv_scale=1.0,
             d_v=v_head_dim,
-            num_cta=self._q8_decode_num_cta(num_tokens, topk // _PPU_Q8_TOPK_TILE),
+            topk_length=topk_length,
         )
         return output[:, :num_heads]
-
-    def _q8_decode_num_cta(self, num_tokens: int, n_tiles: int) -> int:
-        if num_tokens <= 0 or n_tiles <= 0:
-            raise ValueError("PPU q8 decode launch requires positive tokens and tiles.")
-        num_cu = self._q8_num_cu()
-        if num_tokens >= num_cu:
-            return min(num_tokens, 2 * num_cu)
-        return min(2 * num_cu, num_tokens * n_tiles)
-
-    def _q8_num_cu(self) -> int:
-        num_cu = self._q8_num_cu_cached
-        if num_cu is None:
-            num_cu = torch.cuda.get_device_properties(self.device).multi_processor_count
-            self._q8_num_cu_cached = num_cu
-        return num_cu
 
     def _forward_flashmla_sparse_q8kv8(
         self,
