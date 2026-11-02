@@ -108,7 +108,7 @@ class E2ESelectionTest(unittest.TestCase):
             {e["source"]["revision"] for e in imported},
             {"107913533169e97ff4139664110bed4e523c68b2"},
         )
-        self.assertEqual(sum(bool(e["blocked"]) for e in imported), 1)
+        self.assertEqual(sum(bool(e["blocked"]) for e in imported), 0)
         for entry in self.catalog["entries"]:
             self.assertGreaterEqual(
                 entry["worker_minutes"] * 60 - entry["timeout_seconds"], 600
@@ -169,23 +169,13 @@ class E2ESelectionTest(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["family"], "qwen")
 
-    def test_defaults_and_full_accuracy_dependencies(self):
+    def test_defaults_and_test_all_select_independent_cases(self):
         entries, errors = selector.select(
             self.catalog, ["test-qwen", "test-accuracy-full"]
         )
         self.assertEqual(errors, [])
-        by_id = {e["id"]: e for e in entries}
-        self.assertEqual(len(by_id), len(entries))
-        full = [e for e in entries if e["mode"] == "full"]
-        self.assertTrue(full)
-        for entry in full:
-            self.assertEqual(len(entry["dependencies"]), 1)
-            smoke = by_id[entry["dependencies"][0]]
-            self.assertEqual(smoke["mode"], "smoke")
-            self.assertEqual(
-                selector.read_json(ROOT / entry["config"])["model"],
-                selector.read_json(ROOT / smoke["config"])["model"],
-            )
+        self.assertTrue(any(e["mode"] == "full" for e in entries))
+        self.assertTrue(all(not e["dependencies"] for e in self.catalog["entries"]))
         defaults, errors = selector.select(self.catalog, ["test-qwen"])
         self.assertEqual(errors, [])
         self.assertTrue(
@@ -193,6 +183,11 @@ class E2ESelectionTest(unittest.TestCase):
                 e["nodes"] == 1 and (e["category"] == "answer" or e["mode"] == "smoke")
                 for e in defaults
             )
+        )
+        entries, errors = selector.select(self.catalog, ["test-all"])
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            {e["id"] for e in entries}, {e["id"] for e in self.catalog["entries"]}
         )
 
     def test_explicit_distributed_and_pd_expansion(self):
@@ -208,14 +203,17 @@ class E2ESelectionTest(unittest.TestCase):
         self.assertTrue(any(e["category"] == "pd" for e in pd))
         self.assertFalse(any(e["category"] == "perf" for e in pd))
 
-    def test_unsupported_or_blocked_requests_fail_closed(self):
+    def test_deepseek_and_full_selection_include_pro_answer(self):
+        case = "dsv4-pro-0813-mxfp4-answer-144g"
+        self.assertIn(case, self.selected("test-deepseek"))
+        self.assertIn(case, self.selected("test-mxfp4"))
+        self.assertIn(case, self.selected("test-all"))
+
+    def test_unsupported_requests_fail_closed(self):
         for labels in (
             ["test-perf"],
             ["test-functional"],
-            ["test-deepseek"],
             ["test-bf16", "test-pd"],
-            ["test-deepseek", "test-pd"],
-            ["test-all"],
         ):
             with self.subTest(labels=labels):
                 _, errors = selector.select(self.catalog, labels)
@@ -733,60 +731,6 @@ class E2EEvidenceTest(unittest.TestCase):
         self.assertIsNone(values["execution_ppu_card_hours"])
         self.assertIsNone(values["pod_startup_seconds"])
 
-    def test_full_accuracy_requires_successful_same_plan_smoke(self):
-        full = next(e for e in self.catalog["entries"] if e["mode"] == "full")
-        smoke = next(
-            e for e in self.catalog["entries"] if e["id"] == full["dependencies"][0]
-        )
-        plan = {
-            "entries": [dict(e, config_digest="a" * 64) for e in (full, smoke)],
-            "run_id": "42",
-            "attempt": "1",
-            "tested_sha": "c" * 40,
-            "plan_hash": "d" * 64,
-        }
-        smoke = plan["entries"][1]
-        terminal = {
-            **report.identity(plan, smoke),
-            "success": True,
-            "ranks": [{"rank": 0}],
-            "evaluation": {"count": 1},
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            directory = Path(temporary)
-            plan_path = directory / "plan.json"
-            write_json(plan_path, plan)
-            for state in ("missing", "failed", "stale", "passed", "duplicate"):
-                if state != "missing":
-                    value = copy.deepcopy(terminal)
-                    value["success"] = state != "failed"
-                    if state == "stale":
-                        value["attempt"] = "0"
-                    write_json(directory / "results/one/entry.json", value)
-                    if state == "duplicate":
-                        write_json(directory / "results/two/entry.json", value)
-                with self.subTest(state=state), mock.patch.object(
-                    report, "validate_plan"
-                ), mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        "report",
-                        "dependencies",
-                        "--plan",
-                        str(plan_path),
-                        "--entry",
-                        full["id"],
-                        "--directory",
-                        str(directory / "results"),
-                    ],
-                ):
-                    if state == "passed":
-                        report.main()
-                    else:
-                        with self.assertRaises(ValueError):
-                            report.main()
-
     def test_baseline_aggregation_includes_e2e_on_docs_only_requests(self):
         import pr_report
 
@@ -950,6 +894,7 @@ class E2EWorkflowTest(unittest.TestCase):
             ci["jobs"]["e2e-selection"]["if"],
             ci["jobs"]["e2e-gate"]["name"],
             ci["jobs"]["e2e-gate"]["if"],
+            ci["jobs"]["ci-finish"]["name"],
         ]
         for expression in expressions:
             self.assertIn("github.event.label.name == 'run-ci'", expression)
@@ -959,6 +904,9 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertIn("PPU E2E Ignored Event", gate["name"])
         self.assertIn("always()", gate["if"])
         self.assertIn("ci", gate["needs"])
+        finish = ci["jobs"]["ci-finish"]
+        self.assertIn("CI Ignored Event", finish["name"])
+        self.assertEqual(finish["if"], "always()")
 
     def test_ignored_events_cannot_publish_the_required_e2e_check_name(self):
         template = self.workflow("ci.yaml")["jobs"]["e2e-gate"]["name"]
@@ -1007,6 +955,50 @@ class E2EWorkflowTest(unittest.TestCase):
             p.name
             for p in (ROOT / ".github/workflows").iterdir()
             if p.suffix in {".yml", ".yaml"} and "PPU E2E Gate" in p.read_text()
+        ]
+        self.assertEqual(owners, ["ci.yaml"])
+
+    def test_ignored_events_cannot_publish_the_required_ci_result_name(self):
+        template = self.workflow("ci.yaml")["jobs"]["ci-finish"]["name"]
+        script = r"""
+            const {template, events} = JSON.parse(process.argv[1]);
+            console.log(JSON.stringify(events.map(github => template.replace(/\$\{\{([\s\S]*?)\}\}/g,
+                (_, expression) => Function('github', `return (${expression});`)(github)).trim())));
+        """
+        cases = [
+            ("pull_request", "synchronize", "", True),
+            ("pull_request", "labeled", "run-ci", True),
+            ("pull_request", "labeled", "documentation", False),
+            ("pull_request", "unlabeled", "run-ci", False),
+            ("pull_request_review", "submitted", "", False),
+        ]
+        events = [
+            {"event_name": event, "event": {"action": action, "label": {"name": label}}}
+            for event, action, label, _ in cases
+        ]
+        completed = subprocess.run(
+            [
+                "node",
+                "-e",
+                script,
+                json.dumps({"template": template, "events": events}),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        self.assertEqual(
+            json.loads(completed.stdout),
+            [
+                "CI Result" if active else "CI Ignored Event"
+                for _, _, _, active in cases
+            ],
+        )
+        owners = [
+            path.name
+            for path in (ROOT / ".github/workflows").iterdir()
+            if path.suffix in {".yml", ".yaml"} and "CI Result" in path.read_text()
         ]
         self.assertEqual(owners, ["ci.yaml"])
 
@@ -1068,13 +1060,10 @@ class E2EWorkflowTest(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
 
-    def test_sequential_bounded_phases_and_cpu_identity(self):
+    def test_independent_bounded_phases_and_cpu_identity(self):
         jobs = self.workflow("pr-test-ppu-e2e.yml")["jobs"]
-        self.assertEqual(jobs["extended"]["needs"], ["prepare", "default"])
-        self.assertEqual(
-            jobs["distributed"]["needs"], ["prepare", "default", "extended"]
-        )
         for name in ("default", "extended", "distributed"):
+            self.assertEqual(jobs[name]["needs"], "prepare")
             self.assertEqual(jobs[name]["strategy"]["max-parallel"], 1)
             self.assertFalse(jobs[name]["strategy"]["fail-fast"])
             self.assertEqual(jobs[name]["with"]["phase"], name)
@@ -1082,6 +1071,9 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertIn("select_pr_e2e.py cpu", preparation)
         self.assertIn("inputs.cpu_identity", preparation)
         self.assertEqual(jobs["finish"]["if"], "always()")
+        entry = json.dumps(self.workflow("pr-test-ppu-e2e-entry.yml"))
+        self.assertNotIn("pr_e2e_report.py dependencies", entry)
+        self.assertNotIn("e2e-dependencies", entry)
 
     def test_entry_uses_pinned_action_and_strict_sanitized_uploads(self):
         workflow = self.workflow("pr-test-ppu-e2e-entry.yml")
@@ -1097,6 +1089,11 @@ class E2EWorkflowTest(unittest.TestCase):
         self.assertEqual(action["with"]["node_selector"], "board-type=ZW-M890P")
         self.assertEqual(action["with"]["nproc_per_node"], 8)
         self.assertEqual(action["with"]["cleanup_policy"], "always")
+        mounts = action["with"]["host_volumes"].split(",")
+        self.assertEqual(
+            mounts[1],
+            "/wl_nas/pr-ci/cache/shared:/ppu-pr-cache",
+        )
         self.assertIn("|| 0", action["with"]["nnodes"])
         self.assertNotIn("GH_TOKEN", action["with"]["extra_env"])
         self.assertFalse(any("continue-on-error" in s for s in steps))
