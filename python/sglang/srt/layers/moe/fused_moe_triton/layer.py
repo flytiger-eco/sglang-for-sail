@@ -265,6 +265,19 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _validate_ppu_mega_moe_quant_method(quant_method) -> None:
+    if not (_is_ppu and get_moe_a2a_backend().is_megamoe()):
+        return
+
+    if not isinstance(quant_method, Mxfp4MoEMethod):
+        raise ValueError(
+            "PPU --moe-a2a-backend megamoe requires native MXFP4 routed "
+            "experts (Mxfp4MoEMethod), but this layer selected "
+            f"{type(quant_method).__name__}. Use a native MXFP4 checkpoint "
+            "or --moe-a2a-backend deepep."
+        )
+
+
 def _deepep_v2_experts_are_fp8(quant_method) -> bool:
     # All other supported quantization methods are blockwise FP8.
     return not isinstance(quant_method, UnquantizedFusedMoEMethod)
@@ -500,6 +513,7 @@ class FusedMoE(torch.nn.Module):
                 )
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
+        _validate_ppu_mega_moe_quant_method(self.quant_method)
         if (
             get_moe_a2a_backend().is_deepep_v2()
             and isinstance(self.quant_method, Fp8MoEMethod)

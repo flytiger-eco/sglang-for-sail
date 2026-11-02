@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -54,8 +55,12 @@ def _use_amd_flydsl_mega_moe() -> bool:
 
 
 def _mega_moe_mma_type(experts=None) -> str:
-    if experts is not None and experts._mega_moe_nvfp4:
-        return "nvfp4xnvfp4"
+    if experts is not None:
+        mma_type = getattr(experts, "_mega_moe_mma_type", None)
+        if mma_type is not None:
+            return mma_type
+        if experts._mega_moe_nvfp4:
+            return "nvfp4xnvfp4"
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
@@ -150,9 +155,30 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
+def is_ppu_sm89_mxfp4_mega_moe_available(experts=None) -> bool:
+    if not (_is_ppu and _device_sm == 89):
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "get_symm_buffer_for_mega_moe",
+            "transform_weights_for_mega_moe",
+            "mega_moe_pre_dispatch",
+            "fp4_fp4_mega_moe",
+            "get_num_sms",
+        )
+    ) and (experts is None or getattr(experts, "_mega_moe_mma_type", None) == "fp4xfp4")
+
+
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_ppu and _device_sm == 89:
+        return is_ppu_sm89_mxfp4_mega_moe_available(experts)
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -278,6 +304,49 @@ def _run_mega_routed(
     )
 
 
+def run_ppu_sm89_mega_routed(
+    experts,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    buf: SymmBuffer,
+    num_tokens: int,
+    *,
+    hidden_size: int,
+    mma_type: str,
+    activation_clamp: Optional[float] = None,
+    routed_scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    if mma_type == "fp4xfp4":
+        import deep_gemm
+
+        # PPU stages int64 routes into the workspace; the token count is taken
+        # from y, and every rank must call, including empty ranks.
+        if num_tokens > 0:
+            deep_gemm.mega_moe_pre_dispatch(
+                hidden_states, topk_ids.to(torch.int64), topk_weights, buf
+            )
+        y = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
+        deep_gemm.fp4_fp4_mega_moe(
+            y,
+            experts.mega_l1_weights,
+            experts.mega_l2_weights,
+            buf,
+            activation="swiglu",
+            activation_clamp=activation_clamp,
+            fast_math=True,
+        )
+        if routed_scaling_factor != 1.0:
+            y.mul_(routed_scaling_factor)
+        return y
+
+    raise ValueError(f"PPU SM89 MegaMoE has no implementation for mma_type={mma_type}.")
+
+
 def run_mega_routed_experts(
     experts,
     hidden_states: torch.Tensor,
@@ -335,6 +404,20 @@ def run_mega_routed_experts(
             buf,
             num_tokens,
             hidden_size=hidden_size,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    if _is_ppu and _device_sm == 89:
+        return run_ppu_sm89_mega_routed(
+            experts,
+            hidden_states,
+            topk_ids_in,
+            topk_weights_in,
+            buf,
+            num_tokens,
+            hidden_size=hidden_size,
+            mma_type=mma_type,
             activation_clamp=activation_clamp,
             routed_scaling_factor=routed_scaling_factor,
         )

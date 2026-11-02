@@ -1024,6 +1024,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # recipe=(1,32) and f8f8 APIs that accept logical-K recipes; PPU's
             # nopad f8f8 kernel compares physical K and asserts
             # m/k/n mismatch (weight K is packed K/2).
+            if _is_ppu and self.use_mega_moe:
+                # PPU MegaMoE repacks the raw checkpoint pairs (uint8 E2M1
+                # weights + UE8M0 g32 scales) once; the originals are dropped.
+                from deep_gemm import transform_weights_for_mega_moe
+
+                l1_pair, l2_pair = transform_weights_for_mega_moe(
+                    (layer.w13_weight.data, layer.w13_weight_scale.data),
+                    (layer.w2_weight.data, layer.w2_weight_scale.data),
+                )
+                layer.mega_l1_weights = l1_pair
+                layer.mega_l2_weights = l2_pair
+                layer.w13_weight.data = l1_pair[0]
+                layer.w13_weight_scale.data = l1_pair[1]
+                layer.w2_weight.data = l2_pair[0]
+                layer.w2_weight_scale.data = l2_pair[1]
+                layer._mega_moe_mma_type = "fp4xfp4"
+                layer._mega_moe_weights_built = True
+                layer._mxfp4_backend = "deep_gemm"
+                torch.cuda.empty_cache()
+                return
             if _is_ppu:
                 if self.with_bias:
                     w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
