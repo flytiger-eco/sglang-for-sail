@@ -106,7 +106,9 @@ def bind_state(backend, state):
                 name: (
                     [t[i] for t in value]
                     if isinstance(value, list)
-                    else None if value is None else value[i]
+                    else None
+                    if value is None
+                    else value[i]
                 )
                 for name, value in vars(state).items()
             }

@@ -554,9 +554,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
                 lhs, (weight, scales), out, m_indices
             )
 
-        kernel_type = (
-            deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
-        )
+        kernel_type = deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
         execution_hook.assert_called_once_with(
             3,
             128,
@@ -598,9 +596,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
                 sentinel.config,
             )
 
-        kernel_type = (
-            deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
-        )
+        kernel_type = deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
         execution_hook.assert_called_once_with(
             3,
             128,
@@ -641,9 +637,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
                 sentinel.config,
             )
 
-        kernel_type = (
-            deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
-        )
+        kernel_type = deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
         execution_hook.assert_called_once_with(
             3,
             128,
@@ -684,9 +678,7 @@ class TestPpuMxfp4W4A16(unittest.TestCase):
                 sentinel.config,
             )
 
-        kernel_type = (
-            deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
-        )
+        kernel_type = deep_gemm_entrypoint.compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
         execution_hook.assert_called_once_with(
             3,
             128,

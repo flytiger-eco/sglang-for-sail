@@ -1,27 +1,42 @@
 from __future__ import annotations
 
 import logging
+import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed
+from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+    set_is_extend_in_batch,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
+    ChunkSizePredictor,
+)
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
@@ -31,8 +46,9 @@ from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
 )
-from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu, is_xpu
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils.common import get_device_module, is_npu, is_xpu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)

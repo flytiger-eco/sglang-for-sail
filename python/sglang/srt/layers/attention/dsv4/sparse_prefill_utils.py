@@ -170,9 +170,9 @@ def combine_topk_swa_indices(
     assert compressed_base.dtype == torch.int32
     assert swa_base.dtype == torch.int32
     assert compress_ratio >= 1, "compress_ratio must be >= 1 (use topk=0 for SWA-only)"
-    assert (
-        topk_indices.shape[-1] >= topk
-    ), f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
+    assert topk_indices.shape[-1] >= topk, (
+        f"topk_indices width {topk_indices.shape[-1]} must be >= topk {topk}"
+    )
     assert positions is None or positions.dtype == torch.int32
 
     num_tokens = topk_indices.shape[0]

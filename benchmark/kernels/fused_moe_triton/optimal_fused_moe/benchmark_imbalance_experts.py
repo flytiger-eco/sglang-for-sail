@@ -198,9 +198,12 @@ def benchmark_single_moe(opts, moe_func: Callable) -> None:
     kernel_times = list()
     with torch.cuda.nvtx.range(f"main-test"):
         # non-overlap test for debug
-        with context_patch(
-            "sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe.get_work_streams"
-        ) as single_strm_context, torch.cuda.nvtx.range(f"non overlap"):
+        with (
+            context_patch(
+                "sglang.srt.layers.moe.fused_moe_triton.fused_valu_moe.get_work_streams"
+            ) as single_strm_context,
+            torch.cuda.nvtx.range(f"non overlap"),
+        ):
             single_strm_context.side_effect = lambda: [torch.cuda.current_stream()] * 2
             output = moe_func(tokens, weight1, weight2, curr_topk_weight, curr_topk_ids)
 
@@ -219,7 +222,7 @@ def benchmark_single_moe(opts, moe_func: Callable) -> None:
     kernel_times = pd.Series(data=kernel_times[1:])
     average = kernel_times.mean()
     print(
-        f"E={opts.num_experts}, M={opts.num_tokens}, N={opts.immediate_size}, K={opts.hidden_size}, topK={opts.topk}, dtype={opts.dtype}, {moe_func.__name__} kernel_time = {average*1000:.2f} us"
+        f"E={opts.num_experts}, M={opts.num_tokens}, N={opts.immediate_size}, K={opts.hidden_size}, topK={opts.topk}, dtype={opts.dtype}, {moe_func.__name__} kernel_time = {average * 1000:.2f} us"
     )
 
     if opts.accuracy and (moe_func.__name__ != "reference_torch_impl"):

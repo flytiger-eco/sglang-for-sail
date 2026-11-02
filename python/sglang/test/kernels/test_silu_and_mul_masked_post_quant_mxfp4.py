@@ -82,12 +82,12 @@ def test_masked_rows_consistency() -> None:
         )
 
         for e in range(E):
-            assert torch.equal(
-                out_a[e, :valid], out_b[e, :valid]
-            ), f"quant mismatch E={e} swiglu={swiglu}"
-            assert torch.equal(
-                scale_a[e, :, :valid], scale_b[e, :, :valid]
-            ), f"scale mismatch E={e} swiglu={swiglu}"
+            assert torch.equal(out_a[e, :valid], out_b[e, :valid]), (
+                f"quant mismatch E={e} swiglu={swiglu}"
+            )
+            assert torch.equal(scale_a[e, :, :valid], scale_b[e, :, :valid]), (
+                f"scale mismatch E={e} swiglu={swiglu}"
+            )
 
 
 def test_determinism() -> None:
@@ -110,12 +110,12 @@ def test_determinism() -> None:
 
         masked_cpu = masked_m.cpu().tolist()
         for e, m in enumerate(masked_cpu):
-            assert torch.equal(
-                out_a[e, :m], out_b[e, :m]
-            ), f"quant determinism fail E={e} swiglu={swiglu}"
-            assert torch.equal(
-                scale_a[e, :, :m], scale_b[e, :, :m]
-            ), f"scale determinism fail E={e} swiglu={swiglu}"
+            assert torch.equal(out_a[e, :m], out_b[e, :m]), (
+                f"quant determinism fail E={e} swiglu={swiglu}"
+            )
+            assert torch.equal(scale_a[e, :, :m], scale_b[e, :, :m]), (
+                f"scale determinism fail E={e} swiglu={swiglu}"
+            )
 
 
 def test_ep_scale_layout_for_deepgemm() -> None:
@@ -205,12 +205,12 @@ def test_expected_m_bitexact(E, T, two_N, em_list, swiglu_limit) -> None:
             inp, masked_m, swiglu_limit=swiglu_limit, expected_m=em
         )
         for e, m in enumerate(masked_cpu):
-            assert torch.equal(
-                out_base[e, :m], out_opt[e, :m]
-            ), f"quant mismatch: E={E} T={T} em={em} expert={e}"
-            assert torch.equal(
-                scale_base[e, :, :m], scale_opt[e, :, :m]
-            ), f"scale mismatch: E={E} T={T} em={em} expert={e}"
+            assert torch.equal(out_base[e, :m], out_opt[e, :m]), (
+                f"quant mismatch: E={E} T={T} em={em} expert={e}"
+            )
+            assert torch.equal(scale_base[e, :, :m], scale_opt[e, :, :m]), (
+                f"scale mismatch: E={E} T={T} em={em} expert={e}"
+            )
 
 
 if __name__ == "__main__":
