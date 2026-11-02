@@ -489,13 +489,13 @@ class BenchmarkWorker:
                                 best_time = moe_time
                                 best_up_config = copy.deepcopy(up_cfg)
                             print(
-                                f"[{(i+1)/len(other_configs)*100:.2f}% UP][{i+1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% UP][{i + 1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
                                 f"block_m={block_m}, up_config={up_cfg}",
                                 file=f,
                             )
                         except triton.runtime.autotuner.OutOfResources:
                             print(
-                                f"[{(i+1)/len(other_configs)*100:.2f}% UP][{i+1}/{len(other_configs)}] BREAK DOWN!!! bad_config={up_cfg}",
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% UP][{i + 1}/{len(other_configs)}] BREAK DOWN!!! bad_config={up_cfg}",
                                 file=f,
                             )
                             continue
@@ -538,13 +538,13 @@ class BenchmarkWorker:
                                 best_dn_config = copy.deepcopy(dn_cfg)
 
                             print(
-                                f"[{(i+1)/len(other_configs)*100:.2f}% DN][{i+1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% DN][{i + 1}/{len(other_configs)}] moe_time={moe_time:.2f} best_time={best_time:.2f}, "
                                 f"block_m={block_m}, dn_config={dn_cfg}",
                                 file=f,
                             )
                         except triton.runtime.autotuner.OutOfResources:
                             print(
-                                f"[{(i+1)/len(other_configs)*100:.2f}% DN][{i+1}/{len(other_configs)}] BREAK DOWN!!! bad_config={dn_cfg}",
+                                f"[{(i + 1) / len(other_configs) * 100:.2f}% DN][{i + 1}/{len(other_configs)}] BREAK DOWN!!! bad_config={dn_cfg}",
                                 file=f,
                             )
                             continue

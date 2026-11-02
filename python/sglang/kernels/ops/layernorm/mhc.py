@@ -1086,9 +1086,9 @@ def mhc_pre(
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         if is_ppu():
-            assert (
-                n_splits == 1
-            ), "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+            assert n_splits == 1, (
+                "PPU version deep_gemm.tf32_hc_prenorm_gemm doesn't support split-k"
+            )
         else:
             n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 

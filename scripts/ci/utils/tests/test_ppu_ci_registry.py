@@ -164,7 +164,7 @@ class PpuRegistryTest(unittest.TestCase):
 
     def test_kimi_k3_files_have_executable_main_guards(self):
         for relative_path in (
-            "test/registered/unit/test_ppu_kimi_k3_constraints.py",
+            "test/registered/unit/models/test_ppu_kimi_k3_constraints.py",
             "test/registered/unit/layers/moe/test_ppu_kimi_k3_moe.py",
         ):
             with self.subTest(path=relative_path):

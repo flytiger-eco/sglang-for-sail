@@ -226,9 +226,9 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert (
-        cfg.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
+    assert cfg.dp_size == 1, (
+        "For round-robin split mode, dp attention is not supported."
+    )
     if is_ppu():
         if cfg.tp_size > 8:
             logger.warning(
@@ -236,9 +236,9 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
                 f"Cross-machine CP may have precision issues. Proceed with caution."
             )
     else:
-        assert (
-            cfg.tp_size <= 8
-        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues." 
+        assert cfg.tp_size <= 8, (
+            "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+        )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(

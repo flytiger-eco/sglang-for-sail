@@ -524,9 +524,9 @@ def prepare_for_dispatch(
     """
     Select different preprocessing methods based on the JSON configuration.
     """
-    assert (
-        "diverse_ratio" in config.keys()
-    ), "A config json with version=2 need be offered when using FUSEDMOE_OPT=1"
+    assert "diverse_ratio" in config.keys(), (
+        "A config json with version=2 need be offered when using FUSEDMOE_OPT=1"
+    )
     assert 0.0 <= config["diverse_ratio"] <= 1.0
     diverse_ratio = float(
         os.environ.get("FUSEDMOE_DIVERSE_RATIO", config["diverse_ratio"])
@@ -919,7 +919,6 @@ def fused_moe_gemv_persistent_kernel(
             num_stages=1,
             loop_unroll_factor=1,
         ):
-
             if use_id_map:
                 offs_token = tl.load(
                     sorted_token_ids_ptr + tid_m,
@@ -1039,7 +1038,6 @@ def fused_moe_groupedgemm_persistent_kernel(
             num_stages=1,
             loop_unroll_factor=2,
         ):
-
             offs_token = tl.load(
                 sorted_token_ids_ptr
                 + tid_m * BLOCK_SIZE_M
