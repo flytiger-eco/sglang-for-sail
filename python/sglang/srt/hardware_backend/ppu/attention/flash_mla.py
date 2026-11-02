@@ -8,6 +8,8 @@ Exported symbols
 get_mla_metadata
 flash_mla_with_kvcache
 flash_mla_sparse_fwd
+flash_mla_sparse_fp8_fwd
+flash_mla_sparse_decode_fp8_fwd
 """
 
 from typing import Optional, Tuple
@@ -198,4 +200,58 @@ def flash_mla_sparse_fwd(
         d_v=d_v,
         attn_sink=attn_sink,
         topk_length=topk_length,
+    )
+
+
+def flash_mla_sparse_fp8_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    compute_aux: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run PPU native FP8 sparse prefill attention."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    return _flashmla.flash_mla_sparse_fp8_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        compute_aux=compute_aux,
+    )
+
+
+def flash_mla_sparse_decode_fp8_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    d_v: int = 512,
+    num_cta: int = 39,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run PPU native FP8 sparse decode attention."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    return _flashmla.flash_mla_sparse_decode_fp8_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=d_v,
+        num_cta=num_cta,
     )
