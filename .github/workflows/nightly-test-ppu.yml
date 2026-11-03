@@ -356,7 +356,7 @@ jobs:
                       import torch
                       names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
                       require(len(names) == 1 and all('890' in name.upper() for name in names), 'Preflight requires exactly one 890P device')
-                      print('PPU_MODEL_PREFLIGHT_DEVICE_EVIDENCE=' + json.dumps({'requested_devices': 1, 'visible_devices': len(names), 'device_names': names}), flush=True)
+                      print('PPU_MODEL_PREFLIGHT_DEVICE_EVIDENCE=' + json.dumps({'requested_devices': 1, 'visible_devices': len(names), 'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'), 'device_names': names}), flush=True)
                       execution = {'workflow_sha': plan['workflow_sha'], 'devices': names, 'reserved_devices': 1, 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST']}
                   gate = model_preflight(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']))
                   if execution is not None:
@@ -932,6 +932,8 @@ jobs:
                       probe = next(s for s in jobs['sweep-models']['steps'] if s.get('id') == 'model-worker')
                       self.assertEqual(probe['with']['nnodes'], 0)
                       self.assertEqual(probe['with']['nproc_per_node'], 1)
+                      driver = next(s for s in jobs['sweep-prepare']['steps'] if s.get('name') == 'Build self-contained sweep driver')['run']
+                      self.assertIn('export CUDA_VISIBLE_DEVICES=0\n', driver)
                       self.assertEqual(probe['with']['node_selector'], 'board-type=ZW-M890P')
                       self.assertEqual(probe['with']['timeout_minutes'], 20)
                       self.assertNotIn('secrets.', probe['with']['extra_env'])
@@ -1220,7 +1222,7 @@ jobs:
           umask 022
           cd /workspace/source
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
-          export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+          export CUDA_VISIBLE_DEVICES=0
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
