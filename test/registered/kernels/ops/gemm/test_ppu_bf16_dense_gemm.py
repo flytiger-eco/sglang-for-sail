@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 import sglang.srt.layers.deep_gemm_wrapper.compile_utils as compile_utils
 import sglang.srt.layers.quantization.unquant as unquant
-from sglang.srt.utils import is_ppu
+from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,7 +30,7 @@ _SHAPES = ((16, 8192, 4096), (2048, 8192, 4096), (256, 32768, 4096))
 
 @unittest.skipUnless(
     torch.cuda.is_available()
-    and is_ppu()
+    and is_sail()
     and unquant.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM,
     "requires a PPU device with the DeepGEMM JIT enabled",
 )
