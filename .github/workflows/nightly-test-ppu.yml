@@ -268,8 +268,11 @@ jobs:
               main = repo / 'refs/main'
               if main.is_file():
                   revision = main.read_text().strip()
-                  require(re.fullmatch(r'[a-f0-9]{40}', revision), 'Invalid cached main revision: ' + model)
-                  candidates = [snapshots / revision]
+                  if re.fullmatch(r'[a-f0-9]{40}', revision):
+                      candidates = [snapshots / revision]
+                  else:
+                      print('Invalid cached main revision for ' + model + '; scanning snapshots instead', flush=True)
+                      candidates = sorted(snapshots.iterdir()) if snapshots.is_dir() else []
               else:
                   candidates = sorted(snapshots.iterdir()) if snapshots.is_dir() else []
               for snapshot in candidates:
@@ -743,6 +746,9 @@ jobs:
                       (snapshot / 'part.safetensors').write_bytes(b'weights')
                       available = cached_model(cache, 'org/cached')
                       self.assertTrue(available['exists'])
+                      (snapshot.parent.parent / 'refs/main').write_text('main')
+                      self.assertTrue(cached_model(cache, 'org/cached')['exists'])
+                      (snapshot.parent.parent / 'refs/main').write_text('a' * 40)
                       (snapshot / 'alias.safetensors').symlink_to(snapshot / 'part.safetensors')
                       self.assertEqual(cached_model(cache, 'org/cached')['size_bytes'], available['size_bytes'])
                       (snapshot / 'dangling.safetensors').symlink_to(snapshot / 'absent')
