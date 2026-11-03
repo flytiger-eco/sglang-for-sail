@@ -19,7 +19,7 @@ on:
         type: string
         default: ''
       max_parallel:
-        description: 'Concurrent test tasks (1-2); each task requests its required PPU cards'
+        description: 'Concurrent test tasks (1-4); each task requests its required PPU cards'
         type: number
         default: 1
       timeout_per_file:
@@ -173,7 +173,7 @@ jobs:
           def make_plan(scope, suites, timeout, parallel, hardware, *, partition_model=None, partition_model_sha=''):
               require(scope in STAGES, 'Unknown scope')
               require((partition_model is None and partition_model_sha == '') or (isinstance(partition_model, dict) and re.fullmatch(r'[0-9a-f]{40}', partition_model_sha)), 'Partition model must have an immutable identity')
-              require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
+              require(type(parallel) is int and 1 <= parallel <= 4, 'max_parallel must be between 1 and 4')
               require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
               require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['board_devices'] == 8, 'Invalid board capacity')
               require(hardware['test_budget_seconds'] == 10800 and hardware['worker_minutes'] == 300 and hardware['job_minutes'] == 330, 'Unexpected job budgets')
@@ -987,10 +987,11 @@ jobs:
                           print(f"{scope}: {len({e['suite'] for e in plan['entries']})} suites, {len(actual)} enabled registrations, {len(plan['disabled'])} disabled, {len(plan['entries'])} partitions")
 
                   def test_inputs_and_zero_estimates(self):
-                      for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'weekly-test-8-gpu-h200', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 3), ('base', '', 0, True)]:
+                      for scope, suites, timeout, parallel in [('bad', '', 0, 1), ('base', 'unknown', 0, 1), ('base', 'weekly-test-8-gpu-h200', 0, 1), ('base', '', 599, 1), ('base', '', 3601, 1), ('base', '', 0, 0), ('base', '', 0, 5), ('base', '', 0, True)]:
                           with self.assertRaises(ValueError):
                               make_plan(scope, suites, timeout, parallel, hardware)
-                      selected = make_plan('base', 'base-a-test-1-gpu-small', 600, 2, hardware)
+                      selected = make_plan('base', 'base-a-test-1-gpu-small', 600, 4, hardware)
+                      self.assertEqual(selected['parallel'], 4)
                       self.assertEqual({e['suite'] for e in selected['entries']}, {'base-a-test-1-gpu-small'})
                       kernel = make_plan('base', 'base-b-kernel-unit-test-1-gpu-b200', 600, 1, hardware)
                       self.assertEqual({e['suite'] for e in kernel['entries']}, {'base-b-kernel-unit-test-1-gpu-b200'})
