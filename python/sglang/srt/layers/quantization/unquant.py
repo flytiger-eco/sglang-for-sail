@@ -110,7 +110,7 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
-_is_ppu = is_ppu()
+_is_ppu = is_sail()
 # PPU1.0 (SM80, e.g. 810E) and later satisfy DeepGEMM's own configurer floor
 # (sm_version >= 80); the switch below is what actually gates the BF16 path.
 _PPU_BF16_DENSE_MIN_SM = 80
