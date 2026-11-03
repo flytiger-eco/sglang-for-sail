@@ -942,10 +942,10 @@ jobs:
                       worker = next(s for s in execute if s.get('id') == 'worker')
                       request_log = next(s for s in execute if s.get('name') == 'Log requested PPU allocation')
                       self.assertLess(execute.index(request_log), execute.index(worker))
-                      self.assertIn('${{ matrix.n_devices }}', request_log['run'])
+                      self.assertIn('matrix.n_devices', request_log['run'])
                       self.assertEqual(worker['if'], "steps.gate.outputs.runnable == 'true'")
                       self.assertEqual(worker['with']['nnodes'], 0)
-                      self.assertEqual(worker['with']['nproc_per_node'], '${{ matrix.n_devices }}')
+                      self.assertEqual(worker['with']['nproc_per_node'], '${' + '{ matrix.n_devices }}')
                       self.assertEqual(probe['uses'], worker['uses'])
 
                   def test_scope_coverage_and_partitions(self):
