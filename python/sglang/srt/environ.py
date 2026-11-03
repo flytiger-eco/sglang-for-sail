@@ -1755,6 +1755,10 @@ class Envs:
     # graph, so the captured indexer no longer needs every block to be a
     # candidate (the 2048 x 8 window). 0 keeps the dense captured path.
     SGLANG_OPT_DSV41_PREFILL_CAPTURE_CONSUME = EnvBool(False)
+    # DeepSeek-V4.1 eager prefill indexer top-k: select through the two-level
+    # candidate structure (block maxima, then only the kept blocks) instead of a
+    # full-width pass. 0 restores the dense top-k for A/B.
+    SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
