@@ -85,21 +85,21 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         return kernel.call_args.kwargs
 
     def test_encoder_only_swa_decode_uses_symmetric_window(self):
-        from sglang.srt.layers.radix_attention import AttentionType
+        AttentionType = flashattention_backend.AttentionType
 
         kwargs = self._decode_kernel_kwargs(AttentionType.ENCODER_ONLY, 127)
         self.assertEqual(kwargs["window_size"], (127, 127))
         self.assertFalse(kwargs["causal"])
 
     def test_causal_swa_decode_retains_left_window(self):
-        from sglang.srt.layers.radix_attention import AttentionType
+        AttentionType = flashattention_backend.AttentionType
 
         kwargs = self._decode_kernel_kwargs(AttentionType.DECODER, 127)
         self.assertEqual(kwargs["window_size"], (127, 0))
         self.assertTrue(kwargs["causal"])
 
     def test_full_attention_decode_window_is_unchanged(self):
-        from sglang.srt.layers.radix_attention import AttentionType
+        AttentionType = flashattention_backend.AttentionType
 
         for attn_type in (AttentionType.ENCODER_ONLY, AttentionType.DECODER):
             for window in (-1, None):
