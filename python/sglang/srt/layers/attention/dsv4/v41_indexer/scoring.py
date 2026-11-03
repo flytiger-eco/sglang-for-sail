@@ -307,19 +307,53 @@ def dense_prefill_topk(
     kv: Tuple[torch.Tensor, torch.Tensor],
     *,
     out: torch.Tensor,
+    two_level: bool = False,
 ) -> None:
-    """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    """Request-local compressed positions into ``out``, ``-1`` padded, unordered.
+
+    ``two_level`` selects through the candidate structure -- block maxima, then
+    only the kept blocks -- instead of a full-width top-k. That is exact here
+    because nothing is published: the block window is ``k`` itself, so the
+    second level reads ``k * 8`` of the row's columns instead of all of them.
+    """
+    from sglang.kernels.ops.attention.dsv4 import (
+        topk_transform_candidates,
+        topk_transform_ragged_v2,
+    )
 
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(data.request_starts)
-    for tile, logits in score_tiles(data, kv, width_align=4):
-        topk_transform_ragged_v2(
-            logits,
-            data.compress_lens[tile],
-            out_offsets=zero_offsets[tile],
-            out_indices=out[tile],
+    two_level = two_level and out.shape[1] > 0
+    if two_level:
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            candidate_block_ids,
         )
+        from sglang.kernels.ops.attention.dsv4.candidate_table import (
+            CANDIDATE_BLOCK_SIZE,
+        )
+
+    # A block-max key is one 32 B load, so the two-level path needs the tile
+    # stride on an 8-float boundary; the dense path has no such requirement.
+    for tile, logits in score_tiles(data, kv, width_align=8 if two_level else 4):
+        lens = data.compress_lens[tile]
+        if two_level:
+            nblocks = (lens + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
+            blocks = candidate_block_ids(logits, lens, nblocks, out.shape[1])
+            topk_transform_candidates(
+                logits,
+                lens,
+                blocks,
+                out_offsets=zero_offsets[tile],
+                out_indices=out[tile],
+            )
+            del blocks
+        else:
+            topk_transform_ragged_v2(
+                logits,
+                lens,
+                out_offsets=zero_offsets[tile],
+                out_indices=out[tile],
+            )
         # Free this tile's logits before the generator scores the next one.
         del logits
 
