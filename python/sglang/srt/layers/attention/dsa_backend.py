@@ -79,6 +79,7 @@ from sglang.srt.layers.attention.dsa.utils import (  # [patch GLM5.3-Flash v21 P
     pad_dsa_cache_seqlens,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.dsa_nvtx import dsa_sparse_nvtx
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -2027,6 +2028,7 @@ class DeepseekSparseAttnBackend(
 
         self.forward_metadata = metadata
 
+    @dsa_sparse_nvtx
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2388,6 +2390,7 @@ class DeepseekSparseAttnBackend(
                 f"Unsupported {dsa_impl = } for forward_extend. Consider using an other attention backend."
             )
 
+    @dsa_sparse_nvtx
     def forward_decode(
         self,
         q: torch.Tensor,
