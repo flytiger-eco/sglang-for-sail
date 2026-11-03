@@ -426,7 +426,7 @@ def gemm_nt_bf16bf16bf16(
     # Dense BF16 GEMM with K-major (nt) operands only: both lhs [m, k] and
     # rhs [n, k] must be contiguous bf16, and `out` must be bf16. The FP32-out
     # variant is served by gemm_nt_bf16bf16f32 above.
-    assert _is_ppu, "only ppu deepgemm support gemm_nt_bf16bf16bf16"
+    assert is_sail(), "only ppu deepgemm support gemm_nt_bf16bf16bf16"
     assert out.dtype == torch.bfloat16, "bf16 dense deepgemm requires bf16 out"
 
     m, k = lhs.shape
