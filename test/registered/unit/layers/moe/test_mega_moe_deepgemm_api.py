@@ -39,6 +39,147 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
 
+    def test_ppu_activation_separates_symmetric_buffers(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *args, **kwargs: SimpleNamespace(**kwargs)
+        )
+        group = object()
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+
+            def allocate(activation):
+                return mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    8,
+                    64,
+                    2,
+                    512,
+                    512,
+                    mma_type="fp4xfp4",
+                    activation=activation,
+                )
+
+            swiglu = allocate("swiglu")
+            situ = allocate("situ")
+            self.assertIs(situ, allocate("situ"))
+        self.assertIsNot(swiglu, situ)
+        self.assertEqual((swiglu.activation, situ.activation), ("swiglu", "situ"))
+        self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+
+    def test_ppu_routed_experts_forwards_situ_and_scales_once(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.mega_moe_pre_dispatch = MagicMock()
+        deep_gemm.fp4_fp4_mega_moe = MagicMock(
+            side_effect=lambda y, *_args, **_kwargs: y.fill_(2)
+        )
+        experts = SimpleNamespace(mega_l1_weights=object(), mega_l2_weights=object())
+        hidden = torch.ones((2, 4), dtype=torch.bfloat16)
+        ids = torch.zeros((2, 2), dtype=torch.int32)[:, :1]
+        weights = torch.ones((2, 2))[:, :1]
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            result = mega_moe.run_ppu_sm89_mega_routed(
+                experts,
+                hidden,
+                ids,
+                weights,
+                object(),
+                2,
+                hidden_size=4,
+                mma_type="fp4xfp4",
+                activation="situ",
+                routed_scaling_factor=3.0,
+            )
+        self.assertTrue(torch.all(result == 6))
+        self.assertEqual(
+            deep_gemm.fp4_fp4_mega_moe.call_args.kwargs["activation"], "situ"
+        )
+        self.assertEqual(
+            deep_gemm.mega_moe_pre_dispatch.call_args.args[1].dtype, torch.int64
+        )
+        self.assertTrue(
+            deep_gemm.mega_moe_pre_dispatch.call_args.args[1].is_contiguous()
+        )
+        self.assertTrue(
+            deep_gemm.mega_moe_pre_dispatch.call_args.args[2].is_contiguous()
+        )
+
+    def test_ppu_weight_transform_preserves_activation(self):
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        method = object.__new__(Mxfp4MoEMethod)
+        method.use_marlin = False
+        method.use_deep_gemm = False
+        method.use_mega_moe = True
+        method.use_deepgemm_mxfp4_w4a16_mma = False
+        method.use_deepgemm_mxfp4_w4a16_valu = False
+        method.with_bias = False
+        for activation in ("situ", "silu"):
+            with self.subTest(activation=activation):
+                layer = SimpleNamespace(
+                    moe_runner_config=SimpleNamespace(activation=activation)
+                )
+                for name in (
+                    "w13_weight",
+                    "w13_weight_scale",
+                    "w2_weight",
+                    "w2_weight_scale",
+                ):
+                    setattr(
+                        layer,
+                        name,
+                        torch.nn.Parameter(
+                            torch.zeros(1, dtype=torch.uint8), requires_grad=False
+                        ),
+                    )
+                transform = MagicMock(side_effect=lambda l1, l2, **kwargs: (l1, l2))
+                with (
+                    patch("sglang.srt.layers.quantization.mxfp4._is_ppu", True),
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "deep_gemm": SimpleNamespace(
+                                transform_weights_for_mega_moe=transform
+                            )
+                        },
+                    ),
+                    patch.object(torch.cuda, "empty_cache"),
+                ):
+                    method.process_weights_after_loading(layer)
+                self.assertEqual(
+                    transform.call_args.kwargs,
+                    {"activation": "situ"} if activation == "situ" else {},
+                )
+                self.assertTrue(layer._mega_moe_weights_built)
+                self.assertEqual(layer._mega_moe_mma_type, "fp4xfp4")
+
+    def test_kimi_k3_ppu_routes_situ_and_scaling(self):
+        from sglang.srt.models import kimi_k3
+
+        experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=False)
+        model = SimpleNamespace(
+            experts=experts,
+            routed_scaling_factor=2.5,
+            moe_hidden_size=4,
+            _mega_intermediate_size=8,
+            _mega_top_k=2,
+        )
+        x = torch.ones((3, 4), dtype=torch.bfloat16)
+        topk = SimpleNamespace(
+            topk_ids=torch.zeros((3, 2)), topk_weights=torch.ones((3, 2))
+        )
+        output = torch.ones_like(x)
+        with (
+            patch.object(kimi_k3, "is_ppu", return_value=True),
+            patch.object(
+                mega_moe, "run_mega_routed_experts", return_value=output
+            ) as run,
+        ):
+            result = kimi_k3.KimiK3MoE._forward_mega_experts(model, x, topk)
+        self.assertIs(result, output)
+        self.assertEqual(run.call_args.kwargs["activation"], "situ")
+        self.assertEqual(run.call_args.kwargs["num_tokens"], 3)
+        self.assertEqual(run.call_args.kwargs["routed_scaling_factor"], 2.5)
+
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm
         expected_buffer = object()
@@ -194,6 +335,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch("sglang.srt.layers.quantization.mxfp4._is_ppu", False),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),

@@ -562,6 +562,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
         valu_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16.get()
         mma_enabled = envs.SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA.get()
+        if _is_ppu and self.use_mega_moe and (valu_enabled or mma_enabled):
+            raise ValueError("PPU MegaMoE uses W4A4; disable the W4A16 MoE modes.")
         self._validate_ppu_mxfp4_w4a16(
             valu_enabled,
             mma_enabled,
@@ -1027,11 +1029,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if _is_ppu and self.use_mega_moe:
                 # PPU MegaMoE repacks the raw checkpoint pairs (uint8 E2M1
                 # weights + UE8M0 g32 scales) once; the originals are dropped.
+                if self.with_bias:
+                    raise ValueError("PPU MegaMoE does not support expert bias.")
                 from deep_gemm import transform_weights_for_mega_moe
 
+                transform_kwargs = (
+                    {"activation": "situ"}
+                    if layer.moe_runner_config.activation == "situ"
+                    else {}
+                )
                 l1_pair, l2_pair = transform_weights_for_mega_moe(
                     (layer.w13_weight.data, layer.w13_weight_scale.data),
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
+                    **transform_kwargs,
                 )
                 layer.mega_l1_weights = l1_pair
                 layer.mega_l2_weights = l2_pair

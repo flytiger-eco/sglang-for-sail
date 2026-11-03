@@ -123,6 +123,7 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     mma_type: Optional[str] = None,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -137,6 +138,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            activation,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
@@ -149,7 +151,7 @@ def _get_mega_moe_symm_buffer(
                 hidden,
                 intermediate_hidden,
                 mma_type=mma_type,
-                activation="swiglu",
+                activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -314,6 +316,7 @@ def run_ppu_sm89_mega_routed(
     *,
     hidden_size: int,
     mma_type: str,
+    activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
@@ -324,7 +327,10 @@ def run_ppu_sm89_mega_routed(
         # from y, and every rank must call, including empty ranks.
         if num_tokens > 0:
             deep_gemm.mega_moe_pre_dispatch(
-                hidden_states, topk_ids.to(torch.int64), topk_weights, buf
+                hidden_states,
+                topk_ids.to(torch.int64).contiguous(),
+                topk_weights.to(torch.float32).contiguous(),
+                buf,
             )
         y = torch.empty(
             (num_tokens, hidden_size),
@@ -336,7 +342,7 @@ def run_ppu_sm89_mega_routed(
             experts.mega_l1_weights,
             experts.mega_l2_weights,
             buf,
-            activation="swiglu",
+            activation=activation,
             activation_clamp=activation_clamp,
             fast_math=True,
         )
@@ -357,6 +363,7 @@ def run_mega_routed_experts(
     intermediate_size: int,
     top_k: int,
     num_tokens: int,
+    activation: str = "swiglu",
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
@@ -386,6 +393,7 @@ def run_mega_routed_experts(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
         mma_type=mma_type,
+        activation=activation,
     )
 
     if num_tokens > 0:
@@ -418,6 +426,7 @@ def run_mega_routed_experts(
             num_tokens,
             hidden_size=hidden_size,
             mma_type=mma_type,
+            activation=activation,
             activation_clamp=activation_clamp,
             routed_scaling_factor=routed_scaling_factor,
         )
