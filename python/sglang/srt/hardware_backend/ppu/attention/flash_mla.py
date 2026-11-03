@@ -46,14 +46,15 @@ if SGLANG_PROFILE_NVTX:
 def validate_dense_fp8_config(
     dtype, head_dim, head_dim_v, page_size, device, dcp_size=1
 ):
-    """Check the actual PPU library's dense Q8KV8 contract, including auto dtype."""
+    """Check dense Q8KV8 inputs; the installed library validates its targets."""
     if dtype != torch.float8_e4m3fn:
         raise ValueError("PPU FlashMLA dense FP8 requires E4M3 Q and KV cache.")
     major, minor = torch.cuda.get_device_capability(device)
-    # The library checks major == 8 even though its FP8 helper is named
-    # is_sm89_or_newer. Do not assume V900/SM90 support.
-    if major != 8 or minor < 9:
-        raise ValueError("PPU FlashMLA dense FP8 requires an SM89 device.")
+    # Reject known pre-FP8 devices, without permanently excluding newer PPUs.
+    # Some library versions are SM8x-only; their own architecture checks remain
+    # authoritative. Passing this guard does not establish V900/SM90 support.
+    if (major, minor) < (8, 9):
+        raise ValueError("PPU FlashMLA dense FP8 requires an SM89-or-newer device.")
     if head_dim != 576 or head_dim_v != 512:
         raise ValueError("PPU FlashMLA dense FP8 requires Q/K dim 576 and V dim 512.")
     if page_size % 64:

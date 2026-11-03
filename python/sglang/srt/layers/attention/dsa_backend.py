@@ -2881,6 +2881,15 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    @property
+    def flashmla_decode_uses_fp8_cache(self) -> bool:
+        # The compute preference can quantize a BF16 pool on demand, but a
+        # pool already stored as FP8 must always advertise its actual format.
+        return (
+            self.dsa_kv_cache_store_fp8
+            or envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get()
+        )
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -2912,10 +2921,7 @@ class DeepseekSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if (
-            envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get()
-            and not self.dsa_kv_cache_store_fp8
-        ):
+        if self.flashmla_decode_uses_fp8_cache and not self.dsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -2937,7 +2943,7 @@ class DeepseekSparseAttnBackend(
             block_table=torch.empty(
                 (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
-            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            is_fp8_kvcache=self.flashmla_decode_uses_fp8_cache,
         )
 
         if target_q_heads != num_q_heads:
@@ -3505,7 +3511,7 @@ class DeepseekSparseAttnBackend(
             num_q_tokens_per_head_k=seq_len_q * num_heads_q // 1,
             num_heads_k=1,
             num_heads_q=num_heads_q,
-            is_fp8_kvcache=envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+            is_fp8_kvcache=self.flashmla_decode_uses_fp8_cache,
             topk=self.dsa_index_topk,
         )
 

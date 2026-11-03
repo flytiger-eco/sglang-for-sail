@@ -535,6 +535,7 @@ class PpuPathSelectionTest(unittest.TestCase):
         cases = [
             (["test/registered/ppu/pr/test_cpu_eval.py"], cpu),
             (["test/registered/ppu/test_ppu_constraints.py"], cpu),
+            (["test/registered/ppu/test_flashmla_fp8_kv_unit.py"], cpu),
             (["test/registered/unit/server_args/test_server_args.py"], single),
             (["python/sglang/srt/parser/reasoning_parser.py"], single),
             (["test/ppu/module/test_ppu_deepep_hooks.py"], single),
@@ -552,6 +553,8 @@ class PpuPathSelectionTest(unittest.TestCase):
             ),
             (["python/sglang/srt/new_module.py", "README.md"], single),
             (["python/sglang/srt/layers/attention/new.py"], kernel),
+            (["test/ppu/unit/test_flashmla_fp8_kv_device.py"], kernel),
+            (["test/registered/ppu/pr/test_flashmla_fp8_kv.py"], kernel),
             (["python/sglang/srt/mem_cache/radix_cache.py"], kernel),
             (["sgl-kernel/csrc/attention.cu"], kernel),
             (["python/sglang/srt/hardware_backend/ppu/moe/ppu_deepep_hooks.py"], multi),
@@ -606,7 +609,8 @@ class PpuPathSelectionTest(unittest.TestCase):
             self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-flytiger")
             action = next(s for s in jobs[job]["steps"] if s.get("id") == "worker")
             self.assertRegex(
-                action["uses"], r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$"
+                action["uses"],
+                r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$",
             )
             self.assertEqual(
                 action["with"]["timeout_minutes"], {smoke: 40, body: 55, multi: 55}[job]

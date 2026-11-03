@@ -189,13 +189,14 @@ SERVER_PARAMETER_CLI_ORDER = (
 # The environment variables a config may set around the server, and the only
 # ones: an entry here is a name this tree actually reads, checked when it was
 # added.  `SGLANG_WARMUP_TIMEOUT` is declared in `sglang.srt.environ`, and
-# `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` is read through
-# `get_bool_env_var` in `sglang.srt.layers.attention.dsa.utils`.  The internal
+# `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` is accepted through
+# the deprecated-name fallback in `sglang.srt.environ`.  The internal
 # GLM cases also export `SGLANG_NSA_DUAL_STREAM=0`, which is deliberately not
 # here: nothing in this tree reads that name, so accepting it would let a config
 # state a setting no run honours.
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
+    "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
     "SGLANG_OPT_USE_TOPK_V2",
     "SGLANG_DSV4_FP4_EXPERTS",

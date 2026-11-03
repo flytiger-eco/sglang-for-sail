@@ -38,13 +38,17 @@ For dense decode, the installed binary must include FP8 kernels: the version str
 
 | Backend | FP8 cache behavior |
 | --- | --- |
-| Dense `flashmla` decode | Unscaled E4M3 Q and KV, BF16 output; Q/K dimension 576, V dimension 512, page size 64 in SGLang, and no DCP. The current library requires SM89; SM80 and SM90 are rejected for this dense FP8 path. |
+| Dense `flashmla` decode | Unscaled E4M3 Q and KV, BF16 output; Q/K dimension 576, V dimension 512, page size 64 in SGLang, and no DCP. The framework rejects pre-SM89 devices; the installed library validates its architecture targets. Passing the framework check does not establish SM90/V900 support. |
 | DSA `flashmla_sparse` prefill + `flashmla_kv` decode | Packed E4M3 NoPE + scales + BF16 RoPE. Prefill gathers and dequantizes prefix KV to BF16; sparse decode reads the packed cache directly with BF16 Q. |
 | DSA `flashmla_sparse` decode | Requires BF16 KV input; rejected with FP8 cache. Use `flashmla_kv` decode instead. |
 
 Dense Q uses the same raw E4M3 conversion as the MLA cache writer. The PPU
 library has no independent Q/K descale arguments, so checkpoint KV scales are
 not applied to this dense path. E5M2 is not supported by these FlashMLA FP8 paths.
+Some FlashMLA versions still restrict dispatch to SM8x even though their helper
+is named `is_sm89_or_newer`. A V900/SM90 deployment needs an operator build that
+supports that target and separate validation; do not infer support from the
+minimum device check.
 This describes the integration contract, not an accuracy or performance result
 for an unverified device/software combination.
 
@@ -83,8 +87,24 @@ PYTHONPATH=python CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
   -s test/ppu/unit -p 'test_flashmla_fp8_kv*.py' -v
 ```
 
+The CPU regressions are registered in `base-a-test-cpu` and
+`stage-a-test-cpu-ppu`. The registered device wrapper runs BF16 numerical and graph cases
+on the current 810E PR worker and selects the FP8 numerical/graph cases only on
+SM89-or-newer hardware. Changes to the wrapper or device tests trigger the kernel
+lane. This registration does not provision an FP8-capable worker: positive FP8
+coverage still requires that hardware and an appropriate operator binary.
+
 Keep failures on an older operator binary visible; do not skip dense FP8 tests
 merely because the installed binary only accepts FP16/BF16.
+
+### Decode compute preference and cache format
+
+`SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` controls on-demand quantization
+when the DSA decode pool is BF16. An already packed FP8 pool is always advertised
+as FP8 to both metadata construction and decode, even when this variable is `0`.
+The deprecated `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` name remains
+accepted; the canonical DSA name takes precedence when both are set. PPU's default
+of `0` applies only when neither name was explicitly supplied.
 
 ### Serial checkpoint loading
 

@@ -14,7 +14,7 @@ import torch
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "PPU runtime required")
-class TestFlashMlaFp8Device(unittest.TestCase):
+class _FlashMlaDeviceBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         path = Path(__file__).resolve().parents[3] / (
@@ -25,11 +25,11 @@ class TestFlashMlaFp8Device(unittest.TestCase):
         spec.loader.exec_module(cls.ops)
         torch.manual_seed(42)
 
-    def dense_inputs(self, sq=1, page=64):
+    def dense_inputs(self, sq=1, page=64, dtype=torch.float8_e4m3fn):
         b, h, length = 2, 8, 128
-        q = (torch.randn(b, sq, h, 576, device="cuda") * 0.2).to(torch.float8_e4m3fn)
+        q = (torch.randn(b, sq, h, 576, device="cuda") * 0.2).to(dtype)
         kv = (torch.randn(b * length // page, page, 1, 576, device="cuda") * 0.2).to(
-            torch.float8_e4m3fn
+            dtype
         )
         table = torch.arange(b * length // page, device="cuda", dtype=torch.int32).view(
             b, -1
@@ -71,16 +71,27 @@ class TestFlashMlaFp8Device(unittest.TestCase):
             torch.testing.assert_close(out[b].float(), ref, atol=2e-3, rtol=2e-2)
             torch.testing.assert_close(lse[b], ref_lse, atol=2e-3, rtol=2e-3)
 
-    def test_real_backend_uses_raw_fp8_query(self):
-        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+    def check_dense_graph(self, dtype):
+        inputs = self.dense_inputs(dtype=dtype)
+        # Warm up code loading, then capture lazy metadata allocation itself.
+        meta, _ = self.ops.get_mla_metadata()
+        self.run_dense(inputs, meta)
+        torch.cuda.synchronize()
+        meta, _ = self.ops.get_mla_metadata()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out, lse = self.run_dense(inputs, meta)
+        for _ in range(3):
+            q = inputs[0]
+            q.copy_((torch.randn_like(q.float()) * 0.2).to(q.dtype))
+            graph.replay()
+            torch.cuda.synchronize()
+            self.check_dense(inputs, out, lse)
 
-        q = torch.tensor([0.5, 1.0, -2.0, 4.0], device="cuda").reshape(1, 1, 1, 4)
-        q8, dq, dk = FlashMLABackend._prepare_fp8_query(
-            None, q, SimpleNamespace(k_scale=torch.tensor([4.0], device="cuda"))
-        )
-        torch.testing.assert_close(q8.float(), q, atol=0, rtol=0)
-        self.assertIsNone(dq)
-        self.assertIsNone(dk)
+
+class TestFlashMlaBf16Device(_FlashMlaDeviceBase):
+    def test_dense_bf16_graph_capture_and_replay(self):
+        self.check_dense_graph(torch.bfloat16)
 
     def test_real_ppu_configuration_checks(self):
         from sglang.srt.arg_groups.overrides import _ppu_flashmla_kv_cache_checks
@@ -103,6 +114,63 @@ class TestFlashMlaFp8Device(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "flashmla_kv"):
             _ppu_flashmla_kv_cache_checks(config)
 
+    def test_dense_bf16_regression(self):
+        inputs = self.dense_inputs(sq=3, dtype=torch.bfloat16)
+        meta, _ = self.ops.get_mla_metadata()
+        out, lse = self.run_dense(inputs, meta)
+        self.check_dense(inputs, out, lse)
+
+    def test_ragged_bf16_topk_matches_torch_scores(self):
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            DSATopKBackend,
+            TopkTransformMethod,
+        )
+
+        scores = torch.randn(2, 4096, device="cuda").bfloat16()
+        lengths = torch.tensor([3000, 3500], device="cuda", dtype=torch.int32)
+        starts = torch.tensor([0, 37], device="cuda", dtype=torch.int32)
+        offsets = torch.tensor([0, 5000], device="cuda", dtype=torch.int32)
+        result = DSATopKBackend.SGL_KERNEL.topk_transform(
+            scores,
+            lengths,
+            2048,
+            TopkTransformMethod.RAGGED,
+            SimpleNamespace(page_table_1=torch.empty(0, device="cuda")),
+            topk_indices_offset=offsets,
+            row_starts=starts,
+        )
+        for row in range(2):
+            local = result[row].long() - offsets[row].long()
+            begin, count = int(starts[row]), int(lengths[row])
+            self.assertTrue(bool(((local >= 0) & (local < count)).all()))
+            self.assertEqual(local.unique().numel(), 2048)
+            actual = scores[row, local + begin].float().sort().values
+            expected = (
+                scores[row, begin : begin + count]
+                .float()
+                .topk(2048)
+                .values.sort()
+                .values
+            )
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9),
+    "FP8 hardware required (SM89 or newer); BF16 regressions run separately",
+)
+class TestFlashMlaFp8Device(_FlashMlaDeviceBase):
+    def test_real_backend_uses_raw_fp8_query(self):
+        from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
+
+        q = torch.tensor([0.5, 1.0, -2.0, 4.0], device="cuda").reshape(1, 1, 1, 4)
+        q8, dq, dk = FlashMLABackend._prepare_fp8_query(
+            None, q, SimpleNamespace(k_scale=torch.tensor([4.0], device="cuda"))
+        )
+        torch.testing.assert_close(q8.float(), q, atol=0, rtol=0)
+        self.assertIsNone(dq)
+        self.assertIsNone(dk)
+
     def test_dense_decode_and_multi_query(self):
         for sq, page in ((1, 64), (3, 64), (1, 128)):
             with self.subTest(sq=sq, page=page):
@@ -111,29 +179,8 @@ class TestFlashMlaFp8Device(unittest.TestCase):
                 out, lse = self.run_dense(inputs, meta)
                 self.check_dense(inputs, out, lse)
 
-    def test_dense_bf16_regression(self):
-        q, kv, table, lens = self.dense_inputs(sq=3)
-        inputs = (q.bfloat16(), kv.bfloat16(), table, lens)
-        meta, _ = self.ops.get_mla_metadata()
-        out, lse = self.run_dense(inputs, meta)
-        self.check_dense(inputs, out, lse)
-
     def test_dense_graph_capture_and_replay(self):
-        inputs = self.dense_inputs()
-        # Warm up code loading, then capture lazy metadata allocation itself.
-        meta, _ = self.ops.get_mla_metadata()
-        self.run_dense(inputs, meta)
-        torch.cuda.synchronize()
-        meta, _ = self.ops.get_mla_metadata()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out, lse = self.run_dense(inputs, meta)
-        for _ in range(3):
-            q = inputs[0]
-            q.copy_((torch.randn_like(q.float()) * 0.2).to(q.dtype))
-            graph.replay()
-            torch.cuda.synchronize()
-            self.check_dense(inputs, out, lse)
+        self.check_dense_graph(torch.float8_e4m3fn)
 
     def sparse_inputs(self):
         length, heads = 64, 64
@@ -182,40 +229,6 @@ class TestFlashMlaFp8Device(unittest.TestCase):
                 )
                 torch.testing.assert_close(out[0].float(), ref, atol=2e-3, rtol=2e-2)
                 torch.testing.assert_close(lse[0], ref_lse, atol=2e-3, rtol=2e-3)
-
-    def test_ragged_bf16_topk_matches_torch_scores(self):
-        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
-            DSATopKBackend,
-            TopkTransformMethod,
-        )
-
-        scores = torch.randn(2, 4096, device="cuda").bfloat16()
-        lengths = torch.tensor([3000, 3500], device="cuda", dtype=torch.int32)
-        starts = torch.tensor([0, 37], device="cuda", dtype=torch.int32)
-        offsets = torch.tensor([0, 5000], device="cuda", dtype=torch.int32)
-        result = DSATopKBackend.SGL_KERNEL.topk_transform(
-            scores,
-            lengths,
-            2048,
-            TopkTransformMethod.RAGGED,
-            SimpleNamespace(page_table_1=torch.empty(0, device="cuda")),
-            topk_indices_offset=offsets,
-            row_starts=starts,
-        )
-        for row in range(2):
-            local = result[row].long() - offsets[row].long()
-            begin, count = int(starts[row]), int(lengths[row])
-            self.assertTrue(bool(((local >= 0) & (local < count)).all()))
-            self.assertEqual(local.unique().numel(), 2048)
-            actual = scores[row, local + begin].float().sort().values
-            expected = (
-                scores[row, begin : begin + count]
-                .float()
-                .topk(2048)
-                .values.sort()
-                .values
-            )
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_sparse_prefill_requires_bf16_input(self):
         q = torch.zeros(1, 64, 576, device="cuda", dtype=torch.bfloat16)

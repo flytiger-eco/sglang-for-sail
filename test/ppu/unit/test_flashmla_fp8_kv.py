@@ -4,11 +4,16 @@ Kernel numerics and full inference are covered separately on PPU hardware.
 """
 
 import ast
+import concurrent.futures
 import importlib.util
+import logging
+import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from unittest.mock import Mock, patch
 
 import torch
@@ -86,7 +91,7 @@ class TestPpuFlashMlaFp8(unittest.TestCase):
         self.assertIsNone(splits)
 
     def test_dense_unsupported_contracts_fail_before_library(self):
-        for capability in ((8, 0), (9, 0)):
+        for capability in ((8, 0), (8, 6)):
             with self.subTest(capability=capability), patch.object(
                 torch.cuda, "get_device_capability", return_value=capability
             ), self.assertRaisesRegex(ValueError, "SM89"):
@@ -102,6 +107,19 @@ class TestPpuFlashMlaFp8(unittest.TestCase):
                 torch.float8_e4m3fn, 576, 512, 64, "cuda", 2
             )
         self.lib.flash_mla_with_kvcache.assert_not_called()
+
+    def test_newer_devices_defer_target_support_to_the_operator(self):
+        with patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)):
+            self.assertEqual(self.call(), ("out", "lse"))
+        # A successful wrapper check is not a claim that this binary supports
+        # SM90: preserve an operator's own unsupported-target error.
+        self.lib.flash_mla_with_kvcache.side_effect = RuntimeError(
+            "operator target is not supported"
+        )
+        with patch.object(
+            torch.cuda, "get_device_capability", return_value=(9, 0)
+        ), self.assertRaisesRegex(RuntimeError, "operator target"):
+            self.call()
 
     def test_sparse_bf16_query_and_packed_cache_pass_through(self):
         self.call(
@@ -430,6 +448,205 @@ class TestPpuFlashMlaFp8(unittest.TestCase):
         config.kv_cache_dtype = "fp8_e5m2"
         with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
             check(config)
+
+
+class TestFlashMlaReviewRegressions(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "flashmla_review_environ", ROOT / "python/sglang/srt/environ.py"
+        )
+        cls.environ = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.environ)
+
+    def test_legacy_decode_flag_is_explicit_before_platform_defaults(self):
+        old = "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        new = "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        field = self.environ.envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8
+        for legacy in ("0", "1"):
+            with self.subTest(legacy=legacy), patch.dict(
+                os.environ, {old: legacy}, clear=True
+            ):
+                self.assertTrue(field.is_set())
+                # The platform-default guard must leave the alias untouched.
+                self.assertNotIn(new, os.environ)
+                with self.assertWarns(DeprecationWarning):
+                    self.assertEqual(field.get(), legacy == "1")
+                self.assertEqual(os.environ[new], legacy)
+
+    def test_canonical_decode_flag_wins_and_unset_keeps_default_behavior(self):
+        old = "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        new = "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        field = self.environ.envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8
+        for canonical, legacy in (("0", "1"), ("1", "0")):
+            with self.subTest(canonical=canonical), patch.dict(
+                os.environ, {new: canonical, old: legacy}, clear=True
+            ):
+                self.assertTrue(field.is_set())
+                self.assertEqual(field.get(), canonical == "1")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(field.is_set())
+            self.assertTrue(field.get())
+
+    def test_decode_and_metadata_use_actual_cache_format(self):
+        path = "python/sglang/srt/layers/attention/dsa_backend.py"
+        field = self.environ.envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8
+        scope = {"torch": torch, "envs": self.environ.envs, "DSAMetadata": object}
+        get_fp8 = load_function(path, "flashmla_decode_uses_fp8_cache", scope)
+        decode = load_function(path, "_forward_flashmla_kv", scope)
+        compute_metadata = load_function(
+            path,
+            "_compute_flashmla_metadata",
+            dict(scope, DSAFlashMLAMetadata=SimpleNamespace),
+        )
+
+        class Backend:
+            flashmla_decode_uses_fp8_cache = property(get_fp8)
+
+        for stored, compute, expected in (
+            (False, False, False),
+            (False, True, True),
+            (True, False, True),
+            (True, True, True),
+        ):
+            with self.subTest(stored=stored, compute=compute), patch.dict(
+                os.environ, {field.name: str(compute)}, clear=True
+            ):
+                backend = Backend()
+                backend.dsa_kv_cache_store_fp8 = stored
+                backend.flashmla_kv_num_q_heads = 8
+                backend.real_page_size = 64
+                backend.kv_cache_dim = 656 if stored else 576
+                backend.dsa_index_topk = 64
+                kernel = ModuleType("sgl_kernel.flash_mla")
+                kernel.get_mla_metadata = Mock(return_value=(object(), None))
+                kernel.flash_mla_with_kvcache = Mock(
+                    return_value=(torch.zeros(2, 1, 8, 512), None)
+                )
+                with patch.dict(sys.modules, {"sgl_kernel.flash_mla": kernel}):
+                    meta = compute_metadata(backend, torch.tensor([32, 64]), 1)
+                    cache = torch.zeros(
+                        1,
+                        64,
+                        1,
+                        backend.kv_cache_dim,
+                        dtype=torch.uint8 if stored else torch.bfloat16,
+                    )
+                    quantized = torch.zeros(1, 64, 1, 656, dtype=torch.uint8)
+                    quantize = Mock(return_value=quantized)
+                    decode.__globals__["quantize_k_cache"] = quantize
+                    decode(
+                        backend,
+                        torch.zeros(2, 8, 576, dtype=torch.bfloat16),
+                        cache,
+                        512,
+                        576**-0.5,
+                        SimpleNamespace(tp_q_head_num=8, head_dim=576),
+                        SimpleNamespace(
+                            dsa_cache_seqlens_int32=torch.tensor([32, 64]),
+                            flashmla_metadata=meta,
+                        ),
+                        torch.zeros(2, 64, dtype=torch.int32),
+                    )
+                self.assertEqual(
+                    kernel.get_mla_metadata.call_args.kwargs["is_fp8_kvcache"], expected
+                )
+                kwargs = kernel.flash_mla_with_kvcache.call_args.kwargs
+                self.assertEqual(kwargs["is_fp8_kvcache"], expected)
+                self.assertEqual(quantize.call_count, int(compute and not stored))
+                if compute and not stored:
+                    self.assertIs(kwargs["k_cache"], quantized)
+                else:
+                    self.assertEqual(kwargs["k_cache"].data_ptr(), cache.data_ptr())
+
+    def test_longcat_nextn_all_weight_paths_honor_serial_loading(self):
+        helper_scope = dict(
+            torch=torch,
+            concurrent=concurrent,
+            envs=self.environ.envs,
+            Any=Any,
+            Callable=Callable,
+            Dict=Dict,
+            Iterable=Iterable,
+            List=List,
+            Optional=Optional,
+        )
+        should_async = load_function(
+            "python/sglang/srt/model_loader/utils.py", "should_async_load", helper_scope
+        )
+        submit = load_function(
+            "python/sglang/srt/model_loader/utils.py",
+            "maybe_executor_submit",
+            helper_scope,
+        )
+        load = load_function(
+            "python/sglang/srt/models/longcat_flash_nextn.py",
+            "load_weights",
+            dict(
+                helper_scope,
+                Tuple=Tuple,
+                should_async_load=should_async,
+                maybe_executor_submit=submit,
+                default_weight_loader=Mock(),
+                logger=logging.getLogger(__name__),
+            ),
+        )
+        main_thread = threading.get_ident()
+        for disabled in (False, True):
+            with self.subTest(disabled=disabled), patch.dict(
+                os.environ, {"SGLANG_DISABLE_ASYNC_WEIGHT_LOADING": str(disabled)}
+            ), patch.object(torch.cuda, "is_available", return_value=False):
+                calls = []
+
+                def parameter(name):
+                    def loader(param, weight, *shard):
+                        calls.append(
+                            (name, threading.get_ident(), weight.clone(), shard)
+                        )
+
+                    return SimpleNamespace(weight_loader=loader)
+
+                parameters = {
+                    "model.decoder.mlp.gate_up_proj.weight": parameter("stacked"),
+                    "model.decoder.self_attn.fused_qkv_a_proj_with_mqa.weight": parameter(
+                        "fused"
+                    ),
+                    "model.enorm.weight": parameter("ordinary"),
+                }
+                model = SimpleNamespace(
+                    config=SimpleNamespace(q_lora_rank=128),
+                    quant_config=None,
+                    named_parameters=lambda: parameters.items(),
+                    post_load_weights=Mock(),
+                )
+                load(
+                    model,
+                    [
+                        (
+                            "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight",
+                            torch.ones(2, 3),
+                        ),
+                        (
+                            "model.mtp.layers.0.self_attn.q_a_proj.weight",
+                            torch.ones(2, 3),
+                        ),
+                        (
+                            "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                            torch.ones(1, 3),
+                        ),
+                        ("model.mtp.layers.0.enorm.m.weight", torch.ones(3)),
+                    ],
+                )
+                self.assertEqual(
+                    {x[0] for x in calls}, {"stacked", "fused", "ordinary"}
+                )
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(all((x[1] == main_thread) == disabled for x in calls))
+                self.assertEqual(
+                    next(x[2].shape for x in calls if x[0] == "fused"), (3, 3)
+                )
+                self.assertEqual(next(x[3] for x in calls if x[0] == "stacked"), (0,))
+                model.post_load_weights.assert_called_once()
 
 
 if __name__ == "__main__":
