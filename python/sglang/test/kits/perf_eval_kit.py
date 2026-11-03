@@ -200,14 +200,15 @@ SERVER_PARAMETER_CLI_ORDER = (
 # The environment variables a config may set around the server, split by what
 # this tree can say about them.
 #
-# These four have a read point in this tree, checked when the name was added:
+# These names have a read point in this tree:
 # `SGLANG_WARMUP_TIMEOUT` is declared in `sglang.srt.environ`;
-# `SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` is read through
-# `get_bool_env_var` in `sglang.srt.layers.attention.dsa.utils`; and
+# `SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8` and its deprecated NSA
+# alias are resolved by `sglang.srt.environ`; and
 # `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` and
 # `SGLANG_SAIL_DEEPEP_RECV_HOOK` are read on the DeepEP dispatch path.
 SUPPORTED_SERVER_ENVIRONMENT = {
     "SGLANG_WARMUP_TIMEOUT",
+    "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
     "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK",
     "SGLANG_SAIL_DEEPEP_RECV_HOOK",

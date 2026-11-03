@@ -64,7 +64,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+from sglang.srt.model_loader.utils import (
+    maybe_executor_submit,
+    should_async_load,
+    should_deepgemm_weight_requant_ue8m0,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMLP
@@ -600,8 +604,12 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=should_async_load(loaded_weight),
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -653,8 +661,12 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, fused_weight)
+                            maybe_executor_submit(
+                                executor=executor,
+                                futures=futures,
+                                use_async=should_async_load(fused_weight),
+                                func=weight_loader,
+                                func_args=(param, fused_weight),
                             )
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
@@ -677,8 +689,12 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        futures.append(
-                            executor.submit(weight_loader, param, loaded_weight)
+                        maybe_executor_submit(
+                            executor=executor,
+                            futures=futures,
+                            use_async=should_async_load(loaded_weight),
+                            func=weight_loader,
+                            func_args=(param, loaded_weight),
                         )
         self.post_load_weights()
 

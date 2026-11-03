@@ -160,6 +160,11 @@ class _DeprecatedEnvFallback:
         super().__init__(default)
         self.deprecated_name = deprecated_name
 
+    def is_set(self):
+        # Platform defaults must not override an explicitly supplied old name
+        # before get() has had a chance to resolve the alias.
+        return super().is_set() or self.deprecated_name in os.environ
+
     def get(self) -> Any:
         if os.getenv(self.name) is None:
             fallback = os.getenv(self.deprecated_name)
@@ -303,6 +308,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Serialize host-to-device weight loading when a runtime cannot safely
+    # overlap copies from multiple Python loader threads (e.g. some SAIL builds).
+    SGLANG_DISABLE_ASYNC_WEIGHT_LOADING = EnvBool(False)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -1097,7 +1105,9 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
-    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+    )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)

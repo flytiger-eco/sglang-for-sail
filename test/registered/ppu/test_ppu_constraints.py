@@ -100,6 +100,38 @@ class TestPPUBackendDefaults(unittest.TestCase):
         self.assertTrue(envs.SGLANG_SAIL_PLA_CUDA.get())
         self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
 
+    @patch("sglang.srt.server_args.is_ppu", return_value=True)
+    @patch("sglang.srt.server_args.check_acext_version_compatibility")
+    def test_decode_compute_flag_alias_survives_ppu_defaults(
+        self, _mock_acext, _mock_ppu
+    ):
+        from sglang.srt.environ import envs
+        from sglang.srt.server_args import ServerArgs
+
+        canonical = "SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        legacy = "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+        for old, new, expected in (
+            (None, None, False),
+            ("0", None, False),
+            ("1", None, True),
+            ("1", "0", False),
+            ("0", "1", True),
+        ):
+            with self.subTest(legacy=old, canonical=new), patch.dict(os.environ):
+                os.environ.pop(canonical, None)
+                os.environ.pop(legacy, None)
+                if old is not None:
+                    os.environ[legacy] = old
+                if new is not None:
+                    os.environ[canonical] = new
+                args = MagicMock(spec=ServerArgs)
+                args.enable_custom_all_reduce = False
+                ServerArgs._handle_ppu_backends(args)
+                self.assertEqual(
+                    envs.SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8.get(),
+                    expected,
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

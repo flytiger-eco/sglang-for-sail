@@ -15,6 +15,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
@@ -293,9 +294,15 @@ def should_async_load(weight: torch.Tensor) -> bool:
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
 
+    SGLANG_DISABLE_ASYNC_WEIGHT_LOADING opts into inline copies for runtimes
+    that cannot safely overlap host-to-device weight loading across threads.
+
     RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
     must be consumed synchronously before the streamer fills its next batch.
     """
+    if envs.SGLANG_DISABLE_ASYNC_WEIGHT_LOADING.get():
+        return False
+
     if getattr(weight, "_sglang_runai_streamer_tensor", False):
         return False
 
