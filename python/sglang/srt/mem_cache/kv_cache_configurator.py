@@ -3325,6 +3325,49 @@ class KVCacheConfigurator:
         stage_per_req = int(per_req * pp_layer_scale)
 
         has_spec_dec = not self.spec_algorithm.is_none()
+
+        # PD decode sizing must mirror what the decode pool actually allocates:
+        # HybridMambaDecodeReqToTokenPool raises the effective mamba pool to
+        # max(mamba_size, (size + pre_alloc_size) * slots_per_req) and builds
+        # the spec intermediate states for (size + pre_alloc_size + 1) slots
+        # (see sglang/srt/disaggregation/decode.py); under spec decoding the
+        # pool also folds the nextn draft layers into mamba_layer_ids (see
+        # _get_mamba_layer_ids_for_req_pool), which mamba_cache_per_req does
+        # not cover. Without charging both here, the profiled KV budget is
+        # overstated and the decode server OOMs while building the pools.
+        decode_pre_alloc_size = 0
+        decode_slots_per_req = 1
+        # Mirror _build_req_to_token_pool's gate: a role-switch launch builds
+        # HybridMambaDecodeReqToTokenPool on the prefill server too, so it must
+        # carry the same decode-side deductions. Unified memory builds
+        # UnifiedHybridReqToTokenPool instead, which charges pre_alloc once
+        # (size + pre_alloc) inside the unified byte buffer and sizes the spec
+        # intermediates by max_num_reqs; the slot raise mirrored here does not
+        # happen, so unified launches keep the pre-fix budget formulas.
+        disagg = get_disagg()
+        is_pd_decode = (
+            disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        ) and not get_memory().enable_unified_memory
+        if is_pd_decode:
+            decode_pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
+            ping_pong = 2 if not get_schedule().disable_overlap_schedule else 1
+            decode_slots_per_req = 1 + (
+                ping_pong if get_exec().mamba.enable_mamba_extra_buffer else 0
+            )
+        decode_stage_per_req = stage_per_req
+        decode_nextn_layers = 0
+        if is_pd_decode and has_spec_dec and all_mamba_layers:
+            decode_nextn_layers = len(getattr(config, "nextn_layer_ids", None) or [])
+            if decode_nextn_layers:
+                # _get_mamba_layer_ids_for_req_pool appends the full nextn layer
+                # list to every pipeline stage, so scale the per-stage layer
+                # share (max_stage_mamba_layers), not the global layer count.
+                decode_stage_per_req = int(
+                    stage_per_req
+                    * (max_stage_mamba_layers + decode_nextn_layers)
+                    / max_stage_mamba_layers
+                )
+
         # ReplaySSM drops the per-step intermediate_ssm scratch, so its mamba budget
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
@@ -3352,6 +3395,17 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
+        if decode_nextn_layers:
+            # MambaPool allocates the replay rings over
+            # num_mamba_layers = len(mamba_layer_ids), which
+            # _get_mamba_layer_ids_for_req_pool extends with the nextn draft
+            # layers, so the ring bytes carry the same nextn factor as the
+            # per-slot state above.
+            replayssm_ring_per_req = int(
+                replayssm_ring_per_req
+                * (max_stage_mamba_layers + decode_nextn_layers)
+                / max_stage_mamba_layers
+            )
         if replayssm_active and self.hybrid_kda_config is None:
             replay_req_slots = (
                 max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
@@ -3390,8 +3444,8 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
+                    decode_stage_per_req
+                    * (capped_reqs + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3408,10 +3462,12 @@ class KVCacheConfigurator:
             )
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm and on PD prefill.
+            # PD decode builds the intermediate states for
+            # (size + pre_alloc_size + 1) slots.
             if reserves_spec_state:
                 intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
+                    decode_stage_per_req
+                    * (get_schedule().max_mamba_cache_size + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3446,7 +3502,9 @@ class KVCacheConfigurator:
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = (
+                    decode_stage_per_req * (capped_reqs + decode_pre_alloc_size + 1) * D
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot
@@ -3474,10 +3532,30 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1 accounts for each pool's padding slot.
+        # +1 accounts for each pool's padding slot. PD decode charges the
+        # effective pool size after HybridMambaDecodeReqToTokenPool's bump and
+        # the nextn-inclusive per-slot bytes, matching the real allocation.
+        # The pool's request count is capped by the resolver at
+        # min(per-worker max_running_requests, K // ratio); bound the charge by
+        # the same cap instead of treating K as the request count, which would
+        # overcharge whenever the request count is below K.
+        main_slots = get_schedule().max_mamba_cache_size
+        main_per_slot = stage_per_req + extra_per_slot
+        if is_pd_decode:
+            decode_req_bound = main_slots // self._calculate_mamba_ratio()
+            if get_schedule().max_running_requests is not None:
+                decode_req_bound = min(
+                    decode_req_bound,
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                )
+            main_slots = max(
+                main_slots,
+                (max(1, decode_req_bound) + decode_pre_alloc_size)
+                * decode_slots_per_req,
+            )
+            main_per_slot = decode_stage_per_req + extra_per_slot
         mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
-            + replayssm_fixed_bytes
+            (main_slots + 1) * main_per_slot + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
