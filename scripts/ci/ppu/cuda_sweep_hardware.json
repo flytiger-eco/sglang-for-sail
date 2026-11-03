@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "board": "ZW-M890P",
-  "reserved_devices": 8,
+  "board_devices": 8,
   "test_budget_seconds": 10800,
   "worker_minutes": 300,
   "job_minutes": 330,

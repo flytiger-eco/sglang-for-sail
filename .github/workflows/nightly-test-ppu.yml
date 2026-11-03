@@ -19,7 +19,7 @@ on:
         type: string
         default: ''
       max_parallel:
-        description: 'Concurrent whole 890P boards (1-2); not visible card count'
+        description: 'Concurrent test tasks (1-2); each task requests its required PPU cards'
         type: number
         default: 1
       timeout_per_file:
@@ -175,7 +175,7 @@ jobs:
               require((partition_model is None and partition_model_sha == '') or (isinstance(partition_model, dict) and re.fullmatch(r'[0-9a-f]{40}', partition_model_sha)), 'Partition model must have an immutable identity')
               require(type(parallel) is int and 1 <= parallel <= 2, 'max_parallel must be 1 or 2')
               require(type(timeout) is int and (timeout == 0 or 600 <= timeout <= 3600), 'Invalid per-file timeout')
-              require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['reserved_devices'] == 8, 'Invalid board allocation')
+              require(hardware['schema_version'] == 1 and hardware['board'] == 'ZW-M890P' and hardware['board_devices'] == 8, 'Invalid board capacity')
               require(hardware['test_budget_seconds'] == 10800 and hardware['worker_minutes'] == 300 and hardware['job_minutes'] == 330, 'Unexpected job budgets')
               module, registrations = registry()
               groups = defaultdict(list)
@@ -236,12 +236,12 @@ jobs:
               save(BUNDLE / 'plan.json', plan)
               output('sha', plan['sha'])
               output('parallel', plan['parallel'])
-              output('matrix', json.dumps({'include': [{k: e[k] for k in ('id', 'suite', 'partition_id', 'worker_minutes', 'job_minutes')} for e in plan['entries']]}))
+              output('matrix', json.dumps({'include': [{k: e[k] for k in ('id', 'suite', 'partition_id', 'n_devices', 'worker_minutes', 'job_minutes')} for e in plan['entries']]}))
               rows = ['# CUDA registration sweep on 890P', f"Tested SHA: `{plan['sha']}`", f"Workflow SHA: `{plan['workflow_sha']}`", f"CUDA partition model: `{plan['partition_model_sha'] or 'static est_time fallback'}`", '| Suite | Enabled files | Partitions | Policy | Visible / reserved cards | Test budget (min) |', '| --- | ---: | ---: | --- | --- | ---: |']
               for suite in sorted({e['suite'] for e in plan['entries']}):
                   group = [e for e in plan['entries'] if e['suite'] == suite]
-                  rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['partition_policy']} | {group[0]['n_devices']} / 8 | {group[0]['test_budget_seconds'] // 60} |")
-              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", '计划不代表测试通过。Base 包含 kernel unit/benchmark 阶段；不包含 weekly、stress 和 workflow-native 条目。', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
+                  rows.append(f"| {suite} | {sum(len(e['files']) for e in group)} | {len(group)} | {group[0]['partition_policy']} | {group[0]['n_devices']} / {group[0]['n_devices']} | {group[0]['test_budget_seconds'] // 60} |")
+              rows += [f"Disabled registrations (not executed): {len(plan['disabled'])}", 'The plan does not indicate test success. Base includes kernel unit/benchmark stages; weekly, stress, and workflow-native entries are excluded.', 'No cross-suite deduplication or retries. Model inventory is heuristic; missing models are never downloaded.']
               rows.append('Native CUDA sizing and LPT share one pinned model. Whole-suite entries use one task. PPU test budgets are at least 180 minutes and never smaller than the native CUDA run budget; budget expiry remains a failure.')
               summary('\n'.join(rows))
 
@@ -306,7 +306,7 @@ jobs:
               require(inventory['generated_at_commit'] == plan['sha'] and inventory['backend'] == 'cuda', 'Model inventory identity mismatch')
               require(not inventory['parse_failures'], 'Model inventory has parse failures')
               if check_cache:
-                  require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), '预检环境无法读取 HF 缓存：' + str(cache))
+                  require(cache.is_dir() and os.access(cache, os.R_OK | os.X_OK), 'Preflight cannot read the HF cache: ' + str(cache))
                   # Force a directory read so an inaccessible mount cannot masquerade as missing models.
                   with os.scandir(cache) as items:
                       next(items, None)
@@ -350,12 +350,12 @@ jobs:
                   execution = None
                   if worker:
                       sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-                      require(sha == plan['sha'], '预检 worker 的源码 SHA 不匹配')
-                      require(re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['PPU_BASE_IMAGE_DIGEST']), '预检镜像缺少固定 digest')
-                      require(os.environ['PPU_BASE_IMAGE_REF'].endswith('@' + os.environ['PPU_BASE_IMAGE_DIGEST']), '预检镜像身份不匹配')
+                      require(sha == plan['sha'], 'Preflight worker source SHA mismatch')
+                      require(re.fullmatch(r'sha256:[0-9a-f]{64}', os.environ['PPU_BASE_IMAGE_DIGEST']), 'Preflight image is missing an immutable digest')
+                      require(os.environ['PPU_BASE_IMAGE_REF'].endswith('@' + os.environ['PPU_BASE_IMAGE_DIGEST']), 'Preflight image identity mismatch')
                       import torch
                       names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-                      require(len(names) == 8 and all('890' in name.upper() for name in names), '预检需要独占 890P 整板')
+                      require(len(names) == 8 and all('890' in name.upper() for name in names), 'Preflight requires an exclusive 890P board')
                       execution = {'workflow_sha': plan['workflow_sha'], 'devices': names, 'reserved_devices': 8, 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST']}
                   gate = model_preflight(plan, read(BUNDLE / 'models.json'), Path(os.environ['HF_HUB_CACHE']))
                   if execution is not None:
@@ -366,7 +366,7 @@ jobs:
                   read_preflight(plan, directory)
               except Exception as error:
                   save(directory / 'error.json', {'error': str(error)})
-                  summary('模型预检失败，后续测试不得发车：' + str(error))
+                  summary('Model preflight failed; tests must not start: ' + str(error))
                   raise
 
           def write_model_report(gate, directory):
@@ -377,7 +377,7 @@ jobs:
                       writer.writeheader()
                       writer.writerows({**row, 'files': ';'.join(row['files'])} for row in rows)
               missing = [r['model'] for r in gate['models'] if r['exists'] is False]
-              summary('# 模型预检\n' + f"模型数：{len(gate['models'])}；缺失或不完整：{len(missing)}；阻断文件/suite 注册数：{sum(len(v) for v in gate['blocked'].values())}。\n" + '未下载模型。被阻断文件不会执行，详见 missing_models.csv。\n' + '启发式检查：动态 ID、数据集和指定 revision 可能未解析；存在快照不等于权重齐全，也不代表测试通过。\n' + '\n'.join('- `' + model + '`' for model in missing))
+              summary('# Model preflight\n' + f"Models: {len(gate['models'])}; missing or incomplete: {len(missing)}; blocked file/suite registrations: {sum(len(v) for v in gate['blocked'].values())}.\n" + 'No models were downloaded. Blocked files will not run; see missing_models.csv.\n' + 'Heuristic check: dynamic IDs, datasets, and explicit revisions may be unresolved; a snapshot does not guarantee complete weights or test success.\n' + '\n'.join('- `' + model + '`' for model in missing))
 
           def collect_models(source):
               directory = BUNDLE / 'preflight'
@@ -386,26 +386,26 @@ jobs:
               try:
                   plan = context()
                   exported = report.export_evidence(source, directory / 'worker-evidence')
-                  require(os.environ.get('WORKER_OUTCOME') == 'success', 'PPU 预检 worker 未成功完成')
-                  require(not (exported / 'error.json').exists(), 'PPU 预检产生错误报告')
+                  require(os.environ.get('WORKER_OUTCOME') == 'success', 'PPU preflight worker did not complete successfully')
+                  require(not (exported / 'error.json').exists(), 'PPU preflight produced an error report')
                   gate = read_preflight(plan, exported)
-                  require(gate['availability_checked'] is True, '模型可用性尚未检查')
-                  require(gate['cache'] == os.environ['HF_HUB_CACHE'], '预检 HF 缓存路径不匹配')
+                  require(gate['availability_checked'] is True, 'Model availability has not been checked')
+                  require(gate['cache'] == os.environ['HF_HUB_CACHE'], 'Preflight HF cache path mismatch')
                   execution = gate['worker']
-                  require(execution['workflow_sha'] == plan['workflow_sha'], '预检 workflow 身份不匹配')
-                  require(execution['image'] == os.environ['PPU_BASE_IMAGE_REF'] and execution['digest'] == os.environ['PPU_BASE_IMAGE_DIGEST'], '预检镜像身份不匹配')
-                  require(execution['reserved_devices'] == 8 and len(execution['devices']) == 8 and all('890' in n.upper() for n in execution['devices']), '预检板卡身份不匹配')
+                  require(execution['workflow_sha'] == plan['workflow_sha'], 'Preflight workflow identity mismatch')
+                  require(execution['image'] == os.environ['PPU_BASE_IMAGE_REF'] and execution['digest'] == os.environ['PPU_BASE_IMAGE_DIGEST'], 'Preflight image identity mismatch')
+                  require(execution['reserved_devices'] == 8 and len(execution['devices']) == 8 and all('890' in n.upper() for n in execution['devices']), 'Preflight board identity mismatch')
                   inventory = read(BUNDLE / 'models.json')
                   expected = model_preflight(plan, inventory, Path(gate['cache']), check_cache=False)
                   projection = lambda rows: [(r['model'], r['reference_file_count'], r['files']) for r in rows]
-                  require(projection(gate['models']) == projection(expected['models']) and gate['unresolved_files'] == expected['unresolved_files'], '预检模型清单与计划不匹配')
-                  require(all(type(r['exists']) is bool and type(r['size_bytes']) is int and r['size_bytes'] >= 0 for r in gate['models']), '预检模型状态或大小无效')
+                  require(projection(gate['models']) == projection(expected['models']) and gate['unresolved_files'] == expected['unresolved_files'], 'Preflight model inventory does not match the plan')
+                  require(all(type(r['exists']) is bool and type(r['size_bytes']) is int and r['size_bytes'] >= 0 for r in gate['models']), 'Invalid preflight model status or size')
                   missing = {r['model'] for r in gate['models'] if not r['exists']}
                   blocked = {}
                   for entry in plan['entries']:
                       dependencies = {f: set(inventory['file_models'][f]) | set(inventory['suite_model_overrides'].get(entry['suite'], [])) for f in entry['files']}
                       blocked[entry['id']] = {f: sorted(models & missing) for f, models in dependencies.items() if models & missing}
-                  require(gate['blocked'] == blocked, '预检阻断列表与缺失模型不匹配')
+                  require(gate['blocked'] == blocked, 'Preflight blocked list does not match missing models')
                   write_model_report(gate, directory)
               except Exception as error:
                   save(directory / 'error.json', {'error': report.runner.sanitize(str(error))})
@@ -474,11 +474,12 @@ jobs:
                   import torch
                   names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
                   require(len(names) == entry['n_devices'] and all('890' in name.upper() for name in names), 'Unexpected PPU model or visible device count: ' + repr(names))
-                  save(directory / 'environment.json', {'sha': sha, 'workflow_sha': plan['workflow_sha'], 'run_id': plan['run_id'], 'attempt': plan['attempt'], 'plan_hash': plan['plan_hash'], 'devices': names, 'reserved_devices': 8, 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST'], 'python': platform.python_version(), 'torch': torch.__version__})
+                  print('PPU_DEVICE_EVIDENCE=' + json.dumps({'entry_id': entry_id, 'requested_devices': entry['n_devices'], 'visible_devices': len(names), 'cuda_visible_devices': os.environ['CUDA_VISIBLE_DEVICES'], 'device_names': names}), flush=True)
+                  save(directory / 'environment.json', {'sha': sha, 'workflow_sha': plan['workflow_sha'], 'run_id': plan['run_id'], 'attempt': plan['attempt'], 'plan_hash': plan['plan_hash'], 'devices': names, 'reserved_devices': entry['n_devices'], 'image': os.environ['PPU_BASE_IMAGE_REF'], 'digest': os.environ['PPU_BASE_IMAGE_DIGEST'], 'python': platform.python_version(), 'torch': torch.__version__})
                   gate = read_preflight(plan)
                   blocked = gate['blocked'][entry_id]
                   require(gate['cache'] == os.environ['HF_HUB_CACHE'], 'Worker HF cache differs from preflight')
-                  require(any(f not in blocked for f in entry['files']), 'All files are model-blocked; do not allocate a board')
+                  require(any(f not in blocked for f in entry['files']), 'All files are model-blocked; do not allocate PPU devices')
                   state['preflight_hash'] = gate['preflight_hash']
                   save(directory / 'model_availability.json', gate)
                   with (directory / 'setup.log').open('w') as log:
@@ -585,7 +586,7 @@ jobs:
                       require(state['id'] == entry_id and environment['workflow_sha'] == plan['workflow_sha'], 'Worker entry/workflow mismatch')
                       require(state['preflight_hash'] == gate['preflight_hash'], 'Worker model preflight mismatch')
                       require(environment['run_id'] == plan['run_id'] and environment['attempt'] == plan['attempt'], 'Worker run/attempt mismatch')
-                      require(len(environment['devices']) == entry['n_devices'] and all('890' in name.upper() for name in environment['devices']) and environment['reserved_devices'] == 8, 'Worker hardware mismatch')
+                      require(len(environment['devices']) == entry['n_devices'] and all('890' in name.upper() for name in environment['devices']) and environment['reserved_devices'] == entry['n_devices'], 'Worker hardware mismatch')
                       require(environment['digest'] == os.environ['PPU_BASE_IMAGE_DIGEST'] and environment['image'] == os.environ['PPU_BASE_IMAGE_REF'], 'Worker image mismatch')
                       result['image_digest'] = environment['digest']
                       data = read(exported / 'pytest/summary.json')
@@ -605,7 +606,7 @@ jobs:
                   except Exception as error:
                       row = {'auto_status': 'INVALID_EVIDENCE', 'failure_signature': report.runner.sanitize(str(error))}
                       issues.append(row['failure_signature'])
-                  row.update(file=filename, cuda_suite=entry['suite'], board='ZW-M890P', n_devices=entry['n_devices'], reserved_devices=8, entry_id=entry_id)
+                  row.update(file=filename, cuda_suite=entry['suite'], board='ZW-M890P', n_devices=entry['n_devices'], reserved_devices=entry['n_devices'], entry_id=entry_id)
                   result['rows'].append(row)
               result['issues'] = issues
               result['worker_outcome'] = os.environ.get('WORKER_OUTCOME', 'unknown')
@@ -648,7 +649,7 @@ jobs:
                       fallback = {'auto_status': 'NOT_EXECUTED'}
                       if gate is None:
                           fallback.update(triage_status='INFRA_BLOCKED', failure_signature='Model preflight unavailable or invalid; see preflight/error.json and job logs')
-                      rows.extend({'file': f, 'cuda_suite': entry['suite'], 'board': 'ZW-M890P', 'n_devices': entry['n_devices'], 'reserved_devices': 8, 'entry_id': entry['id'], **{k: plan[k] for k in ('sha', 'run_id', 'attempt')}, **(model_blocked_row(blocked[f]) if f in blocked else fallback)} for f in entry['files'])
+                      rows.extend({'file': f, 'cuda_suite': entry['suite'], 'board': 'ZW-M890P', 'n_devices': entry['n_devices'], 'reserved_devices': entry['n_devices'], 'entry_id': entry['id'], **{k: plan[k] for k in ('sha', 'run_id', 'attempt')}, **(model_blocked_row(blocked[f]) if f in blocked else fallback)} for f in entry['files'])
                       continue
                   if result.get('success') is not True or result.get('issues') or result.get('worker_outcome') != 'success':
                       issues.append('Failed entry: ' + entry['id'])
@@ -704,7 +705,7 @@ jobs:
                       plan = {'sha': 'b' * 40, 'workflow_sha': env['WORKFLOW_SHA'], 'plan_hash': 'plan', 'run_id': 'contract', 'attempt': '1', 'entries': [entry], 'disabled': []}
                       state = {'id': entry['id'], 'sha': plan['sha'], 'plan_hash': plan['plan_hash'], 'preflight_hash': self.gate(plan)['preflight_hash'], 'phase': 'complete', 'exit_code': 0}
                       environment = {k: plan[k] for k in ('sha', 'workflow_sha', 'plan_hash', 'run_id', 'attempt')}
-                      environment.update(devices=['ZW-M890P'], reserved_devices=8, digest=env['PPU_BASE_IMAGE_DIGEST'], image=env['PPU_BASE_IMAGE_REF'])
+                      environment.update(devices=['ZW-M890P'], reserved_devices=entry['n_devices'], digest=env['PPU_BASE_IMAGE_DIGEST'], image=env['PPU_BASE_IMAGE_REF'])
                       data = {'selected': [record['file']], 'files': [record], 'success': True, 'allowed_skips': []}
                       save(directory / 'summary.json', data)
                       save(directory.parent / 'environment.json', environment)
@@ -788,7 +789,7 @@ jobs:
                       with patch.object(os, 'scandir', side_effect=PermissionError('denied')):
                           with self.assertRaises(PermissionError):
                               model_preflight(plan, inventory, self.directory / 'cache')
-                      with self.assertRaisesRegex(ValueError, '无法读取'):
+                      with self.assertRaisesRegex(ValueError, 'cannot read'):
                           model_preflight(plan, inventory, self.directory / 'no-mount')
                       inventory['parse_failures'] = {'test.py': 'SyntaxError'}
                       with self.assertRaisesRegex(ValueError, 'parse failures'):
@@ -866,7 +867,7 @@ jobs:
                       with patch.dict(globals(), BUNDLE=self.directory, context=lambda: plan), patch.dict(os.environ, HF_HUB_CACHE=str(self.directory / 'cache')), patch.dict(sys.modules, torch=fake_torch), patch.object(subprocess, 'check_output', return_value=plan['sha']), contextlib.redirect_stdout(io.StringIO()):
                           save(BUNDLE / 'models.json', inventory)
                           models_command(source, worker=True)
-                          with patch.dict(globals(), cached_model=lambda *a: self.fail('编排侧不得探测 NAS 模型缓存')), patch.object(os, 'access', side_effect=AssertionError('编排侧不得检查模型缓存权限')):
+                          with patch.dict(globals(), cached_model=lambda *a: self.fail('Controller must not inspect the NAS model cache')), patch.object(os, 'access', side_effect=AssertionError('Controller must not check model cache permissions')):
                               collect_models(source)
                           gate = read_preflight(plan)
                           self.assertTrue(gate['availability_checked'])
@@ -891,7 +892,7 @@ jobs:
                                   self.assertFalse((bundle / 'preflight/model_preflight.json').exists())
                                   self.assertTrue((bundle / 'preflight/error.json').is_file())
                           with patch.dict(os.environ, HF_HUB_CACHE=str(self.directory / 'unmounted')):
-                              with self.assertRaisesRegex(ValueError, '无法读取'):
+                              with self.assertRaisesRegex(ValueError, 'cannot read'):
                                   models_command(self.directory / 'failed-worker', worker=True)
                           self.assertFalse((self.directory / 'failed-worker/model_preflight.json').exists())
                           for name, target, attribute, value in [('sha', subprocess, 'check_output', 'wrong'), ('hardware', fake_torch.cuda, 'get_device_name', 'NVIDIA'), ('devices', fake_torch.cuda, 'device_count', 1)]:
@@ -939,7 +940,12 @@ jobs:
                           self.assertIn('sweep-models', jobs[name]['needs'])
                       execute = jobs['sweep-execute']['steps']
                       worker = next(s for s in execute if s.get('id') == 'worker')
+                      request_log = next(s for s in execute if s.get('name') == 'Log requested PPU allocation')
+                      self.assertLess(execute.index(request_log), execute.index(worker))
+                      self.assertIn('${{ matrix.n_devices }}', request_log['run'])
                       self.assertEqual(worker['if'], "steps.gate.outputs.runnable == 'true'")
+                      self.assertEqual(worker['with']['nnodes'], 0)
+                      self.assertEqual(worker['with']['nproc_per_node'], '${{ matrix.n_devices }}')
                       self.assertEqual(probe['uses'], worker['uses'])
 
                   def test_scope_coverage_and_partitions(self):
@@ -960,6 +966,8 @@ jobs:
                           self.assertEqual({e['suite'] for e in plan['entries']}, {r.effective_suite for r in expected if r.disabled is None})
                           for e in plan['entries']:
                               self.assertTrue(e['files'])
+                              self.assertEqual(e['n_devices'], hardware['runner_configs'][e['runner_config']])
+                              self.assertIn(e['n_devices'], (1, 2, 4, 8))
                               self.assertGreaterEqual(e['test_budget_seconds'], hardware['test_budget_seconds'])
                               self.assertLessEqual(e['test_budget_seconds'], 21600)
                               self.assertGreaterEqual(e['worker_minutes'] * 60 - e['test_budget_seconds'], 7200)
@@ -1046,7 +1054,7 @@ jobs:
                           plan = make_plan(scope, '', 0, 2, hardware)
                           self.assertEqual(plan['parallel'], 2)
                           self.assertNotIn('plan_only', plan)
-                          self.assertEqual(plan['hardware']['reserved_devices'], 8)
+                          self.assertEqual(plan['hardware']['board_devices'], 8)
                           self.assertTrue(all(e['suite'].split('-test-', 1)[0] in STAGES[scope] for e in plan['entries']))
                       with self.assertRaisesRegex(ValueError, 'Unknown scope'):
                           make_plan('all', '', 0, 2, hardware)
@@ -1065,7 +1073,9 @@ jobs:
                           plan = context()
                           self.assertTrue(plan['entries'])
                           self.assertEqual(outputs['sha'], plan['sha'])
-                          self.assertEqual(len(json.loads(outputs['matrix'])['include']), len(plan['entries']))
+                          matrix = json.loads(outputs['matrix'])['include']
+                          self.assertEqual(len(matrix), len(plan['entries']))
+                          self.assertEqual([item['n_devices'] for item in matrix], [entry['n_devices'] for entry in plan['entries']])
 
                   def test_result_classes(self):
                       cases = [('PASS', '<testcase/>', 0, ''), ('PASS_WITH_SKIPS', '<testcase/><testcase><skipped message="unsupported"/></testcase>', 0, ''), ('ALL_SKIPPED', '<testcase><skipped/></testcase>', 0, ''), ('ZERO_COLLECTED', '', 5, ''), ('FAIL', '<testcase><failure/></testcase>', 1, ''), ('FAIL', '<testcase><error/></testcase>', 1, ''), ('FAIL', '<testcase/><error/>', 1, ''), ('TIMEOUT', None, None, 'timed out after 600 seconds'), ('INFRA_MODEL', None, 1, 'LocalEntryNotFoundError'), ('OOM', None, 1, 'out of memory'), ('CRASH', None, 1, '')]
@@ -1375,7 +1385,7 @@ jobs:
         with:
           name: ppu-sweep-models-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-sweep/preflight
-      - name: Gate model-blocked files before board allocation
+      - name: Gate model-blocked files before PPU allocation
         id: gate
         run: |
           mkdir -p "$RESULT_DIR"
@@ -1389,14 +1399,18 @@ jobs:
           python3 .ppu-sweep/sweep.py cluster --destination "$RESULT_DIR/cluster.json"
           test ! -e "$EVIDENCE_SOURCE"
           mkdir -p "$EVIDENCE_SOURCE"
-      - name: Execute CUDA registrations on an exclusive 890P board
+      - name: Log requested PPU allocation
+        if: steps.gate.outputs.runnable == 'true'
+        run: |
+          echo "PPU_DEVICE_REQUEST: entry=${{ matrix.id }} suite=${{ matrix.suite }} requested_devices=${{ matrix.n_devices }}"
+      - name: Execute CUDA registrations with requested PPU devices
         if: steps.gate.outputs.runnable == 'true'
         id: worker
         uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
           image: ${{ env.PPU_BASE_IMAGE_REF }}
           nnodes: 0
-          nproc_per_node: 8
+          nproc_per_node: ${{ matrix.n_devices }}
           node_selector: board-type=ZW-M890P
           namespace: ppu-sched
           job_suffix: sweep-${{ matrix.id }}
