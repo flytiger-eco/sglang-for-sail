@@ -49,6 +49,10 @@ on:
         description: 'Source code version; manually specify a tag when building and publishing multiple wheel packages'
         required: false
         type: string
+      kernel_tag_version:
+        description: 'Release version for the sglang-kernel wheel; empty means read python/sglang/kernels/aot/pyproject_ppu.toml'
+        required: false
+        type: string
       build_command:
         description: 'Build command'
         required: false
@@ -57,6 +61,48 @@ permissions:
   contents: read
 
 jobs:
+  # sglang-kernel ships the PPU AOT kernels built by setup_ppu.py and is a
+  # separate distribution name from sglang, so it needs its own call into the
+  # template: matrix-release.yml picks exactly one wheel by package_name from
+  # the source tree, and both wheels start with `sglang`.
+  kernel-version:
+    name: Resolve sglang-kernel version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag_version: ${{ steps.resolve.outputs.tag_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version from kernels/aot/pyproject_ppu.toml
+        id: resolve
+        env:
+          KERNEL_TAG_VERSION: ${{ inputs.kernel_tag_version || '' }}
+          SGLANG_TAG_VERSION: ${{ inputs.tag_version || '' }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/sglang/kernels/aot/pyproject_ppu.toml | head -1)
+          if [ -z "$version" ]; then
+            echo '::error::无法从 python/sglang/kernels/aot/pyproject_ppu.toml 读取 version' >&2
+            exit 1
+          fi
+          # Publishing follows the same gate as the sglang wheel: a tag push or an
+          # explicit tag_version. Without it the template only builds the wheel
+          # and stores it as an artifact. kernel_tag_version overrides both, so a
+          # kernel bump can be released on its own.
+          if [ -n "$KERNEL_TAG_VERSION" ]; then
+            tag_version="$KERNEL_TAG_VERSION"
+          elif [ "$REF_TYPE" = 'tag' ] || [ -n "$SGLANG_TAG_VERSION" ]; then
+            tag_version="$version"
+          else
+            tag_version=''
+          fi
+          echo "sglang-kernel version: $version (release as: ${tag_version:-<artifact only>})"
+          {
+            echo "version=$version"
+            echo "tag_version=$tag_version"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     uses: flytiger-eco/shared-workflows/.github/workflows/matrix-release.yml@main
     permissions:
@@ -89,3 +135,43 @@ jobs:
         pip install build wheel setuptools setuptools-scm setuptools-rust
         git config --global --add safe.directory ''*''
         python3 -m build --wheel' }}
+
+  build-kernel:
+    name: Build sglang-kernel
+    needs: kernel-version
+    uses: flytiger-eco/shared-workflows/.github/workflows/matrix-release.yml@main
+    permissions:
+      contents: write
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      data_token: ${{ secrets.DATA_TOKEN }}
+    with:
+      package_name: sglang-kernel
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      # Empty while the sglang wheel is only built as an artifact: the template
+      # then skips repack/publish for the kernel as well.
+      tag_version: ${{ needs.kernel-version.outputs.tag_version }}
+      # setup_ppu.py reads its version from pyproject_ppu.toml and needs the
+      # PPU SDK toolchain (hggc); pyproject.toml is swapped in because the
+      # generic one pins distro CUDA metadata the PPU SDK does not provide.
+      build_command: |
+        unset PIP_INDEX_URL
+        export HOME=$(eval echo ~$(id -un))
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        export MAX_JOBS="${MAX_JOBS:-$(nproc)}"
+        git config --global --add safe.directory '*'
+        pip install --no-input wheel setuptools
+        cd python/sglang/kernels/aot
+        test -f setup_ppu.py || { echo '::error::python/sglang/kernels/aot/setup_ppu.py is missing' >&2; exit 1; }
+        python3 -c 'import torch; print(f"torch {torch.__version__} (cuda {torch.version.cuda})")'
+        cp pyproject_ppu.toml pyproject.toml
+        python3 setup_ppu.py bdist_wheel
