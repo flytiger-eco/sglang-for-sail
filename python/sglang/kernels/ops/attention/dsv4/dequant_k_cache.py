@@ -32,7 +32,7 @@ PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 # One warp per token: the warp then reads that token's 576 cache bytes and
 # writes its 1024 output bytes as contiguous 16-byte vectors. Fastest of
-# 8/16/32 measured on ZW-M890P.
+# 8/16/32 measured on 890.
 VECTORIZED_THREADS_PER_TOKEN = 32
 
 
