@@ -50,14 +50,17 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    get_draft_total_num_kv_heads,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_transfer_kv_layer_ids,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    set_draft_kv_transfer_metadata,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -459,6 +462,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
+        draft_kv_entry_count = 0
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -468,16 +472,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+            draft_kv_entry_count = len(draft_kv_data_ptrs)
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
+
+        draft_pool = self.draft_token_to_kv_pool
+        set_draft_kv_transfer_metadata(
+            kv_args,
+            draft_pool,
+            draft_kv_entry_count=draft_kv_entry_count,
+            tp_size=get_parallel().attn_tp_size,
+            total_head_num=(
+                get_draft_total_num_kv_heads(self.scheduler)
+                if draft_kv_entry_count
+                else None
+            ),
+        )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.kv_layer_ids = (
-            self.token_to_kv_pool.get_kv_layer_ids()
-            if self.draft_token_to_kv_pool is None
-            and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
-            else []
+        kv_args.kv_layer_ids = get_transfer_kv_layer_ids(
+            self.token_to_kv_pool,
+            draft_pool,
+            self.scheduler.model_config.num_hidden_layers,
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
