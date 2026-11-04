@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip, is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +154,41 @@ def resolve_compressed_kv_layout(
     if kv_layout is KVLayout.V4:
         assert option in (None, "fp8"), "the V4 main cache only pairs with V4 caches"
         return KVLayout.V4
-    assert kv_layout is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
-    if option == "fp8":
-        return KVLayout.V41
-    if option == "fp4":
-        return KVLayout.V41_FP4
-    return KVLayout.V41_FP4 if compress_ratio in (1, 2) else KVLayout.V41
+    assert kv_layout.encoding is KVLayout.V41, f"{kv_layout} is not a main-cache layout"
+    use_fp4 = option == "fp4" or (option is None and compress_ratio in (1, 2))
+    encoding = KVLayout.V41_FP4 if use_fp4 else KVLayout.V41
+    # The compressed cache must use the same arrangement as the main cache: the
+    # decode kernel reads both with one geometry (see KVLayout.row_addressing).
+    return encoding.with_interleaved(kv_layout.is_interleaved)
+
+
+def flashmla_supports_v41_kv_layouts() -> bool:
+    """Whether the installed FlashMLA advertises the V4.1 packed KV formats.
+
+    The layouts themselves are just bytes per token, so a FlashMLA build without
+    the 528 B (fp8) / 288 B (fp4) decode paths accepts the launch and only fails
+    once a request needs attention. Both the standalone package used on PPU and
+    the sgl-kernel copy used on CUDA document the formats in the decode entry
+    point's docstring, so probe that.
+    """
+
+    def advertises(entry) -> bool:
+        doc = getattr(entry, "__doc__", None) or ""
+        return "528" in doc and "288" in doc
+
+    try:
+        import flash_mla  # standalone build (PPU / PYTHONPATH installs)
+    except Exception:
+        flash_mla = None
+    if flash_mla is not None and advertises(
+        getattr(flash_mla, "flash_mla_with_kvcache", None)
+    ):
+        return True
+    try:
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+    except Exception:
+        return False
+    return advertises(flash_mla_with_kvcache)
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
@@ -175,7 +204,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         return KVLayout.V4, None
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
-    assert mode in ("v41", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
+    assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
     is_sm100 = (
         torch.cuda.is_available()
         and torch.version.cuda is not None
@@ -191,11 +220,32 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
             raise ValueError(
                 "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
             )
+        if mode == "v41_new":
+            raise ValueError(
+                "the interleaved V4.1 layouts are CUDA/PPU only; gfx950 AITER reads "
+                "the block-split v41 layout"
+            )
         return KVLayout.V41, option
-    if mode == "auto" and not is_sm100:
+    # SAIL (PPU) ships the V4.1 packed layouts through its own FlashMLA build;
+    # sm89 boards (M890P) run the same kernels for these formats.
+    is_sail_sm89 = is_sail() and get_platform().device_sm >= 89
+    if mode == "auto" and not (is_sm100 or is_sail_sm89):
         return KVLayout.V4, None
-    assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    return KVLayout.V41, option
+    assert is_sm100 or is_sail_sm89, (
+        "the V4.1 KV cache layouts need an SM100 / SM103 GPU, or SAIL (PPU) sm89+"
+    )
+    # Fail at launch rather than on the first request: a FlashMLA build without
+    # the V4.1 formats would reject the 528 B / 288 B rows during decode.
+    assert flashmla_supports_v41_kv_layouts(), (
+        "SGLANG_DSV4_KV_LAYOUT selects a V4.1 layout but the installed FlashMLA "
+        "does not advertise the 528 B / 288 B KV formats; upgrade flash_mla or "
+        "unset SGLANG_DSV4_KV_LAYOUT"
+    )
+    # The PPU FlashMLA reads a token's scales at the tail of its own row, i.e. the
+    # interleaved arrangement, so SAIL defaults to V41_NEW. CUDA defaults to the
+    # block-split V41 that pairs with the sgl-kernel FlashMLA build.
+    interleaved = mode == "v41_new" or (mode == "auto" and is_sail_sm89)
+    return (KVLayout.V41_NEW if interleaved else KVLayout.V41), option
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -1141,6 +1191,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.kv_layout in (
             KVLayout.V4,
             KVLayout.V41,
+            KVLayout.V41_NEW,
         ), f"{self.kv_layout} is only valid for a compressed (extra) cache"
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
@@ -2298,7 +2349,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:
-            assert compress_kv_pool.kv_layout is KVLayout.V41_FP4, (
+            assert compress_kv_pool.kv_layout.is_fp4, (
                 "in-kernel RoPE is for the fp4 cache; fp8 caches take the finished value"
             )
         return compress_kv_pool.set_key_buffer_fused(
