@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, print_warning_once
+from sglang.srt.utils import is_gfx95_supported, is_sail, print_warning_once
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -32,7 +32,7 @@ PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 # One warp per token: the warp then reads that token's 576 cache bytes and
 # writes its 1024 output bytes as contiguous 16-byte vectors. Fastest of
-# 8/16/32 measured on ZW-M890P.
+# 8/16/32 measured on 890.
 VECTORIZED_THREADS_PER_TOKEN = 32
 
 
@@ -141,9 +141,12 @@ def dequantize_k_cache_paged_v41(
     Bit-exact with the pure-torch dequantizer of these formats.
     """
     layout = KVLayout.parse(layout)
-    assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
+    assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
         supported = is_gfx95_supported()
+    elif is_sail():
+        # SAIL (PPU) runs the same Triton dequant on sm89; verified bit-exact.
+        supported = get_jit_cuda_arch().major >= 8
     else:
         supported = get_jit_cuda_arch().major >= 10
     if not supported:
@@ -176,9 +179,10 @@ def dequantize_k_cache_paged_v41(
 
     kernel = (
         _dequantize_k_cache_paged_v41_fp8_kernel
-        if layout is KVLayout.V41
+        if layout.encoding is KVLayout.V41
         else _dequantize_k_cache_paged_v41_fp4_kernel
     )
+    data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
     kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -190,7 +194,9 @@ def dequantize_k_cache_paged_v41(
         DATA_BYTES=layout.data_bytes,
         SCALE_BYTES=layout.scale_bytes,
         TILE_SIZE=layout.tile_size,
-        S_OFFSET_BYTES=layout.scale_offset(page_size),
+        DATA_STRIDE=data_stride,
+        SCALE_BASE=scale_base,
+        SCALE_STRIDE=scale_stride,
         IS_HIP=is_hip_runtime(),
     )
     return out
@@ -430,7 +436,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
@@ -440,8 +448,11 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     offs = tl.arange(0, DATA_BYTES)
     vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
@@ -465,7 +476,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
@@ -476,8 +489,11 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     boffs = tl.arange(0, DATA_BYTES)
     packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
