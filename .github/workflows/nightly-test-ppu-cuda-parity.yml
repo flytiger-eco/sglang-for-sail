@@ -25,6 +25,24 @@ on:
         description: 'Seconds (600-3600); 0 uses each PPU registration est_time'
         type: number
         default: 0
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Full commit SHA to test; empty uses the dispatched commit'
+        type: string
+        default: ''
+      suite:
+        description: 'PPU nightly suite to execute'
+        type: string
+        default: all
+      max_parallel:
+        description: 'Concurrent suite tasks (1-3)'
+        type: number
+        default: 1
+      timeout_per_file:
+        description: 'Seconds (600-3600); 0 uses each PPU registration est_time'
+        type: number
+        default: 0
 
 concurrency:
   group: ppu-nightly-cuda-parity-${{ github.ref }}-${{ inputs.suite }}

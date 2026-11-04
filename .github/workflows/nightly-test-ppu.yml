@@ -1,14 +1,29 @@
-name: PPU CUDA Sweep (890P, temporary nightly entry)
-run-name: PPU CUDA sweep | ${{ inputs.scope }} | parallel=${{ inputs.max_parallel }}
+name: Nightly Test (PPU)
+run-name: Nightly Test (PPU) | ${{ inputs.mode }} | ${{ github.ref }}
 
-# Temporarily reuse the registered nightly path. Move the sweep and restore nightly after validation; do not merge.
+# Reuse the registered nightly path for both the temporary CUDA sweep and the
+# PPU nightly reusable workflow, so either mode can run on its feature branch.
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Test mode'
+        type: choice
+        options: [ppu-nightly, cuda-sweep]
+        default: ppu-nightly
       ref:
         description: 'Full dispatched commit SHA; empty uses the dispatched commit'
         type: string
         default: ''
+      suite:
+        description: 'PPU nightly suite to execute when mode is ppu-nightly'
+        type: choice
+        options:
+          - all
+          - nightly-test-1-gpu-large
+          - nightly-test-2-gpu-large
+          - nightly-test-4-gpu-h100
+        default: all
       scope:
         description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
         type: choice
@@ -19,7 +34,7 @@ on:
         type: string
         default: ''
       max_parallel:
-        description: 'Concurrent test tasks (1-4); each task requests its required PPU cards'
+        description: 'Concurrent test tasks (1-4 for sweep, 1-3 for PPU nightly)'
         type: number
         default: 1
       timeout_per_file:
@@ -28,7 +43,7 @@ on:
         default: 0
 
 concurrency:
-  group: ppu-cuda-sweep-890p-${{ inputs.scope }}
+  group: ppu-test-dispatch-${{ inputs.mode }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -44,7 +59,18 @@ env:
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
+  ppu-nightly:
+    if: inputs.mode == 'ppu-nightly'
+    uses: ./.github/workflows/nightly-test-ppu-cuda-parity.yml
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+      suite: ${{ inputs.suite }}
+      max_parallel: ${{ inputs.max_parallel }}
+      timeout_per_file: ${{ inputs.timeout_per_file }}
+    secrets: inherit
+
   sweep-prepare:
+    if: inputs.mode == 'cuda-sweep'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -927,11 +953,16 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'mode', 'ref', 'suite', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(inputs['mode']['options'], ['ppu-nightly', 'cuda-sweep'])
+                      self.assertEqual(inputs['suite']['options'], ['all', 'nightly-test-1-gpu-large', 'nightly-test-2-gpu-large', 'nightly-test-4-gpu-h100'])
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
-                      for name in ('sweep-image', 'sweep-execute'):
-                          self.assertNotIn('if', jobs[name])
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      for name in ('sweep-prepare', 'sweep-models', 'sweep-image', 'sweep-execute'):
+                          self.assertEqual(jobs[name]['if'], "inputs.mode == 'cuda-sweep'")
+                      self.assertEqual(jobs['sweep-summarize']['if'], '${' + '{ always() && inputs.mode == \'cuda-sweep\' }}')
+                      self.assertEqual(jobs['ppu-nightly']['if'], "inputs.mode == 'ppu-nightly'")
+                      self.assertEqual(jobs['ppu-nightly']['uses'], './.github/workflows/nightly-test-ppu-cuda-parity.yml')
+                      self.assertEqual(jobs['ppu-nightly']['secrets'], 'inherit')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1273,6 +1304,7 @@ jobs:
           retention-days: 30
 
   sweep-models:
+    if: inputs.mode == 'cuda-sweep'
     needs: [sweep-prepare, sweep-image]
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1338,6 +1370,7 @@ jobs:
           retention-days: 30
 
   sweep-image:
+    if: inputs.mode == 'cuda-sweep'
     needs: sweep-prepare
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1361,6 +1394,7 @@ jobs:
           printf 'image=%s\ndigest=%s\n' "$PPU_BASE_IMAGE_REF" "$PPU_BASE_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
   sweep-execute:
+    if: inputs.mode == 'cuda-sweep'
     needs: [sweep-prepare, sweep-models, sweep-image]
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1451,7 +1485,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always()
+    if: ${{ always() && inputs.mode == 'cuda-sweep' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
