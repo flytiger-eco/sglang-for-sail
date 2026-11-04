@@ -4,19 +4,19 @@ E2E test: verify DSA fast_topk_v2 (unfused path) does not crash with
 (bug 85825908).
 
 Run:
-    # Requires 8× ZW-M890P GPUs with a GLM-5.2 MXFP4-FP8 model
+    # Requires 8× 890 GPUs with a GLM-5.2 MXFP4-FP8 model
     export MODEL_PATH=<path-to-GLM-5.2-MXFP4-FP8>
     export SGLANG_DSA_FUSE_TOPK=0
     export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
     pytest test/ppu/e2e/test_dsa_topk_dtype_unfused.py -v
 
 Prerequisites:
-    - 8× ZW-M890P (PPU 890P, 8×144GB) with NSA + EAGLE enabled
+    - 8× 890 (PPU 890P, 8×144GB) with NSA + EAGLE enabled
     - Or the test will start server internally (slow, ~10min with DG JIT)
 
 Affected models/dtypes/platforms:
     - GLM-5.2 MXFP4-FP8 (FP4 indexer path, force_unfused_topk)
-    - ZW-M890P (PPU 890P, 8×144GB)
+    - 890 (PPU 890P, 8×144GB)
     - NSA attention backend with EAGLE speculative decoding
     - Triggered when SGLANG_DSA_FUSE_TOPK=0 forces unfused topk path
 """
