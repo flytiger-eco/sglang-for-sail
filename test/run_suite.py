@@ -180,6 +180,10 @@ NIGHTLY_SUITES = {
         "nightly-xpu-4-gpu",
     ],
     HWBackend.PPU: [
+        # CUDA-qualified PPU coverage uses the same stage/runner_config suite names.
+        "nightly-test-1-gpu-large",
+        "nightly-test-2-gpu-large",
+        "nightly-test-4-gpu-h100",
         "nightly-1-ppu",
         "nightly-2-ppu",
         "nightly-4-ppu",
