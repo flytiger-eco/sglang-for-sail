@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    max_prefill_buffer_tokens,
     model_config_of,
     resolving_view,
 )
@@ -77,7 +78,14 @@ def mega_moe_needs_token_budget(
     nvfp4_experts = quantization == "modelopt_fp4" or "FP4" in str(
         hf_quant_config.get("quant_algo", "")
     )
-    return model_arch in MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts
+    # Every supported PPU MegaMoE path repacks native MXFP4 experts and
+    # discards the ordinary runner's layout. This is a platform/layout
+    # restriction, not an architecture allowlist (e.g. DeepSeek V3).
+    return (
+        get_platform().is_ppu
+        or model_arch in MEGA_MOE_NO_FALLBACK_ARCHS
+        or nvfp4_experts
+    )
 
 
 def validate_mega_moe_token_budget_for_model(server_args: ServerArgs) -> None:
@@ -131,9 +139,6 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
         return
 
-    if cfg.pp_size > 1 and cfg.enable_dynamic_chunking:
-        return
-
     if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
         raise ValueError(
             f"{model_label} with MegaMoE requires chunked prefill to be enabled. "
@@ -142,12 +147,15 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             "token requirement would not have a strict prefill-forward bound."
         )
 
+    # Includes PP dynamic chunks and their startup profiling probes. The
+    # resolution pipeline has already applied DP's chunk-size adjustment.
+    prefill_tokens = max_prefill_buffer_tokens(server_args)
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
         token_alignment = 1
         local_chunked_prefill_size = (
-            cfg.chunked_prefill_size + token_partition_size - 1
+            prefill_tokens + token_partition_size - 1
         ) // token_partition_size
     elif cfg.enable_dp_attention:
         token_partition_size = cfg.dp_size
@@ -156,7 +164,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             cfg.tp_size // cfg.dp_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+        local_chunked_prefill_size = prefill_tokens
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1
@@ -166,7 +174,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             cfg.tp_size // token_partition_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size
+        local_chunked_prefill_size = prefill_tokens
 
     if local_chunked_prefill_size <= 0:
         raise ValueError(
@@ -174,6 +182,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             "chunked prefill size. "
             f"Current values: chunked_prefill_size="
             f"{cfg.chunked_prefill_size}, "
+            f"prefill_buffer_tokens={prefill_tokens}, "
             f"token_partition={token_partition_name}, "
             f"token_partition_size={token_partition_size}."
         )
@@ -190,6 +199,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             "cover each rank's effective prefill token budget. "
             f"Current values: chunked_prefill_size="
             f"{cfg.chunked_prefill_size}, "
+            f"prefill_buffer_tokens={prefill_tokens}, "
             f"token_partition={token_partition_name}, "
             f"token_partition_size={token_partition_size}, "
             f"token_alignment={token_alignment}, "
@@ -198,7 +208,8 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             f"{max_tokens_per_rank}. Set "
             "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
             f"least {required_tokens_per_rank}, or lower "
-            "--chunked-prefill-size until the effective per-rank budget fits."
+            "--chunked-prefill-size / --max-prefill-tokens until the effective "
+            "per-rank budget fits."
         )
 
 

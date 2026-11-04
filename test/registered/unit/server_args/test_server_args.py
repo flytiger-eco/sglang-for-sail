@@ -274,8 +274,11 @@ class TestPrepareServerArgs(CustomTestCase):
             "DeepseekV4ForCausalLM",
         ):
             self.assertTrue(mega_moe_needs_token_budget(arch, {}, None), arch)
-        # MXFP4 DeepSeek-family models keep their runtime fallback.
-        self.assertFalse(mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, None))
+        # Only non-PPU MXFP4 DeepSeek models retain an ordinary-runner layout.
+        with override_platform(is_ppu=False):
+            self.assertFalse(
+                mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, None)
+            )
         # NVFP4 experts are repacked at load: every model is checked.
         self.assertTrue(
             mega_moe_needs_token_budget(
@@ -285,6 +288,119 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(
             mega_moe_needs_token_budget("DeepseekV3ForCausalLM", {}, "modelopt_fp4")
         )
+
+    def test_ppu_megamoe_budget_covers_repacked_models_before_loading(self):
+        from sglang.srt.arg_groups.mega_moe_hook import (
+            mega_moe_needs_token_budget,
+            validate_mega_moe_token_budget_for_model,
+        )
+        from sglang.srt.environ import envs
+
+        with override_platform(is_ppu=True, device_sm=89, is_cuda=False, is_hip=False):
+            for arch in ("DeepseekV3ForCausalLM", "KimiK3ForConditionalGeneration"):
+                with self.subTest(arch=arch):
+                    self.assertTrue(mega_moe_needs_token_budget(arch, {}, None))
+                    args = ServerArgs(
+                        model_path="dummy",
+                        moe_a2a_backend="megamoe",
+                        disaggregation_mode="prefill",
+                        tp_size=16,
+                        ep_size=16,
+                        chunked_prefill_size=4096,
+                    )
+                    model_config = SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=[arch]),
+                        hf_quant_config={"quant_method": "mxfp4"},
+                    )
+                    with patch(
+                        "sglang.srt.arg_groups.mega_moe_hook.model_config_of",
+                        return_value=model_config,
+                    ):
+                        for cap in (4095, 4096):
+                            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                                cap
+                            ):
+                                if cap < 4096:
+                                    with self.assertRaisesRegex(
+                                        ValueError, "required_per_rank=4096"
+                                    ):
+                                        validate_mega_moe_token_budget_for_model(args)
+                                else:
+                                    validate_mega_moe_token_budget_for_model(args)
+
+    def test_megamoe_dp_budget_uses_resolved_chunk_once(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(is_ppu=True, device_sm=89, is_cuda=False, is_hip=False):
+            for chunk, resolved, required in ((8192, 4096, 4096), (8194, 4097, 4104)):
+                with self.subTest(chunk=chunk):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        moe_a2a_backend="megamoe",
+                        tp_size=16,
+                        ep_size=16,
+                        dp_size=2,
+                        enable_dp_attention=True,
+                        chunked_prefill_size=chunk,
+                        disaggregation_mode="prefill",
+                        cuda_graph_config=CudaGraphConfig(
+                            prefill=PhaseConfig(backend=Backend.DISABLED)
+                        ),
+                    )
+                    # The dummy-model pipeline returns early; execute the real
+                    # DP handler before the budget hook, as the pipeline does.
+                    handle_data_parallelism(args)
+                    self.assertEqual(
+                        resolution_result(args, "chunked_prefill_size"), resolved
+                    )
+                    for cap in (2048, required - 1, required):
+                        with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                            cap
+                        ):
+                            if cap < required:
+                                with self.assertRaisesRegex(
+                                    ValueError, f"required_per_rank={required}"
+                                ):
+                                    validate_mega_moe_token_budget(
+                                        args, "DeepseekV3ForCausalLM"
+                                    )
+                            else:
+                                validate_mega_moe_token_budget(
+                                    args, "DeepseekV3ForCausalLM"
+                                )
+
+    def test_megamoe_dynamic_budget_covers_prediction_and_profiling(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        with override_platform(is_ppu=True, device_sm=89, is_cuda=False, is_hip=False):
+            for max_prefill, required in ((1024, 1280), (2048, 2048)):
+                with self.subTest(max_prefill=max_prefill):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        moe_a2a_backend="megamoe",
+                        pp_size=2,
+                        enable_dynamic_chunking=True,
+                        chunked_prefill_size=1024,
+                        max_prefill_tokens=max_prefill,
+                        disaggregation_mode="prefill",
+                    )
+                    for cap in (1024, required - 1, required):
+                        with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                            cap
+                        ):
+                            if cap < required:
+                                with self.assertRaisesRegex(
+                                    ValueError, f"required_per_rank={required}"
+                                ):
+                                    validate_mega_moe_token_budget(
+                                        args, "DeepseekV3ForCausalLM"
+                                    )
+                            else:
+                                validate_mega_moe_token_budget(
+                                    args, "DeepseekV3ForCausalLM"
+                                )
 
     def test_megamoe_decode_tokens_per_rank_follows_graph_bs_and_draft_tokens(self):
         # cuda_graph_config only exists on a GPU host; use a stand-in view.

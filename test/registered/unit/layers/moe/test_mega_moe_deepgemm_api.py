@@ -150,7 +150,53 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     {"activation": "situ"} if activation == "situ" else {},
                 )
                 self.assertTrue(layer._mega_moe_weights_built)
+                self.assertTrue(layer._mega_moe_requires_only)
                 self.assertEqual(layer._mega_moe_mma_type, "fp4xfp4")
+
+    def test_repacked_experts_reject_over_cap_instead_of_falling_back(self):
+        moe = SimpleNamespace(experts=SimpleNamespace(_mega_moe_requires_only=True))
+        with (
+            patch.object(mega_moe, "_use_amd_flydsl_mega_moe", return_value=False),
+            patch.object(mega_moe, "get_moe_a2a_backend") as backend,
+            patch.object(mega_moe, "is_mega_moe_experts_ready", return_value=True),
+            patch.object(mega_moe, "get_is_capture_mode") as capture,
+            patch.object(
+                mega_moe, "get_dp_global_num_tokens", return_value=None
+            ) as tokens,
+            patch.object(mega_moe, "is_dsa_enable_prefill_cp", return_value=False),
+            mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                4
+            ),
+        ):
+            backend.return_value.is_megamoe.return_value = True
+            for capturing in (False, True):
+                capture.return_value = capturing
+                with self.subTest(capturing=capturing):
+                    self.assertTrue(
+                        mega_moe.should_use_mega_moe(moe, torch.empty(4, 1))
+                    )
+                    with self.assertRaisesRegex(ValueError, "cannot fall back"):
+                        mega_moe.should_use_mega_moe(moe, torch.empty(5, 1))
+            capture.return_value = False
+            tokens.return_value = [4, 5]
+            with self.assertRaisesRegex(ValueError, "required_per_rank=5"):
+                mega_moe.should_use_mega_moe(moe, torch.empty(4, 1))
+            # The existing fallback remains valid for non-repacked experts.
+            moe.experts._mega_moe_requires_only = False
+            self.assertFalse(mega_moe.should_use_mega_moe(moe, torch.empty(4, 1)))
+
+    def test_repacked_experts_cannot_use_missing_or_disabled_megamoe(self):
+        moe = SimpleNamespace(experts=SimpleNamespace(_mega_moe_requires_only=True))
+        with (
+            patch.object(mega_moe, "_use_amd_flydsl_mega_moe", return_value=False),
+            patch.object(mega_moe, "get_moe_a2a_backend") as backend,
+            patch.object(mega_moe, "is_mega_moe_experts_ready", return_value=False),
+        ):
+            for enabled in (False, True):
+                backend.return_value.is_megamoe.return_value = enabled
+                with self.subTest(enabled=enabled):
+                    with self.assertRaisesRegex(RuntimeError, "Repacked PPU MXFP4"):
+                        mega_moe.should_use_mega_moe(moe, torch.empty(1, 1))
 
     def test_kimi_k3_ppu_routes_situ_and_scaling(self):
         from sglang.srt.models import kimi_k3

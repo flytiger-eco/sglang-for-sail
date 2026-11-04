@@ -195,11 +195,19 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
 
         return should_use_flydsl_mega_moe(moe, hidden_states)
 
+    mega_only = getattr(moe.experts, "_mega_moe_requires_only", False)
     if not get_moe_a2a_backend().is_megamoe():
+        if mega_only:
+            raise RuntimeError("Repacked PPU MXFP4 experts require MegaMoE.")
         return False
     if not is_mega_moe_experts_ready(moe.experts):
+        if mega_only:
+            raise RuntimeError(
+                "Repacked PPU MXFP4 experts require a ready MegaMoE backend; "
+                "the ordinary expert runner cannot use this weight layout."
+            )
         return False
-    if get_is_capture_mode():
+    if get_is_capture_mode() and not mega_only:
         return True
 
     global_num_tokens = get_dp_global_num_tokens()
@@ -208,6 +216,13 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if mega_only and max_tokens_per_rank > cap:
+        raise ValueError(
+            f"Repacked PPU MXFP4 experts cannot fall back to the ordinary "
+            f"runner: required_per_rank={max_tokens_per_rank} exceeds "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}. "
+            "Raise the env var or lower the per-rank token budget."
+        )
     return max_tokens_per_rank <= cap
 
 

@@ -1050,6 +1050,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = l2_pair[0]
                 layer.w2_weight_scale.data = l2_pair[1]
                 layer._mega_moe_mma_type = "fp4xfp4"
+                layer._mega_moe_requires_only = True
                 layer._mega_moe_weights_built = True
                 layer._mxfp4_backend = "deep_gemm"
                 torch.cuda.empty_cache()
