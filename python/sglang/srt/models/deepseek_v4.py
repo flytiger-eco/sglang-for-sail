@@ -4870,6 +4870,12 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
         # The loader hands this mapper to every quant config; other formats were
         # written against different names, so only Quark checkpoints get it.
+        # On PPU we still need it: hybrid checkpoints (MoE MXFP4 + dense FP8
+        # per-channel) list `fp8_channelwise_layers` in HF naming, and without
+        # the mapping none of those layers match -> dense linears are built as
+        # MXFP4 and weight loading fails on shape mismatch.
+        if _is_sail:
+            return cls.hf_to_sglang_mapper
         return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
 
     def __init__(
