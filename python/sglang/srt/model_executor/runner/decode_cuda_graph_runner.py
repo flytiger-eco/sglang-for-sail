@@ -395,10 +395,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._resolve_attention_variant = self.attention_graph_variants.select
 
         # --- bucket sizes ---------------------------------------------
+        # DP-local draft reduce-scatter still requires attention-TP-aligned rows,
+        # even when the narrowed draft TP scope reports no gathered-buffer need.
+        gathered_buffer_required = self.require_gathered_buffer or (
+            self._forward_is_dp_local(model_runner)
+            and get_parallel().attn_dp_enabled
+            and self.captured_req_width % get_parallel().attn_tp_size != 0
+        )
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner,
             self.captured_req_width,
-            gathered_buffer_required=self.require_gathered_buffer,
+            gathered_buffer_required=gathered_buffer_required,
         )
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
