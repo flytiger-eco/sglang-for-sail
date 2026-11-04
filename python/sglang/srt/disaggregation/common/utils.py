@@ -139,8 +139,20 @@ def group_concurrent_contiguous(
 class DCPTokenTransferPlan:
     target_src_token_indices: npt.NDArray[np.int64]
     target_dst_token_indices: npt.NDArray[np.int64]
-    draft_src_token_indices: npt.NDArray[np.int64]
-    draft_dst_token_indices: npt.NDArray[np.int64]
+    draft_src_token_indices: npt.NDArray[np.int64] = dataclasses.field(
+        default_factory=lambda: np.empty((0,), dtype=np.int64)
+    )
+    draft_dst_token_indices: npt.NDArray[np.int64] = dataclasses.field(
+        default_factory=lambda: np.empty((0,), dtype=np.int64)
+    )
+
+    @property
+    def src_token_indices(self) -> npt.NDArray[np.int64]:
+        return self.target_src_token_indices
+
+    @property
+    def dst_token_indices(self) -> npt.NDArray[np.int64]:
+        return self.target_dst_token_indices
 
     def empty(self) -> bool:
         return (
@@ -159,9 +171,21 @@ def build_dcp_token_transfer_plan(
     src_page_offset: int = 0,
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
+    replicate_to_virtual: bool = False,
 ) -> DCPTokenTransferPlan:
+    if physical_page_size <= 0 or dcp_size <= 0 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError("Invalid DCP page size or rank")
+    if src_page_offset < 0 or decode_prefix_len < 0:
+        raise ValueError("Negative PD token offset")
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    if (
+        src_pages.ndim != 1
+        or dst_pages.ndim != 1
+        or np.any(src_pages < 0)
+        or np.any(dst_pages < 0)
+    ):
+        raise ValueError("PD pages must be one-dimensional nonnegative indices")
     virtual_page_size = physical_page_size * dcp_size
     if decode_prefix_len % virtual_page_size != 0:
         raise ValueError(
@@ -170,20 +194,32 @@ def build_dcp_token_transfer_plan(
         )
     if num_kv_tokens is None:
         num_kv_tokens = src_pages.size * physical_page_size
+    if num_kv_tokens < 0 or num_kv_tokens > src_pages.size * physical_page_size:
+        raise ValueError("PD token count exceeds source page capacity")
     if num_kv_tokens == 0:
         empty = np.empty((0,), dtype=np.int64)
         return DCPTokenTransferPlan(empty, empty.copy(), empty.copy(), empty.copy())
 
     def rows(offsets, dst_page_size, dst_local):
+        dst_ordinals = dst_local // dst_page_size
+        if dst_ordinals.size and (
+            dst_pages.size == 0 or int(dst_ordinals.max()) >= dst_pages.size
+        ):
+            raise ValueError(
+                "Insufficient destination DCP pages: "
+                f"required={int(dst_ordinals.max()) + 1}, provided={dst_pages.size}"
+            )
         return (
             src_pages[offsets // physical_page_size] * physical_page_size
             + offsets % physical_page_size,
-            dst_pages[dst_local // dst_page_size] * dst_page_size
-            + dst_local % dst_page_size,
+            dst_pages[dst_ordinals] * dst_page_size + dst_local % dst_page_size,
         )
 
     draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
     draft_local = src_page_offset * physical_page_size + draft_offsets
+    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
+    if replicate_to_virtual:
+        return DCPTokenTransferPlan(draft_src, draft_dst)
     chunk_start = decode_prefix_len + src_page_offset * physical_page_size
     target_offsets = np.arange(
         (dcp_rank - chunk_start) % dcp_size,
@@ -193,5 +229,115 @@ def build_dcp_token_transfer_plan(
     )
     target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
     target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
-    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
     return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
+
+
+def _draft_head_transfer_geometry(
+    src_token_bytes: int,
+    dst_token_bytes: int,
+    total_heads: int,
+    src_tp_size: int,
+    src_tp_rank: int,
+    dst_tp_size: int,
+    dst_tp_rank: int,
+) -> Tuple[int, int, int]:
+    """Return the intersecting draft-head slice for one contacted TP sender."""
+    if (
+        min(total_heads, src_tp_size, dst_tp_size, src_token_bytes, dst_token_bytes)
+        <= 0
+    ):
+        raise ValueError("Draft head geometry must be positive")
+    if not (0 <= src_tp_rank < src_tp_size and 0 <= dst_tp_rank < dst_tp_size):
+        raise ValueError("Draft TP rank out of range")
+    if max(src_tp_size, dst_tp_size) % min(src_tp_size, dst_tp_size):
+        raise ValueError("Draft TP sizes must divide each other")
+    for tp in (src_tp_size, dst_tp_size):
+        if max(total_heads, tp) % min(total_heads, tp):
+            raise ValueError("Draft head count and TP size must divide each other")
+    src_heads = max(1, total_heads // src_tp_size)
+    dst_heads = max(1, total_heads // dst_tp_size)
+    if src_token_bytes % src_heads or dst_token_bytes % dst_heads:
+        raise ValueError("Draft token bytes must divide into whole heads")
+    head_bytes = src_token_bytes // src_heads
+    if head_bytes != dst_token_bytes // dst_heads:
+        raise ValueError("Draft source/destination bytes per head differ")
+    src_replication = max(1, src_tp_size // total_heads)
+    dst_replication = max(1, dst_tp_size // total_heads)
+    if src_tp_size > dst_tp_size:
+        group_size = src_tp_size // dst_tp_size
+        group_start = dst_tp_rank * group_size
+        if not group_start <= src_tp_rank < group_start + group_size:
+            return 0, 0, 0
+        owner = max(group_start, src_tp_rank // src_replication * src_replication)
+        if src_tp_rank != owner:
+            return 0, 0, 0
+    elif src_tp_rank != dst_tp_rank // (dst_tp_size // src_tp_size):
+        return 0, 0, 0
+    src_begin = src_tp_rank // src_replication * src_heads
+    dst_begin = dst_tp_rank // dst_replication * dst_heads
+    begin, end = (
+        max(src_begin, dst_begin),
+        min(src_begin + src_heads, dst_begin + dst_heads),
+    )
+    if begin >= end:
+        return 0, 0, 0
+    return (
+        (begin - src_begin) * head_bytes,
+        (begin - dst_begin) * head_bytes,
+        (end - begin) * head_bytes,
+    )
+
+
+def build_draft_head_transfer_blocks(
+    plan,
+    *,
+    src_ptr,
+    dst_ptr,
+    src_token_bytes,
+    dst_token_bytes,
+    total_heads,
+    src_tp_size,
+    src_tp_rank,
+    dst_tp_size,
+    dst_tp_rank,
+):
+    """Map draft tokens and head slices without dropping required TP senders."""
+    src_offset, dst_offset, width = _draft_head_transfer_geometry(
+        src_token_bytes,
+        dst_token_bytes,
+        total_heads,
+        src_tp_size,
+        src_tp_rank,
+        dst_tp_size,
+        dst_tp_rank,
+    )
+    if (
+        plan.src_token_indices.ndim != 1
+        or plan.dst_token_indices.ndim != 1
+        or len(plan.src_token_indices) != len(plan.dst_token_indices)
+        or np.any(plan.src_token_indices < 0)
+        or np.any(plan.dst_token_indices < 0)
+    ):
+        raise ValueError("Invalid draft token indices")
+    if not width:
+        return []
+    if width == src_token_bytes == dst_token_bytes:
+        src_groups, dst_groups = group_concurrent_contiguous(
+            plan.src_token_indices, plan.dst_token_indices
+        )
+        return [
+            (
+                src_ptr + int(src[0]) * src_token_bytes + src_offset,
+                dst_ptr + int(dst[0]) * dst_token_bytes + dst_offset,
+                len(src) * width,
+            )
+            for src, dst in zip(src_groups, dst_groups)
+        ]
+    return [
+        (
+            src_ptr + int(src) * src_token_bytes + src_offset,
+            dst_ptr + int(dst) * dst_token_bytes + dst_offset,
+            width,
+        )
+        for src, dst in zip(plan.src_token_indices, plan.dst_token_indices)
+    ]

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -51,6 +51,10 @@ def _fetching_receiver(connection_pool):
         connection_lock=threading.Lock(),
         is_mla_backend=False,
     )
+    receiver.kv_mgr._deduplicate_mla_senders = (
+        CommonKVManager._deduplicate_mla_senders.__get__(receiver.kv_mgr)
+    )
+    receiver.prefill_info = None
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
     receiver.prefill_dp_rank = 0
