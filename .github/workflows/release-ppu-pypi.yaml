@@ -50,7 +50,7 @@ on:
         required: false
         type: string
       kernel_tag_version:
-        description: 'Release version for the sglang-kernel wheel; empty means read python/sglang/kernels/aot/pyproject_ppu.toml'
+        description: 'Release version for the sglang-kernel wheel; empty means read python/sglang/kernels/aot/pyproject_sail.toml'
         required: false
         type: string
       build_command:
@@ -61,7 +61,7 @@ permissions:
   contents: read
 
 jobs:
-  # sglang-kernel ships the PPU AOT kernels built by setup_ppu.py and is a
+  # sglang-kernel ships the PPU AOT kernels built by setup_sail.py and is a
   # separate distribution name from sglang, so it needs its own call into the
   # template: matrix-release.yml picks exactly one wheel by package_name from
   # the source tree, and both wheels start with `sglang`.
@@ -73,7 +73,7 @@ jobs:
       tag_version: ${{ steps.resolve.outputs.tag_version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve version from kernels/aot/pyproject_ppu.toml
+      - name: Resolve version from kernels/aot/pyproject_sail.toml
         id: resolve
         env:
           KERNEL_TAG_VERSION: ${{ inputs.kernel_tag_version || '' }}
@@ -81,9 +81,9 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/sglang/kernels/aot/pyproject_ppu.toml | head -1)
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/sglang/kernels/aot/pyproject_sail.toml | head -1)
           if [ -z "$version" ]; then
-            echo '::error::无法从 python/sglang/kernels/aot/pyproject_ppu.toml 读取 version' >&2
+            echo '::error::无法从 python/sglang/kernels/aot/pyproject_sail.toml 读取 version' >&2
             exit 1
           fi
           # Publishing follows the same gate as the sglang wheel: a tag push or an
@@ -160,7 +160,7 @@ jobs:
       # Empty while the sglang wheel is only built as an artifact: the template
       # then skips repack/publish for the kernel as well.
       tag_version: ${{ needs.kernel-version.outputs.tag_version }}
-      # setup_ppu.py reads its version from pyproject_ppu.toml and needs the
+      # setup_sail.py reads its version from pyproject_sail.toml and needs the
       # PPU SDK toolchain (hggc); pyproject.toml is swapped in because the
       # generic one pins distro CUDA metadata the PPU SDK does not provide.
       build_command: |
@@ -171,7 +171,7 @@ jobs:
         git config --global --add safe.directory '*'
         pip install --no-input wheel setuptools
         cd python/sglang/kernels/aot
-        test -f setup_ppu.py || { echo '::error::python/sglang/kernels/aot/setup_ppu.py is missing' >&2; exit 1; }
+        test -f setup_sail.py || { echo '::error::python/sglang/kernels/aot/setup_sail.py is missing' >&2; exit 1; }
         python3 -c 'import torch; print(f"torch {torch.__version__} (cuda {torch.version.cuda})")'
-        cp pyproject_ppu.toml pyproject.toml
-        python3 setup_ppu.py bdist_wheel
+        cp pyproject_sail.toml pyproject.toml
+        python3 setup_sail.py bdist_wheel
