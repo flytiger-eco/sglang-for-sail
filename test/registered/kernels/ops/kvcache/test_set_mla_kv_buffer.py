@@ -293,22 +293,17 @@ def test_set_mla_kv_buffer_triton_fp8_quant_reserved_skip_index():
     )
 
 
-@pytest.mark.parametrize("rope_kind", ["none", "empty"])
 @pytest.mark.parametrize("nope_dim", [512, 193])
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("byte_storage", [False, True])
 def test_set_mla_kv_buffer_triton_fp8_quant_zero_rope(
-    rope_kind, nope_dim, loc_dtype, byte_storage
+    nope_dim, loc_dtype, byte_storage
 ):
-    """Exercise the block writer with absent RoPE and a partial final block."""
+    """Exercise the block writer with zero-width RoPE and a partial final block."""
     fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
     cache_k_nope = torch.randn((4, 1, nope_dim), dtype=torch.bfloat16, device=DEVICE)
     cache_k_nope[[0, 2]] = torch.nan
-    cache_k_rope = (
-        None
-        if rope_kind == "none"
-        else torch.empty((4, 1, 0), dtype=torch.bfloat16, device=DEVICE)
-    )
+    cache_k_rope = torch.empty((4, 1, 0), dtype=torch.bfloat16, device=DEVICE)
     initial = torch.ones((32, 1, nope_dim), device=DEVICE).to(fp8_dtype)
     kv_buffer = initial.view(torch.uint8) if byte_storage else initial
     expected_bytes = kv_buffer.view(torch.uint8).clone()
@@ -325,9 +320,8 @@ def test_set_mla_kv_buffer_triton_fp8_quant_zero_rope(
     assert torch.equal(kv_buffer.view(torch.uint8), expected_bytes)
 
     before = kv_buffer.view(torch.uint8).clone()
-    empty_rope = None if rope_kind == "none" else cache_k_rope[:0]
     set_mla_kv_buffer_triton_fp8_quant(
-        kv_buffer, loc[:0], cache_k_nope[:0], empty_rope, fp8_dtype
+        kv_buffer, loc[:0], cache_k_nope[:0], cache_k_rope[:0], fp8_dtype
     )
     assert torch.equal(kv_buffer.view(torch.uint8), before)
 

@@ -380,7 +380,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: Optional[torch.Tensor],
+    cache_k_rope: torch.Tensor,
     fp8_dtype: torch.dtype,
     *,
     reserved_skip_index: int = 0,
@@ -388,13 +388,13 @@ def set_mla_kv_buffer_triton_fp8_quant(
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
-    ``cache_k_rope`` may be None or zero-width for zero-RoPE MLA.
+    ``cache_k_rope`` may be zero-width for zero-RoPE MLA.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
     nope_dim = cache_k_nope.shape[-1]
-    rope_dim = cache_k_rope.shape[-1] if cache_k_rope is not None else 0
-    rope_stride = cache_k_rope.stride(0) if cache_k_rope is not None else 0
+    rope_dim = cache_k_rope.shape[-1]
+    rope_stride = cache_k_rope.stride(0)
     total_dim = nope_dim + rope_dim
     n_loc = loc.numel()
 
