@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.srt.utils.network import is_port_available
+from sglang.test.gpu_idle_cleanup import cleanup_residual_gpu_processes
 from sglang.test.run_eval import run_eval
 from sglang.utils import normalize_base_url
 
@@ -2047,12 +2048,12 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
 def _wait_for_gpu_idle_in_ci(
     timeout: float = _GPU_IDLE_TIMEOUT_SECS,
     poll_interval: float = _GPU_IDLE_POLL_INTERVAL_SECS,
+    cleanup_timeout: float = 10.0,
 ) -> None:
-    """Wait until visible GPUs release residual memory from earlier tests.
+    """Wait for visible GPUs to become idle, then clean up residual GPU processes.
 
-    Killed server processes return GPU memory asynchronously; launching the
-    next server too early makes memory profiling over-commit the KV cache and
-    OOM. Abort with the offending processes if the memory is never returned.
+    Cleanup is CI-only and covers only compute processes on visible GPUs, excluding
+    this process and PID 1. Set SGLANG_CI_CLEANUP_GPU_PROCS=0 to disable it.
     """
     if not is_in_ci():
         return
@@ -2071,9 +2072,31 @@ def _wait_for_gpu_idle_in_ci(
             if not busy_reports:
                 return
             if time.monotonic() >= deadline:
+                cleanup_errors = []
+                if get_bool_env_var("SGLANG_CI_CLEANUP_GPU_PROCS", "true"):
+                    killed, cleanup_errors = cleanup_residual_gpu_processes(
+                        pynvml, gpu_indices
+                    )
+                    if killed:
+                        print(
+                            f"[CI GPU Idle] Cleaned up residual GPU processes: {killed}",
+                            flush=True,
+                        )
+                        cleanup_deadline = time.monotonic() + cleanup_timeout
+                        while True:
+                            busy_reports = _collect_busy_gpu_reports(
+                                pynvml, gpu_indices
+                            )
+                            if not busy_reports:
+                                return
+                            if time.monotonic() >= cleanup_deadline:
+                                break
+                            time.sleep(poll_interval)
+                details = f"GPU(s) still not idle after waiting {timeout:.0f}s"
+                if cleanup_errors:
+                    details += f"; cleanup errors: {' | '.join(cleanup_errors)}"
                 raise RuntimeError(
-                    f"GPU(s) still not idle after waiting {timeout:.0f}s "
-                    f"before setUpClass: {'; '.join(busy_reports)}"
+                    f"{details} before setUpClass: {'; '.join(busy_reports)}"
                 )
             print(
                 f"[CI GPU Idle] Waiting for GPU to become idle: "
