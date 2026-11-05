@@ -406,6 +406,13 @@ class Fp8Config(QuantizationConfig):
                 return NPUMXFP8OnlineMoEMethod(self)
 
             if self.is_fp4_experts and _is_ppu:
+                from sglang.srt.configs.model_config import MIMO_V2_MODEL_ARCHS
+                from sglang.srt.runtime_context import process_model_config
+
+                architectures = process_model_config().hf_config.architectures
+                if any(arch in MIMO_V2_MODEL_ARCHS for arch in architectures):
+                    return Fp8MoEMethod(self, use_ppu_w4a8=True)
+
                 from sglang.srt.layers.quantization.mxfp4 import (
                     Mxfp4MoEMethod,
                 )
@@ -1168,8 +1175,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Fp8Config, *, use_ppu_w4a8: bool = False):
         self.quant_config = quant_config
+        self.use_ppu_w4a8 = use_ppu_w4a8
+        if use_ppu_w4a8:
+            from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            backend = get_moe_runner_backend()
+            if not (backend.is_auto() or backend.is_deep_gemm()):
+                raise ValueError("PPU MiMo W4A8 requires the deep_gemm runner")
+            if get_moe_a2a_backend().value not in ("none", "deepep"):
+                raise ValueError("PPU MiMo W4A8 supports none/deepep dispatch")
+            if is_tbo_enabled() or is_sbo_enabled():
+                raise ValueError("PPU MiMo W4A8 does not support TBO/SBO yet")
+            if get_moe_a2a_backend().is_deepep() and (
+                get_exec().moe.deepep_dispatcher_output_dtype not in ("auto", "fp8")
+                or envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            ):
+                raise ValueError("PPU MiMo W4A8 requires FP8 DeepEP dispatch")
+            if quant_config.weight_block_size is None:
+                raise ValueError(
+                    "PPU MiMo W4A8 requires weight_block_size for block-scale loading"
+                )
+            if (
+                not quant_config.is_fp4_experts
+                or quant_config.activation_scheme != "dynamic"
+                or quant_config.use_mxfp8
+                or quant_config.dequant_fp4_to_fp8
+            ):
+                raise ValueError("PPU MiMo W4A8 requires native MXFP4 experts")
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
@@ -1511,6 +1546,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        if self.use_ppu_w4a8:
+            if with_bias:
+                raise ValueError("PPU MiMo W4A8 does not support expert bias")
+            extra_weight_attrs["fp4_scale_dtype"] = torch.uint8
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -1525,6 +1564,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             with_bias=with_bias,
             **extra_weight_attrs,
         )
+
+        if self.use_ppu_w4a8:
+            # Raw E8M0 checkpoint scales: exponent 127 represents one.
+            layer.w13_weight_scale_inv.data.fill_(127)
+            layer.w2_weight_scale_inv.data.fill_(127)
 
         if (
             not self.is_fp4_expert
@@ -2168,6 +2212,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_ppu_w4a8:
+            import deep_gemm
+
+            for name in ("w13", "w2"):
+                weight = getattr(layer, f"{name}_weight")
+                scale = getattr(layer, f"{name}_weight_scale_inv")
+                weight.data, scale.data, inv_scale = (
+                    deep_gemm.preprocess_weights_and_scales(
+                        deep_gemm.PreprocessMode.W4A8_MXFP4_MMA,
+                        False,
+                        weight.view(torch.uint8).contiguous(),
+                        scale.contiguous(),
+                    )
+                )
+                setattr(layer, f"{name}_w4a8_inv_scale", inv_scale)
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"dispatcher_output_dtype": "fp8", "is_channel_quant": True}
+                )
+            return
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2511,6 +2576,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         moe_runner_backend = get_moe_runner_backend()
 
+        if self.use_ppu_w4a8:
+            self.runner = MoeRunner(MoeRunnerBackend.DEEP_GEMM, moe_runner_config)
+            # The PPU fused standard op handles W8A8/W4A4, not native W4A8.
+            self.runner.fused_func = None
+            self._owns_moe_runner = True
+            return
+
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2821,7 +2893,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                block_shape=block_shape,
+                block_shape=None if self.use_ppu_w4a8 else block_shape,
+                per_channel_quant=self.use_ppu_w4a8,
+                use_mxfp4_w4a8=self.use_ppu_w4a8,
+                w13_w4a8_inv_scale=getattr(layer, "w13_w4a8_inv_scale", 1.0),
+                w2_w4a8_inv_scale=getattr(layer, "w2_w4a8_inv_scale", 1.0),
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
             )
