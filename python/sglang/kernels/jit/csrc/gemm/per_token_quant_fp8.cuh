@@ -734,6 +734,264 @@ void launch_per_token_quant_fp8(
 
 #endif
 
+// ---------------------------------------------------------------------------
+// 4. RMSNorm + per-token quant, one launch (prefill).
+//    y = (x * rsqrt(mean(x^2) + eps)) * weight is rounded to T once, written as
+//    the normalized row (the indexer reads it) and quantized per token from
+//    those same rounded values (the following GEMM reads that). Both passes
+//    run off one staged copy of the row, so the activation is read from HBM
+//    once instead of once per kernel. kInt8 selects the int8 contract
+//    (scale = max(max|y|, 1e-10) / 127, round half to even) instead of FP8.
+// ---------------------------------------------------------------------------
+#ifndef USE_ROCM
+template <int kVecSize>
+SGL_DEVICE void per_token_quant_store_int8(
+    const PerTokenQuantVector<__nv_bfloat16, kVecSize>& input_vec, float scale_inv, int8_t* token_output, int i) {
+  constexpr int kChunk = 16;
+  int8_t packed[kVecSize];
+#pragma unroll
+  for (uint32_t j = 0; j < kVecSize; ++j) {
+    packed[j] = static_cast<int8_t>(rintf(static_cast<float>(input_vec[j]) * scale_inv));
+  }
+#pragma unroll
+  for (int j = 0; j < kVecSize; j += kChunk) {
+    device::AlignedVector<int8_t, kChunk> chunk;
+#pragma unroll
+    for (int t = 0; t < kChunk; ++t) {
+      chunk[t] = packed[j + t];
+    }
+    chunk.store(token_output + i * kVecSize + j);
+  }
+}
+
+template <
+    typename T,
+    typename DST_DTYPE,
+    int kTokensPerCTA = 8,
+    int kVecSize = 16,
+    bool useAIU = false,
+    bool kInt8 = false>
+__global__ void rmsnorm_per_token_quant_persistent_kernel(
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    T* __restrict__ output_y,
+    DST_DTYPE* __restrict__ output_q,
+    float* __restrict__ output_s,
+    const int64_t hidden_dim,
+    const int64_t input_stride,
+    const int64_t num_tokens,
+    const float eps) {
+  const int warp_id = threadIdx.x / kPerTokenQuantWarpSize;
+  const int lane_id = threadIdx.x & (kPerTokenQuantWarpSize - 1);
+  const int64_t first_token = static_cast<int64_t>(blockIdx.x) * kTokensPerCTA + warp_id;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * kTokensPerCTA;
+
+  extern __shared__ __align__(16) char smem_buffer[];
+  const int warp_smem_stride = (hidden_dim * static_cast<int>(sizeof(T)) + 127) / 128 * 128;
+  T* smem_buf = reinterpret_cast<T*>(smem_buffer + warp_id * warp_smem_stride);
+
+  using vec_t = PerTokenQuantVector<T, kVecSize>;
+  const int32_t num_vec_elems = hidden_dim / kVecSize;
+
+  for (int64_t token_id = first_token; token_id < num_tokens; token_id += stride) {
+    const T* src = input + token_id * input_stride;
+    // Stage the row once; the norm, the max and the quantize passes all read
+    // it back from shared memory.
+#if defined(SGL_PER_TOKEN_QUANT_SAIL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    if constexpr (sizeof(T) == 2 and useAIU) {
+      constexpr int AIU_CHUNK_SLISE_4 = 16 * 64;
+      for (int aiu_cp_offset = 0; aiu_cp_offset < hidden_dim; aiu_cp_offset += AIU_CHUNK_SLISE_4) {
+        load_128b_aiu<T, false>(smem_buf + aiu_cp_offset, src + aiu_cp_offset, 64, 16, 64, 16, 0, 0);
+      }
+    } else
+#endif
+    {
+      constexpr int kCopiesPerVec = kVecSize * static_cast<int>(sizeof(T)) / 16;
+      for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
+#pragma unroll
+        for (int j = 0; j < kCopiesPerVec; ++j) {
+          __pipeline_memcpy_async(
+              reinterpret_cast<char*>(smem_buf + i * kVecSize) + j * 16,
+              reinterpret_cast<const char*>(src + i * kVecSize) + j * 16,
+              16);
+        }
+      }
+      __pipeline_commit();
+      __pipeline_wait_prior(0);
+    }
+    __syncwarp();
+
+    // Pass-1: E[x^2] over the row.
+    float sum_sq = 0.0f;
+    for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
+      vec_t x_vec;
+      x_vec.cast_load(smem_buf + i * kVecSize);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        const float value = static_cast<float>(x_vec[j]);
+        sum_sq = fmaf(value, value, sum_sq);
+      }
+    }
+    const float inv = rsqrtf(device::warp::reduce_sum(sum_sq) / static_cast<float>(hidden_dim) + eps);
+
+    // Pass-2: normalize, emit the rounded row, and track the per-token max of
+    // that row (the quantize scale is derived from it, not from fp32 values).
+    constexpr int kStoreChunk = 16 / static_cast<int>(sizeof(T));
+    float row_max = 0.0f;
+    T* dst_y = output_y + token_id * hidden_dim;
+    for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
+      vec_t x_vec, w_vec, out_vec;
+      x_vec.cast_load(smem_buf + i * kVecSize);
+      w_vec.cast_load(weight + static_cast<int64_t>(i) * kVecSize);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        const float value = static_cast<float>(x_vec[j]) * inv * static_cast<float>(w_vec[j]);
+        const T rounded = static_cast<T>(value);
+        out_vec[j] = rounded;
+        row_max = fmaxf(row_max, fabsf(static_cast<float>(rounded)));
+      }
+      T* dst = dst_y + static_cast<int64_t>(i) * kVecSize;
+#pragma unroll
+      for (int j = 0; j < kVecSize; j += kStoreChunk) {
+        device::AlignedVector<T, kStoreChunk> chunk;
+#pragma unroll
+        for (int t = 0; t < kStoreChunk; ++t) {
+          chunk[t] = out_vec[j + t];
+        }
+        chunk.store(dst + j);
+      }
+      // Keep the rounded row for the quantize pass.
+      T* smem_dst = smem_buf + i * kVecSize;
+#pragma unroll
+      for (int j = 0; j < kVecSize; j += kStoreChunk) {
+        device::AlignedVector<T, kStoreChunk> chunk;
+#pragma unroll
+        for (int t = 0; t < kStoreChunk; ++t) {
+          chunk[t] = out_vec[j + t];
+        }
+        chunk.store(smem_dst + j);
+      }
+    }
+
+    const float row_absmax = device::warp::reduce_max(row_max);
+    // Int8 floors the absmax and rounds half to even; FP8 uses E4M3's 448.
+    const float quant_range = kInt8 ? 127.0f : device::math::FP8_E4M3_MAX;
+    const float denom = kInt8 ? fmaxf(row_absmax, 1e-10f) : row_absmax;
+    const float scale = denom / quant_range;
+    if (lane_id == 0) {
+      output_s[token_id] = scale;
+    }
+    // fp8 keeps the reciprocal of the stored scale (that is what the plain
+    // per-token quant kernel does); int8 mirrors the triton reference's
+    // 127 / absmax and relies on its 1e-10 floor instead of a zero guard.
+    const float scale_inv = kInt8 ? (quant_range / denom) : (scale == 0.f ? 0.f : 1.0f / scale);
+
+    // Pass-3: quantize the rounded row.
+    DST_DTYPE* token_output = output_q + token_id * hidden_dim;
+    for (int32_t i = lane_id; i < num_vec_elems; i += kPerTokenQuantWarpSize) {
+      vec_t input_vec;
+      input_vec.cast_load(smem_buf + i * kVecSize);
+      if constexpr (kInt8) {
+        per_token_quant_store_int8(input_vec, scale_inv, token_output, i);
+      } else {
+        per_token_quant_store(input_vec, scale_inv, token_output, i);
+      }
+    }
+    __syncwarp();
+  }
+}
+
+// Same CTA-size selection as the plain quant kernel so both launches pick a
+// comparable occupancy on the same row shape.
+template <typename T, typename DST_DTYPE, bool kInt8, bool kUseAIU>
+bool launch_rmsnorm_per_token_quant_persistent(
+    DLDevice device,
+    const T* input,
+    const T* weight,
+    T* output_y,
+    DST_DTYPE* output_q,
+    float* output_s,
+    uint32_t hidden_dim,
+    int64_t input_stride,
+    uint32_t num_tokens,
+    float eps,
+    uint32_t sm_count) {
+  const size_t stride = (static_cast<size_t>(hidden_dim) * sizeof(T) + 127) / 128 * 128;
+  int max_smem = 0;
+  CHECK_CUDA(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device.device_id));
+  int best_cta = 0, best_score = 0, best_blocks = 0;
+  size_t best_smem = 0;
+  auto consider = [&](auto kernel, int cta) {
+    const size_t smem = stride * cta;
+    if (smem > static_cast<size_t>(max_smem)) return;
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)) !=
+        cudaSuccess) {
+      (void)cudaGetLastError();
+      return;
+    }
+    const int blocks = host::runtime::get_blocks_per_sm(kernel, cta * kPerTokenQuantWarpSize, smem);
+    const int score = blocks * cta;
+    if (score > best_score || (score == best_score && cta > best_cta)) {
+      best_cta = cta;
+      best_score = blocks * cta;
+      best_blocks = blocks;
+      best_smem = smem;
+    }
+  };
+  consider(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 2, 16, kUseAIU, kInt8>, 2);
+  consider(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 4, 16, kUseAIU, kInt8>, 4);
+  consider(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 8, 16, kUseAIU, kInt8>, 8);
+  if (best_score == 0) return false;
+  const uint32_t grid = std::min(sm_count * best_blocks, host::div_ceil(num_tokens, static_cast<uint32_t>(best_cta)));
+  auto launch = [&](auto kernel) {
+    host::LaunchKernel(grid, best_cta * kPerTokenQuantWarpSize, device, best_smem)(
+        kernel,
+        input,
+        weight,
+        output_y,
+        output_q,
+        output_s,
+        static_cast<int64_t>(hidden_dim),
+        input_stride,
+        static_cast<int64_t>(num_tokens),
+        eps);
+  };
+  switch (best_cta) {
+    case 2:
+      launch(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 2, 16, kUseAIU, kInt8>);
+      break;
+    case 4:
+      launch(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 4, 16, kUseAIU, kInt8>);
+      break;
+    case 8:
+      launch(rmsnorm_per_token_quant_persistent_kernel<T, DST_DTYPE, 8, 16, kUseAIU, kInt8>);
+      break;
+  }
+  return true;
+}
+
+template <typename T, typename DST_DTYPE, bool kInt8>
+bool launch_rmsnorm_per_token_quant(
+    DLDevice device,
+    const T* input,
+    const T* weight,
+    T* output_y,
+    DST_DTYPE* output_q,
+    float* output_s,
+    uint32_t hidden_dim,
+    int64_t input_stride,
+    uint32_t num_tokens,
+    float eps) {
+  const uint32_t sm_count = host::runtime::get_sm_count(device.device_id);
+  if (hidden_dim % 1024 == 0) {
+    return launch_rmsnorm_per_token_quant_persistent<T, DST_DTYPE, kInt8, true>(
+        device, input, weight, output_y, output_q, output_s, hidden_dim, input_stride, num_tokens, eps, sm_count);
+  }
+  return launch_rmsnorm_per_token_quant_persistent<T, DST_DTYPE, kInt8, false>(
+      device, input, weight, output_y, output_q, output_s, hidden_dim, input_stride, num_tokens, eps, sm_count);
+}
+#endif
+
 /** \brief Validate and launch dynamic per-token FP8 E4M3 quantization. */
 template <typename T>
 void per_token_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
@@ -790,6 +1048,84 @@ void per_token_quant_fp8(tvm::ffi::TensorView input, tvm::ffi::TensorView output
         hidden_dim,
         num_tokens);
   }
+}
+
+/** \brief Validate and launch fused RMSNorm + per-token quantization.
+ *
+ * ``input`` is ``[M, K]`` and may be a row slice with ``stride(0) > K``;
+ * ``output_y`` receives the normalized row in the input dtype, ``output_q`` /
+ * ``output_s`` the per-token payload for the following GEMM. The fp8 entry
+ * point takes an E4M3 payload, the int8 entry point an int8 payload whose
+ * scale is max(max|y|, 1e-10) / 127.
+ */
+template <typename T, typename DST_DTYPE, bool kInt8>
+void rmsnorm_per_token_quant_impl(
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView output_y,
+    tvm::ffi::TensorView output_q,
+    tvm::ffi::TensorView output_s,
+    double eps) {
+  using namespace host;
+  auto M = SymbolicSize{"num_tokens"};
+  auto K = SymbolicSize{"hidden_dim"};
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+
+  TensorMatcher({M, K}).with_dtype<T>().with_device(device).with_strides({-1, 1}).verify(input);
+  TensorMatcher({K}).with_dtype<T>().with_device(device).verify(weight);
+  TensorMatcher({M, K}).with_dtype<T>().with_device(device).verify(output_y);
+  if constexpr (kInt8) {
+    TensorMatcher({M, K}).with_dtype<int8_t>().with_device(device).verify(output_q);
+  } else {
+    TensorMatcher({M, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(output_q);
+  }
+  TensorMatcher({M, 1}).with_dtype<float>().with_device(device).verify(output_s);
+
+  CHECK_HOST(M.unwrap() > 0) << "rmsnorm_per_token_quant: num_tokens must be positive";
+  CHECK_HOST(K.unwrap() > 0 && K.unwrap() % 16 == 0)
+      << "rmsnorm_per_token_quant: hidden_dim must be positive and a multiple of 16, got " << K.unwrap();
+  CHECK_HOST(M.unwrap() <= UINT32_MAX && K.unwrap() <= UINT32_MAX)
+      << "rmsnorm_per_token_quant: dimensions exceed uint32 indexing";
+
+  const uint32_t num_tokens = static_cast<uint32_t>(M.unwrap());
+  const uint32_t hidden_dim = static_cast<uint32_t>(K.unwrap());
+  // Bound to a local first: CHECK_HOST is a macro, and the commas inside the
+  // template argument list would be read as extra macro arguments.
+  const bool launched = launch_rmsnorm_per_token_quant<T, DST_DTYPE, kInt8>(
+      device.unwrap(),
+      static_cast<const T*>(input.data_ptr()),
+      static_cast<const T*>(weight.data_ptr()),
+      static_cast<T*>(output_y.data_ptr()),
+      static_cast<DST_DTYPE*>(output_q.data_ptr()),
+      static_cast<float*>(output_s.data_ptr()),
+      hidden_dim,
+      input.stride(0),
+      num_tokens,
+      static_cast<float>(eps));
+  CHECK_HOST(launched) << "rmsnorm_per_token_quant: no launch configuration fits hidden_dim=" << hidden_dim;
+}
+
+template <typename T>
+void rmsnorm_per_token_quant_fp8(
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView output_y,
+    tvm::ffi::TensorView output_q,
+    tvm::ffi::TensorView output_s,
+    double eps) {
+  rmsnorm_per_token_quant_impl<T, fp8_e4m3_t, false>(input, weight, output_y, output_q, output_s, eps);
+}
+
+template <typename T>
+void rmsnorm_per_token_quant_int8(
+    tvm::ffi::TensorView input,
+    tvm::ffi::TensorView weight,
+    tvm::ffi::TensorView output_y,
+    tvm::ffi::TensorView output_q,
+    tvm::ffi::TensorView output_s,
+    double eps) {
+  rmsnorm_per_token_quant_impl<T, int8_t, true>(input, weight, output_y, output_q, output_s, eps);
 }
 
 }  // namespace sglang

@@ -184,6 +184,18 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
+            # x = (fp8_input, per_token_input_scale[, orig_dtype]).
+            return apply_fp8_linear(
+                x[0],
+                layer.weight,
+                layer.weight_scale,
+                input_scale=x[1],
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                pre_quant_output_dtype=x[2] if len(x) > 2 else None,
+            )
         return apply_fp8_linear(
             x,
             layer.weight,
