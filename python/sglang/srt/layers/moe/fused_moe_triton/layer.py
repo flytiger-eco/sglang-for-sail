@@ -1235,6 +1235,16 @@ class FusedMoE(torch.nn.Module):
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
 
+        if (
+            _is_ppu
+            and isinstance(method, Fp8MoEMethod)
+            and method.use_ppu_w4a8
+            and param.dtype == torch.uint8
+            and loaded_weight.dtype == torch.float8_e8m0fnu
+        ):
+            # Preserve E8M0 exponent bytes, not their decoded numeric values.
+            loaded_weight = loaded_weight.view(torch.uint8)
+
         # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
         # expert weights into block layout. During weight update, we must restore
         # canonical load-time shapes before copying checkpoint tensors.
