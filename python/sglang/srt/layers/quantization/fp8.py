@@ -1185,11 +1185,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             backend = get_moe_runner_backend()
             if not (backend.is_auto() or backend.is_deep_gemm()):
                 raise ValueError("PPU MiMo W4A8 requires the deep_gemm runner")
-            if get_moe_a2a_backend().value not in ("none", "deepep"):
-                raise ValueError("PPU MiMo W4A8 supports none/deepep dispatch")
+            if not get_moe_a2a_backend().is_deepep():
+                raise ValueError("PPU MiMo W4A8 requires --moe-a2a-backend deepep")
             if is_tbo_enabled() or is_sbo_enabled():
                 raise ValueError("PPU MiMo W4A8 does not support TBO/SBO yet")
-            if get_moe_a2a_backend().is_deepep() and (
+            if (
                 get_exec().moe.deepep_dispatcher_output_dtype not in ("auto", "fp8")
                 or envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
             ):

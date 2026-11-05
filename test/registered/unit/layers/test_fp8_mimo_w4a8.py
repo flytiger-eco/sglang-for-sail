@@ -34,6 +34,7 @@ class TestFp8MimoW4A8(CustomTestCase):
             role="test",
         )
         get_flags().moe.runner_backend = MoeRunnerBackend.DEEP_GEMM
+        get_flags().moe.a2a_backend = MoeA2ABackend.DEEPEP
         self.config = fp8.Fp8Config(
             is_checkpoint_fp8_serialized=True,
             is_fp4_experts=True,

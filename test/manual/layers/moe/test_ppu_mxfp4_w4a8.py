@@ -1,6 +1,6 @@
 """One-GPU W4A8 integration checks; requires the matching PPU DeepGEMM build.
 
-Uses real weight preprocessing, routing, activation quantization and both GEMMs.
+Uses real weight preprocessing, activation quantization and both GEMMs.
 This does not replace checkpoint accuracy or multi-node DeepEP validation.
 """
 
@@ -22,9 +22,7 @@ from sglang.srt.layers.moe.moe_runner.deep_gemm import (
     DeepGemmMoeQuantInfo,
     DeepGemmRunnerInput,
 )
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import StandardTopKOutput
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.runtime_context import get_flags, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -40,6 +38,7 @@ def runtime():
         role="test",
     )
     get_flags().moe.runner_backend = MoeRunnerBackend.DEEP_GEMM
+    get_flags().moe.a2a_backend = MoeA2ABackend.DEEPEP
     torch.cuda.set_device(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     with tempfile.TemporaryDirectory(prefix="w4a8-single-rank-") as directory:
@@ -130,32 +129,6 @@ def reference_moe(x, ids, route_weights, weights):
         out = (quantized @ down[expert].T).bfloat16()
         result.index_add_(0, tokens, out.float() * route_weights[tokens, slots, None])
     return result.bfloat16()
-
-
-@pytest.mark.parametrize("tokens", [1, 17, 65, 257])
-@torch.inference_mode()
-def test_standard_moe(tokens):
-    torch.manual_seed(20261104)
-    layer, method, weights = make_layer()
-    x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
-    ids = torch.stack(
-        [torch.randperm(4, device="cuda")[:2] for _ in range(tokens)]
-    ).int()
-    probabilities = torch.rand(tokens, 2, device="cuda").softmax(-1)
-    expected = reference_moe(x, ids, probabilities, weights)
-    dispatch = StandardDispatchOutput(
-        hidden_states=x,
-        hidden_states_scale=None,
-        topk_output=StandardTopKOutput(probabilities, ids, None),
-    )
-    actual = method.apply(layer, dispatch).hidden_states
-    torch.cuda.synchronize()
-    assert torch.isfinite(actual).all()
-    delta = (actual.float() - expected.float()).square().sum()
-    energy = actual.float().square().sum() + expected.float().square().sum()
-    difference = (delta / energy.clamp_min(1e-20)).item()
-    print(f"tokens={tokens} normalized_squared_error={difference:.8g}", flush=True)
-    assert difference < 0.0015
 
 
 @torch.inference_mode()
@@ -282,40 +255,5 @@ def test_masked_moe_graph_replay(intermediate):
                     captured[expert, :count], eager[expert, :count], rtol=0, atol=0
                 )
             check_reference(captured)
-    finally:
-        capture_flags.disable_dispose_tensor = previous_dispose
-
-
-@torch.inference_mode()
-def test_standard_graph_replay():
-    torch.manual_seed(20261104)
-    layer, method, _ = make_layer()
-    tokens = 17
-    x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
-    ids = torch.stack(
-        [torch.randperm(4, device="cuda")[:2] for _ in range(tokens)]
-    ).int()
-    probabilities = torch.rand(tokens, 2, device="cuda").softmax(-1)
-    dispatch = StandardDispatchOutput(
-        x, None, StandardTopKOutput(probabilities, ids, None)
-    )
-    capture_flags = get_flags().capture
-    previous_dispose = capture_flags.disable_dispose_tensor
-    capture_flags.disable_dispose_tensor = True
-    try:
-        for _ in range(3):
-            method.apply(layer, dispatch)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = method.apply(layer, dispatch).hidden_states
-        for scale in (0.25, 2.0):
-            x.copy_(torch.randn_like(x) * scale)
-            # Change expert occupancy as well as activation values between replays.
-            ids.copy_((ids + 1) % 4)
-            eager = method.apply(layer, dispatch).hidden_states.clone()
-            graph.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(captured, eager, rtol=0, atol=0)
     finally:
         capture_flags.disable_dispose_tensor = previous_dispose
