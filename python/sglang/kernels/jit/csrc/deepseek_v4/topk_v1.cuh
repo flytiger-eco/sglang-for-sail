@@ -22,11 +22,11 @@ namespace sglang {
 // merges across every loaded object, so whichever module was used second
 // skipped its cudaFuncSetAttribute opt-in and then failed to launch with 64 KB
 // of dynamic shared memory ("invalid argument").
-constexpr uint32_t kMaxTopK = 1024;
+constexpr uint32_t kMaxTopK = 2048;
 // Fixed, and deliberately not tied to `topk`: run_cumsum() and the histogram
 // init below index up to RADIX + 1 == 257 threads, so a block sized after a
 // small topk would silently skip part of the histogram.
-constexpr uint32_t kTopKBlockSize = kMaxTopK;
+constexpr uint32_t kTopKBlockSize = 1024;
 constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
 
 struct TopKParams {
@@ -54,6 +54,7 @@ SGL_DEVICE uint32_t convert_to_uint32(float x) {
 }
 
 SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
+  if (page_table == nullptr) return static_cast<int32_t>(i);
   const uint32_t mask = (1u << page_bits) - 1u;
   return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
@@ -63,14 +64,15 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
 // ============================================================
 
 namespace v3 {
-constexpr uint32_t kBlockSize = 1024;
+constexpr uint32_t kBlockSize = kTopKBlockSize;
 constexpr uint32_t kNumWarps = kBlockSize / 32;
 constexpr uint32_t kHistBits = 12;
 constexpr uint32_t kHistBins = 1 << kHistBits;  // 4096
 constexpr uint32_t kVecsPerThread = 4;
 constexpr uint32_t kMax1PassLength = kVecsPerThread * 4 * kBlockSize;  // 16384
 constexpr uint32_t kMax2PassLength = 2 * kMax1PassLength;              // 32768
-constexpr uint32_t kMaxTies = 1024;
+// 2048 ties occupy 16KB, the same size as the histogram in their shared union.
+constexpr uint32_t kMaxTies = kMaxTopK;
 }  // namespace v3
 
 using Vec4 = device::AlignedVector<float, 4>;
@@ -148,7 +150,7 @@ struct RegisterTopKSmem {
 
 template <bool kIs2Pass>
 [[maybe_unused]]
-SGL_DEVICE void register_topk(
+SGL_DEVICE bool register_topk(
     const float* __restrict__ scores,
     int32_t* __restrict__ indices,
     const uint32_t length,
@@ -254,6 +256,11 @@ SGL_DEVICE void register_topk(
 
   const auto [thr_bin, num_above, num_equal] = smem->match;
 
+  // The tie buffer ranks at most kMaxTies arrivals; a coarse bin with more
+  // members would rank an arbitrary subset, so let the caller run the radix
+  // selection over the whole row instead.
+  if (num_equal > v3::kMaxTies) return true;
+
   // Phase 3: Scatter
   constexpr uint32_t kMaxTolerance = 0;
   const bool need_tiebreak = (num_equal + num_above > topk + kMaxTolerance);
@@ -318,7 +325,7 @@ SGL_DEVICE void register_topk(
   }
 
 [[maybe_unused]] LABEL_SCATTER_DONE:
-  if (!need_tiebreak) return;
+  if (!need_tiebreak) return false;
 
   // Phase 4: Tie-breaking within the threshold bin
   __syncthreads();
@@ -327,11 +334,14 @@ SGL_DEVICE void register_topk(
   const uint32_t topk_remain = topk - num_above;
 
   const auto is_greater = [](const TieV3& a, const TieV3& b) {
-    return (a.score > b.score) || (a.score == b.score && a.idx < b.idx);
+    if (a.score > b.score) return true;
+    if (a.score < b.score) return false;
+    // Equal scores or NaNs use the position as a deterministic tie-breaker.
+    return a.idx < b.idx;
   };
 
   if (num_ties <= 32u) {
-    if (lane_id >= num_ties || warp_id >= num_ties) return;
+    if (lane_id >= num_ties || warp_id >= num_ties) return false;
     const uint32_t mask = (1ull << num_ties) - 1u;
     const auto tie = tie_buffer[lane_id];
     const auto target_tie = tie_buffer[warp_id];
@@ -383,6 +393,7 @@ SGL_DEVICE void register_topk(
       }
     }
   }
+  return false;
 }
 
 [[maybe_unused]]
@@ -394,15 +405,10 @@ SGL_DEVICE void naive_transform(
     const uint32_t length,
     const uint32_t page_bits,
     const uint32_t topk) {
-  if (const auto tx = threadIdx.x; tx < length) {
-    indices[tx] = page_to_indices(page_table, tx, page_bits);
+  for (uint32_t i = threadIdx.x; i < topk; i += v3::kBlockSize) {
+    indices[i] = i < length ? page_to_indices(page_table, i, page_bits) : -1;
     if (raw_indices != nullptr) {
-      raw_indices[tx] = tx;
-    }
-  } else if (tx < topk) {
-    indices[tx] = -1;  // fill invalid indices to -1
-    if (raw_indices != nullptr) {
-      raw_indices[tx] = -1;
+      raw_indices[i] = i < length ? static_cast<int32_t>(i) : -1;
     }
   }
 }
@@ -459,6 +465,91 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         s_chunk_buf[bi][tx * 4 + e] = (base + e < length) ? input[base + e] : 0.0f;
       }
     }
+  };
+
+  // Exact fallback for a coarse bin that exceeds the candidate buffer: refine
+  // with histogram-only passes over the whole row, then write the selection
+  // once. Only the pathological clustering case takes this path, so the extra
+  // row scans stay off the normal route.
+  const auto radix_topk_exact = [&] {
+    uint32_t prefix = 0;
+    uint32_t remain = topk;
+    for (uint32_t round = 0; round < 4; ++round) {
+      const uint32_t byte_shift = 24 - round * 8;
+      const uint32_t prefix_shift = 32 - round * 8;
+      if (tx < RADIX + 1) s_histogram[tx] = 0;
+      __syncthreads();
+      issue_chunk(0, 0);
+      cp_async_commit();
+      issue_chunk(1, 1);
+      cp_async_commit();
+      for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+        const uint32_t bi = ci & 1;
+        cp_async_wait_group<1>();
+        __syncthreads();
+        const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+        for (uint32_t e = 0; e < 4; ++e) {
+          const uint32_t idx = base + tx * 4 + e;
+          if (idx >= length) continue;
+          const uint32_t key = convert_to_uint32(s_chunk_buf[bi][tx * 4 + e]);
+          if (round == 0 || (key >> prefix_shift) == prefix) {
+            ::atomicAdd(&s_histogram[(key >> byte_shift) & 0xFF], 1);
+          }
+        }
+        __syncthreads();
+        issue_chunk(ci + 2, bi);
+        cp_async_commit();
+      }
+      cp_async_wait_all();
+      __syncthreads();
+      run_cumsum();
+      if (tx == 0) s_threshold_bin_id = 0;
+      __syncthreads();
+      if (tx < RADIX && s_histogram[tx] > remain && s_histogram[tx + 1] <= remain) {
+        s_threshold_bin_id = tx;
+      }
+      __syncthreads();
+      const uint32_t threshold = s_threshold_bin_id;
+      remain -= s_histogram[threshold + 1];
+      prefix = (prefix << 8) | threshold;
+    }
+
+    if (tx == 0) {
+      s_counter = 0;
+      s_last_remain = static_cast<int32_t>(remain);
+    }
+    __syncthreads();
+    issue_chunk(0, 0);
+    cp_async_commit();
+    issue_chunk(1, 1);
+    cp_async_commit();
+    for (uint32_t ci = 0; ci < num_chunks; ++ci) {
+      const uint32_t bi = ci & 1;
+      cp_async_wait_group<1>();
+      __syncthreads();
+      const uint32_t base = ci * kChunkFloats;
+#pragma unroll
+      for (uint32_t e = 0; e < 4; ++e) {
+        const uint32_t idx = base + tx * 4 + e;
+        if (idx >= length) continue;
+        const uint32_t key = convert_to_uint32(s_chunk_buf[bi][tx * 4 + e]);
+        if (key > prefix) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          output[pos] = static_cast<int32_t>(idx);
+        } else if (key == prefix) {
+          if (::atomicAdd(&s_last_remain, -1) > 0) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            output[pos] = static_cast<int32_t>(idx);
+          }
+        }
+      }
+      __syncthreads();
+      issue_chunk(ci + 2, bi);
+      cp_async_commit();
+    }
+    cp_async_wait_all();
+    __syncthreads();
   };
 
   // stage 1: 8bit coarse histogram, pipelined via the chunk loader above.
@@ -557,6 +648,11 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     __syncthreads();
   }
 
+  if (s_num_input[0] > SMEM_INPUT_SIZE) {
+    radix_topk_exact();
+    return;
+  }
+
   // stage 2: refine with 8bit radix passes
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
@@ -622,6 +718,10 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
         }
       }
       __syncthreads();
+      if (s_num_input[r_idx ^ 1] > SMEM_INPUT_SIZE) {
+        radix_topk_exact();
+        return;
+      }
     }
   }
 }
@@ -636,45 +736,44 @@ __global__ __launch_bounds__(v3::kBlockSize, 2) void topk_512_transform_v3(const
 
   const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
-  const auto page_ptr = page_table + work_id * page_table_stride;
+  const auto page_ptr = page_table == nullptr ? nullptr : page_table + work_id * page_table_stride;
   const auto indices_ptr = page_indices + work_id * topk;
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * topk : nullptr;
 
   device::PDLWaitPrimary<kUsePDL>();
 
   if (seq_len <= topk) {
-    // Trivial case: just transform indices
-    const auto tx = threadIdx.x;
-    if (tx < seq_len) {
-      indices_ptr[tx] = page_to_indices(page_ptr, tx, page_bits);
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = tx;
-      }
-    } else if (tx < topk) {
-      indices_ptr[tx] = -1;
-      if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = -1;
-      }
-    }
+    // Strided output is needed when topk exceeds the 1024 threads per block.
+    naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits, topk);
   } else if (seq_len <= v3::kMax1PassLength) {
-    register_topk<false>(score_ptr, s_topk_indices, seq_len, topk, _smem);
+    const bool overflow = register_topk<false>(score_ptr, s_topk_indices, seq_len, topk, _smem);
     __syncthreads();
+    if (overflow) {
+      // A coarse threshold bin held more scores than the tie buffer ranks;
+      // select from the whole row instead.
+      radix_topk(score_ptr, s_topk_indices, seq_len, topk);
+      __syncthreads();
+    }
     const auto tx = threadIdx.x;
-    if (tx < topk) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+    for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
+      indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
       if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+        raw_indices_ptr[i] = s_topk_indices[i];
       }
     }
   } else if (seq_len <= v3::kMax2PassLength) {  // Stall instruction fetch: consider tagged as likely?
     [[likely]];
-    register_topk<true>(score_ptr, s_topk_indices, seq_len, topk, _smem);
+    const bool overflow = register_topk<true>(score_ptr, s_topk_indices, seq_len, topk, _smem);
     __syncthreads();
+    if (overflow) {
+      radix_topk(score_ptr, s_topk_indices, seq_len, topk);
+      __syncthreads();
+    }
     const auto tx = threadIdx.x;
-    if (tx < topk) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+    for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
+      indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
       if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+        raw_indices_ptr[i] = s_topk_indices[i];
       }
     }
   } else {
@@ -682,10 +781,10 @@ __global__ __launch_bounds__(v3::kBlockSize, 2) void topk_512_transform_v3(const
     radix_topk(score_ptr, s_topk_indices, seq_len, topk);
     __syncthreads();
     const auto tx = threadIdx.x;
-    if (tx < topk) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+    for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
+      indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
       if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+        raw_indices_ptr[i] = s_topk_indices[i];
       }
     }
   }
@@ -704,7 +803,7 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   /// NOTE: dangerous prefetch seq_len before PDL wait
   const uint32_t seq_len = seq_lens[work_id];
   const auto score_ptr = scores + work_id * score_stride;
-  const auto page_ptr = page_table + work_id * page_table_stride;
+  const auto page_ptr = page_table == nullptr ? nullptr : page_table + work_id * page_table_stride;
   const auto indices_ptr = page_indices + work_id * topk;
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * topk : nullptr;
 
@@ -716,10 +815,10 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
     __shared__ int32_t s_topk_indices[kMaxTopK];
     radix_topk(score_ptr, s_topk_indices, seq_len, topk);
     const auto tx = threadIdx.x;
-    if (tx < topk) {
-      indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
+    for (uint32_t i = tx; i < topk; i += v3::kBlockSize) {
+      indices_ptr[i] = page_to_indices(page_ptr, s_topk_indices[i], page_bits);
       if (raw_indices_ptr != nullptr) {
-        raw_indices_ptr[tx] = s_topk_indices[tx];
+        raw_indices_ptr[i] = s_topk_indices[i];
       }
     }
   }
@@ -744,7 +843,7 @@ struct TopKKernel {
   static void transform(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
-      const tvm::ffi::TensorView page_table,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
@@ -765,11 +864,17 @@ struct TopKKernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(seq_lens);
-    TensorMatcher({B, -1})  // strided page table
-        .with_strides({P, 1})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(page_table);
+    const int32_t* page_table_ptr = nullptr;
+    int64_t page_table_stride = 0;
+    if (page_table.has_value()) {
+      TensorMatcher({B, -1})  // strided page table
+          .with_strides({P, 1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(page_table.value());
+      page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
+      page_table_stride = P.unwrap();
+    }
     TensorMatcher({B, K})  // output, must be contiguous
         .with_dtype<int32_t>()
         .with_device(device)
@@ -788,15 +893,15 @@ struct TopKKernel {
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto topk = static_cast<uint32_t>(K.unwrap());
-    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 1024]");
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
     const auto params = TopKParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<int32_t*>(seq_lens.data_ptr()),
-        .page_table = static_cast<int32_t*>(page_table.data_ptr()),
+        .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
         .score_stride = S.unwrap(),
-        .page_table_stride = P.unwrap(),
+        .page_table_stride = page_table_stride,
         .page_bits = page_bits,
         .topk = topk,
     };

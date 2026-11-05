@@ -14,10 +14,12 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.srt.utils import is_sail
 
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
+    decode_score_chunks,
     decode_scores,
     get_deep_gemm_prefill_data,
     prefill_requests,
@@ -88,6 +90,8 @@ class DenseBlocksBackend:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
+        if is_sail():
+            return self._sail_publish_decode(inputs)
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -116,11 +120,72 @@ class DenseBlocksBackend:
         select_decode(inputs, d, inputs.indexer.index_topk)
         return published
 
+    def _sail_publish_decode(self, inputs: DecodeInputs):
+        picked = []  # (first row, its block ids) per scored chunk
+        for d in decode_score_chunks(
+            inputs=inputs,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        ):
+            picked.append(
+                (
+                    d.row_start,
+                    select_candidate_block_ids(
+                        d.scores,
+                        d.lens[:, None],
+                        topk_blocks=self.topk_blocks,
+                        block_size=self.block_size,
+                    ),
+                )
+            )
+            k = min(inputs.indexer.index_topk, d.lmax)
+            idx = d.scores.topk(k, dim=-1, sorted=False).indices
+            write_decode(inputs, d, idx)
+            del d  # release this chunk's logits before the next chunk is scored
+        if not picked:
+            return None
+        width = max(ids.shape[1] for _, ids in picked)
+        blocks = torch.full(
+            (inputs.positions.shape[0], width),
+            -1,
+            dtype=torch.int32,
+            device=inputs.positions.device,
+        )
+        for start, ids in picked:
+            blocks[start : start + ids.shape[0], : ids.shape[1]] = ids
+        return BlockIds(blocks=blocks)
+
+    def _sail_consume_decode(
+        self,
+        inputs: DecodeInputs,
+        published: Optional[BlockIds],
+    ) -> None:
+        assert published is not None
+        assert published.blocks.shape[0] == inputs.positions.shape[0]
+        for d in decode_score_chunks(
+            inputs=inputs,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        ):
+            k = min(inputs.indexer.index_topk, d.lmax)
+            idx = topk_among_blocks(
+                d.scores,
+                d.lens,
+                published.blocks[d.row_start : d.row_start + d.bs],
+                k,
+                block_size=self.block_size,
+            )
+            write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
+            del d  # release this chunk's logits before the next chunk is scored
+
     def consume_decode(
         self,
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if is_sail():
+            self._sail_consume_decode(inputs, published)
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -144,7 +209,7 @@ class DenseBlocksBackend:
 
     def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         selected, blocks = _publish_prefill_blocks(
@@ -165,7 +230,7 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -187,7 +252,6 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
                 picked.append(
@@ -223,7 +287,6 @@ class DenseBlocksBackend:
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
         ):
             for chunk in chunks:
                 idx = topk_among_blocks(

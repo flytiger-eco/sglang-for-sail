@@ -1,18 +1,58 @@
-"""SGLang DSv4.1 prefill integration of Mega mHC.
+"""DSv4.1 shifted MegaMHC boundary, adapted from SGLang PR #42808.
 
-Credit: DeepSeek's DeepGEMM project provides the fused Mega mHC kernel.
+Credit: DeepSeek's DeepGEMM project provides the fused MegaMHC kernel:
 https://github.com/deepseek-ai/DeepGEMM
+
+PPU SM89+ requires a DeepGEMM build exporting a compatible ``mega_mhc`` API.
+This adapter does not make the upstream SM100 kernel executable on PPU.
 """
+
+from __future__ import annotations
+
+import functools
+import logging
+from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.utils import get_device_sm, is_cuda, is_sail
 
-if is_cuda():
-    import deep_gemm
+logger = logging.getLogger(__name__)
+
+HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-def mhc_mega_boundary(
+@functools.cache
+def _mega_mhc_kernel():
+    try:
+        import deep_gemm
+    except ImportError:
+        kernel = None
+    else:
+        kernel = getattr(deep_gemm, "mega_mhc", None)
+    if not callable(kernel):
+        logger.warning(
+            "MegaMHC prefill requested but DeepGEMM has no mega_mhc API; "
+            "using the existing mHC path."
+        )
+        return None
+    return kernel
+
+
+def mega_mhc_supported() -> bool:
+    """Whether this build can run the fused MegaMHC boundary."""
+    if not ENABLE_JIT_DEEPGEMM:
+        return False
+    sm = get_device_sm()
+    if is_sail():
+        supported = sm >= 89
+    else:
+        supported = is_cuda() and 100 <= sm < 110
+    return supported and _mega_mhc_kernel() is not None
+
+
+def try_mhc_mega_boundary(
     x,
     residual,
     pre,
@@ -26,22 +66,52 @@ def mhc_mega_boundary(
     hc_eps,
     norm_eps,
     sinkhorn_iters,
-):
-    """Update the residual, collapse with carried pre, and compute next stats.
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, HcTriplet]]:
+    """Update residual, collapse with carried pre, and compute next stats.
 
-    The collapse uses ``pre`` from the preceding sublayer, not the new pre
-    produced from the updated residual. Preserve this DSv4.1 shifted ordering.
-    Used by the opt-in SM10x prefill path. Before CUDA graph capture, warm up
-    on the capture stream to initialize DeepGEMM's per-stream barriers.
+    The collapse uses the preceding sublayer's ``pre``, not the newly computed
+    pre. BF16 output keeps the existing attention/MoE quantization contracts.
+    Warm on each execution stream before CUDA Graph capture to initialize the
+    backend's per-stream barriers. A failure after launch propagates; it must
+    not trigger a retry against potentially modified buffers. ``None`` means
+    the caller must fall back before any buffer is touched.
     """
+    if x.ndim != 2 or residual.ndim != 3:
+        return None
     rows, hidden = x.shape
+    if not 0 < rows <= 1 << 20 or hidden <= 0 or hidden % 1024 or sinkhorn_iters < 1:
+        return None
     hc = residual.shape[1]
+    if hc < 1:
+        return None
+    tensors = (
+        (x, (rows, hidden), torch.bfloat16),
+        (residual, (rows, hc, hidden), torch.bfloat16),
+        (pre, (rows, hc), torch.float32),
+        (post, (rows, hc), torch.float32),
+        (comb, (rows, hc, hc), torch.float32),
+        (fn, (24, hc * hidden), torch.float32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (weight, (hidden,), torch.bfloat16),
+    )
+    if not x.is_cuda or any(
+        tensor.shape != shape
+        or tensor.dtype != dtype
+        or tensor.device != x.device
+        or not tensor.is_contiguous()
+        for tensor, shape, dtype in tensors
+    ):
+        return None
+    kernel = _mega_mhc_kernel()
+    if kernel is None:
+        return None
     updated = torch.empty_like(residual)
     normalized = torch.empty_like(x)
     next_pre = torch.empty((rows, hc, 1), device=x.device, dtype=torch.float32)
     next_post = torch.empty_like(next_pre)
     next_comb = torch.empty_like(comb)
-    deep_gemm.mega_mhc(
+    kernel(
         x=x,
         residual=residual,
         shifted_prev_mix=pre.unsqueeze(-1),
@@ -65,4 +135,8 @@ def mhc_mega_boundary(
         new_comb_res_mix=next_comb,
         y_bf16=normalized,
     )
-    return updated, normalized, (next_pre.squeeze(-1), next_post.squeeze(-1), next_comb)
+    return updated, normalized, (
+        next_pre.squeeze(-1),
+        next_post.squeeze(-1),
+        next_comb,
+    )

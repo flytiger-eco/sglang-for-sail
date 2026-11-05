@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,6 +37,9 @@ register_cpu_ci(est_time=17, suite="base-a-test-cpu")
 _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
 _METADATA = "sglang.srt.layers.attention.dsv4.metadata"
 _MQA_UTILS = "sglang.srt.layers.attention.mqa_logits_utils"
+# PPU (SAIL) bypasses the upstream non-paged indexer and does not build its
+# SM100 candidate gating; the contract cases below assert the CUDA behaviour.
+_IS_SAIL = is_sail()
 
 # issue #35201: 372K raw tokens -> 92992 c4 columns, padded to 93184 by DeepGEMM.
 _ISSUE_C4_COLS = 92992
@@ -355,6 +359,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             with self.subTest(case=case):
                 self.assertFalse(self._is_eligible(**case))
 
+    @unittest.skipIf(_IS_SAIL, "PPU bypasses the upstream non-paged indexer (_get_nonpaged_indexer_plan returns None on SAIL)")
     def test_single_request_plan_contract(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
@@ -405,6 +410,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         with threshold.override(0):
             self.assertIsNone(build_plan())
 
+    @unittest.skipIf(_IS_SAIL, "PPU bypasses the upstream non-paged indexer (_get_nonpaged_indexer_plan returns None on SAIL)")
     def test_plan_row_chunking_follows_the_forward_budget(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
@@ -449,6 +455,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             plan.rows_per_chunk * mqa_logits_row_bytes(plan.max_seqlen_k), budget
         )
 
+    @unittest.skipIf(_IS_SAIL, "PPU bypasses the upstream non-paged indexer (_get_nonpaged_indexer_plan returns None on SAIL)")
     def test_extreme_plan_metadata_is_bounded_and_fail_closed(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
         backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
@@ -497,6 +504,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         with threshold.override(query_rows):
             self.assertIsNone(build_plan())
 
+    @unittest.skipIf(_IS_SAIL, "PPU bypasses the upstream non-paged indexer (_get_nonpaged_indexer_plan returns None on SAIL)")
     def test_query_threshold_boundary(self):
         can_use_nonpaged_indexer = MagicMock(return_value=True)
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
@@ -929,6 +937,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             compressed_page_size=64,
             topk_metadata_chunks=self.topk_plans,
             use_topk_v2=True,
+            rows_per_request=1,
             row_chunks=lambda: list(zip(self.chunks, self.plans)),
         )
         inputs = DecodeInputs(
@@ -972,6 +981,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         for call, plan in zip(topk.call_args_list, self.topk_plans):
             self.assertIs(call.kwargs["topk_metadata"], plan)
 
+    @unittest.skipIf(_IS_SAIL, "v0.5.22 PPU fork's sparse_table has no topk_transform_paged_from_metadata")
     def test_candidate_publisher_takes_one_schedule_per_call(self):
         from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
 
@@ -1040,7 +1050,66 @@ class TestChunkedPagedDecode(CustomTestCase):
         self._assert_chunked_calls(deep_gemm, topk)
 
 
+class TestGroupedVerifyRows(CustomTestCase):
+    """Static verify rows reach the paged logits kernel as one request per block."""
+
+    def _args(self, rows_per_request, rows=slice(None)):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            DeepGEMMDecodeData,
+        )
+
+        requests, block, heads, pages = 3, 6, 2, 4
+        num_rows = requests * block
+        lens = torch.arange(num_rows, dtype=torch.int32) + 100
+        table = torch.arange(requests * pages, dtype=torch.int32).view(requests, pages)
+        metadata = SimpleNamespace(
+            compressed_seq_lens=lens,
+            page_table=table.repeat_interleave(block, dim=0),
+            rows_per_request=rows_per_request,
+        )
+        data = DeepGEMMDecodeData(
+            q_fp4=torch.arange(num_rows * heads * 64, dtype=torch.int8).view(
+                num_rows, 1, heads, 64
+            ),
+            q_sf=torch.arange(num_rows * heads, dtype=torch.int32).view(
+                num_rows, 1, heads
+            ),
+            weights=torch.zeros((num_rows, heads), dtype=torch.float32),
+            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
+        )
+        return data, metadata, table, data.paged_logits_args(metadata, rows)
+
+    def test_one_row_per_request_keeps_the_per_row_layout(self):
+        data, metadata, _table, ((q, sf), lens, table) = self._args(1)
+        self.assertTrue(torch.equal(q, data.q_fp4))
+        self.assertTrue(torch.equal(sf, data.q_sf))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens))
+        self.assertTrue(torch.equal(table, metadata.page_table))
+
+    def test_block_rows_become_one_request(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(6)
+        self.assertEqual(tuple(q.shape), (3, 6, 2, 64))
+        self.assertEqual(tuple(sf.shape), (3, 6, 2))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens.view(3, 6)))
+        self.assertEqual(tuple(table.shape), (3, 4))
+        self.assertTrue(torch.equal(table, per_request_table))
+        self.assertEqual(table.stride(1), 1)
+
+    def test_row_chunk_groups_its_own_rows(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(
+            6, slice(6, 18)
+        )
+        self.assertEqual(tuple(q.shape), (2, 6, 2, 64))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4[6:18]))
+        self.assertTrue(
+            torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6))
+        )
+        self.assertTrue(torch.equal(table, per_request_table[1:]))
+
+
 class TestCandidateIndexerGating(CustomTestCase):
+    @unittest.skipIf(_IS_SAIL, "SM100 candidate-indexer gating does not apply on PPU")
     def test_candidate_indexer_gating(self):
         from sglang.srt.layers.attention.dsv4 import v41_indexer
         from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (

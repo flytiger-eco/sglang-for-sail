@@ -28,7 +28,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_mega import (
+    mega_mhc_supported,
+    try_mhc_mega_boundary,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -579,11 +582,13 @@ def _compute_triplet(
 
 
 def _can_use_mega_mhc(cfg: HcConfig) -> bool:
-    return (
-        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        and get_platform().is_sm100
-        and not cfg.cp_prefill
-    )
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get() or cfg.cp_prefill:
+        return False
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if is_batch_invariant_mode_enabled():
+        return False
+    return mega_mhc_supported()
 
 
 def _post_fusion(
@@ -606,7 +611,7 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
-        updated, normalized, stats = mhc_mega_boundary(
+        result = try_mhc_mega_boundary(
             y,
             residual,
             pre,
@@ -621,7 +626,9 @@ def _post_fusion(
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
         )
-        return HcState(updated, pre, HcNormed(normalized), stats)
+        if result is not None:
+            updated, normalized, stats = result
+            return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None
         and next.norm_fusable
