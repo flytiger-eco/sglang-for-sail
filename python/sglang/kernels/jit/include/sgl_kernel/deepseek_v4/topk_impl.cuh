@@ -27,6 +27,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #if !defined(USE_ROCM)
 // currently only apply cluster for SM90 & SM100, SM120 has poor cluster performance
@@ -170,8 +171,9 @@ struct alignas(8) TieValue {
 // Per-batch problem description + page-table transform sink
 // ---------------------------------------------------------------------------
 
-struct TopKProblem {
-  const float* __restrict__ in;
+template <typename DType>
+struct TopKProblemT {
+  const DType* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -182,6 +184,8 @@ struct TopKProblem {
     out[pos] = static_cast<int32_t>(raw_idx) + bias;
   }
 };
+
+using TopKProblem = TopKProblemT<fp32_t>;
 
 // ---------------------------------------------------------------------------
 // Shared configuration + tie handling (exact radix select on the threshold bin)
@@ -197,7 +201,9 @@ struct TopKConfig {
   // filled from them (above_count can be 0, e.g. heavily tied or all-inf
   // scores). A smaller cap leaves slots that handle_tie can only pad, and
   // padded slots inside the first min(seq_len, topk) entries are dereferenced
-  // by downstream sparse attention.
+  // by downstream sparse attention. A bin holding MORE than kMaxNumTie
+  // candidates (distinct values included) is not clipped: the register and
+  // streaming paths resolve it with TopKRadixBase::select_overflow_bin.
   static constexpr uint32_t kMaxNumTie = 2048;
   static constexpr uint32_t kRadixSize = 1 << 8;
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
@@ -221,9 +227,10 @@ struct TopKConfig {
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  template <typename Problem>
   SGL_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const Problem& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -311,10 +318,10 @@ struct TopKConfig {
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
-  template <uint32_t kItems>
+  template <uint32_t kItems, typename Problem>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const Problem& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -417,6 +424,8 @@ struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kHistBits = kHistBits_;
   static constexpr uint32_t kHistSize = 1 << kHistBits;
   using vec_t = AlignedVector<float, kVecSize>;
+  template <typename DType>
+  using in_vec_t = AlignedVector<DType, kVecSize>;
 
   struct Smem {
     uint32_t count_eq;
@@ -438,8 +447,34 @@ struct TopKRadixBase : TopKConfig {
   };
 
  protected:
-  template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  template <typename DType>
+  SGL_DEVICE static void load_input_vec(  //
+      vec_t& dst,
+      const DType* __restrict__ in,
+      uint32_t vi,
+      uint32_t seq_len) {
+    if constexpr (std::is_same_v<DType, fp32_t>) {
+      dst.load(in, vi);
+    } else {
+      const auto base = vi * kVecSize;
+      if (base + kVecSize <= seq_len) {
+        in_vec_t<DType> src;
+        src.load(in, vi);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          dst[j] = cast<float>(src[j]);
+        }
+      } else {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          dst[j] = base + j < seq_len ? cast<float>(in[base + j]) : padding_value();
+        }
+      }
+    }
+  }
+
+  template <uint32_t N = 1, typename DType, typename F>
+  SGL_DEVICE static void for_each_input(const DType* __restrict__ in, uint32_t seq_len, F&& fn) {
     constexpr auto kStride = N * kBlockSize;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;  // fully-in-bounds vectors
@@ -447,7 +482,7 @@ struct TopKRadixBase : TopKConfig {
     // lane | rank | warp
     auto vi = N == 1 ? tx : (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
     if (vi < num_full) {
-      vec_t next_vec;
+      in_vec_t<DType> next_vec;
       next_vec.load(in, vi);
 #pragma unroll 1
       do {
@@ -457,7 +492,7 @@ struct TopKRadixBase : TopKConfig {
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          fn(cur[j], base + j);
+          fn(cast<float>(cur[j]), base + j);
         }
       } while (vi < num_full);
     }
@@ -465,11 +500,18 @@ struct TopKRadixBase : TopKConfig {
     if (vi == num_full) {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
-      vec_t cur;
-      cur.load(in, vi);
+      if constexpr (std::is_same_v<DType, fp32_t>) {
+        vec_t cur;
+        cur.load(in, vi);
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j) {
-        if (base + j < seq_len) fn(cur[j], base + j);
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (base + j < seq_len) fn(cur[j], base + j);
+        }
+      } else {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (base + j < seq_len) fn(cast<float>(in[base + j]), base + j);
+        }
       }
     }
   }
@@ -524,6 +566,94 @@ struct TopKRadixBase : TopKConfig {
 
     __syncthreads();
   }
+
+  /// Exact selection for a threshold bin whose collect overflowed tie_values
+  /// (num_ties > kMaxNumTie): the buffer then holds an arbitrary subset of the
+  /// bin, which may miss strictly larger scores. Instead rescan the row from
+  /// global memory and radix-select the bin on the exact fp32 key, 8 bits per
+  /// round with histogram-only passes, then emit once. `base` / `topk` are as
+  /// in handle_tie; requires 0 < topk <= num_ties. Must be called by the whole
+  /// block after the collect pass has been published by a barrier.
+  template <typename DType>
+  SGL_DEVICE static void select_overflow_bin(  //
+      const TopKProblemT<DType>& problem,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t base,
+      const uint32_t num_ties,
+      const uint32_t topk,
+      Smem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = broadcast(tx / kWarpSize);
+    // Only the coarse histogram and tie_values are dead here; the 256-bin
+    // scratch lives in tie_handle, which overlaps neither of them.
+    const auto scratch = &smem->tie_handle;
+    const auto histogram = scratch->histogram[0];
+    // Visit exactly the elements the collect pass classified as ties; scores
+    // go through the same DType -> float cast, and padding (NaN) never ties.
+    const auto for_each_tie = [&](auto&& fn) {
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (!(val >= v_hi) && val >= v_lo) fn(val, idx);
+      });
+    };
+
+    uint32_t prefix = 0;        // decided high bits of the threshold key
+    uint32_t prefix_mask = 0;   // which bits of `prefix` are decided
+    uint32_t total = num_ties;  // ties whose key matches `prefix`
+    uint32_t remain = topk;     // slots still owed to those ties
+    if (tx == kRadixSize) scratch->counter = scratch->counter_final = 0;
+#pragma unroll 1
+    for (uint32_t round = 0; round < 4; ++round) {
+      const uint32_t shift = 24 - round * 8;
+      if (tx < kRadixSize) histogram[tx] = 0;
+      __syncthreads();
+      for_each_tie([&](float val, uint32_t) {
+        const auto key = extract_exact_bin(val);
+        if ((key & prefix_mask) == prefix) atomicAdd(&histogram[(key >> shift) & 0xFFu], 1);
+      });
+      __syncthreads();
+
+      uint32_t hist_val = 0;
+      uint32_t warp_inc = 0;
+      if (tx < kRadixSize) {
+        hist_val = histogram[tx];
+        warp_inc = warp::inclusive_sum(hist_val, lane_id);
+        if (lane_id == kWarpSize - 1) scratch->warp_sum[warp_id] = warp_inc;
+      }
+      __syncthreads();
+      if (tx < kRadixSize) {
+        const auto inter = warp::reduce_sum(lane_id < warp_id ? scratch->warp_sum[lane_id] : 0);
+        const auto above = total - (inter + warp_inc);  // matching keys in higher digits
+        if (above < remain && above + hist_val >= remain) {
+          scratch->match = {tx, above, hist_val};
+        }
+      }
+      __syncthreads();
+
+      // 0 < remain <= total holds every round, so exactly one digit matched.
+      const auto [digit, above_count, equal_count] = scratch->match;
+      prefix |= digit << shift;
+      prefix_mask |= 0xFFu << shift;
+      remain -= above_count;
+      total = equal_count;
+      if (remain == total) break;  // the whole digit bin is selected
+    }
+
+    // Keys above the decided prefix are selected outright; `remain` of the keys
+    // equal to it fill the trailing slots. Once all 32 bits are decided those
+    // are bit-identical scores. The counters were published by the first round.
+    const auto num_above = topk - remain;
+    for_each_tie([&](float val, uint32_t idx) {
+      const auto key = extract_exact_bin(val) & prefix_mask;
+      if (key > prefix) {
+        problem.emit(base + atomicAdd(&scratch->counter, 1), idx);
+      } else if (key == prefix) {
+        const auto pos = atomicAdd(&scratch->counter_final, 1);
+        if (pos < remain) problem.emit(base + num_above + pos, idx);
+      }
+    });
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -539,8 +669,8 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename DType>
+  SGL_DEVICE static void forward(const TopKProblemT<DType>& problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -559,7 +689,7 @@ struct TopKRegister : TopKRadixBase<12> {
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(problem.in, vi);
+      if (vi < num_full) load_input_vec(local_vecs[i], problem.in, vi, problem.seq_len);
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -627,6 +757,10 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      // The registers are not kept live for this rare path; rescan global memory.
+      return select_overflow_bin(problem, v_lo, v_hi, count_gt, count_eq, remain_topk, smem);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -640,8 +774,8 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename DType>
+  SGL_DEVICE static void forward(TopKProblemT<DType> problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -704,6 +838,9 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    if (count_eq > kMaxNumTie && remain_topk > 0) [[unlikely]] {
+      return select_overflow_bin(problem, v_lo, v_hi, count_gt, count_eq, remain_topk, smem);
+    }
     const auto tie_count = min(count_eq, kMaxNumTie);
     handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
   }
@@ -752,8 +889,8 @@ struct TopKCluster : TopKRadixBase<10> {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
   }
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename DType>
+  SGL_DEVICE static void forward(TopKProblemT<DType> problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cooperative_groups::this_cluster();

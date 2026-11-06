@@ -150,3 +150,7 @@ def test_v1_top2048_cuda_graph_replay():
         torch.cuda.synchronize()
         for row, size in enumerate(lens):
             _check_row(scores[row], output[row], size, 2048)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

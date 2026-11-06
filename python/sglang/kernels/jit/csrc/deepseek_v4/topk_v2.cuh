@@ -28,6 +28,7 @@ namespace sglang {
 
 namespace impl = device::topk;
 using impl::TopKProblem;
+using impl::TopKProblemT;
 
 enum class TopKMode {
   INDICES,      ///< raw selected indices into `out`; `page_table` unused
@@ -70,8 +71,9 @@ struct PageTransform {
   }
 };
 
+template <typename DType>
 struct TopKPagedParams {
-  const float* __restrict__ scores;
+  const DType* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
@@ -102,22 +104,23 @@ struct TopKPagedParams {
         page_bits,
         raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk)};
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
+  SGL_DEVICE TopKProblemT<DType> problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
-    return TopKProblem{
+    return TopKProblemT<DType>{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
         .topk = topk,
         .seq_len = seq_len,
     };
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
+  SGL_DEVICE TopKProblemT<DType> problem(uint32_t batch_id) const {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
 
+template <typename DType>
 struct TopKRaggedParams {
-  float* __restrict__ scores;  // NOTE: may write
+  DType* __restrict__ scores;  // NOTE: may write
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ row_starts;
   const int32_t* __restrict__ out_offsets;
@@ -139,8 +142,8 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   }
 }
 
-template <bool kPDL, TopKMode kMode>
-SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransform& transform) {
+template <bool kPDL, TopKMode kMode, typename Problem>
+SGL_DEVICE void trivial_transform(const Problem& problem, const PageTransform& transform) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
@@ -155,8 +158,8 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
   });
 }
 
-template <TopKMode kMode>
-SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
+template <TopKMode kMode, typename Problem>
+SGL_DEVICE void paged_transform(const Problem& problem, int32_t* out, const PageTransform& transform) {
   static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
@@ -199,8 +202,8 @@ SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const 
  *     reordering.
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
-template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+template <bool kPDL, typename DType>
+TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams<DType> params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto bx = blockIdx.x;
@@ -227,11 +230,11 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
+      score[row_start - rem + tx] = device::cast<DType>(impl::padding_value());
     }
   }
   using device::topk::broadcast;
-  const auto problem = TopKProblem{
+  const auto problem = TopKProblemT<DType>{
       .in = score + (row_start - rem),
       .out = out,
       .topk = topk,
@@ -250,10 +253,6 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
   // PDL trigger secondary at the end the block typically has no use, so ignore it
 }
 
-#ifdef USE_ROCM
-// Only the ROCm DSA prefill emits this layout today, so CUDA/XPU builds stay
-// unchanged. Nothing below is AMD-specific; the guard can be dropped later.
-
 /**
  * \brief Parameters of the packed (DSA extend) layout.
  *
@@ -263,9 +262,10 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
  * expands one request into many query-token rows, so several score rows share a
  * page-table row; `row_to_batch[i]` says which one.
  */
+template <typename DType>
 struct TopKPackedParams {
   // NOTE: may write. The head of the window is masked in place, see the kernel.
-  float* __restrict__ scores;
+  DType* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;      // per-row window length
   const int32_t* __restrict__ row_starts;    // per-row score column offset
   const int32_t* __restrict__ row_to_batch;  // per-row page-table row; null => identity
@@ -290,8 +290,8 @@ struct TopKPackedParams {
  * is picked per row at runtime and only the register and streaming
  * implementations are instantiated (no plan, no cluster path).
  */
-template <bool kPDL>
-TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams params) {
+template <bool kPDL, typename DType>
+TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams<DType> params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
@@ -305,7 +305,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   const auto out = params.page_indices + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
 
-  auto problem = TopKProblem{
+  auto problem = TopKProblemT<DType>{
       .in = score + row_start,
       .out = out,
       .topk = topk,
@@ -324,7 +324,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
+      score[row_start - rem + tx] = device::cast<DType>(impl::padding_value());
     }
   }
   using device::topk::broadcast;
@@ -345,7 +345,6 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   __syncthreads();
   paged_transform<TopKMode::PAGE_TABLE>(problem, out, transform);
 }
-#endif  // USE_ROCM
 
 /**
  * \brief Main kernel for the short items and epilogue of long items.
@@ -356,8 +355,8 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel, TopKMode kMode>
-TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params) {
+template <bool kPDL, int kLevel, TopKMode kMode, typename DType>
+TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams<DType> params) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   constexpr bool kHandleCluster = (kLevel == 3);
@@ -435,8 +434,8 @@ constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
 /// Persistent cluster kernel for the items the plan routed to the pool; topk_main_kernel handles the rest.
-template <bool kPDL, uint32_t kClusterSize>
-CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
+template <bool kPDL, uint32_t kClusterSize, typename DType>
+CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams<DType> params) {
   device::enable_smem_spilling();
   using ClusterN = impl::TopKCluster<kClusterSize>;
   __shared__ impl::MaxSmem<typename ClusterN::Smem> smem;
@@ -456,8 +455,8 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   }
 }
 
-template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
-CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
+template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy, typename DType>
+CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams<DType> params) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   const auto bx = blockIdx.x;
@@ -489,7 +488,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
     if constexpr (kNeedStaging) {
       problem.out = cluster.map_shared_rank(s_topk_indices, 0);
     }
-    ClusterN::forward<kPDL>(problem, &smem);
+    ClusterN::template forward<kPDL>(problem, &smem);
     if constexpr (kNeedStaging) {
       device::PDLTriggerSecondary<kPDL>();
       cluster.sync();
@@ -604,7 +603,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan_cluster(
 
 #endif  // SUPPORT_CLUSTER
 
-template <bool kUsePDL>
+template <bool kUsePDL, typename DType = fp32_t>
 struct TopKKernel {
   static void plan(  //
       const tvm::ffi::TensorView seq_lens,
@@ -662,7 +661,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<DType>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -703,7 +702,7 @@ struct TopKKernel {
     }
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 input elements");
     RuntimeCheck(metadata.size(0) == B.unwrap() + 1, "invalid metadata shape");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
@@ -724,8 +723,8 @@ struct TopKKernel {
       }
     };
 
-    const auto params = TopKPagedParams{
-        .scores = static_cast<const float*>(scores.data_ptr()),
+    const auto params = TopKPagedParams<DType>{
+        .scores = static_cast<const DType*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
@@ -764,7 +763,7 @@ struct TopKKernel {
           if (batch_size <= kMaxCluster16BatchSize) {
             constexpr uint32_t kClusterSize = 16;
             // Widths above 8 are non-portable; the launch is rejected without this.
-            const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
+            const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1, DType>;
             [[maybe_unused]]
             static const bool _ = [&kernel] {
               const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
@@ -782,16 +781,16 @@ struct TopKKernel {
             constexpr uint32_t kClusterSize = 8;
             return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-                .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+                .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2, DType>, params);
           } else {
             constexpr uint32_t kClusterSize = 8;
             const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
             LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-                .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize>, params);
+                .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize, DType>, params);
             LaunchKernel(batch_size, kBlockSize, device)
                 .config({.use_pdl = kUsePDL})
-                .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
+                .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode, DType>, params);
             return void();
           }
         }
@@ -800,15 +799,15 @@ struct TopKKernel {
       if (max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode, DType>, params);
       } else if (max_seq_len <= kReg4MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, kMode>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, kMode, DType>, params);
       } else {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode, DType>, params);
       }
     });
   }
@@ -842,7 +841,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<DType>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -866,12 +865,12 @@ struct TopKKernel {
       row_starts_ptr = static_cast<const int32_t*>(row_starts.value().data_ptr());
     }
 
-    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 input elements");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
-    const auto params = TopKRaggedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
+    const auto params = TopKRaggedParams<DType>{
+        .scores = static_cast<DType*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .row_starts = row_starts_ptr,
         .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
@@ -881,10 +880,9 @@ struct TopKKernel {
     };
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
-        .launch(topk_ragged_kernel<kUsePDL>, params);
+        .launch(topk_ragged_kernel<kUsePDL, DType>, params);
   }
 
-#ifdef USE_ROCM  // see the packed kernel above
   /**
    * \brief Packed (DSA extend prefill) variant of `transform_paged`: per-row
    * window inside one batch-global score buffer, page-table output, no plan.
@@ -915,7 +913,7 @@ struct TopKKernel {
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
-        .with_dtype<float>()
+        .with_dtype<DType>()
         .with_device(device_)
         .verify(scores);
     TensorMatcher({B})  // seq_lens
@@ -947,15 +945,15 @@ struct TopKKernel {
     }
 
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
-    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 input elements");
     // The kernel masks the head of each window in place, so overlapping rows
     // would clobber each other.
     RuntimeCheck(S.unwrap() >= L.unwrap(), "scores rows must not overlap");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
-    const auto params = TopKPackedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
+    const auto params = TopKPackedParams<DType>{
+        .scores = static_cast<DType*>(scores.data_ptr()),
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
         .row_to_batch = row_to_batch_ptr,
@@ -968,9 +966,8 @@ struct TopKKernel {
     };
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
-        .launch(topk_packed_kernel<kUsePDL>, params);
+        .launch(topk_packed_kernel<kUsePDL, DType>, params);
   }
-#endif  // USE_ROCM
 };
 
 }  // namespace sglang

@@ -659,7 +659,7 @@ def topk_from_pooled_history_logits(
         "page_table_row_index requires the fused fast_kpool group_topk path"
     )
 
-    from sgl_kernel import fast_topk_v2
+    from sglang.kernels.ops.attention.fast_topk import fast_topk_v2
 
     selected_groups = fast_topk_v2(
         logits,

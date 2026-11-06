@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -411,6 +415,7 @@ class DeepseekSparseAttnBackend(
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        self.indexer_num_heads = get_dsa_index_n_heads(hf_config)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -800,10 +805,15 @@ class DeepseekSparseAttnBackend(
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
     def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+        # Match the indexer's Q tensor, not the tensor-parallel MLA heads.
+        # FP4 stores two values per byte; its kernel uses the packed head dim.
+        head_dim = self.indexer_head_dim
+        if getattr(self.token_to_kv_pool, "use_fp4_indexer", False):
+            head_dim //= 2
         return (
             1,  # next_n
-            self.num_q_heads,  # num_heads
-            self.indexer_head_dim,  # head_dim
+            self.indexer_num_heads,
+            head_dim,
             (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
         )
 

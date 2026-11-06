@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -133,7 +133,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         ks: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         ke_offset: Optional[torch.Tensor] = None,
-        batch_idx_list: Optional[List[int]] = None,
+        batch_idx_list: Optional[Union[List[int], torch.Tensor]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if topk_indices_offset_override is not None:
@@ -142,12 +142,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         elif cu_seqlens_q is not None:
             cu_seqlens_q = cu_seqlens_q.to(torch.int32)
             cu_seqlens_q_topk = compute_cu_seqlens(cu_seqlens_q)
-            cu_topk_indices_offset = torch.repeat_interleave(
-                cu_seqlens_q_topk[:-1],
-                cu_seqlens_q,
-                # Avoid reading sum(cu_seqlens_q) back to the host.
-                output_size=logits.shape[0],
-            )
+            cu_topk_indices_offset = None
+            if self.topk_transform_method == TopkTransformMethod.RAGGED:
+                cu_topk_indices_offset = torch.repeat_interleave(
+                    cu_seqlens_q_topk[:-1],
+                    cu_seqlens_q,
+                    # Avoid reading sum(cu_seqlens_q) back to the host.
+                    output_size=logits.shape[0],
+                )
         else:
             cu_seqlens_q_topk = self.attn_metadata.cu_seqlens_q
             cu_topk_indices_offset = self.attn_metadata.topk_indices_offset
