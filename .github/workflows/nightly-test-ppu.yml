@@ -155,13 +155,25 @@ jobs:
               "/nas_aisw",
               "/nas_aisw/datasets",
               "/nas_aisw/datasets/datasets",
+              "/nas_aisw/datasets/datasets/LLM",
+              "/nas_aisw/datasets/datasets/LLM/anon8231489123",
+              "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0",
+              "/nas_aisw/datasets/datasets/LLM/ZhipuAI",
+              "/nas_aisw/datasets/datasets/LLM/ZhipuAI/v2",
+              "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination",
+              "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1",
               "/nas_aisw/datasets/hf_cache",
           ):
               root = Path(value)
               entries = []
               error = None
               try:
-                  entries = sorted(path.name + "/" if path.is_dir() else path.name for path in root.iterdir())[:100]
+                  entries = sorted(
+                      path.name + " -> " + os.readlink(path)
+                      if path.is_symlink()
+                      else path.name + "/" if path.is_dir() else path.name
+                      for path in root.iterdir()
+                  )[:100]
               except OSError as exc:
                   error = f"{type(exc).__name__}: {exc}"
               print(
@@ -181,7 +193,7 @@ jobs:
               "MMMU",
           }
           if search_root.is_dir():
-              for current, directories, files in os.walk(search_root):
+              for current, directories, files in os.walk(search_root, followlinks=True):
                   visited += 1
                   current_path = Path(current)
                   depth = len(current_path.relative_to(search_root).parts)
