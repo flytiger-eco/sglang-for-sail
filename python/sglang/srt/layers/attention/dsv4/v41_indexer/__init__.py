@@ -108,8 +108,6 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
-    from sglang.srt.runtime_context import get_parallel
-
     from .dense_blocks import DenseBlocksBackend
 
     use_deep_gemm_prefill = _use_deep_gemm_prefill()
@@ -131,26 +129,47 @@ def make_candidate_indexer(
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
         DEEPGEMM_PAGED_SPARSE_MQA_LOGITS,
+        DEEPGEMM_SPARSE_MQA_LOGITS,
     )
 
-    if not DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+    # Decode reads the paged index-K pool; without that API it stays dense.
+    decode_backend = dense_blocks
+    if DEEPGEMM_PAGED_SPARSE_MQA_LOGITS:
+        from .sparse_table import SparseTableBackend
+
+        decode_backend = SparseTableBackend(
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token=req_to_token,
+            page_size=page_size,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+        )
+    else:
         logger.warning(
             "Candidate indexer requested but DeepGEMM has no paged sparse MQA "
             "logits API (sgl-deep-gemm >= 0.2.0 with "
-            "SGLANG_ENABLE_JIT_DEEPGEMM on); falling back to dense blocks."
+            "SGLANG_ENABLE_JIT_DEEPGEMM on); decode uses dense blocks."
         )
-        return dense_blocks, dense_blocks
-    from .sparse_table import SparseTableBackend
 
-    sparse_table = SparseTableBackend(
-        token_to_kv_pool=token_to_kv_pool,
-        req_to_token=req_to_token,
-        page_size=page_size,
-        candidate_topk_blocks=candidate_topk_blocks,
-        candidate_block_size=candidate_block_size,
+    # The torch prefill env keeps prefill on dense blocks.
+    if not use_deep_gemm_prefill:
+        return dense_blocks, decode_backend
+    # The varlen path scores the published blocks over the request-flattened
+    # index K, so it serves both CP and non-CP prefill.
+    if DEEPGEMM_SPARSE_MQA_LOGITS:
+        from .sparse_varlen import VarlenSparsePrefillBackend
+
+        logger.info("Prefill candidate indexer: DeepGEMM varlen sparse MQA logits")
+        return (
+            VarlenSparsePrefillBackend(
+                token_to_kv_pool=token_to_kv_pool,
+                req_to_token=req_to_token,
+                candidate_topk_blocks=candidate_topk_blocks,
+            ),
+            decode_backend,
+        )
+    logger.warning(
+        "Prefill candidate indexer: DeepGEMM has no varlen sparse MQA logits "
+        "API; using the paged sparse table."
     )
-    # A CP rank's rows are an interleaved subset of the batch; the torch prefill
-    # env keeps the sparse table on decode only.
-    if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
-        return dense_blocks, sparse_table
-    return sparse_table, sparse_table
+    return decode_backend, decode_backend
