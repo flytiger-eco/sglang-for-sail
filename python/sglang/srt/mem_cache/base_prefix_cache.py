@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,6 +31,8 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.runtime_context import get_observability, get_parallel
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
@@ -318,8 +322,162 @@ def zero_match_result(
         swa_host_hit_length=0,
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
+        # A dropped match must not keep a mamba branching hint either: it
+        # describes the discarded prefix and would mis-drive checkpointing on
+        # the recomputed one.
+        mamba_branching_seqlen=None,
         full_kv_hit_length=0,
     )
+
+
+def rollback_matched_mamba_state(
+    tree_cache, req, *, mamba_held_before_match: Optional[bool] = None
+) -> None:
+    """Undo the mamba state a discarded ``match_prefix`` left on ``req``.
+
+    ``match_prefix(cow_mamba=True)`` may allocate a mamba slot and stage
+    copy-on-write/clear metadata on ``req.kv``. A caller that drops the match
+    (a request the scheduler does not admit, or a prefix reuse rejected by the
+    DSA prefill-CP alignment gate) must roll that state back, otherwise the
+    request leaks a slot and later carries stale COW hints.
+
+    ``mamba_held_before_match`` is ``req.kv.holds_mamba`` captured before
+    ``match_prefix``. Pass it at call sites where the request may already hold
+    a slot from an earlier round, so only a freshly allocated slot is freed.
+    When omitted, the current value is used, which keeps the scheduler's
+    post-hoc behaviour for requests that have never been admitted.
+
+    Session-held slots have their own lifecycle; freeing one here causes a
+    double free, so they are always skipped.
+    """
+    req.kv.mamba_cow_src_index = None
+    req.kv.mamba_needs_clear = False
+    mamba_allocator = getattr(
+        getattr(tree_cache, "req_to_token_pool", None), "mamba_allocator", None
+    )
+    if (
+        (mamba_held_before_match is None or not mamba_held_before_match)
+        and req.kv.holds_mamba
+        and mamba_allocator is not None
+        and not getattr(req, "session", None)
+    ):
+        mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+        req.kv.mamba_pool_idx = None
+
+
+@lru_cache(maxsize=1)
+def dsa_cp_prefix_cache_alignment() -> int:
+    """Prefix-hit length alignment required by the DSA prefill-CP kpool path.
+
+    Returns 1 (no constraint) unless the experimental DSA prefill-CP prefix
+    cache is active. When active, a reused prefix must satisfy
+    ``prefix_len % lcm(page_size, index_kpool) == 0``: the kpool write path
+    derives pooled slots from ``global_position // index_kpool`` and rejects a
+    non-aligned chunk start deep inside the indexer, so an unaligned hit must
+    be dropped before allocation instead of raising there. The radix tree
+    matches whole pages and ``index_kpool`` divides ``page_size`` today, so
+    this is a defence-in-depth guard for future granularity changes.
+    """
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+        return 1
+
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
+
+    if not is_dsa_prefill_cp_interleave():
+        return 1
+
+    from math import lcm
+
+    from sglang.srt.configs.model_config import get_dsa_index_kpool
+    from sglang.srt.runtime_context import get_server_args, process_model_config
+
+    page_size = int(getattr(get_server_args(), "page_size", 1) or 1)
+    index_kpool = int(get_dsa_index_kpool(process_model_config().hf_config))
+    return lcm(max(1, page_size), max(1, index_kpool))
+
+
+_MISALIGNED_PREFIX_HIT_WARNED = False
+
+
+def dsa_cp_prefix_reuse_length(match_result: MatchResult) -> int:
+    """Length of the prefix a match would actually reuse.
+
+    ``device_indices`` only covers the device-resident part of the hit; with
+    HiCache a match can extend into host memory (``host_hit_length``) and
+    ``full_kv_hit_length`` reports the component-independent total. The
+    alignment gate must judge the whole reusable prefix, not just its device
+    tail, otherwise an unaligned host extension would slip through and reach
+    the kpool path.
+    """
+    device_len = len(match_result.device_indices)
+    host_len = int(getattr(match_result, "host_hit_length", 0) or 0)
+    full_len = int(getattr(match_result, "full_kv_hit_length", 0) or 0)
+    return max(device_len + host_len, full_len)
+
+
+def is_dsa_cp_prefix_hit_misaligned(match_result: MatchResult) -> bool:
+    """Whether a prefix hit violates the DSA prefill-CP kpool alignment."""
+    alignment = dsa_cp_prefix_cache_alignment()
+    if alignment <= 1:
+        return False
+    hit_len = dsa_cp_prefix_reuse_length(match_result)
+    if hit_len == 0 or hit_len % alignment == 0:
+        return False
+
+    global _MISALIGNED_PREFIX_HIT_WARNED
+    if not _MISALIGNED_PREFIX_HIT_WARNED:
+        _MISALIGNED_PREFIX_HIT_WARNED = True
+        logger.warning(
+            "DSA prefill CP prefix cache: a %d-token prefix hit is not aligned "
+            "to %d; dropping the reuse for this request (recompute).",
+            hit_len,
+            alignment,
+        )
+    return True
+
+
+def drop_misaligned_dsa_cp_prefix_reuse(
+    tree_cache,
+    req,
+    match_result: MatchResult,
+    *,
+    mamba_held_before_match: Optional[bool] = None,
+    extra_key: Optional[str] = None,
+) -> MatchResult:
+    """Drop a misaligned reuse together with the mamba state its match staged.
+
+    Every ``cow_mamba=True`` caller must use this instead of zeroing on its
+    own: ``zero_match_result`` alone leaves the allocated mamba slot and the
+    staged COW hints on the request (see ``rollback_matched_mamba_state``).
+    Returns the match unchanged when it is aligned or the gate is inactive.
+    """
+    if not is_dsa_cp_prefix_hit_misaligned(match_result):
+        return match_result
+    rollback_matched_mamba_state(
+        tree_cache, req, mamba_held_before_match=mamba_held_before_match
+    )
+    return zero_match_result(tree_cache, match_result, extra_key=extra_key)
+
+
+def enforce_dsa_cp_prefix_cache_alignment(
+    tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
+) -> MatchResult:
+    """Drop a single prefix reuse whose hit length violates the kpool alignment.
+
+    Never disables the radix cache: only this request's reuse is abandoned and
+    its prefix is recomputed, which is the documented degradation contract for
+    the experimental DSA prefill-CP prefix cache.
+
+    NOTE: callers that matched with ``cow_mamba=True`` must use
+    ``drop_misaligned_dsa_cp_prefix_reuse`` instead: zeroing a match alone
+    leaves the allocated mamba slot and the staged COW hints on the request
+    (see ``rollback_matched_mamba_state``).
+    """
+    if not is_dsa_cp_prefix_hit_misaligned(match_result):
+        return match_result
+    return zero_match_result(tree_cache, match_result, extra_key=extra_key)
 
 
 def _dfs_weight_order(

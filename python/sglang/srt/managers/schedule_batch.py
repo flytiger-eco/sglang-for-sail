@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
     MatchPrefixParams,
+    drop_misaligned_dsa_cp_prefix_reuse,
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
@@ -1639,6 +1640,9 @@ class Req(ReqDllmMixin):
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
+            # Snapshot before match: a cow_mamba match may allocate a mamba slot
+            # and stage COW metadata that must be undone if the match is dropped.
+            mamba_held_before_match = self.kv.holds_mamba
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1655,6 +1659,17 @@ class Req(ReqDllmMixin):
                 match_result = zero_match_result(
                     tree_cache, match_result, extra_key=self.extra_key
                 )
+            # DSA prefill CP: a reuse must stay kpool-aligned, otherwise the
+            # kpool extend path raises; degrade to recompute for this request.
+            # The match ran with cow_mamba, so the shared helper also undoes
+            # the staged mamba slot/COW state before declaring the miss.
+            match_result = drop_misaligned_dsa_cp_prefix_reuse(
+                tree_cache,
+                self,
+                match_result,
+                mamba_held_before_match=mamba_held_before_match,
+                extra_key=self.extra_key,
+            )
             (
                 self.prefix_indices,
                 self.last_node,
@@ -3122,13 +3137,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         clear_tensors = []
         for req in reqs:
             if req.kv.mamba_cow_src_index is not None:
-                cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                # Prefill CP keeps one full mamba replica per rank, so the
+                # deferred COW set must stay 1:1 with held slots; a staged COW
+                # without a destination means the mirror already diverged.
+                # ``mamba_pool_idx`` is 0-dim everywhere it is produced
+                # (``mid[0]`` / ``dst_index[0]``), and ``unsqueeze(0)`` below
+                # relies on that to build a 1-D gather index. The source comes
+                # from the tree component value and is 0-dim on the same paths,
+                # so normalize both sides to 1-D before ``torch.cat`` (a 0-dim
+                # tensor cannot be concatenated).
+                assert req.kv.holds_mamba and req.kv.mamba_pool_idx.ndim == 0, (
+                    "staged mamba COW without a single held slot"
+                )
+                cow_src_tensors.append(req.kv.mamba_cow_src_index.reshape(-1))
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = False
             elif req.kv.mamba_needs_clear:
+                assert req.kv.holds_mamba and req.kv.mamba_pool_idx.ndim == 0, (
+                    "staged mamba clear without a single held slot"
+                )
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_needs_clear = False
+        # (COW sources and destinations are appended together above; the
+        # per-request ndim check covers the slot-shape invariant.)
         self.mamba_cow_src_indices = (
             torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
