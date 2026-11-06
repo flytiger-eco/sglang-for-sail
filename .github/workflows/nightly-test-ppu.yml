@@ -26,6 +26,10 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
+      dataset_preflight_only:
+        description: 'Run only the NAS dataset preflight; skip test execution and summary'
+        type: boolean
+        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -72,8 +76,105 @@ jobs:
       - name: Build self-contained sweep driver
         run: |
           python3 -m pip install PyYAML==6.0.3 pytest==8.3.5
-          mkdir -p .ppu-sweep
+          mkdir -p .ppu-sweep/compat
           cp scripts/ci/ppu/cuda_sweep_hardware.json .ppu-sweep/hardware.json
+          cat > .ppu-sweep/compat/sitecustomize.py <<'PY'
+          import os
+
+          import datasets
+          import huggingface_hub
+
+          _DATASET_DIRS = {
+              "THUDM/LongBench-v2": "/nas_aisw/datasets/datasets/LLM/ZhipuAI/v2/LongBench-v2",
+              "MMMU/MMMU": "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1/MMMU",
+              "lmms-lab/MMMU": "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1/MMMU",
+          }
+          _SHAREGPT_REPO = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+          _SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
+          _SHAREGPT_PATH = (
+              "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0/"
+              "ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"
+          )
+
+          _original_load_dataset = datasets.load_dataset
+          _original_hf_hub_download = huggingface_hub.hf_hub_download
+
+          def _load_dataset(path, *args, **kwargs):
+              if path in _DATASET_DIRS:
+                  source = path
+                  path = _DATASET_DIRS[path]
+                  if not os.path.isdir(path):
+                      raise FileNotFoundError(f"NAS dataset directory not found: {path}")
+                  print(f"PPU dataset redirect: {source} -> {path}", flush=True)
+              return _original_load_dataset(path, *args, **kwargs)
+
+          def _hf_hub_download(repo_id, filename, *args, **kwargs):
+              if repo_id == _SHAREGPT_REPO and filename == _SHAREGPT_FILENAME:
+                  if not os.path.isfile(_SHAREGPT_PATH):
+                      raise FileNotFoundError(f"NAS dataset file not found: {_SHAREGPT_PATH}")
+                  print(
+                      f"PPU dataset redirect: {repo_id}/{filename} -> {_SHAREGPT_PATH}",
+                      flush=True,
+                  )
+                  return _SHAREGPT_PATH
+              return _original_hf_hub_download(repo_id, filename, *args, **kwargs)
+
+          datasets.load_dataset = _load_dataset
+          huggingface_hub.hf_hub_download = _hf_hub_download
+          PY
+          cat > .ppu-sweep/dataset_preflight.py <<'PY'
+          import json
+          import os
+
+          from datasets import load_dataset
+          from huggingface_hub import hf_hub_download
+
+          sharegpt = hf_hub_download(
+              repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+              filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+              repo_type="dataset",
+          )
+          if not os.path.isfile(sharegpt) or os.path.getsize(sharegpt) == 0:
+              raise RuntimeError(f"Invalid ShareGPT file: {sharegpt}")
+          print(
+              "PPU_DATASET_PREFLIGHT "
+              + json.dumps({"dataset": "ShareGPT", "path": sharegpt, "bytes": os.path.getsize(sharegpt)}),
+              flush=True,
+          )
+
+          def check_row(repo_id, name, split, required):
+              args = (repo_id,) if name is None else (repo_id, name)
+              dataset = load_dataset(*args, split=split, streaming=True)
+              try:
+                  row = next(iter(dataset))
+              except StopIteration as error:
+                  raise RuntimeError(f"Empty dataset: {repo_id} {name} {split}") from error
+              missing = sorted(set(required) - set(row))
+              if missing:
+                  raise RuntimeError(f"Missing columns for {repo_id} {name} {split}: {missing}")
+              print(
+                  "PPU_DATASET_PREFLIGHT "
+                  + json.dumps(
+                      {
+                          "dataset": repo_id,
+                          "name": name,
+                          "split": split,
+                          "columns": sorted(row),
+                      }
+                  ),
+                  flush=True,
+              )
+
+          check_row(
+              "THUDM/LongBench-v2",
+              None,
+              "train",
+              {"context", "question", "choice_A", "choice_B", "choice_C", "choice_D"},
+          )
+          check_row("MMMU/MMMU", "Math", "test", {"question", "image_1"})
+          check_row("MMMU/MMMU", "Accounting", "validation", {"question", "image_1"})
+          check_row("lmms-lab/MMMU", "Accounting", "validation", {"question", "image_1"})
+          PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
           import csv
@@ -927,12 +1028,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'dataset_preflight_only'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertNotIn('if', jobs['sweep-execute'])
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.dataset_preflight_only != true')
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.dataset_preflight_only != true')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1231,15 +1332,17 @@ jobs:
           cd /workspace/source
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
           export CUDA_VISIBLE_DEVICES=0
+          export PYTHONPATH="/workspace/source/.ppu-sweep/compat${PYTHONPATH:+:$PYTHONPATH}"
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          timeout --signal=TERM --kill-after=30s 300s python3 .ppu-sweep/dataset_preflight.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
           set -euo pipefail
           cd /workspace/source
-          export PYTHONPATH="$PWD/python:$PWD/test${PYTHONPATH:+:$PYTHONPATH}"
+          export PYTHONPATH="$PWD/.ppu-sweep/compat:$PWD/python:$PWD/test${PYTHONPATH:+:$PYTHONPATH}"
           export SGLANG_TEST_MAX_RETRY=0 SGLANG_IS_IN_CI=true
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
@@ -1365,6 +1468,7 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
+    if: inputs.dataset_preflight_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1454,7 +1558,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always()
+    if: always() && inputs.dataset_preflight_only != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
