@@ -50,6 +50,8 @@ use crate::{
     },
 };
 
+mod streaming;
+
 #[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
@@ -575,6 +577,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -658,12 +661,10 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Count the request from dispatch so load-based policies see it before
+        // upstream headers arrive; streaming responses attach their own guards.
+        let prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
+        let decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -708,6 +709,21 @@ impl PDRouter {
             decode_url: decode.url(),
         }
         .emit();
+
+        // Actual generated decode output proves that KV handoff succeeded.
+        // Preserve the normal P completion gate when P logprobs must be merged.
+        if context.is_stream && !context.return_logprob {
+            return self
+                .execute_streaming_until_decode_token(
+                    prefill_request,
+                    decode_request,
+                    &context,
+                    prefill,
+                    decode,
+                    [prefill_guard, decode_guard],
+                )
+                .await;
+        }
 
         let prefill_fut = prefill_request.send();
         let decode_fut = decode_request.send();
@@ -758,16 +774,14 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
-                .await
-            {
-                Err(error_response) => error_response,
-                Ok(_) => error::bad_gateway(
-                    "prefill_server_error",
-                    "Prefill reported failure but returned a success response".to_string(),
-                ),
-            };
+            let mut response =
+                match Self::process_prefill_response(prefill_result, prefill.url(), false).await {
+                    Err(error_response) => error_response,
+                    Ok(_) => error::bad_gateway(
+                        "prefill_server_error",
+                        "Prefill reported failure but returned a success response".to_string(),
+                    ),
+                };
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
@@ -831,22 +845,19 @@ impl PDRouter {
 
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
+                    match Self::process_prefill_response(
+                        prefill_result,
+                        prefill.url(),
+                        context.return_logprob,
+                    )
+                    .await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
                     }
                 } else {
                     // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
+                    match Self::process_prefill_response(prefill_result, prefill.url(), false).await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
@@ -876,6 +887,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        None,
                     )
                 } else {
                     // Non-streaming response
@@ -1116,6 +1128,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        admission_guards: Option<Vec<WorkerLoadGuard>>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1204,15 +1217,18 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        let guards = admission_guards.unwrap_or_else(|| {
+            vec![
+                WorkerLoadGuard::new(prefill, headers.as_ref()),
+                WorkerLoadGuard::new(decode, headers.as_ref()),
+            ]
+        });
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
         let mut response_headers = headers.unwrap_or_default();
+        response_headers.remove(CONTENT_LENGTH);
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
@@ -1267,7 +1283,6 @@ impl PDRouter {
 
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
-        &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
@@ -2048,6 +2063,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1
