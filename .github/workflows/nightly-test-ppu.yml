@@ -26,10 +26,6 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
-      dataset_preflight_only:
-        description: 'Run only the NAS dataset preflight; skip test execution and summary'
-        type: boolean
-        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -121,172 +117,6 @@ jobs:
 
           datasets.load_dataset = _load_dataset
           huggingface_hub.hf_hub_download = _hf_hub_download
-          PY
-          cat > .ppu-sweep/dataset_preflight.py <<'PY'
-          import json
-          import os
-          import time
-          import traceback
-          from pathlib import Path
-
-          from datasets import load_dataset
-          from huggingface_hub import hf_hub_download
-
-          roots = {
-              "ShareGPT": "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0/ShareGPT_Vicuna_unfiltered",
-              "LongBench-v2": "/nas_aisw/datasets/datasets/LLM/ZhipuAI/v2/LongBench-v2",
-              "MMMU": "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1/MMMU",
-          }
-          for label, value in roots.items():
-              root = Path(value)
-              entries = []
-              if root.is_dir():
-                  for path in sorted(root.iterdir()):
-                      entries.append(path.name + "/" if path.is_dir() else path.name)
-                      if path.is_dir():
-                          entries.extend(f"{path.name}/{child.name}" for child in sorted(path.iterdir())[:20])
-              print(
-                  "PPU_DATASET_LAYOUT "
-                  + json.dumps({"dataset": label, "root": value, "entries": entries[:80]}),
-                  flush=True,
-              )
-
-          for value in (
-              "/nas_aisw",
-              "/nas_aisw/datasets",
-              "/nas_aisw/datasets/datasets",
-              "/nas_aisw/datasets/datasets/LLM",
-              "/nas_aisw/datasets/datasets/LLM/anon8231489123",
-              "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0",
-              "/nas_aisw/datasets/datasets/LLM/ZhipuAI",
-              "/nas_aisw/datasets/datasets/LLM/ZhipuAI/v2",
-              "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination",
-              "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1",
-              "/nas_aisw/datasets/hf_cache",
-          ):
-              root = Path(value)
-              entries = []
-              error = None
-              try:
-                  entries = sorted(
-                      path.name + " -> " + os.readlink(path)
-                      if path.is_symlink()
-                      else path.name + "/" if path.is_dir() else path.name
-                      for path in root.iterdir()
-                  )[:100]
-              except OSError as exc:
-                  error = f"{type(exc).__name__}: {exc}"
-              print(
-                  "PPU_NAS_PROBE "
-                  + json.dumps({"root": value, "entries": entries, "error": error}),
-                  flush=True,
-              )
-
-          matches = []
-          visited = 0
-          deadline = time.monotonic() + 60
-          search_root = Path("/nas_aisw/datasets")
-          target_names = {
-              "ShareGPT_Vicuna_unfiltered",
-              "ShareGPT_V3_unfiltered_cleaned_split.json",
-              "LongBench-v2",
-              "MMMU",
-          }
-          if search_root.is_dir():
-              for current, directories, files in os.walk(search_root, followlinks=True):
-                  visited += 1
-                  current_path = Path(current)
-                  depth = len(current_path.relative_to(search_root).parts)
-                  if depth >= 7:
-                      directories[:] = []
-                  for name in directories + files:
-                      if name in target_names:
-                          matches.append(str(current_path / name))
-                  if visited >= 20000 or len(matches) >= 30 or time.monotonic() >= deadline:
-                      break
-          print(
-              "PPU_NAS_SEARCH "
-              + json.dumps({"matches": matches, "visited_directories": visited}),
-              flush=True,
-          )
-
-          failures = []
-
-          def run_check(label, check):
-              try:
-                  check()
-              except Exception as error:
-                  failures.append(f"{label}: {type(error).__name__}: {error}")
-                  print(
-                      "PPU_DATASET_PREFLIGHT_ERROR "
-                      + json.dumps({"check": label, "error": failures[-1]}),
-                      flush=True,
-                  )
-                  traceback.print_exc()
-
-          def check_sharegpt():
-              sharegpt = hf_hub_download(
-                  repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-                  filename="ShareGPT_V3_unfiltered_cleaned_split.json",
-                  repo_type="dataset",
-              )
-              if not os.path.isfile(sharegpt) or os.path.getsize(sharegpt) == 0:
-                  raise RuntimeError(f"Invalid ShareGPT file: {sharegpt}")
-              print(
-                  "PPU_DATASET_PREFLIGHT "
-                  + json.dumps(
-                      {"dataset": "ShareGPT", "path": sharegpt, "bytes": os.path.getsize(sharegpt)}
-                  ),
-                  flush=True,
-              )
-
-          def check_row(repo_id, name, split, required):
-              args = (repo_id,) if name is None else (repo_id, name)
-              dataset = load_dataset(*args, split=split, streaming=True)
-              try:
-                  row = next(iter(dataset))
-              except StopIteration as error:
-                  raise RuntimeError(f"Empty dataset: {repo_id} {name} {split}") from error
-              missing = sorted(set(required) - set(row))
-              if missing:
-                  raise RuntimeError(f"Missing columns for {repo_id} {name} {split}: {missing}")
-              print(
-                  "PPU_DATASET_PREFLIGHT "
-                  + json.dumps(
-                      {
-                          "dataset": repo_id,
-                          "name": name,
-                          "split": split,
-                          "columns": sorted(row),
-                      }
-                  ),
-                  flush=True,
-              )
-
-          run_check("ShareGPT", check_sharegpt)
-          run_check(
-              "LongBench-v2 train",
-              lambda: check_row(
-                  "THUDM/LongBench-v2",
-                  None,
-                  "train",
-                  {"context", "question", "choice_A", "choice_B", "choice_C", "choice_D"},
-              ),
-          )
-          run_check(
-              "MMMU Math test",
-              lambda: check_row("MMMU/MMMU", "Math", "test", {"question", "image_1"}),
-          )
-          run_check(
-              "MMMU Accounting validation",
-              lambda: check_row("MMMU/MMMU", "Accounting", "validation", {"question", "image_1"}),
-          )
-          run_check(
-              "lmms-eval MMMU Accounting validation",
-              lambda: check_row("lmms-lab/MMMU", "Accounting", "validation", {"question", "image_1"}),
-          )
-          if failures:
-              raise RuntimeError("Dataset preflight failures: " + json.dumps(failures))
           PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
@@ -1141,12 +971,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'dataset_preflight_only'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.dataset_preflight_only != true')
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.dataset_preflight_only != true')
+                      self.assertNotIn('if', jobs['sweep-execute'])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1445,11 +1275,9 @@ jobs:
           cd /workspace/source
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
           export CUDA_VISIBLE_DEVICES=0
-          export PYTHONPATH="/workspace/source/.ppu-sweep/compat${PYTHONPATH:+:$PYTHONPATH}"
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
-          timeout --signal=TERM --kill-after=30s 300s python3 .ppu-sweep/dataset_preflight.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1581,7 +1409,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: inputs.dataset_preflight_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1671,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && inputs.dataset_preflight_only != true
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
