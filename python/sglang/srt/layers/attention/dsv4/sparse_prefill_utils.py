@@ -32,7 +32,6 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -40,6 +39,7 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_align
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
@@ -48,7 +48,6 @@ SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 # Bf16 workspace per-token width, matching ``dequantize_k_cache_paged``'s
 # output: 448 fp8 nope (dequanted) + 64 bf16 rope = 512.
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
-DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
@@ -62,16 +61,13 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
 
     ``dsv4_prefill_backend`` is the production configuration. The environment
     variable remains as a debug override while the runtime path is being
-    hardened: truthy values force Q8 on, falsy values force it off.
+    hardened: any value forces the override, truthy enables Q8.
+
+    Read through the env registry: only registered variables are forwarded to
+    the DP scheduler processes, which is where this selector runs.
     """
-    env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
-    if env_value is not None:
-        return env_value.lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+    if envs.SGLANG_DSV4_Q8KV8_PREFILL.is_set():
+        return envs.SGLANG_DSV4_Q8KV8_PREFILL.get()
     return dsv4_prefill_backend == "flashmla_sparse_q8"
 
 
