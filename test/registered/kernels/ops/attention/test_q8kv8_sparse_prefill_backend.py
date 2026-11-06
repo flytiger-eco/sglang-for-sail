@@ -24,7 +24,10 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     sparse_mla_q8kv8_prefill_fwd,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DeepseekV4AttnBackend,
+    _require_q8kv8_flashmla_interface,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     CompressedGather,
     SparsePrefillChunkCache,
@@ -32,7 +35,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import is_sm90_supported
+from sglang.srt.utils import get_platform, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -855,6 +858,108 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         **kwargs,
     )
     torch.testing.assert_close(actual, expected.squeeze(1), atol=2e-2, rtol=2e-2)
+
+
+def _ppu_quantized_available() -> bool:
+    if not (torch.cuda.is_available() and get_platform().is_ppu):
+        return False
+    try:
+        import flash_mla
+    except ImportError:
+        return False
+    return hasattr(flash_mla, "flash_mla_sparse_quantized_fwd")
+
+
+@pytest.fixture()
+def runtime_context():
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    publish(ServerArgs(model_path="dummy"), role="test")
+    try:
+        yield
+    finally:
+        reset_context()
+
+
+@pytest.mark.skipif(
+    not _ppu_quantized_available(),
+    reason="PPU flash_mla without flash_mla_sparse_quantized_fwd",
+)
+def test_q8kv8_sparse_prefill_ppu_dispatch_matches_bf16_path(
+    runtime_context, monkeypatch
+):
+    """The PPU path must keep the BF16 gather and call the quantized kernel."""
+    import flash_mla
+    import sgl_kernel.flash_mla as sgl_flash_mla
+
+    from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+        flash_mla_sparse_fwd as ppu_flash_mla_sparse_fwd,
+    )
+
+    # The server reaches this through ppu_flashmla_hooks; apply the same
+    # replacement so the BF16 reference uses the PPU implementation.
+    monkeypatch.setattr(sgl_flash_mla, "flash_mla_sparse_fwd", ppu_flash_mla_sparse_fwd)
+
+    backend, forward_batch, token_to_kv_pool, q, attn_sink, core_attn_metadata = (
+        _make_sparse_prefill_case(torch.device("cuda"), local_heads=64)
+    )
+    kwargs = dict(
+        q=q,
+        layer_id=0,
+        compress_ratio=0,
+        forward_batch=forward_batch,
+        token_to_kv_pool=token_to_kv_pool,
+        core_attn_metadata=core_attn_metadata,
+        attn_sink=attn_sink,
+    )
+
+    monkeypatch.delenv("SGLANG_DSV4_Q8KV8_PREFILL", raising=False)
+    bf16_out = backend._forward_prefill_sparse(**kwargs)
+    torch.cuda.synchronize()
+
+    calls = []
+    real_quantized = flash_mla.flash_mla_sparse_quantized_fwd
+
+    def _spy(**call_kwargs):
+        calls.append(call_kwargs)
+        return real_quantized(**call_kwargs)
+
+    monkeypatch.setenv("SGLANG_DSV4_Q8KV8_PREFILL", "1")
+    monkeypatch.setattr(flash_mla, "flash_mla_sparse_quantized_fwd", _spy)
+    q8_out = backend._forward_prefill_sparse(**kwargs)
+    torch.cuda.synchronize()
+
+    assert len(calls) == 1
+    assert calls[0]["q"].dtype == torch.bfloat16
+    assert calls[0]["kv"].dtype == torch.bfloat16
+    assert calls[0]["d_v"] == 512
+    assert calls[0]["quantization"] is None
+    assert calls[0]["compute_aux"] is False
+
+    assert q8_out.shape == bf16_out.shape
+    assert q8_out.dtype == bf16_out.dtype == torch.bfloat16
+    assert torch.isfinite(q8_out.float()).all()
+
+    abs_diff = (q8_out.float() - bf16_out.float()).abs()
+    assert abs_diff.mean().item() < 0.03
+    assert torch.quantile(abs_diff.flatten(), 0.99).item() < 0.2
+    torch.testing.assert_close(
+        q8_out.float(), bf16_out.float(), atol=2.5e-1, rtol=3.0e-1
+    )
+
+
+def test_q8kv8_ppu_requires_flashmla_quantized_interface(monkeypatch):
+    """Enabling q8 on PPU without the flash_mla API must fail at startup."""
+    stub = types.ModuleType("flash_mla")
+    stub.flash_mla_sparse_fwd = lambda **kwargs: None
+    monkeypatch.setitem(sys.modules, "flash_mla", stub)
+
+    with pytest.raises(AssertionError, match="flash_mla_sparse_quantized_fwd"):
+        _require_q8kv8_flashmla_interface()
+
+    stub.flash_mla_sparse_quantized_fwd = lambda **kwargs: None
+    _require_q8kv8_flashmla_interface()
 
 
 if __name__ == "__main__":
