@@ -477,6 +477,13 @@ radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const 
     for (uint32_t round = 0; round < 4; ++round) {
       const uint32_t byte_shift = 24 - round * 8;
       const uint32_t prefix_shift = 32 - round * 8;
+      // The previous round subtracts `s_histogram[threshold + 1]` from its own
+      // `remain` with no barrier after the selection, so resetting the
+      // histogram without one lets a fast warp zero bins a slow warp has not
+      // read yet. `remain` then diverges per thread, the crossing-bin search
+      // below picks thresholds that do not match the histogram, and the final
+      // scatter writes past `topk` (seen as illegal memory access under load).
+      __syncthreads();
       if (tx < RADIX + 1) s_histogram[tx] = 0;
       __syncthreads();
       issue_chunk(0, 0);
