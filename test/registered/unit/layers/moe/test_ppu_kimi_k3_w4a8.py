@@ -12,7 +12,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-from sglang.kernels.ops.quantization import fp8_kernel as fp8_module
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils, entrypoint
 from sglang.srt.layers.moe import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.moe.fused_moe_triton import layer as fused_layer
@@ -48,45 +47,11 @@ def _runner(activation="situ"):
     return runner
 
 
-def test_w4a8_fp8_quant_selects_fused_scale_writer():
-    x = torch.empty((2, 256), dtype=torch.bfloat16)
-    with patch.object(fp8_module, "sgl_per_token_quant_fp8") as aot:
-        fp8_module.sglang_per_token_quant_fp8(x)
-        fp8_module.sglang_per_token_quant_fp8(x, scale_multiplier=2.0)
-        assert [call.args[-1] for call in aot.call_args_list] == [1.0, 2.0]
-
-
-def test_w4a8_fp8_quant_wrapper_forwards_scale():
-    from sglang.kernels.ops import quantization
-    from sglang.kernels.spec import KernelBackend
-
-    x = torch.empty((2, 256), dtype=torch.bfloat16)
-    q = torch.empty((2, 256), dtype=torch.float8_e4m3fn)
-    scale = torch.empty((2, 1), dtype=torch.float32)
-    aot = Mock()
-    with (
-        patch.dict(
-            sys.modules,
-            {"sgl_kernel": SimpleNamespace(sgl_per_token_quant_fp8=aot)},
-        ),
-        patch.object(quantization, "get_kernel") as resolve,
-    ):
-        quantization.sgl_per_token_quant_fp8(x, q, scale, 2.0)
-        aot.assert_called_once_with(x, q, scale, 2.0)
-        resolve.assert_not_called()
-
-        quantization.sgl_per_token_quant_fp8(x, q, scale)
-        resolve.assert_called_once_with(
-            "quantization.sgl_per_token_quant_fp8", KernelBackend.JIT
-        )
-        resolve.return_value.assert_called_once_with(x, q, scale)
-
-
-def test_w4a8_normal_dispatch_quant_folds_scale():
+def test_w4a8_normal_dispatch_quant_keeps_channel_scale():
     dispatcher = object.__new__(deepep_module._DeepEPDispatcherImplNormal)
     dispatcher.use_fp8 = True
     dispatcher.async_finish = False
-    dispatcher.quant_config = {"is_channel_quant": True, "w4a8_scale_multiplier": 2.0}
+    dispatcher.quant_config = {"is_channel_quant": True}
     x = torch.empty((1, 256), dtype=torch.bfloat16)
     topk = SimpleNamespace(
         topk_weights=torch.ones((1, 1)),
@@ -97,11 +62,11 @@ def test_w4a8_normal_dispatch_quant_folds_scale():
         patch.object(deepep_module, "sglang_per_token_group_quant_fp8") as quantize,
     ):
         dispatcher.dispatch_a(x, topk)
-    assert quantize.call_args.kwargs["scale_multiplier"] == 2.0
+    assert "scale_multiplier" not in quantize.call_args.kwargs
     assert quantize.call_args.args[1] == 256
 
 
-def test_w4a8_standard_preprocess_folds_scale():
+def test_w4a8_standard_preprocess_keeps_channel_scale():
     from sglang.kernels.ops.moe import ep_moe_kernels
 
     x = torch.empty((1, 256), dtype=torch.bfloat16)
@@ -125,14 +90,13 @@ def test_w4a8_standard_preprocess_folds_scale():
             ep_moe_kernels, "moe_ep_deepgemm_preprocess", return_value=output
         ) as preprocess,
     ):
-        result = runner_module.pre_permute_standard_to_deep_gemm(
+        runner_module.pre_permute_standard_to_deep_gemm(
             SimpleNamespace(hidden_states=x, topk_output=topk),
             _quant_info(),
             config,
             {},
         )
-    assert preprocess.call_args.kwargs["scale_multiplier"] == 2.0
-    assert result.w13_scale_compensated
+    assert "scale_multiplier" not in preprocess.call_args.kwargs
 
 
 @pytest.mark.parametrize("a2a", [MoeA2ABackend.NONE, MoeA2ABackend.DEEPEP])
@@ -218,8 +182,7 @@ def test_w4a8_weight_creation_accepts_activation(activation):
     assert layer.w13_weight.shape == (2, 256, 128)
 
 
-@pytest.mark.parametrize("a2a", [MoeA2ABackend.NONE, MoeA2ABackend.DEEPEP])
-def test_w4a8_preprocess_keeps_independent_inverse_scales(a2a):
+def test_w4a8_preprocess_keeps_independent_inverse_scales():
     layer = SimpleNamespace(
         w13_weight=torch.nn.Parameter(
             torch.zeros((2, 256, 128), dtype=torch.uint8), requires_grad=False
@@ -257,7 +220,6 @@ def test_w4a8_preprocess_keeps_independent_inverse_scales(a2a):
     with (
         patch.dict(sys.modules, {"deep_gemm": fake_dg}),
         patch.object(torch.cuda, "empty_cache"),
-        patch.object(mxfp4, "get_moe_a2a_backend", return_value=a2a),
     ):
         mxfp4.Mxfp4MoEMethod.process_weights_after_loading(method, layer)
 
@@ -265,9 +227,7 @@ def test_w4a8_preprocess_keeps_independent_inverse_scales(a2a):
     assert (layer.w13_weight_inv_scale, layer.w2_weight_inv_scale) == (2.0, 3.0)
     assert layer.w13_weight_scale.shape == (2, 4, 512)
     assert layer.w2_weight_scale.shape == (2, 4, 256)
-    assert layer.dispatcher.quant_config.get("w4a8_scale_multiplier") == (
-        2.0 if a2a.is_deepep() else None
-    )
+    assert layer.dispatcher.quant_config == {"dispatcher_output_dtype": "fp8"}
 
 
 def test_w4a8_preprocess_pads_tp_down_k_after_loading():
@@ -312,8 +272,7 @@ def test_w4a8_preprocess_pads_tp_down_k_after_loading():
 
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("activation", ["silu", "situ"])
-@pytest.mark.parametrize("compensated", [False, True])
-def test_w4a8_runner_scales_both_gemms(masked, activation, compensated):
+def test_w4a8_runner_scales_both_gemms(masked, activation):
     quant_info = _quant_info()
     shape = (2, 3, 256) if masked else (3, 256)
     quantized_input = torch.empty(shape, dtype=torch.float8_e4m3fn)
@@ -326,14 +285,14 @@ def test_w4a8_runner_scales_both_gemms(masked, activation, compensated):
         masked_m=masked_m,
         expected_m=2 if masked else None,
         m_indices=torch.zeros((3,), dtype=torch.int32) if not masked else None,
-        w13_scale_compensated=compensated,
     )
     down_input = torch.empty((*shape[:-1], 128), dtype=torch.float8_e4m3fn)
     down_scale = torch.full((*shape[:-1], 1), 7.0)
     fake_dg = SimpleNamespace(
-        ActivationQuantMode=SimpleNamespace(FP8_CHANNEL=sentinel.fp8_channel),
-        situ_and_mul=lambda *args, **kwargs: (down_input, down_scale),
-        silu_and_mul=lambda *args, **kwargs: (down_input, down_scale),
+        ActivationMode=SimpleNamespace(SILU=sentinel.silu, SITU=sentinel.situ),
+        QuantMode=SimpleNamespace(FP8_CHANNEL=sentinel.fp8_channel),
+        activation_and_mul=lambda *args, **kwargs: (down_input, down_scale),
+        activation_and_mul_masked=lambda *args, **kwargs: (down_input, down_scale),
     )
     fn = (
         "grouped_gemm_nt_f8f4bf16_masked"
@@ -345,8 +304,10 @@ def test_w4a8_runner_scales_both_gemms(masked, activation, compensated):
         patch.object(runner_module.deep_gemm_wrapper, fn) as gemm,
         patch.object(
             fake_dg,
-            f"{activation}_and_mul",
-            wraps=getattr(fake_dg, f"{activation}_and_mul"),
+            "activation_and_mul_masked" if masked else "activation_and_mul",
+            wraps=getattr(
+                fake_dg, "activation_and_mul_masked" if masked else "activation_and_mul"
+            ),
         ) as act,
     ):
         output = (
@@ -359,23 +320,24 @@ def test_w4a8_runner_scales_both_gemms(masked, activation, compensated):
 
     assert output.shape == shape
     assert gemm.call_count == 2
-    torch.testing.assert_close(
-        gemm.call_args_list[0].args[0][1], scale if compensated else scale * 2
-    )
+    torch.testing.assert_close(gemm.call_args_list[0].args[0][1], scale)
+    assert gemm.call_args_list[0].kwargs["inv_scale"] == 2.0
     assert gemm.call_args_list[1].args[0][0] is down_input
     assert gemm.call_args_list[1].args[0][1] is down_scale
-    assert act.call_args.args[:2] == (
+    assert gemm.call_args_list[1].kwargs["inv_scale"] == 4.0
+    assert act.call_args.args[:3] == (
+        sentinel.situ if activation == "situ" else sentinel.silu,
         sentinel.fp8_channel,
         gemm.call_args_list[0].args[2],
     )
-    assert act.call_args.kwargs["weight_inv_scale"] == 4.0
     if masked:
-        assert act.call_args.kwargs["masked_m"] is masked_m
+        assert act.call_args.args[3] is masked_m
         assert gemm.call_args_list[1].args[-2:] == (masked_m, 2)
 
 
 @pytest.mark.parametrize("layout", ["nopad", "masked", "fused"])
-def test_w4a8_wrapper_uses_exported_grouped_gemm_name(layout):
+@pytest.mark.parametrize("inv_scale", [1.0, 2.0])
+def test_w4a8_wrapper_uses_exported_grouped_gemm_name(layout, inv_scale):
     lhs_shape = (2, 8, 256) if layout == "masked" else (8, 256)
     lhs = (torch.empty(lhs_shape), torch.empty(lhs_shape[:-1] + (1,)))
     rhs = (torch.empty((2, 256, 128)), torch.empty((2, 256, 8)))
@@ -401,9 +363,24 @@ def test_w4a8_wrapper_uses_exported_grouped_gemm_name(layout):
         ),
     ):
         getattr(entrypoint, f"grouped_gemm_nt_f8f4bf16_{layout}")(
-            lhs, rhs, out, *extra_args
+            lhs, rhs, out, *extra_args, inv_scale=inv_scale
         )
-    getattr(fake_dg, api_name).assert_called_once_with(lhs, rhs, out, *extra_args)
+    getattr(fake_dg, api_name).assert_called_once_with(
+        lhs, rhs, out, *extra_args, inv_scale=inv_scale
+    )
+
+
+def test_w4a8_fused_fake_accepts_inverse_scale():
+    result = ppu_module.grouped_gemm_nt_f8f4bf16_fused_fake(
+        torch.empty((3, 256)),
+        torch.empty((3, 1)),
+        torch.empty((2, 256, 128)),
+        torch.empty((2, 256, 8)),
+        torch.empty((3, 256)),
+        torch.empty((3, 2), dtype=torch.int32),
+        inv_scale=2.0,
+    )
+    assert [tensor.shape for tensor in result] == [(2,), (6,), (6,)]
 
 
 @pytest.mark.parametrize(
@@ -453,19 +430,16 @@ def test_w4a8_none_uses_fused_or_nopad_without_changing_combine(fused, activatio
     down_input = torch.empty((2, 128), dtype=torch.float8_e4m3fn)
     down_scale = torch.ones((2, 1), dtype=torch.float32)
     fake_dg = SimpleNamespace(
-        ActivationQuantMode=SimpleNamespace(FP8_CHANNEL=sentinel.fp8_channel),
-        situ_and_mul=lambda *args, **kwargs: (down_input, down_scale),
-        silu_and_mul=lambda *args, **kwargs: (down_input, down_scale),
+        ActivationMode=SimpleNamespace(SILU=sentinel.silu, SITU=sentinel.situ),
+        QuantMode=SimpleNamespace(FP8_CHANNEL=sentinel.fp8_channel),
+        activation_and_mul=lambda *args, **kwargs: (down_input, down_scale),
     )
     with (
         patch.dict(sys.modules, {"deep_gemm": fake_dg}),
         patch.object(
             ppu_module,
             "sglang_per_token_quant_fp8",
-            side_effect=lambda x, scale_multiplier: (
-                quantized,
-                row_scale * scale_multiplier,
-            ),
+            return_value=(quantized, row_scale),
             create=True,
         ) as quantize,
         patch.object(
@@ -492,8 +466,8 @@ def test_w4a8_none_uses_fused_or_nopad_without_changing_combine(fused, activatio
         ) as permute,
         patch.object(
             fake_dg,
-            f"{activation}_and_mul",
-            wraps=getattr(fake_dg, f"{activation}_and_mul"),
+            "activation_and_mul",
+            wraps=fake_dg.activation_and_mul,
         ) as act,
         patch.object(ppu_module, "ep_gather") as gather,
         patch.object(ppu_module, "SGLANG_PROFILE_NVTX", False),
@@ -520,9 +494,15 @@ def test_w4a8_none_uses_fused_or_nopad_without_changing_combine(fused, activatio
     assert nopad_gemm.call_count == (1 if fused else 2)
     first = fused_gemm.call_args if fused else nopad_gemm.call_args_list[0]
     first_scale = first.args[1] if fused else first.args[0][1]
-    torch.testing.assert_close(first_scale, torch.full((2, 1), 6.0))
+    torch.testing.assert_close(first_scale, row_scale)
+    assert first.kwargs["inv_scale"] == 2.0
     assert nopad_gemm.call_args.args[0][0] is down_input
     assert nopad_gemm.call_args.args[0][1] is down_scale
-    assert quantize.call_args.kwargs["scale_multiplier"] == 2.0
+    assert nopad_gemm.call_args.kwargs["inv_scale"] == 4.0
+    assert act.call_args.args[:2] == (
+        sentinel.situ if activation == "situ" else sentinel.silu,
+        sentinel.fp8_channel,
+    )
+    quantize.assert_called_once_with(hidden_states)
     act.assert_called_once()
     gather.assert_called_once()
