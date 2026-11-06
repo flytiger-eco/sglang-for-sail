@@ -125,22 +125,60 @@ jobs:
           cat > .ppu-sweep/dataset_preflight.py <<'PY'
           import json
           import os
+          import traceback
+          from pathlib import Path
 
           from datasets import load_dataset
           from huggingface_hub import hf_hub_download
 
-          sharegpt = hf_hub_download(
-              repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-              filename="ShareGPT_V3_unfiltered_cleaned_split.json",
-              repo_type="dataset",
-          )
-          if not os.path.isfile(sharegpt) or os.path.getsize(sharegpt) == 0:
-              raise RuntimeError(f"Invalid ShareGPT file: {sharegpt}")
-          print(
-              "PPU_DATASET_PREFLIGHT "
-              + json.dumps({"dataset": "ShareGPT", "path": sharegpt, "bytes": os.path.getsize(sharegpt)}),
-              flush=True,
-          )
+          roots = {
+              "ShareGPT": "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0/ShareGPT_Vicuna_unfiltered",
+              "LongBench-v2": "/nas_aisw/datasets/datasets/LLM/ZhipuAI/v2/LongBench-v2",
+              "MMMU": "/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1/MMMU",
+          }
+          for label, value in roots.items():
+              root = Path(value)
+              entries = []
+              if root.is_dir():
+                  for path in sorted(root.iterdir()):
+                      entries.append(path.name + "/" if path.is_dir() else path.name)
+                      if path.is_dir():
+                          entries.extend(f"{path.name}/{child.name}" for child in sorted(path.iterdir())[:20])
+              print(
+                  "PPU_DATASET_LAYOUT "
+                  + json.dumps({"dataset": label, "root": value, "entries": entries[:80]}),
+                  flush=True,
+              )
+
+          failures = []
+
+          def run_check(label, check):
+              try:
+                  check()
+              except Exception as error:
+                  failures.append(f"{label}: {type(error).__name__}: {error}")
+                  print(
+                      "PPU_DATASET_PREFLIGHT_ERROR "
+                      + json.dumps({"check": label, "error": failures[-1]}),
+                      flush=True,
+                  )
+                  traceback.print_exc()
+
+          def check_sharegpt():
+              sharegpt = hf_hub_download(
+                  repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
+                  filename="ShareGPT_V3_unfiltered_cleaned_split.json",
+                  repo_type="dataset",
+              )
+              if not os.path.isfile(sharegpt) or os.path.getsize(sharegpt) == 0:
+                  raise RuntimeError(f"Invalid ShareGPT file: {sharegpt}")
+              print(
+                  "PPU_DATASET_PREFLIGHT "
+                  + json.dumps(
+                      {"dataset": "ShareGPT", "path": sharegpt, "bytes": os.path.getsize(sharegpt)}
+                  ),
+                  flush=True,
+              )
 
           def check_row(repo_id, name, split, required):
               args = (repo_id,) if name is None else (repo_id, name)
@@ -165,15 +203,30 @@ jobs:
                   flush=True,
               )
 
-          check_row(
-              "THUDM/LongBench-v2",
-              None,
-              "train",
-              {"context", "question", "choice_A", "choice_B", "choice_C", "choice_D"},
+          run_check("ShareGPT", check_sharegpt)
+          run_check(
+              "LongBench-v2 train",
+              lambda: check_row(
+                  "THUDM/LongBench-v2",
+                  None,
+                  "train",
+                  {"context", "question", "choice_A", "choice_B", "choice_C", "choice_D"},
+              ),
           )
-          check_row("MMMU/MMMU", "Math", "test", {"question", "image_1"})
-          check_row("MMMU/MMMU", "Accounting", "validation", {"question", "image_1"})
-          check_row("lmms-lab/MMMU", "Accounting", "validation", {"question", "image_1"})
+          run_check(
+              "MMMU Math test",
+              lambda: check_row("MMMU/MMMU", "Math", "test", {"question", "image_1"}),
+          )
+          run_check(
+              "MMMU Accounting validation",
+              lambda: check_row("MMMU/MMMU", "Accounting", "validation", {"question", "image_1"}),
+          )
+          run_check(
+              "lmms-eval MMMU Accounting validation",
+              lambda: check_row("lmms-lab/MMMU", "Accounting", "validation", {"question", "image_1"}),
+          )
+          if failures:
+              raise RuntimeError("Dataset preflight failures: " + json.dumps(failures))
           PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
