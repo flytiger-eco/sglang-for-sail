@@ -114,15 +114,41 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
 
 
 # PD DSA prefill CP KV resharding is incompatible with the radix prefix cache.
+def dsa_cp_prefix_cache_enabled() -> bool:
+    """Experimental switch: keep the radix cache on under PD DSA prefill CP."""
+    return envs.SGLANG_DSA_CP_PREFIX_CACHE.get()
+
+
+def supports_dsa_cp_prefix_cache(server_args: ServerArgs) -> bool:
+    """Whether the deployment is the supported DSA prefill-CP scenario.
+
+    Only interleave CP is supported: the CP KV/indexer pools then hold a full
+    logical-order copy on every rank, so prefix pages are readable by the
+    existing DSA indexer/attention paths and no CP-aware resharding is needed.
+    """
+    return (
+        getattr(server_args, "disaggregation_mode", "null") != "null"
+        and getattr(server_args, "enable_prefill_cp", False)
+        and getattr(server_args, "cp_strategy", None) == "interleave"
+    )
+
+
 def should_bypass_dsa_cp_prefix_cache(
     server_args: ServerArgs, *, is_dsa: bool = True
 ) -> bool:
     """Whether PD DSA prefill CP must bypass the legacy radix cache."""
-    return (
-        is_dsa
-        and getattr(server_args, "disaggregation_mode", "null") != "null"
-        and getattr(server_args, "enable_prefill_cp", False)
-    )
+    if not is_dsa:
+        return False
+    if getattr(server_args, "disaggregation_mode", "null") == "null" or not getattr(
+        server_args, "enable_prefill_cp", False
+    ):
+        # Not the PD prefill-CP scenario at all: today's behavior (no bypass).
+        return False
+    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache(server_args):
+        # Experimental un-bypass. Everything else (e.g. a non-interleave
+        # strategy) keeps bypassing the radix cache.
+        return False
+    return True
 
 
 class DisaggregationMode(Enum):
