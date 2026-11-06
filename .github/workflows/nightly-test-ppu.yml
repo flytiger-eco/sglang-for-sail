@@ -125,6 +125,7 @@ jobs:
           cat > .ppu-sweep/dataset_preflight.py <<'PY'
           import json
           import os
+          import time
           import traceback
           from pathlib import Path
 
@@ -149,6 +150,53 @@ jobs:
                   + json.dumps({"dataset": label, "root": value, "entries": entries[:80]}),
                   flush=True,
               )
+
+          for value in (
+              "/nas_aisw",
+              "/nas_aisw/datasets",
+              "/nas_aisw/datasets/datasets",
+              "/nas_aisw/datasets/hf_cache",
+          ):
+              root = Path(value)
+              entries = []
+              error = None
+              try:
+                  entries = sorted(path.name + "/" if path.is_dir() else path.name for path in root.iterdir())[:100]
+              except OSError as exc:
+                  error = f"{type(exc).__name__}: {exc}"
+              print(
+                  "PPU_NAS_PROBE "
+                  + json.dumps({"root": value, "entries": entries, "error": error}),
+                  flush=True,
+              )
+
+          matches = []
+          visited = 0
+          deadline = time.monotonic() + 60
+          search_root = Path("/nas_aisw/datasets")
+          target_names = {
+              "ShareGPT_Vicuna_unfiltered",
+              "ShareGPT_V3_unfiltered_cleaned_split.json",
+              "LongBench-v2",
+              "MMMU",
+          }
+          if search_root.is_dir():
+              for current, directories, files in os.walk(search_root):
+                  visited += 1
+                  current_path = Path(current)
+                  depth = len(current_path.relative_to(search_root).parts)
+                  if depth >= 7:
+                      directories[:] = []
+                  for name in directories + files:
+                      if name in target_names:
+                          matches.append(str(current_path / name))
+                  if visited >= 20000 or len(matches) >= 30 or time.monotonic() >= deadline:
+                      break
+          print(
+              "PPU_NAS_SEARCH "
+              + json.dumps({"matches": matches, "visited_directories": visited}),
+              flush=True,
+          )
 
           failures = []
 
