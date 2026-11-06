@@ -1190,7 +1190,13 @@ class SchedulerMetricsReporter:
         host_pool = getattr(
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
-        assert host_pool is not None, "Host pool not found"
+        # ChunkCache (selected when the DSA CP prefix cache is bypassed)
+        # has no host tier, so there is nothing to publish; leave the gauge
+        # fields at their defaults instead of asserting. HiRadixCache is
+        # unaffected: its host pool is never None when hierarchical cache
+        # is enabled.
+        if host_pool is None:
+            return
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total

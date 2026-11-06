@@ -65,6 +65,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    drop_misaligned_dsa_cp_prefix_reuse,
+    enforce_dsa_cp_prefix_cache_alignment,
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -172,6 +174,11 @@ def match_prefix_for_req(
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens()
     key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
 
+    # Snapshot before match: a cow_mamba match may allocate a mamba slot and
+    # stage COW metadata that must be undone if the reuse is dropped below.
+    mamba_held_before_match = (
+        bool(getattr(req.kv, "holds_mamba", False)) if cow_mamba else None
+    )
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=RadixKey(
@@ -186,6 +193,23 @@ def match_prefix_for_req(
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
         match_result = zero_match_result(
+            tree_cache, match_result, extra_key=req.extra_key
+        )
+    # DSA prefill CP: a reuse must stay kpool-aligned, otherwise the kpool
+    # extend path raises; degrade to recompute for this request. A cow_mamba
+    # match must go through the shared helper so the staged mamba slot/COW
+    # state is rolled back; zeroing alone would leak it (and would also hide
+    # the misalignment from any caller that wants to gate afterwards).
+    if cow_mamba:
+        match_result = drop_misaligned_dsa_cp_prefix_reuse(
+            tree_cache,
+            req,
+            match_result,
+            mamba_held_before_match=mamba_held_before_match,
+            extra_key=req.extra_key,
+        )
+    else:
+        match_result = enforce_dsa_cp_prefix_cache_alignment(
             tree_cache, match_result, extra_key=req.extra_key
         )
     (

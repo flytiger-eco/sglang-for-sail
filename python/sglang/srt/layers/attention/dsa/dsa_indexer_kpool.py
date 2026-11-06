@@ -1279,6 +1279,20 @@ class IndexerKPool(MultiPlatformOp):
         assert n_real <= total_q, (
             f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
         )
+        # The ragged read must address one row per plan row; a mismatch means
+        # the pooled prefix view and the query rows drifted apart (read would
+        # silently skip candidates).
+        assert ks_per_q.numel() == n_real and ke_per_q.numel() == n_real, (
+            "kpool plan row mismatch: "
+            f"ks={ks_per_q.numel()} ke={ke_per_q.numel()} rows={n_real}"
+        )
+        assert pool_lens.numel() == n_real, (
+            f"kpool plan pooled lens {pool_lens.numel()} != rows {n_real}"
+        )
+        assert total_k_rows % max(1, self.index_kpool) == 0, (
+            "ragged k rows are not a multiple of index_kpool: "
+            f"{total_k_rows} % {self.index_kpool}"
+        )
 
         kv_fp8 = None
         if total_k_rows > 0:

@@ -228,6 +228,11 @@ def _append_local_rows(
         local_extend_seq_lens_cpu, local_seq_lens_cpu, strict=True
     ):
         assert q_len > 0, f"local_extend_seq_lens_cpu has non-positive {q_len = }"
+        # The extend chunk starts at seq_len - q_len; a negative prefix means
+        # the batch metadata and the CP shard disagree about this request.
+        assert seq_len >= q_len, (
+            f"extend chunk exceeds sequence length ({q_len=} > {seq_len=})"
+        )
         plan.ragged_q_len.append(q_len)
         pool_seq_len = seq_len // pool_size
         pool_pages_i = (pool_seq_len + slots_per_page - 1) // slots_per_page
