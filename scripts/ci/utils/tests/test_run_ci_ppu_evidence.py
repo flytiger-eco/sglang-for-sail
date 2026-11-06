@@ -125,11 +125,18 @@ class StrictRunnerTest(unittest.TestCase):
 
     def test_timeout(self):
         result, report = self.run_fixture(
-            "import time\ndef test_wait(): time.sleep(60)\n", timeout=1
+            "import time\nprint('TIMEOUT_OUTPUT_MARKER')\n"
+            "def test_wait(): time.sleep(60)\n",
+            timeout=1,
         )
         self.assertEqual(result, 1)
         self.assertIn("timed out", report["files"][0]["error"])
         self.assertLess(report["elapsed"], 5)
+        log = self.root / "results" / report["files"][0]["log"]
+        text = log.read_text()
+        self.assertIn("TIMEOUT_OUTPUT_MARKER", text)
+        self.assertIn("Current thread", text)
+        self.assertIn("in test_wait", text)
 
     def test_suite_deadline(self):
         result, report = self.run_fixture("def test_ok(): pass\n", suite_timeout=0)

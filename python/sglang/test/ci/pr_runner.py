@@ -144,7 +144,11 @@ def run_pytest_files(
             if remaining <= 0:
                 raise TimeoutError("suite budget exhausted")
             env = dict(
-                os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTEST_ADDOPTS=""
+                os.environ,
+                PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+                PYTEST_ADDOPTS="",
+                PYTHONUNBUFFERED="1",
+                PYTHONFAULTHANDLER="1",
             )
             # -o addopts= prevents repository configuration from changing selection.
             command = [
@@ -153,6 +157,7 @@ def run_pytest_files(
                 "pytest",
                 filename,
                 "-v",
+                "-s",
                 "-o",
                 "addopts=",
                 "-o",
@@ -170,6 +175,14 @@ def run_pytest_files(
 
                 try:
                     record["returncode"] = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    # Dump all pytest threads before killing the process group.
+                    try:
+                        os.kill(process.pid, signal.SIGABRT)
+                        process.wait(timeout=10)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        pass
+                    raise
                 finally:
                     stop_process(process)
                     process = None

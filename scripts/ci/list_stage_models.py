@@ -519,6 +519,10 @@ def build_inventory(
         "model_count": len(all_models),
         "runner_label_count": len(runner_labels),
         "all_models": sorted(all_models),
+        "file_models": {
+            name: sorted(models) for name, models in sorted(file_models.items())
+        },
+        "suite_model_overrides": by_suite,
         "parse_failures": dict(sorted(parse_failures.items())),
         "runner_labels": runner_labels,
         "unmapped_suites": unmapped_suites,
