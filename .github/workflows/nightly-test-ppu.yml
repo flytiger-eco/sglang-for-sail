@@ -12,7 +12,7 @@ on:
       scope:
         description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
         type: choice
-        options: [base, extra, nightly, all]
+        options: [base, extra, nightly]
         default: base
       suites:
         description: 'Optional comma-separated exact CUDA suites within the selected scope'
@@ -26,10 +26,6 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
-      model_preflight_only:
-        description: 'Run only the NAS model preflight; skip test execution and summary'
-        type: boolean
-        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -144,7 +140,6 @@ jobs:
           ROOT = Path.cwd().resolve()
           # Base includes the original CUDA kernel unit/benchmark registrations for complete coverage across all three scopes.
           STAGES = {'base': {'base-a', 'base-b', 'base-b-kernel-unit', 'base-b-kernel-benchmark', 'base-c'}, 'extra': {'extra-a', 'extra-b'}, 'nightly': {'nightly'}}
-          STAGES['all'] = set().union(*STAGES.values())
 
           def require(condition, message):
               if not condition:
@@ -976,12 +971,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'model_preflight_only'})
-                      self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly', 'all'])
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.model_preflight_only != true')
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.model_preflight_only != true')
+                      self.assertNotIn('if', jobs['sweep-execute'])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1016,7 +1011,6 @@ jobs:
                                   if isinstance(key, ast.Attribute) and key.attr == 'CUDA':
                                       cuda_suites[node.targets[0].id] = ast.literal_eval(value)
                       expected_suites = {'base': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('base-')}, 'extra': {s for s in cuda_suites['PER_COMMIT_SUITES'] if s.startswith('extra-')}, 'nightly': set(cuda_suites['NIGHTLY_SUITES'])}
-                      expected_suites['all'] = set().union(*expected_suites.values())
                       for scope, suites in expected_suites.items():
                           plan = make_plan(scope, '', 0, 1, hardware)
                           expected = [r for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite in suites and not r.nightly]
@@ -1111,19 +1105,19 @@ jobs:
                               resolve_partition_model()
 
                   def test_parallel_scope_contracts(self):
-                      for scope in ('base', 'extra', 'nightly', 'all'):
+                      for scope in ('base', 'extra', 'nightly'):
                           plan = make_plan(scope, '', 0, 2, hardware)
                           self.assertEqual(plan['parallel'], 2)
                           self.assertNotIn('plan_only', plan)
                           self.assertEqual(plan['hardware']['board_devices'], 8)
                           self.assertTrue(all(e['suite'].split('-test-', 1)[0] in STAGES[scope] for e in plan['entries']))
                       with self.assertRaisesRegex(ValueError, 'Unknown scope'):
-                          make_plan('invalid', '', 0, 2, hardware)
+                          make_plan('all', '', 0, 2, hardware)
                       extra = next(r.effective_suite for r in registrations if r.backend == module.HWBackend.CUDA and r.effective_suite.startswith('extra-') and r.disabled is None)
                       with self.assertRaisesRegex(ValueError, 'selected scope'):
                           make_plan('base', extra, 0, 2, hardware)
                       save(self.directory / 'hardware.json', hardware)
-                      inputs = {'SCOPE': 'invalid', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2'}
+                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2'}
                       outputs = {}
                       with patch.dict(globals(), BUNDLE=self.directory, resolve_partition_model=lambda: (None, ''), output=lambda k, v: outputs.update({k: v})), patch.dict(os.environ, inputs):
                           with self.assertRaisesRegex(ValueError, 'Unknown scope'):
@@ -1415,7 +1409,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: inputs.model_preflight_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1505,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && inputs.model_preflight_only != true
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
