@@ -429,6 +429,11 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # top-k v3 exact-fallback race UT: worker / iteration / row-shape knobs
+    SGLANG_TEST_TOPK_RACE_WORKERS = EnvInt(4)
+    SGLANG_TEST_TOPK_RACE_ITERS = EnvInt(60)
+    SGLANG_TEST_TOPK_RACE_SEQ = EnvInt(100000)
+    SGLANG_TEST_TOPK_RACE_BATCH = EnvInt(576)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
