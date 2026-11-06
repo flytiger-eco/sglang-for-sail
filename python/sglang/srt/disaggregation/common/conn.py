@@ -331,12 +331,28 @@ class CommonKVManager(BaseKVManager):
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
         exception because each CP rank owns different state layers.
+
+        Rank0-only sending is valid only because interleave CP keeps a full
+        replica on every rank; any other strategy shards state and would lose
+        the non-rank0 shards if this returned True. Only the experimental
+        DSA prefill-CP prefix cache relies on that invariant, so the check is
+        gated on its switch: other PD CP models keep the previous behaviour.
         """
-        return (
+        if (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
-        )
+        ):
+            if envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+                from sglang.srt.runtime_context import get_server_args
+
+                cp_strategy = getattr(get_server_args(), "cp_strategy", None)
+                assert cp_strategy == "interleave", (
+                    "rank0-only CP state transfer assumes interleave CP keeps a "
+                    f"full replica on every rank; got cp_strategy={cp_strategy}"
+                )
+            return True
+        return False
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
         if self.dcp_size == dst_dcp_size:

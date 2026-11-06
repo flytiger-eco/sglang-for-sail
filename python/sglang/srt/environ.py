@@ -1334,6 +1334,11 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    # Experimental: keep the radix (prefix) cache enabled under DSA prefill
+    # context parallelism on PD prefill workers instead of bypassing it.
+    # Default OFF keeps today's behavior; enabling it is only valid for
+    # interleave CP with page_size == 64 (checked in the KV cache builder).
+    SGLANG_DSA_CP_PREFIX_CACHE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
@@ -1789,6 +1794,11 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    # Experimental: keep the radix (prefix) cache enabled under DSA prefill
+    # context parallelism on PD prefill workers instead of bypassing it.
+    # Default OFF keeps today's behavior; enabling it is only valid for
+    # interleave CP with page_size == 64 (checked in the KV cache builder).
+    SGLANG_DSA_CP_PREFIX_CACHE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
