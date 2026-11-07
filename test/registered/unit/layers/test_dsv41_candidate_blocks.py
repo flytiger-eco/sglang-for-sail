@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -6,7 +8,10 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+    BlockIds,
+    _publish_tile_blocks,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -63,6 +68,39 @@ class TestCandidateBlockIds(CustomTestCase):
                 )
                 expected = set(range((width + 7) // 8))
                 self.assertEqual(id_sets(blocks), [expected, expected])
+
+    def test_publish_tile_uses_aligned_view_without_pad(self):
+        rows, lc = 4, 19
+        lens = torch.tensor([19, 18, 9, 1], dtype=torch.int32)
+        original = torch.randn(rows, 24)
+        visible = original[:, :lc].masked_fill(
+            torch.arange(lc)[None, :] >= lens[:, None], -torch.inf
+        )
+        expected = select_candidate_block_ids(
+            logits=visible,
+            compress_lens=lens[:, None],
+            topk_blocks=2,
+            block_size=8,
+        )
+        data = SimpleNamespace(
+            compress_lens=lens,
+            rows_per_request=[rows],
+            lens_per_request=[lc],
+        )
+        actual = torch.full((rows, 2), -1, dtype=torch.int32)
+        with patch(
+            "sglang.kernels.ops.attention.dsv4.candidate_blocks.F.pad",
+            side_effect=AssertionError("F.pad should not be called"),
+        ):
+            _publish_tile_blocks(
+                data=data,
+                tile=slice(0, rows),
+                logits=original.clone(),
+                blocks=actual,
+                topk_blocks=2,
+                block_size=8,
+            )
+        torch.testing.assert_close(actual, expected)
 
 
 class TestTopkAmongBlocks(CustomTestCase):
