@@ -1,43 +1,30 @@
-"""Unit tests: `input_embeds` static slot for the prefill CUDA-graph body
-(breakable / full) — text-only EAGLE/MTP draft regression.
+"""CPU tests for the prefill CUDA-graph static ``input_embeds`` slot.
 
-Root cause under test (E8 verdict): the prefill CUDA-graph buffer registry
-registered the static `input_embeds` slot only for multimodal models, so a
-text-only draft (MTP) graph captured the `input_embeds is None` branch of the
-inner layer model. On replay, the outer MTP wrapper computes the real-time
-fusion input `fc(cat(embed_tokens(ids), target_hidden_states))` and passes it
-as the 4th positional arg of `layer_model.forward`, but with no slot
-`replay_layer_forward` silently dropped it — the draft prefill only ever
-consumed token embeddings and the target hidden states never entered the
-draft computation.
+The captured prefill body (breakable / full backends) reads its stack input
+from a static slot. When the outer model computes that input itself -- a
+multimodal merge, or an EAGLE/MTP draft fusing the target's hidden states with
+the token embeddings -- the slot must exist before capture and be refreshed
+before every replay. Without it, the graph keeps the capture-time
+``embed_tokens(input_ids)`` branch and the live input is silently dropped.
 
-Fix under test (branch xujiantao/agent/draft_prefill_graph_fixes, commit
-c8720fb): the slot registration is gated by `register_input_embeds`
-independently of is_multimodal; the runner derives it from
-`needs_input_embeds_slot = is_multimodal or (eagle draft + eager-tail
-backend)`; a missing `input_embeds` source buffer is owned by the registry
-instead of raising; and a live fusion input without a slot now raises
-RuntimeError instead of being dropped.
+Contracts under test:
 
-Covered contracts (C1-C7 + 无畏号 T1-T22):
-  C1/T1-T5  slot registration matrix + slot attributes + reset_padding,
-  C2a-d/T6-T8  source adoption: input_embeds optional, others strict,
-  C3/T22  capture binds forward_batch.input_embeds to the static slot
-          (same storage as replay) or None,
-  C4/T16/T20  replay copies the live fusion input bitwise into the slot
-              before graph replay, live rows only,
-  C5/T17  no fusion input ⇒ `embed()(input_ids)` fallback, fail-closed
-          without get_input_embeddings(),
-  C6/T18-T19/T21  guardrail: live fusion input with no slot ⇒ RuntimeError
-          naming the slot and the disabled-backend escape hatch, raised
-          before replay,
-  C7  non-first PP rank ⇒ no slot fill, replay still runs,
-  T9-T11  the `needs_input_embeds_slot` predicate matrix (target unchanged,
-          draft-only fix).
+  C1  ``register_input_embeds`` gates the slot independently of
+      ``is_multimodal``; omitting the flag keeps the multimodal-only default.
+  C2  ``input_embeds`` falls back to a registry-owned buffer when the source
+      buffers object has none; any other missing source buffer raises.
+  C3  capture binds ``forward_batch.input_embeds`` to the static slot.
+  C4  replay copies the live stack input into the slot before the graph runs,
+      live rows only.
+  C5  with no live input the slot is filled from the embedding accessor; with
+      no accessor at all the replay fails closed.
+  C6  a live stack input with no slot raises instead of being dropped, unless
+      it is exactly ``embed(input_ids)`` -- the same value the captured body
+      computes for itself.
+  C7  non-first PP ranks neither fill the slot nor trip the guard.
 
-No server, no model loading, no accelerator, no network. CPU-only. Small
-explicit geometry (max_num_tokens=64, hidden=16/32) — no production config
-is read.
+No server, no model loading, no accelerator, no network. CPU only. Small
+explicit geometry (max_num_tokens=64, hidden=16/32).
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,9 +32,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-import ast
-import inspect
-import textwrap
 import unittest
 from types import SimpleNamespace
 
@@ -66,6 +50,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
+    _needs_input_embeds_slot,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_utils.buffers import PrefillInputBuffers
@@ -82,6 +67,8 @@ NUM_TOKENS = 32
 EMBED_DTYPE = torch.bfloat16
 DEVICE = torch.device("cpu")
 
+_OMITTED = object()
+
 
 def _embed_formula(input_ids: torch.Tensor) -> torch.Tensor:
     """Deterministic embedding value: depends only on the token id."""
@@ -96,6 +83,9 @@ def _build_registry(
     max_num_tokens=MAX_NUM_TOKENS,
     source=None,
 ):
+    kwargs = {}
+    if register_input_embeds is not _OMITTED:
+        kwargs["register_input_embeds"] = register_input_embeds
     return build_prefill_registry(
         device=DEVICE,
         max_bs=MAX_BS,
@@ -106,7 +96,7 @@ def _build_registry(
         embed_dtype=EMBED_DTYPE,
         share_pool=False,
         source=source,
-        register_input_embeds=register_input_embeds,
+        **kwargs,
     )
 
 
@@ -127,10 +117,10 @@ def _detached_input_ids(num_tokens=NUM_TOKENS):
     return torch.arange(num_tokens, dtype=torch.int64) % 1000
 
 
-def _detached_fusion(num_tokens=NUM_TOKENS):
+def _detached_fusion(num_tokens=NUM_TOKENS, width=HIDDEN):
     return (
-        torch.arange(num_tokens * HIDDEN, dtype=torch.float32)
-        .reshape(num_tokens, HIDDEN)
+        torch.arange(num_tokens * width, dtype=torch.float32)
+        .reshape(num_tokens, width)
         .to(EMBED_DTYPE)
     )
 
@@ -146,8 +136,8 @@ class _StubEmbedding(torch.nn.Module):
 
 
 class _StubLayerModel(torch.nn.Module):
-    """Mimics the inner Qwen3_5ForCausalLM signature: input_embeds is the
-    4th positional parameter (detected via inspect.signature)."""
+    """Mimics a transformer body whose forward takes ``input_embeds`` as its
+    4th positional parameter."""
 
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
         raise AssertionError(
@@ -157,8 +147,8 @@ class _StubLayerModel(torch.nn.Module):
 
 
 class _StubOuterModel(torch.nn.Module):
-    """Mimics the MTP wrapper: computes a fusion input and passes it as the
-    4th positional arg of the (possibly monkey-patched) layer model."""
+    """Mimics an MTP wrapper: computes the body's stack input and passes it
+    as the 4th positional argument of the layer model."""
 
     def __init__(self, layer_model, embed):
         super().__init__()
@@ -174,14 +164,32 @@ class _StubOuterModel(torch.nn.Module):
         return self.layer_model(input_ids, positions, forward_batch, fusion)
 
 
-class _StubOuterModelNoEmbeddings(torch.nn.Module):
-    """Same as _StubOuterModel but exposes no get_input_embeddings()."""
+class _StubOuterModelWithEmbedInputIds(torch.nn.Module):
+    """Wrapper exposing ``embed_input_ids()`` instead of
+    ``get_input_embeddings()``."""
+
+    def __init__(self, layer_model, embed):
+        super().__init__()
+        self.layer_model = layer_model
+        self._embed = embed
+
+    def embed_input_ids(self, input_ids):
+        return self._embed(input_ids)
+
+    def forward(self, input_ids, positions, forward_batch, fusion=None):
+        if fusion is None:
+            return self.layer_model(input_ids, positions, forward_batch)
+        return self.layer_model(input_ids, positions, forward_batch, fusion)
+
+
+class _StubOuterModelNoEmbedAccessor(torch.nn.Module):
+    """Wrapper with no embedding accessor at all."""
 
     def __init__(self, layer_model):
         super().__init__()
         self.layer_model = layer_model
 
-    def forward(self, input_ids, positions, forward_batch, fusion=None):
+    def forward(self, input_ids, positions, forward_batch):
         return self.layer_model(input_ids, positions, forward_batch)
 
 
@@ -242,7 +250,7 @@ def _make_runner(
         pp_group=SimpleNamespace(is_first_rank=pp_is_first_rank, is_last_rank=False),
         attn_backend=object(),
         attn_tp_sequence_sharded=lambda num_tokens: False,
-        model_config=SimpleNamespace(context_len=4096),
+        model_config=SimpleNamespace(context_len=4096, hidden_size=HIDDEN),
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
         graph_shared_output=None,
@@ -296,43 +304,14 @@ def _run_body(runner, *, fusion=None, num_tokens=NUM_TOKENS, static_num_tokens=N
     return forward_batch, shape_key, output
 
 
-def _predicate_expression():
-    """Extract the real `needs_input_embeds_slot` RHS from __init__ source.
-
-    The predicate is an inline assignment in __init__ (not a callable), so
-    the test executes the actual source expression against a stub instance —
-    if the fix's predicate changes shape or disappears, this fails loudly.
-    """
-    source = textwrap.dedent(inspect.getsource(PrefillCudaGraphRunner.__init__))
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and target.attr == "needs_input_embeds_slot"
-                ):
-                    return ast.get_source_segment(source, node.value)
-    raise AssertionError(
-        "PrefillCudaGraphRunner.__init__ no longer assigns "
-        "needs_input_embeds_slot; the fix predicate is missing."
-    )
-
-
 class TestRegistrySlotRegistration(CustomTestCase):
-    """C1/C2c (T1-T4): the input_embeds slot registration matrix."""
+    """C1: the input_embeds slot registration matrix."""
 
     def test_text_only_registry_registers_input_embeds_slot(self):
-        # C1 regression: at baseline the slot only exists under
-        # is_multimodal, so a text-only model whose layer_model.forward
-        # accepts input_embeds got no slot and replay dropped the live
-        # fusion input. Also T1: mrope stays multimodal-gated.
+        # A text-only model whose layer_model.forward accepts input_embeds must
+        # be able to opt in; mrope stays multimodal-gated.
         reg = _build_registry(is_multimodal=False, register_input_embeds=True)
-        self.assertTrue(
-            reg.has_slot("input_embeds"),
-            "text-only model whose layer_model.forward accepts input_embeds "
-            "must have the input_embeds static slot",
-        )
+        self.assertTrue(reg.has_slot("input_embeds"))
         self.assertFalse(reg.has_slot("mrope_positions"))
         slot = reg.get_slot("input_embeds")
         self.assertEqual(tuple(slot.buffer.shape), (MAX_NUM_TOKENS, HIDDEN))
@@ -341,8 +320,8 @@ class TestRegistrySlotRegistration(CustomTestCase):
         self.assertFalse(slot.copy_from_fb)
 
     def test_text_only_registry_input_embeds_slot_cross_geometry_hidden32(self):
-        # C1 under a different hidden width: the slot must size from the
-        # passed hidden_size, not from any production model config.
+        # The slot sizes from the passed hidden_size, not from any production
+        # model config.
         reg = _build_registry(
             is_multimodal=False, register_input_embeds=True, hidden_size=HIDDEN_ALT
         )
@@ -352,26 +331,32 @@ class TestRegistrySlotRegistration(CustomTestCase):
         self.assertEqual(slot.buffer.dtype, EMBED_DTYPE)
 
     def test_multimodal_registry_keeps_input_embeds_and_mrope_slots(self):
-        # T3: multimodal path unchanged.
         reg = _build_registry(is_multimodal=True, register_input_embeds=True)
         self.assertTrue(reg.has_slot("input_embeds"))
         self.assertTrue(reg.has_slot("mrope_positions"))
 
     def test_eager_extend_registry_omits_input_embeds_slot(self):
-        # C2c/T2: the eager extend path passes register_input_embeds=False
-        # and must keep carrying input_embeds from the batch (read input),
-        # never written in-graph.
+        # The eager extend path passes register_input_embeds=False and keeps
+        # carrying input_embeds from the batch (a read input, never written
+        # in-graph).
         reg = _build_registry(is_multimodal=False, register_input_embeds=False)
         self.assertFalse(reg.has_slot("input_embeds"))
 
-    def test_input_embeds_slot_reset_padding_clears_only_tail(self):
-        # T5: reset_padding(raw_n, padded_n) zeroes [raw_n:padded_n] and
-        # leaves [0:raw_n] bitwise untouched.
-        reg = _build_registry(is_multimodal=False, register_input_embeds=True)
-        self.assertTrue(
-            reg.has_slot("input_embeds"),
-            "input_embeds slot missing for text-only registry",
+    def test_omitted_flag_keeps_multimodal_only_default(self):
+        # Callers that pass no flag keep the historical behavior: text-only
+        # gets no slot, and a zero default hidden_size cannot fabricate a
+        # zero-width one.
+        text_reg = _build_registry(
+            is_multimodal=False, register_input_embeds=_OMITTED, hidden_size=0
         )
+        self.assertFalse(text_reg.has_slot("input_embeds"))
+        mm_reg = _build_registry(is_multimodal=True, register_input_embeds=_OMITTED)
+        self.assertTrue(mm_reg.has_slot("input_embeds"))
+
+    def test_input_embeds_slot_reset_padding_clears_only_tail(self):
+        # reset_padding(raw_n, padded_n) zeroes [raw_n:padded_n] and leaves
+        # [0:raw_n] bitwise untouched.
+        reg = _build_registry(is_multimodal=False, register_input_embeds=True)
         buffer = reg.get_slot("input_embeds").buffer
         head = _detached_fusion(NUM_TOKENS)
         buffer[:NUM_TOKENS] = head
@@ -388,29 +373,24 @@ class TestRegistrySlotRegistration(CustomTestCase):
 
 
 class TestSourceAdoption(CustomTestCase):
-    """C2a/C2d (T6-T8): source buffers — input_embeds optional, others strict."""
+    """C2: source buffers -- input_embeds optional, others strict."""
 
     def test_text_only_source_build_registers_registry_owned_input_embeds_slot(self):
-        # C2a/T6: a text-only PrefillInputBuffers does not allocate
-        # input_embeds (方案B: buffers.py unchanged); build_prefill_registry
-        # must not raise and must let the registry own the allocation.
+        # A text-only PrefillInputBuffers does not allocate input_embeds;
+        # build_prefill_registry must not raise and must own the allocation.
         buffers = _create_buffers(is_multimodal=False)
         self.assertIsNone(buffers.input_embeds)
         reg = _build_registry(
             is_multimodal=False, register_input_embeds=True, source=buffers
         )
-        self.assertTrue(
-            reg.has_slot("input_embeds"),
-            "text-only source with register_input_embeds=True must still get "
-            "the input_embeds slot (registry-owned allocation)",
-        )
+        self.assertTrue(reg.has_slot("input_embeds"))
         slot = reg.get_slot("input_embeds")
         self.assertIsNotNone(slot.buffer)
         self.assertEqual(tuple(slot.buffer.shape), (MAX_NUM_TOKENS, HIDDEN))
         self.assertEqual(slot.buffer.dtype, EMBED_DTYPE)
 
     def test_multimodal_source_adopts_same_input_embeds_buffer(self):
-        # T7: multimodal adoption unchanged — the registry adopts the source
+        # Multimodal adoption is unchanged: the registry adopts the source
         # buffer (same object) instead of reallocating.
         buffers = _create_buffers(is_multimodal=True)
         self.assertIsNotNone(buffers.input_embeds)
@@ -421,8 +401,8 @@ class TestSourceAdoption(CustomTestCase):
         self.assertIs(reg.get_slot("input_embeds").buffer, buffers.input_embeds)
 
     def test_source_missing_non_input_embeds_buffer_raises(self):
-        # C2d/T8: the relaxation is scoped to input_embeds only; any other
-        # missing source buffer must still raise ValueError.
+        # The relaxation is scoped to input_embeds only; any other missing
+        # source buffer must still raise ValueError.
         source = SimpleNamespace(
             input_ids=torch.zeros(MAX_NUM_TOKENS, dtype=torch.int64),
             out_cache_loc=torch.zeros(MAX_NUM_TOKENS, dtype=torch.int64),
@@ -433,79 +413,55 @@ class TestSourceAdoption(CustomTestCase):
             )
 
 
-class TestNeedsInputEmbedsSlotPredicate(CustomTestCase):
-    """T9-T11 / 契约用例17: the __init__ predicate matrix.
+class TestSlotEligibility(CustomTestCase):
+    """C1 eligibility: the predicate and its effect on the built registry."""
 
-    The predicate is an inline assignment in __init__; this test executes
-    the real assignment expression (extracted via ast from the actual
-    source) with a stub instance whose `_uses_eager_prefill_tail` is the
-    real method. Expected matrix (multimodal, is_eagle, draft, backend):
+    CELLS = [
+        # (is_multimodal, is_eagle, is_draft_worker, captures_body, expected)
+        (False, True, False, True, False),  # eagle target: unchanged
+        (False, True, True, True, True),  # eagle draft under a body backend
+        (False, True, True, False, False),  # no body capture: no slot
+        (True, False, False, True, True),  # multimodal
+        (True, True, True, False, True),  # multimodal wins over the backend
+        (False, False, True, True, False),  # non-eagle draft
+    ]
 
-        text-only target   (F, T, F, breakable)    ⇒ False  (target unchanged)
-        eagle draft        (F, T, T, breakable)    ⇒ True
-        eagle draft        (F, T, T, full)         ⇒ True
-        eagle draft        (F, T, T, tc_piecewise) ⇒ False
-        multimodal         (T, *, *, *)            ⇒ True
-        non-eagle draft    (F, F, T, breakable)    ⇒ False
-    """
-
-    def _eval_predicate(self, *, is_multimodal, is_eagle, is_draft_worker, backend):
-        runner = object.__new__(PrefillCudaGraphRunner)
-        runner.is_multimodal = is_multimodal
-        runner.prefill_backend_name = backend
-        model_runner = SimpleNamespace(is_draft_worker=is_draft_worker)
-        # Restricted namespace: the evaluated string is the fix's own
-        # predicate expression extracted from the pinned source of this
-        # repo (never external input); builtins are disabled because the
-        # expression only performs attribute lookups and a method call.
-        namespace = {
-            "__builtins__": {},
-            "self": runner,
-            "is_eagle": is_eagle,
-            "model_runner": model_runner,
-        }
-        return eval(_predicate_expression(), namespace)
-
-    def test_predicate_matrix(self):
-        cells = [
-            # (is_multimodal, is_eagle, is_draft_worker, backend, expected)
-            (False, True, False, Backend.BREAKABLE, False),
-            (False, True, True, Backend.BREAKABLE, True),
-            (False, True, True, Backend.FULL, True),
-            (False, True, True, Backend.TC_PIECEWISE, False),
-            (True, False, False, Backend.BREAKABLE, True),
-            (True, True, True, Backend.TC_PIECEWISE, True),
-            (False, False, True, Backend.BREAKABLE, False),
-        ]
-        for is_multimodal, is_eagle, is_draft, backend, expected in cells:
+    def test_eligibility_matrix(self):
+        for is_mm, is_eagle, is_draft, captures, expected in self.CELLS:
             with self.subTest(
-                is_multimodal=is_multimodal,
+                is_multimodal=is_mm,
                 is_eagle=is_eagle,
                 is_draft_worker=is_draft,
-                backend=backend,
+                captures_body=captures,
             ):
-                actual = self._eval_predicate(
-                    is_multimodal=is_multimodal,
-                    is_eagle=is_eagle,
-                    is_draft_worker=is_draft,
-                    backend=backend,
+                self.assertEqual(
+                    _needs_input_embeds_slot(
+                        is_multimodal=is_mm,
+                        is_eagle=is_eagle,
+                        is_draft_worker=is_draft,
+                        captures_body=captures,
+                    ),
+                    expected,
                 )
-                self.assertEqual(actual, expected)
 
-    def test_init_wires_predicate_into_registry_build(self):
-        # The predicate must feed build_prefill_registry's
-        # register_input_embeds argument (wiring pin; textual by design).
-        source = inspect.getsource(PrefillCudaGraphRunner.__init__)
-        self.assertIn(
-            "register_input_embeds=self.needs_input_embeds_slot",
-            source,
-            "build_prefill_registry must receive the needs_input_embeds_slot "
-            "predicate as register_input_embeds",
-        )
+    def test_eligibility_drives_registry_slot(self):
+        # The eligibility decision must be the one the registry acts on.
+        for is_mm, is_eagle, is_draft, captures, expected in self.CELLS:
+            eligible = _needs_input_embeds_slot(
+                is_multimodal=is_mm,
+                is_eagle=is_eagle,
+                is_draft_worker=is_draft,
+                captures_body=captures,
+            )
+            with self.subTest(expected=expected):
+                reg = _build_registry(
+                    is_multimodal=is_mm, register_input_embeds=eligible
+                )
+                self.assertEqual(reg.has_slot("input_embeds"), expected)
 
 
 class TestCapturePrepareInputEmbedsBinding(CustomTestCase):
-    """C3/C2b (T22 capture half): capture binds the static slot / None."""
+    """C3: capture binds the static slot, or None when there is none."""
 
     def test_capture_prepare_binds_static_slot_for_text_only(self):
         runner = _make_runner(_build_registry(is_multimodal=False))
@@ -513,11 +469,7 @@ class TestCapturePrepareInputEmbedsBinding(CustomTestCase):
         expected = runner.buffer_registry.get_slot("input_embeds").slice_for(
             1, NUM_TOKENS
         )
-        self.assertIsNotNone(
-            forward_batch.input_embeds,
-            "capture must bind forward_batch.input_embeds to the static slot "
-            "so the captured body takes the input_embeds branch",
-        )
+        self.assertIsNotNone(forward_batch.input_embeds)
         self.assertEqual(forward_batch.input_embeds.data_ptr(), expected.data_ptr())
         self.assertEqual(tuple(forward_batch.input_embeds.shape), (NUM_TOKENS, HIDDEN))
 
@@ -538,8 +490,7 @@ class TestCapturePrepareInputEmbedsBinding(CustomTestCase):
         self.assertEqual(forward_batch.input_embeds.data_ptr(), expected.data_ptr())
 
     def test_build_layer_model_forward_kwargs_binds_input_embeds_by_signature(self):
-        # Capture-side branch solidification: the capture forward passes
-        # forward_batch.input_embeds into layer_model.forward by name, so with
+        # The capture forward passes forward_batch.input_embeds by name, so with
         # the slot bound the graph captures the input_embeds branch instead of
         # embed_tokens(input_ids).
         layer_model = _StubLayerModel()
@@ -560,7 +511,7 @@ class TestCapturePrepareInputEmbedsBinding(CustomTestCase):
 
 
 class TestLiveInputEmbedsLookup(CustomTestCase):
-    """T12-T15: _live_input_embeds lookup order."""
+    """Replay-side lookup order of the live stack input."""
 
     def test_lookup_order(self):
         runner = _make_runner(_build_registry(is_multimodal=True))
@@ -568,18 +519,18 @@ class TestLiveInputEmbedsLookup(CustomTestCase):
         embeds_x = torch.zeros(2, HIDDEN)
         embeds_y = torch.ones(2, HIDDEN)
         embeds_z = torch.full((2, HIDDEN), 2.0)
-        # T12: kwarg input_embeds wins.
+        # kwarg input_embeds wins.
         self.assertIs(live([], {"input_embeds": embeds_x}), embeds_x)
-        # T13: fallback kwarg inputs_embeds.
+        # fallback kwarg inputs_embeds.
         self.assertIs(live([], {"inputs_embeds": embeds_y}), embeds_y)
-        # T14: positional slot at _input_embeds_arg_idx (3 for the MTP draft).
+        # positional slot at _input_embeds_arg_idx (3 for the MTP draft).
         self.assertIs(live([None, None, None, embeds_z], {}), embeds_z)
-        # T15: nothing present ⇒ None (triggers the embed fallback).
+        # nothing present: None, which triggers the embed fallback.
         self.assertIsNone(live([], {}))
 
 
 class TestReplayFusionInputCopy(CustomTestCase):
-    """C4/C5 (T16-T17, T20): replay fills the slot from the live input."""
+    """C4/C5: replay fills the slot from the live input or the embeddings."""
 
     def test_replay_copies_live_fusion_input_into_slot_before_replay(self):
         for is_multimodal in (True, False):
@@ -588,41 +539,24 @@ class TestReplayFusionInputCopy(CustomTestCase):
                 runner = _make_runner(registry, is_multimodal=is_multimodal)
                 original_forward = runner.layer_model.forward
                 fusion = _detached_fusion()
-                # Core regression (C4): on the baseline the text-only branch
-                # fails this assertion (no slot) instead of raising from
-                # helper code.
-                self.assertTrue(
-                    registry.has_slot("input_embeds"),
-                    "text-only model whose layer_model.forward accepts "
-                    "input_embeds must have the input_embeds static slot",
-                )
                 _, shape_key, output = _run_body(runner, fusion=fusion)
                 slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
                 self.assertTrue(torch.equal(slot[:NUM_TOKENS], fusion))
                 self.assertEqual(runner.backend.replay_calls, [shape_key])
-                # T20: the slot was already filled when the graph replayed.
+                # The slot was already filled when the graph replayed.
                 self.assertEqual(len(runner.backend.replay_slot_snapshots), 1)
                 self.assertTrue(
                     torch.equal(runner.backend.replay_slot_snapshots[0], fusion)
                 )
                 self.assertEqual(tuple(output.shape), (NUM_TOKENS, HIDDEN))
                 # The monkey-patch must be restored after the body runs.
-                # (bound methods compare equal per (func, instance) pair)
                 self.assertEqual(runner.layer_model.forward, original_forward)
 
-    def test_replay_copies_exact_live_rows_when_bucket_matches(self):
-        registry = _build_registry(is_multimodal=True)
-        runner = _make_runner(registry)
-        fusion = _detached_fusion()
-        _run_body(runner, fusion=fusion)
-        slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
-        self.assertTrue(torch.equal(slot, fusion))
-
     def test_replay_copies_live_rows_when_bucket_pads_the_batch(self):
-        # C4: static_num_tokens (capture bucket) > raw_num_tokens (live
-        # tokens) — the copy must fill exactly the live prefix of the static
-        # slot and leave the padding rows bitwise untouched (asserted against
-        # a snapshot, not against any particular initial value).
+        # static_num_tokens (capture bucket) > raw_num_tokens (live tokens):
+        # the copy fills exactly the live prefix and leaves the padding rows
+        # bitwise untouched (asserted against a snapshot, not against any
+        # particular initial value).
         registry = _build_registry(is_multimodal=True)
         runner = _make_runner(registry)
         live_rows = NUM_TOKENS - 4
@@ -647,8 +581,27 @@ class TestReplayFusionInputCopy(CustomTestCase):
             )
         )
 
+    def test_replay_copies_widened_fused_input_into_widened_slot(self):
+        # A wrapper that fuses several copies of the hidden state declares the
+        # wider stack-input width; the slot must be sized from that declaration
+        # so the per-replay copy matches.
+        probe = _make_runner(_build_registry())
+        probe.model_runner.model.input_embeds_hidden_size = HIDDEN_ALT
+        self.assertEqual(probe._input_embeds_hidden_size(), HIDDEN_ALT)
+
+        registry = _build_registry(
+            is_multimodal=False,
+            register_input_embeds=True,
+            hidden_size=probe._input_embeds_hidden_size(),
+        )
+        runner = _make_runner(registry)
+        widened = _detached_fusion(width=HIDDEN_ALT)
+        _run_body(runner, fusion=widened)
+        slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
+        self.assertTrue(torch.equal(slot, widened))
+
     def test_replay_without_fusion_input_uses_embed_fallback(self):
-        # C5/T17: no live fusion input ⇒ the slot is fed from
+        # No live stack input: the slot is fed from
         # get_input_embeddings()(input_ids), called exactly once.
         registry = _build_registry(is_multimodal=True)
         runner = _make_runner(registry)
@@ -664,22 +617,38 @@ class TestReplayFusionInputCopy(CustomTestCase):
         self.assertEqual(len(runner.backend.replay_calls), 1)
         self.assertEqual(tuple(output.shape), (NUM_TOKENS, HIDDEN))
 
-    def test_replay_embed_fallback_fails_closed_without_get_input_embeddings(self):
-        # C5/T17: no fusion input and no get_input_embeddings ⇒ fail closed.
+    def test_replay_without_fusion_input_falls_back_to_embed_input_ids(self):
+        # Some wrappers expose embed_input_ids() instead of
+        # get_input_embeddings(); the fallback must use it.
         registry = _build_registry(is_multimodal=True)
         runner = _make_runner(registry)
-        layer_model = runner.layer_model
-        runner.model_runner.model = _StubOuterModelNoEmbeddings(layer_model)
-        with self.assertRaises(AssertionError):
+        embed = _StubEmbedding()
+        runner.model_runner.model = _StubOuterModelWithEmbedInputIds(
+            runner.layer_model, embed
+        )
+        forward_batch, _, _ = _run_body(runner)
+        self.assertEqual(len(embed.calls), 1)
+        slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
+        expected = (
+            _embed_formula(forward_batch.input_ids).repeat(1, HIDDEN).to(EMBED_DTYPE)
+        )
+        self.assertTrue(torch.equal(slot[:NUM_TOKENS], expected))
+
+    def test_replay_embed_fallback_fails_closed_without_embed_accessor(self):
+        # No live input and no embedding accessor: fail closed.
+        registry = _build_registry(is_multimodal=True)
+        runner = _make_runner(registry)
+        runner.model_runner.model = _StubOuterModelNoEmbedAccessor(runner.layer_model)
+        with self.assertRaisesRegex(RuntimeError, "get_input_embeddings"):
             _run_body(runner)
 
 
 class TestNoDroppedInputEmbedsGuardrail(CustomTestCase):
-    """C6/T18-T21: a live fusion input without a slot must fail loudly."""
+    """C6/C7: a live stack input without a slot must fail loudly."""
 
     def test_replay_fusion_input_without_slot_raises_before_replay(self):
-        # C6/T21 via the full replay dispatch: the guard raises before the
-        # graph replays (replay_calls stays empty).
+        # Via the full replay dispatch: the guard raises before the graph
+        # replays (replay_calls stays empty).
         registry = _build_registry(is_multimodal=False, register_input_embeds=False)
         self.assertFalse(registry.has_slot("input_embeds"))
         runner = _make_runner(registry)
@@ -688,8 +657,6 @@ class TestNoDroppedInputEmbedsGuardrail(CustomTestCase):
         self.assertEqual(runner.backend.replay_calls, [])
 
     def test_guardrail_message_names_slot_and_disabled_escape_hatch(self):
-        # T18: the RuntimeError names the input_embeds slot and points at
-        # --cuda-graph-backend-prefill=disabled.
         registry = _build_registry(is_multimodal=False, register_input_embeds=False)
         runner = _make_runner(registry)
         args = [None, None, None, _detached_fusion()]
@@ -698,17 +665,27 @@ class TestNoDroppedInputEmbedsGuardrail(CustomTestCase):
         self.assertIn("--cuda-graph-backend-prefill=disabled", str(ctx.exception))
 
     def test_guardrail_is_noop_without_live_input(self):
-        # T19: no slot and no live input ⇒ the guard must not raise.
         registry = _build_registry(is_multimodal=False, register_input_embeds=False)
         runner = _make_runner(registry)
         self.assertIsNone(
             runner._assert_no_dropped_input_embeds([None, None, None], {})
         )
 
+    def test_guardrail_accepts_precomputed_token_embeddings(self):
+        # A wrapper that only pre-computes embed_tokens(input_ids) (a
+        # language-model-only multimodal layout) hands the body exactly what
+        # its captured embedding branch computes: the replay must proceed.
+        registry = _build_registry(is_multimodal=False, register_input_embeds=False)
+        runner = _make_runner(registry)
+        input_ids = _detached_input_ids()
+        token_embeds = runner.model_runner.model.get_input_embeddings()(input_ids)
+        _, shape_key, _ = _run_body(runner, fusion=token_embeds)
+        self.assertEqual(runner.backend.replay_calls, [shape_key])
+
     def test_replay_skips_slot_fill_on_non_first_pp_rank(self):
-        # C7: a non-first PP rank neither fills the slot nor trips the
-        # guardrail; the graph replay still runs. The replay-time snapshot
-        # proves the slot was still empty when the graph replayed.
+        # A non-first PP rank neither fills the slot nor trips the guardrail;
+        # the replay still runs. The replay-time snapshot proves the slot was
+        # still empty when the graph replayed.
         registry = _build_registry(is_multimodal=True)
         runner = _make_runner(registry, pp_is_first_rank=False)
         _run_body(runner, fusion=_detached_fusion())
