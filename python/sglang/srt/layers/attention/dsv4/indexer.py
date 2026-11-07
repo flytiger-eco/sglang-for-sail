@@ -1464,6 +1464,16 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
+            # bf16 paged logits let the PPU DeepSelect top-k consume them directly.
+            paged_logits_dtype_kwargs = (
+                {"logits_dtype": torch.bfloat16}
+                if is_sail()
+                and envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get()
+                and not _USE_INT8
+                and use_fp4_indexer
+                and not use_aiter_fp4
+                else {}
+            )
 
             def run_paged_indexer(
                 rows: slice,
@@ -1480,6 +1490,7 @@ class C4IndexerBackendMixin:
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
+                    **paged_logits_dtype_kwargs,
                 )
                 run_topk_transform(rows, logits, topk_plan)
 

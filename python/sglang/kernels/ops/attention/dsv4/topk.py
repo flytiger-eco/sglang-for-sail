@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import Optional, Tuple
 
 import torch
 
@@ -11,10 +12,13 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sail, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
+
+logger = logging.getLogger(__name__)
 
 
 @cache_once
@@ -152,6 +156,21 @@ def topk_transform_paged(
     On the CUDA/PPU JIT path, ``page_tables=None`` writes raw positions into
     ``out_page_indices`` without allocating an identity page table or a v2 plan.
     """
+    if scores.dtype == torch.bfloat16:
+        if is_sail() and is_deep_select_available():
+            topk_transform_paged_deep_select(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+            return
+        # V1 is fp32-only; a bf16 score converts to fp32 exactly, so the
+        # selection is the same and the PPU knob still works without the wheel.
+        warn_bf16_topk_fallback()
+        scores = scores.float()
     if page_tables is None and (is_hip_runtime() or is_xpu()):
         raise NotImplementedError("V1 raw-index output requires the CUDA/PPU JIT path")
     if is_hip_runtime():
@@ -414,6 +433,9 @@ def topk_transform_sparse(
     ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
     published blocks as pool slots / 8, compressed positions for logical ids."""
+    if is_sail() and is_deep_select_available():
+        topk_transform_sparse_deep_select(logits, valid_lens, blocks, out_indices)
+        return
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
     )
@@ -451,6 +473,175 @@ def topk_transform_512_bf16(
     module = _jit_topk_bf16_module()
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+@cache_once
+def _deep_select_wheel_available() -> bool:
+    """Whether the precompiled PPU DeepSelect wheel exposes its top-k entry."""
+    try:
+        from deep_select.interface import topk  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_deep_select_available() -> bool:
+    """Whether the DSV4 index top-k may dispatch to DeepSelect: the knob is on
+    (off by default) and the precompiled PPU wheel exposes its top-k entry.
+    The knob is read per call so a test can override it; the import probe is
+    the expensive part and stays cached."""
+    return (
+        envs.SGLANG_OPT_DSV41_DEEP_SELECT_TOPK.get() and _deep_select_wheel_available()
+    )
+
+
+@cache_once
+def warn_bf16_topk_fallback() -> None:
+    """One log per process: bf16 logits still select on the fp32 kernels."""
+    logger.warning(
+        "DeepSelect is unavailable or disabled (needs "
+        "SGLANG_OPT_DSV41_DEEP_SELECT_TOPK=1 and the deep_select wheel); the "
+        "DSV4 index top-k falls back to fp32 (bf16 logits convert exactly)."
+    )
+
+
+@cache_once
+def _deep_select_stride_requirement() -> Tuple[int, int]:
+    from deep_select.interface import get_stride_requirement
+
+    return get_stride_requirement()
+
+
+def _deep_select_aligned_scores(scores: torch.Tensor) -> torch.Tensor:
+    """Materialize a copy whose row stride satisfies the wheel's contract."""
+    run_bytes = _deep_select_stride_requirement()[0]
+    if (
+        scores.stride(-1) == 1
+        and scores.stride(0) * scores.element_size() % run_bytes == 0
+    ):
+        return scores
+    step = run_bytes // scores.element_size()
+    width = scores.shape[1]
+    padded = (width + step - 1) // step * step
+    buf = torch.empty(
+        (scores.shape[0], padded), dtype=scores.dtype, device=scores.device
+    )
+    buf[:, :width] = scores
+    return buf[:, :width]
+
+
+def topk_transform_paged_deep_select(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    output_idx_offset: Optional[torch.Tensor] = None,
+) -> None:
+    """Page-table top-k through the precompiled DeepSelect wheel.
+
+    Same contract as :func:`topk_transform_paged`: row ``b`` takes the
+    ``k = out_page_indices.shape[1]`` best of its first ``seq_lens[b]`` scores,
+    writes them as pool slots (``-1`` past the valid count) and, when given, as
+    raw positions into ``out_raw_indices``.
+
+    The wheel is bf16-only, so fp32 scores (the DeepGEMM index-logit default)
+    are rounded to bf16 first; the selection is then exactly a bf16 top-k.
+    """
+    from deep_select.interface import topk as deep_select_topk
+
+    rows, k = out_page_indices.shape
+    if rows == 0 or k == 0:
+        return
+    if scores.dtype != torch.bfloat16:
+        scores = scores.to(torch.bfloat16)
+    scores = _deep_select_aligned_scores(scores)
+    end = seq_lens.to(torch.int32)
+    if end.stride(0) != 1:
+        end = end.contiguous()
+    # Let the wheel allocate the result: for a k that is not a multiple of 8 it
+    # pads the row stride, while a caller-provided contiguous (rows, k) buffer
+    # would be rejected. The selection order is arbitrary either way.
+    assert output_idx_offset is None or page_tables is None, (
+        "output_idx_offset applies to raw request-local positions only"
+    )
+    _, idx = deep_select_topk(
+        scores,
+        k,
+        sorted=False,
+        end=end,
+        indices_type=torch.int32,
+        sorted_index=False,
+        output_idx=None,
+        output_idx_offset=output_idx_offset,
+        idx_oob_fill_value=-1,
+        return_value=False,
+    )
+    if out_raw_indices is not None:
+        out_raw_indices.copy_(idx)
+    if page_tables is None:
+        out_page_indices.copy_(idx)
+        return
+    valid = idx >= 0
+    clamped = idx.clamp_min(0)
+    page_cols = (clamped // page_size).to(torch.int64)
+    slots = page_tables.gather(1, page_cols) * page_size + clamped % page_size
+    out_page_indices.copy_(torch.where(valid, slots, -1).to(torch.int32))
+
+
+def topk_transform_ragged_deep_select(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_indices: torch.Tensor,
+    offsets: Optional[torch.Tensor] = None,
+) -> None:
+    """Request-local top-k (raw positions, ``-1`` padded) via DeepSelect."""
+    topk_transform_paged_deep_select(
+        scores, seq_lens, None, out_indices, 1, None, output_idx_offset=offsets
+    )
+
+
+def topk_transform_sparse_deep_select(
+    logits: torch.Tensor,
+    valid_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Compact-block top-k through DeepSelect; same contract as
+    :func:`topk_transform_sparse`: ``logits`` is bf16 with the kept blocks laid
+    back to back, ``valid_lens`` is the prefix each row may read, and column
+    ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8`` (``-1`` padded)."""
+    from deep_select.interface import topk as deep_select_topk
+
+    rows, k = out_indices.shape
+    if rows == 0 or k == 0:
+        return
+    logits = _deep_select_aligned_scores(logits)
+    end = valid_lens.to(torch.int32)
+    if end.stride(0) != 1:
+        end = end.contiguous()
+    _, compact = deep_select_topk(
+        logits,
+        k,
+        sorted=False,
+        end=end,
+        indices_type=torch.int32,
+        sorted_index=False,
+        output_idx=None,
+        idx_oob_fill_value=-1,
+        return_value=False,
+    )
+    valid = compact >= 0
+    col = compact.clamp_min(0)
+    blk = blocks.gather(1, (col // CANDIDATE_BLOCK_SIZE).to(torch.int64))
+    out_indices.copy_(
+        torch.where(
+            valid,
+            blk * CANDIDATE_BLOCK_SIZE + col % CANDIDATE_BLOCK_SIZE,
+            -1,
+        ).to(torch.int32)
     )
 
 

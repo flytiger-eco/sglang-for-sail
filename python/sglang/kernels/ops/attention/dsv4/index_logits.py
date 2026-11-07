@@ -17,16 +17,35 @@ from sglang.srt.utils.common import ceil_align, is_sail
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
+# Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
+# DeepSelect reads past a row's end (DeepGEMM pads the stride but its tensor's storage ends at the last row)
+FLAT_LOGITS_WIDTH_ALIGN = 64
+
+
+def flat_index_logits_dtype() -> torch.dtype:
+    """bf16 logits on PPU when the knob is on, fp32 everywhere else: only the
+    PPU top-k consumers take bf16, so no other platform changes dtype."""
+    if is_sail() and envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get():
+        return torch.bfloat16
+    return torch.float32
+
 
 def flat_index_logits_rows_per_tile(
-    rows: int, width: int, *, heads: int, budget_bytes: int
+    rows: int,
+    width: int,
+    *,
+    heads: int,
+    budget_bytes: int,
+    item_size: int = 4,
 ) -> int:
-    """Rows per fp32 logits tile within ``budget_bytes``, at the kernel's row
-    alignment."""
+    """Rows per logits tile within ``budget_bytes`` (sized as fp32, which also
+    bounds bf16), at the kernel's row alignment."""
     row_alignment = 128 // heads
+    # NOTE: for bf16, the estimated row bytes is 2 times the actual bytes
+    effective_width = width * item_size // 4
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
+        row_bytes=mqa_logits_row_bytes(effective_width),
         budget_bytes=budget_bytes,
     )
     if rows_per_chunk is None:
@@ -43,41 +62,47 @@ def flat_index_logits_tiles(
     lengths: torch.Tensor,
     context_lengths: list[int],
     budget_bytes: int,
-    width_align: int = 4,
 ) -> Iterator[tuple[slice, torch.Tensor]]:
-    """``(rows, logits)`` per row tile, each fp32 tile within ``budget_bytes``:
+    """``(rows, logits)`` per row tile, each tile within ``budget_bytes``:
     ``logits[i, j]`` scores query row ``rows.start + i`` against ``kv[starts + j]``,
     garbage past the row's ``lengths``; the width is ``max(context_lengths)``
-    aligned to ``width_align``."""
+    aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]
-    width = ceil_align(max(context_lengths, default=0), width_align)
+    width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
         return
+    logits_dtype = flat_index_logits_dtype()
     if is_sail():
         max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
         if max_logits_mb <= 0:
             raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
         # PPU obeys the same MB knob as the INT8 indexer in place of the
-        # caller's generic budget; the sliced FP32 tile is its only live
-        # logits tensor, so the planner's row accounting applies as-is.
+        # caller's generic budget; the sliced tile is its only live logits
+        # tensor, so the planner's row accounting applies as-is.
         budget_bytes = max_logits_mb * 1024 * 1024
     rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
+        rows,
+        width,
+        heads=q[0].shape[1],
+        budget_bytes=budget_bytes,
+        item_size=logits_dtype.itemsize,
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
+        tile_starts = starts[tile]
         yield (
             tile,
             fp8_fp4_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
-                starts[tile],
-                starts[tile] + lengths[tile],
+                tile_starts,
+                tile_starts + lengths[tile],
                 False,
                 width,
+                logits_dtype=logits_dtype,
             ),
         )
 
@@ -97,6 +122,11 @@ def deep_gemm_fp4_paged_mqa_logits(
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
+    dtype_kwargs = (
+        {"logits_dtype": torch.bfloat16}
+        if is_sail() and envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get()
+        else {}
+    )
     return fp8_fp4_paged_mqa_logits(
         q_fp4,
         k_cache,
@@ -106,6 +136,7 @@ def deep_gemm_fp4_paged_mqa_logits(
         deep_gemm_metadata,
         max_seq_len,
         False,
+        **dtype_kwargs,
     )
 
 
