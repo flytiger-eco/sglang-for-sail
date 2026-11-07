@@ -573,9 +573,7 @@ class TestLiveInputEmbedsLookup(CustomTestCase):
         # T13: fallback kwarg inputs_embeds.
         self.assertIs(live([], {"inputs_embeds": embeds_y}), embeds_y)
         # T14: positional slot at _input_embeds_arg_idx (3 for the MTP draft).
-        self.assertIs(
-            live([None, None, None, embeds_z], {}), embeds_z
-        )
+        self.assertIs(live([None, None, None, embeds_z], {}), embeds_z)
         # T15: nothing present ⇒ None (triggers the embed fallback).
         self.assertIsNone(live([], {}))
 
@@ -644,8 +642,9 @@ class TestReplayFusionInputCopy(CustomTestCase):
         slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
         self.assertTrue(torch.equal(slot[:live_rows], fusion))
         self.assertTrue(
-            torch.equal(registry.get_slot("input_embeds").buffer[live_rows:],
-                        before_tail)
+            torch.equal(
+                registry.get_slot("input_embeds").buffer[live_rows:], before_tail
+            )
         )
 
     def test_replay_without_fusion_input_uses_embed_fallback(self):
@@ -658,7 +657,9 @@ class TestReplayFusionInputCopy(CustomTestCase):
         self.assertEqual(len(embed.calls), 1)
         self.assertTrue(torch.equal(embed.calls[0], forward_batch.input_ids))
         slot = registry.get_slot("input_embeds").slice_for(1, NUM_TOKENS)
-        expected = _embed_formula(forward_batch.input_ids).repeat(1, HIDDEN).to(EMBED_DTYPE)
+        expected = (
+            _embed_formula(forward_batch.input_ids).repeat(1, HIDDEN).to(EMBED_DTYPE)
+        )
         self.assertTrue(torch.equal(slot[:NUM_TOKENS], expected))
         self.assertEqual(len(runner.backend.replay_calls), 1)
         self.assertEqual(tuple(output.shape), (NUM_TOKENS, HIDDEN))
@@ -700,7 +701,9 @@ class TestNoDroppedInputEmbedsGuardrail(CustomTestCase):
         # T19: no slot and no live input ⇒ the guard must not raise.
         registry = _build_registry(is_multimodal=False, register_input_embeds=False)
         runner = _make_runner(registry)
-        self.assertIsNone(runner._assert_no_dropped_input_embeds([None, None, None], {}))
+        self.assertIsNone(
+            runner._assert_no_dropped_input_embeds([None, None, None], {})
+        )
 
     def test_replay_skips_slot_fill_on_non_first_pp_rank(self):
         # C7: a non-first PP rank neither fills the slot nor trips the
