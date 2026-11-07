@@ -837,16 +837,20 @@ def build_prefill_registry(
     enable_prefill_cp: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    register_input_embeds: bool = True,
+    register_input_embeds: Optional[bool] = None,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable / full (prefill) cuda-graph runners.
 
-    ``register_input_embeds`` (default ``True``) registers the multimodal
-    ``input_embeds`` slot; the eager extend path passes ``False`` so it is
-    carried from the batch (a read input) rather than written in-graph.
+    ``register_input_embeds`` registers the ``input_embeds`` slot: the
+    stable-address input the captured body reads whenever the outer model
+    computes the transformer-stack input itself (a multimodal merge, or an
+    EAGLE/MTP draft fusing the target's hidden states). ``None`` preserves the
+    historical multimodal-only default; a text-only caller that needs the slot
+    opts in explicitly. Callers that carry ``input_embeds`` from the batch (a
+    read input, never written in-graph) pass ``False``.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
@@ -910,17 +914,24 @@ def build_prefill_registry(
                 slice_fn=lambda buf, n: buf[:, :n],
             )
         )
-        if register_input_embeds:
-            slots.append(
-                GraphSlot(
-                    "input_embeds",
-                    lambda _bs2, mt: (mt, hidden_size),
-                    embed_dtype,
-                    axis="tokens",
-                    padding_policy=PaddingPolicy.ZERO,
-                    copy_from_fb=False,
-                )
+    # Not multimodal-only: any model whose outer wrapper computes the
+    # transformer-stack input needs this slot. Without it the captured body
+    # keeps the capture-time `embed_tokens(input_ids)` branch and the live
+    # input passed at replay (e.g. an EAGLE/MTP draft's fused target hidden
+    # states) is silently dropped.
+    if register_input_embeds is None:
+        register_input_embeds = is_multimodal
+    if register_input_embeds:
+        slots.append(
+            GraphSlot(
+                "input_embeds",
+                lambda _bs2, mt: (mt, hidden_size),
+                embed_dtype,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+                copy_from_fb=False,
             )
+        )
     if enable_mamba_track:
         slots.append(GraphSlot("mamba_track_indices", _bs, torch.int64, axis="bs"))
         slots.append(GraphSlot("mamba_track_mask", _bs, torch.bool, axis="bs"))
@@ -968,10 +979,17 @@ def build_prefill_registry(
         if source is not None:
             bind = getattr(source, slot.name, None)
             if bind is None:
-                raise ValueError(
-                    f"source is missing buffer {slot.name!r} required by the "
-                    "prefill registry; cannot adopt."
-                )
+                # `input_embeds` is optional on the source: PrefillInputBuffers
+                # allocates it only for multimodal models, but a text-only
+                # EAGLE/MTP draft needs the slot as well. Let the registry own
+                # that allocation (still name-coalesced through the shared pool)
+                # instead of widening the source dataclass. Every other slot
+                # must be adopted so capture and replay share one data_ptr.
+                if slot.name != "input_embeds":
+                    raise ValueError(
+                        f"source is missing buffer {slot.name!r} required by the "
+                        "prefill registry; cannot adopt."
+                    )
         reg.register_slot(slot, bind=bind)
 
     # PP stage inputs live outside ForwardBatch; adopt runner-owned buffers for
