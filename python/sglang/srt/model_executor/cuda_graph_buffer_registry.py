@@ -837,19 +837,20 @@ def build_prefill_registry(
     enable_prefill_cp: bool = False,
     # Per-bucket attn-TP sharded (SP) predicate; defaults to replicated.
     attn_tp_sharded_fn: Callable[[int], bool] = lambda num_tokens: False,
-    register_input_embeds: bool = True,
+    register_input_embeds: Optional[bool] = None,
     share_pool: bool = True,
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
     piecewise / breakable / full (prefill) cuda-graph runners.
 
-    ``register_input_embeds`` (default ``True``) registers the ``input_embeds``
-    slot: the stable-address input the captured body reads whenever the outer
-    model computes the transformer-stack input itself (a multimodal merge, or an
-    EAGLE/MTP draft fusing the target's hidden states). Callers that instead
-    carry ``input_embeds`` from the batch (a read input, never written in-graph)
-    pass ``False``.
+    ``register_input_embeds`` registers the ``input_embeds`` slot: the
+    stable-address input the captured body reads whenever the outer model
+    computes the transformer-stack input itself (a multimodal merge, or an
+    EAGLE/MTP draft fusing the target's hidden states). ``None`` preserves the
+    historical multimodal-only default; a text-only caller that needs the slot
+    opts in explicitly. Callers that carry ``input_embeds`` from the batch (a
+    read input, never written in-graph) pass ``False``.
 
     Padding policies match the inline copy/zero in
     ``PiecewiseCudaGraphRunner.load_batch``: ``input_ids`` / ``positions``
@@ -918,6 +919,8 @@ def build_prefill_registry(
     # keeps the capture-time `embed_tokens(input_ids)` branch and the live
     # input passed at replay (e.g. an EAGLE/MTP draft's fused target hidden
     # states) is silently dropped.
+    if register_input_embeds is None:
+        register_input_embeds = is_multimodal
     if register_input_embeds:
         slots.append(
             GraphSlot(

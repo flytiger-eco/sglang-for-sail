@@ -168,6 +168,26 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def _needs_input_embeds_slot(
+    *,
+    is_multimodal: bool,
+    is_eagle: bool,
+    is_draft_worker: bool,
+    captures_body: bool,
+) -> bool:
+    """Whether the captured prefill body can only read its stack input from
+    the static ``input_embeds`` slot.
+
+    A multimodal merge always composes the input above the captured body. An
+    EAGLE/MTP draft does too when its wrapper fuses the target's hidden states
+    before calling the body; a draft that fuses inside the body it captures
+    (``llama_eagle`` / ``llama_eagle3`` run the ``fc`` in the module owning
+    ``.layers``) keeps embedding and fusion in the graph and does not need the
+    slot, but registering it only costs one buffer and one copy per replay.
+    """
+    return is_multimodal or (is_eagle and is_draft_worker and captures_body)
+
+
 def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     """Find the module that owns decoder layers behind language/model wrappers."""
     try:
@@ -366,25 +386,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
         # --- buffers ---------------------------------------------------
-        # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
-        # which `general_mm_embed_routine` copies the merged text+media
-        # embeddings into. A model whose merge happens above the embedding width
-        # (e.g. a residual-stream merge) writes a wider tensor than
-        # `config.hidden_size`, so let it declare that width.
+        # `input_embeds_hidden_size` sizes the stack-input slot: the width the
+        # outer model writes into it. That is `config.hidden_size` unless the
+        # model merges at a wider width (a residual-stream merge, an hc-flattened
+        # MTP fusion) and declares it.
         #
-        # The captured body reads its stack input from the static `input_embeds`
-        # slot. Multimodal models already need it; an EAGLE/MTP draft under a
-        # body-capture backend (Breakable / Full) needs it as well, because its
-        # outer wrapper computes the fused input (embed_tokens + the target's
-        # hidden states) eagerly and passes it as `input_embeds`. Without the
-        # slot, replay keeps the capture-time `embed_tokens(input_ids)` branch
-        # and silently drops that live input. PrefillInputBuffers only allocates
-        # the multimodal case, so for a text-only draft the registry owns the
-        # allocation (see build_prefill_registry's optional-source handling).
-        self.needs_input_embeds_slot = self.is_multimodal or (
-            is_eagle
-            and model_runner.is_draft_worker
-            and self._uses_eager_prefill_tail()
+        # The captured body reads that stack input from the static slot when the
+        # outer model computes it; otherwise the slot is unused.
+        self.needs_input_embeds_slot = _needs_input_embeds_slot(
+            is_multimodal=self.is_multimodal,
+            is_eagle=is_eagle,
+            is_draft_worker=model_runner.is_draft_worker,
+            captures_body=self._uses_eager_prefill_tail(),
         )
         input_embeds_hidden_size = self._input_embeds_hidden_size()
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
@@ -648,18 +661,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64 if not is_npu() else torch.int32
 
     def _input_embeds_hidden_size(self) -> int:
-        """Width of the `input_embeds` the model writes inside the graph.
-
-        Defaults to `config.hidden_size`; a model that merges multimodal
-        embeddings at a wider width declares it via `input_embeds_hidden_size`.
-
-        `getattr` with a default rather than an always-present field: the
-        property exists only on the handful of model classes whose merge width
-        differs, and adding it to every model in the registry to satisfy a
-        `None` check is not worth it. Same shape as the `hc_hidden_size`
-        opt-in already threaded through `base_runner` and
-        `decode_cuda_graph_runner`.
-        """
+        """Stack-input width, `config.hidden_size` unless the model declares a
+        different `input_embeds_hidden_size`."""
         return getattr(
             self.model_runner.model,
             "input_embeds_hidden_size",
@@ -1956,54 +1959,66 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return static_forward_batch
 
     def _live_input_embeds(self, args, layer_kwargs):
-        """The stack input the outer model computed for this replay, or None.
-
-        Lookup order mirrors the captured signature: the ``input_embeds`` /
-        ``inputs_embeds`` keyword first, then the positional slot the layer
-        model declares, so an outer wrapper that passes it positionally (a
-        multimodal merge, an EAGLE/MTP draft fusing target hidden states) is
-        still found.
-        """
+        """The stack input the outer model computed for this replay, if any."""
         ie = layer_kwargs.get("input_embeds")
         if ie is None:
             ie = layer_kwargs.get("inputs_embeds")
-        ie_idx = getattr(self, "_input_embeds_arg_idx", None)
+        ie_idx = self._input_embeds_arg_idx
         if ie is None and ie_idx is not None and len(args) > ie_idx:
             ie = args[ie_idx]
         return ie
 
+    def _embed_input_ids(self, input_ids: torch.Tensor) -> Optional[torch.Tensor]:
+        """Token embeddings through the accessor this model exposes."""
+        model = self.model_runner.model
+        get_input_embeddings = getattr(model, "get_input_embeddings", None)
+        if get_input_embeddings is not None:
+            return get_input_embeddings()(input_ids)
+        embed_input_ids = getattr(model, "embed_input_ids", None)
+        if embed_input_ids is not None:
+            return embed_input_ids(input_ids)
+        return None
+
     def _fill_input_embeds_slot(self, args, layer_kwargs, static_num_tokens: int):
-        """A text-only batch would otherwise replay the captured input_embeds."""
+        """Feed the slot the live stack input, or the token embeddings."""
         ie = self._live_input_embeds(args, layer_kwargs)
         if ie is None:
             input_ids = layer_kwargs.get("input_ids")
-            if input_ids is None and len(args) > 0:
+            if input_ids is None and args:
                 input_ids = args[0]
-            embed = getattr(self.model_runner.model, "get_input_embeddings", None)
-            assert input_ids is not None and embed is not None, (
-                "prefill CUDA graph replay needs input_embeds for the static "
-                "slot, and the model exposes no get_input_embeddings()"
-            )
-            ie = embed()(input_ids)
+            ie = None if input_ids is None else self._embed_input_ids(input_ids)
+            if ie is None:
+                raise RuntimeError(
+                    "prefill CUDA graph replay needs a stack input for the "
+                    "static 'input_embeds' slot, but the model exposes neither "
+                    "get_input_embeddings() nor embed_input_ids()"
+                )
         self.buffer_registry.get_slot("input_embeds").slice_for(1, static_num_tokens)[
             : ie.shape[0]
         ].copy_(ie)
 
     def _assert_no_dropped_input_embeds(self, args, layer_kwargs) -> None:
-        """Fail loudly when the captured body cannot see a live stack input.
-
-        Without an ``input_embeds`` slot the replayed body still holds the
-        capture-time ``embed_tokens(input_ids)`` branch, so a runtime-computed
-        input (an EAGLE/MTP draft's fused target hidden states, a multimodal
-        merge) would be dropped silently and the graph would return wrong
-        values instead of raising.
-        """
-        dropped = self._live_input_embeds(args, layer_kwargs)
-        if dropped is None:
+        """Raise when replay would silently drop a live stack input."""
+        live = self._live_input_embeds(args, layer_kwargs)
+        if live is None:
             return
+        input_ids = layer_kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
+        if input_ids is not None:
+            token_embeds = self._embed_input_ids(input_ids)
+            if (
+                token_embeds is not None
+                and token_embeds.shape == live.shape
+                and torch.equal(token_embeds, live)
+            ):
+                # The wrapper only pre-computed embed_tokens(input_ids) (e.g. a
+                # language-model-only multimodal config), which is what the
+                # captured body computes for itself: dropping it is a no-op.
+                return
         raise RuntimeError(
             "prefill CUDA graph replay received live input_embeds with shape "
-            f"{tuple(dropped.shape)}, but the buffer registry has no "
+            f"{tuple(live.shape)}, but the buffer registry has no "
             "'input_embeds' slot: the captured body would keep its capture-time "
             "embed_tokens(input_ids) branch and silently drop this input. "
             "Register the slot for this model (see "
@@ -2025,14 +2040,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         full_path = self._is_full_backend
 
         def replay_layer_forward(*args, **layer_kwargs):
-            # The captured body graph reads activations from the static
-            # input_embeds slot. The outer model.forward (run eagerly)
-            # passes the live embeddings into layer_model.forward as the
-            # 4th positional arg (or input_embeds kwarg): for multimodal
-            # batches these are the composed text+vision embeds, for
-            # text-only batches they are get_input_embeddings()(input_ids).
-            # Copy them into the slot before replay so the graph sees the
-            # current request's embeddings (mirrors main's BCG closure).
+            # The captured body reads its stack input from the static slot when
+            # the outer model computed one; copy it in before replaying so the
+            # graph sees the current batch.
             if self.model_runner.pp_group.is_first_rank:
                 if self.buffer_registry.has_slot("input_embeds"):
                     self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
