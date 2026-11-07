@@ -26,7 +26,6 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_candidates,
     topk_transform_paged,
-    topk_transform_ragged_v2,
     topk_transform_sparse,
 )
 from sglang.srt.environ import envs
@@ -41,6 +40,7 @@ from .scoring import (
     get_index_k_cache,
     quantize_index_q,
     score_tiles,
+    topk_ragged,
 )
 from .types import (
     CandidateMetadata,
@@ -559,19 +559,17 @@ def publish_prefill_table(
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
-    # Two levels instead of one full-width pass: the block maxima cost one read
-    # of the scores, and the selection then reads only the kept blocks (the
-    # block keys are needed for the published table either way). Exact while
-    # index_topk < topk_blocks, see `topk_transform_candidates`.
+    # The block keys are needed for the published table either way; the source's
+    # own top-k reads only the kept blocks on fp32 and goes full-width
+    # DeepSelect on bf16 logits.
     two_level = (
         envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
         and 0 < out_positions.shape[1] < topk_blocks
     )
-    # the block keys read the score rows through 32-byte vectors
-    for tile, logits in score_tiles(data, kv, width_align=8):
+    for tile, logits in score_tiles(data, kv):
         lens = data.compress_lens[tile]
         candidate_block_ids(logits, lens, nblocks[tile], topk_blocks, out=blocks[tile])
-        if two_level:
+        if two_level and logits.dtype == torch.float32:
             topk_transform_candidates(
                 logits,
                 lens,
@@ -580,11 +578,8 @@ def publish_prefill_table(
                 out_indices=out_positions[tile],
             )
         else:
-            topk_transform_ragged_v2(
-                logits,
-                lens,
-                out_offsets=zero_offsets[tile],
-                out_indices=out_positions[tile],
+            topk_ragged(
+                logits, lens, out=out_positions[tile], offsets=zero_offsets[tile]
             )
         del logits  # release this tile before the next one is scored
     return _build_prefill_table(

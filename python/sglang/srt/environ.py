@@ -1771,6 +1771,11 @@ class Envs:
     # candidate structure (block maxima, then only the kept blocks) instead of a
     # full-width pass. 0 restores the dense top-k for A/B.
     SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
+    # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels (flat prefill
+    # tiles and the paged decode path) store bf16 instead of fp32 (the reference ranks bf16
+    # scores); every consumer of those logits must take bf16. The sparse indexer APIs are
+    # bf16-only already and ignore this switch.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # Force the Q8KV8 sparse prefill on/off regardless of --dsv4-prefill-backend.

@@ -287,8 +287,6 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
 def score_tiles(
     data: DeepGEMMPrefillData,
     kv: Tuple[torch.Tensor, torch.Tensor],
-    *,
-    width_align: int,
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
@@ -298,8 +296,34 @@ def score_tiles(
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
         budget_bytes=_deep_gemm_score_budget_bytes(),
-        width_align=width_align,
     )
+
+
+def topk_ragged(
+    logits: torch.Tensor,
+    lens: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    offsets: torch.Tensor,
+) -> None:
+    """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
+    ``-1`` padded, unordered: DeepSelect for bf16 logits on PPU, top-k v2 for
+    fp32 (or bf16 without the wheel, converted exactly)."""
+    from sglang.kernels.ops.attention.dsv4 import (
+        is_deep_select_available,
+        topk_transform_ragged_deep_select,
+        topk_transform_ragged_v2,
+    )
+    from sglang.kernels.ops.attention.dsv4.topk import warn_bf16_topk_fallback
+
+    if logits.dtype == torch.bfloat16 and is_deep_select_available():
+        topk_transform_ragged_deep_select(logits, lens, out, offsets)
+        return
+    if logits.dtype == torch.bfloat16:
+        # v2 is fp32-only; bf16 values convert exactly, so the order is the same
+        warn_bf16_topk_fallback()
+        logits = logits.float()
+    topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
 
 
 def dense_prefill_topk(
@@ -315,11 +339,9 @@ def dense_prefill_topk(
     only the kept blocks -- instead of a full-width top-k. That is exact here
     because nothing is published: the block window is ``k`` itself, so the
     second level reads ``k * 8`` of the row's columns instead of all of them.
+    It applies to fp32 logits; bf16 logits go through DeepSelect.
     """
-    from sglang.kernels.ops.attention.dsv4 import (
-        topk_transform_candidates,
-        topk_transform_ragged_v2,
-    )
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_candidates
 
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(data.request_starts)
@@ -332,11 +354,9 @@ def dense_prefill_topk(
             CANDIDATE_BLOCK_SIZE,
         )
 
-    # A block-max key is one 32 B load, so the two-level path needs the tile
-    # stride on an 8-float boundary; the dense path has no such requirement.
-    for tile, logits in score_tiles(data, kv, width_align=8 if two_level else 4):
+    for tile, logits in score_tiles(data, kv):
         lens = data.compress_lens[tile]
-        if two_level:
+        if two_level and logits.dtype == torch.float32:
             nblocks = (lens + CANDIDATE_BLOCK_SIZE - 1) // CANDIDATE_BLOCK_SIZE
             blocks = candidate_block_ids(logits, lens, nblocks, out.shape[1])
             topk_transform_candidates(
@@ -348,12 +368,7 @@ def dense_prefill_topk(
             )
             del blocks
         else:
-            topk_transform_ragged_v2(
-                logits,
-                lens,
-                out_offsets=zero_offsets[tile],
-                out_indices=out[tile],
-            )
+            topk_ragged(logits, lens, out=out[tile], offsets=zero_offsets[tile])
         # Free this tile's logits before the generator scores the next one.
         del logits
 
