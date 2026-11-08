@@ -34,6 +34,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # lifecycle rides the full-KV allocator and radix tree.
     # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
     index_state_dtype = torch.bfloat16
+    # CPU backup currently omits QSA rings/compressed keys and NEXTN draft state.
+    # Decode memory-pressure retraction must abort rather than resume stale slots.
+    supports_cpu_retraction = False
 
     @classmethod
     def qsa_bytes_per_token(

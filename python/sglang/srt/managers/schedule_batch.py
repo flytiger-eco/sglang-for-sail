@@ -3347,7 +3347,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 # No backup exists and the device KV is already freed, so the
                 # request cannot resume.
-                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                if (
+                    get_disagg().disaggregation_decode_retraction_backup == "cpu_tensor"
+                    and not getattr(
+                        self.token_to_kv_pool_allocator.get_kvcache(),
+                        "supports_cpu_retraction",
+                        True,
+                    )
+                ):
+                    message = (
+                        "QSA state cannot be safely restored after decode memory "
+                        "pressure. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                elif get_disagg().disaggregation_decode_retraction_backup == "none":
                     message = (
                         "Retracted under decode memory pressure without a KV "
                         "backup. Retry later."

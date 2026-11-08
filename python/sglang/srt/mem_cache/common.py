@@ -240,6 +240,21 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if backend == "cpu_tensor":
+        if not getattr(
+            token_to_kv_pool_allocator.get_kvcache(), "supports_cpu_retraction", True
+        ):
+            # The inherited CPU copy omits compressed keys and the pending
+            # key/RoPE rings. NEXTN draft state also cannot be restored here.
+            # Returning False uses the request-local retraction abort path;
+            # normal serving remains available without an unsafe resume.
+            pool = token_to_kv_pool_allocator.get_kvcache()
+            # Match CPU offload's synchronization before the caller frees slots
+            # that an overlapped target/draft forward may still be reading.
+            torch.get_device_module(pool.device).synchronize(pool.device)
+            logger.warning(
+                "Cannot safely back up QSA state for decode retraction: rid=%s", req.rid
+            )
+            return False
         req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
         return True
     if backend != "host_pool":
