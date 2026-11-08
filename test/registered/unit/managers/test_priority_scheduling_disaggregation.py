@@ -201,6 +201,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
     def _pop_bootstrapping_swa_branch(self, write_policy):
         queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.bootstrap_overlap = False
         queue.scheduler_stage_metrics = None
         queue.pp_size = 1
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)

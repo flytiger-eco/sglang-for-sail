@@ -194,6 +194,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.bootstrap_overlap = envs.SGLANG_DISAGG_BOOTSTRAP_OVERLAP.get()
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -554,7 +555,11 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+                    (
+                        self.bootstrap_overlap
+                        or req.prefill_attempt_count
+                        < get_disagg().optimistic_prefill_attempts
+                    )
                     and not req.is_retracted  # engine paused
                     and not (
                         _uses_write_through_cache(self.scheduler.tree_cache)
@@ -564,7 +569,8 @@ class PrefillBootstrapQueue:
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
-                    req.prefill_attempt_count += 1
+                    if not self.bootstrap_overlap:
+                        req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
@@ -1302,7 +1308,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
-                elif self.has_bootstrapped_waiting_req():
+                elif (
+                    self.has_bootstrapped_waiting_req()
+                    and not self.disagg_prefill_bootstrap_queue.bootstrap_overlap
+                ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
                     if not self.enable_overlap:
