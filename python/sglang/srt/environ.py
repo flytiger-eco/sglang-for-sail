@@ -723,6 +723,9 @@ class Envs:
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGG_EXPANDED_INPUT_LEN = EnvBool(False)
     SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT = EnvFloat(180.0)
+    # Admit Prefill during bootstrap without spending optimistic-prefill attempts.
+    # The same PP and hierarchical-cache compatibility restrictions apply.
+    SGLANG_DISAGG_BOOTSTRAP_OVERLAP = EnvBool(False)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)

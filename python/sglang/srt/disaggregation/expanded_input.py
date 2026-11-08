@@ -93,6 +93,21 @@ def validate_expanded_input_config(cfg, architecture):
         raise ValueError("Expanded-input Prefill requires --disagg-decode-urls")
 
 
+def optimistic_prefill_supported(cfg):
+    return cfg.pp_size == 1 and (
+        not cfg.enable_hierarchical_cache
+        or (
+            cfg.hicache_storage_backend is None
+            and cfg.hicache_write_policy in ("write_back", "write_through")
+        )
+        or (
+            cfg.hicache_storage_backend is not None
+            and cfg.hicache_host_memory_mode == "buffer_only"
+            and cfg.hicache_write_policy == "write_through"
+        )
+    )
+
+
 def finalize_expanded_input_positions(req):
     """Apply length-dependent options only after authoritative metadata arrives."""
     options = getattr(req, "_deferred_position_options", None)
