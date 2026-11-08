@@ -21,6 +21,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 ROOT = Path(__file__).resolve().parents[4]
 BASE_PATH = ROOT / "python/sglang/srt/multimodal/processors/base_processor.py"
 LOADER_PATH = ROOT / "python/sglang/srt/multimodal/aim_image_loader.py"
@@ -172,9 +176,6 @@ class TestAimProcessorImageLoading(unittest.TestCase):
         self.assertIs(result[0], tensor)
         self.assertEqual(self.calls, [])
 
-
-
-
     def test_preprocessed_input_ids_early_return_keeps_original_objects(self):
         data = {"format": "processor_output", "input_ids": [1, 2]}
         result = asyncio.run(
@@ -183,7 +184,6 @@ class TestAimProcessorImageLoading(unittest.TestCase):
         self.assertIs(result.images[0], data)
         self.assertEqual(result.input_ids, [1, 2])
         self.assertEqual(self.calls, [])
-
 
     def test_batch_switch_uses_prefetch_once(self):
         self.namespace["envs"].SGLANG_ENABLE_REDKV_MGET = env(True)

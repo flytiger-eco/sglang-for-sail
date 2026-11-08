@@ -11,11 +11,16 @@ EPD_TEST_QWEN4_MODEL_PATH and EPD_TEST_PREFILL_URL. It verifies the actual model
 QSA and PLE config instead of treating the request's model alias as deployment.
 Match preprocessing limits on Encoder (vision_config.image) and standalone
 (image) before comparing prompt lengths. No gateway changes are required.
+Reference checks compare the complete generated token sequence. Set
+EPD_TEST_LOGPROB_ATOL only to an absolute logprob tolerance calibrated for the
+same model, quantization and parallel configurations to additionally compare
+token probabilities; no cross-platform numerical tolerance is assumed.
 """
 
 import base64
 import io
 import json
+import math
 import os
 import secrets
 import unittest
@@ -70,11 +75,57 @@ def payload(size, reverse=False):
     }
 
 
-def answer(url, body):
+def generation_details(response):
+    choice = response["choices"][0]
+    items = (choice.get("logprobs") or {}).get("content")
+    if not items:
+        raise AssertionError("Reference comparison requires generated-token logprobs")
+    probabilities = [item["logprob"] for item in items]
+    if not all(isinstance(p, (int, float)) and math.isfinite(p) for p in probabilities):
+        raise AssertionError("Generated-token logprobs must be finite numbers")
+    return {
+        "text": choice["message"]["content"],
+        "prompt_tokens": response["usage"]["prompt_tokens"],
+        "generated_tokens": [item["token"] for item in items],
+        "output_logprobs": probabilities,
+    }
+
+
+def assert_reference_matches(test_case, actual, reference, *, logprob_atol=None):
+    """Check generated content as well as lengths, including captured replays."""
+    for result in (actual, reference):
+        test_case.assertTrue(
+            result.get("generated_tokens"),
+            "Capture lacks generated tokens; regenerate it with the current EPD suite",
+        )
+    test_case.assertEqual(actual["prompt_tokens"], reference["prompt_tokens"])
+    test_case.assertEqual(actual["text"], reference["text"])
+    test_case.assertEqual(actual["generated_tokens"], reference["generated_tokens"])
+    if logprob_atol is not None:
+        tolerance = float(logprob_atol)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("EPD_TEST_LOGPROB_ATOL must be finite and non-negative")
+        for result in (actual, reference):
+            test_case.assertEqual(
+                len(result["output_logprobs"]), len(result["generated_tokens"])
+            )
+        for actual_logprob, reference_logprob in zip(
+            actual["output_logprobs"], reference["output_logprobs"]
+        ):
+            test_case.assertTrue(math.isfinite(actual_logprob))
+            test_case.assertTrue(math.isfinite(reference_logprob))
+            test_case.assertAlmostEqual(
+                actual_logprob, reference_logprob, delta=tolerance
+            )
+
+
+def answer(url, body, *, details=False):
     # MiniLB forwards JSON but not X-Request-ID. Older deployed routers may
     # forward the header instead; both identities must describe the same pair.
     pair_key = uuid.uuid4().hex
     body = dict(body, bootstrap_pair_key=pair_key)
+    if details:
+        body["logprobs"] = True
     response = requests.post(
         url.rstrip("/") + "/v1/chat/completions",
         json=body,
@@ -84,6 +135,8 @@ def answer(url, body):
     response.raise_for_status()
     result = response.json()
     assert result.get("choices"), result
+    if details:
+        return generation_details(result)
     return result["choices"][0]["message"]["content"], result["usage"]["prompt_tokens"]
 
 
@@ -247,7 +300,8 @@ class TestExpandedInputEPD(PDDisaggregationServerBase):
             for reverse in (False, True):
                 with self.subTest(size=size, reverse=reverse):
                     body = payload(size, reverse)
-                    text, tokens = answer(self.lb_url, body)
+                    generated = answer(self.lb_url, body, details=True)
+                    text, tokens = generated["text"], generated["prompt_tokens"]
                     expected = "blue" if reverse else "red"
                     self.assertIn(expected, text.lower())
                     self.assertNotIn("red" if reverse else "blue", text.lower())
@@ -256,14 +310,18 @@ class TestExpandedInputEPD(PDDisaggregationServerBase):
                         {
                             "body": body,
                             "expected": expected,
-                            "text": text,
-                            "prompt_tokens": tokens,
+                            **generated,
                         }
                     )
                     if self.reference_url:
-                        reference, ref_tokens = answer(self.reference_url, body)
-                        self.assertIn(expected, reference.lower())
-                        self.assertEqual(tokens, ref_tokens)
+                        reference = answer(self.reference_url, body, details=True)
+                        self.assertIn(expected, reference["text"].lower())
+                        assert_reference_matches(
+                            self,
+                            generated,
+                            reference,
+                            logprob_atol=os.getenv("EPD_TEST_LOGPROB_ATOL"),
+                        )
         self.assertGreater(len({r["prompt_tokens"] for r in records}), 1)
         path = os.getenv("EPD_TEST_CAPTURE_PATH")
         if path:
@@ -507,9 +565,16 @@ class TestStandaloneReplay(CustomTestCase):
             with self.subTest(
                 expected=row["expected"], prompt_tokens=row["prompt_tokens"]
             ):
-                text, tokens = answer(os.environ["EPD_TEST_REFERENCE_URL"], row["body"])
-                self.assertIn(row["expected"], text.lower())
-                self.assertEqual(tokens, row["prompt_tokens"])
+                reference = answer(
+                    os.environ["EPD_TEST_REFERENCE_URL"], row["body"], details=True
+                )
+                self.assertIn(row["expected"], reference["text"].lower())
+                assert_reference_matches(
+                    self,
+                    row,
+                    reference,
+                    logprob_atol=os.getenv("EPD_TEST_LOGPROB_ATOL"),
+                )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,44 @@
 """Credential sanitization for readbacks and dumps; live config/IPC stays raw."""
 
+import re
+
 SECRET_FIELDS = frozenset(
     {"api_key", "admin_api_key", "disagg_decode_control_key", "ssl_keyfile_password"}
 )
+
+
+def redact_url_userinfo(value):
+    """Mask URL authority credentials without changing paths, queries or hosts."""
+    # A whole URL (or --option=URL argv item) may contain quoted spaces in
+    # userinfo. Handle its authority before scanning embedded command URLs.
+    prefix = re.match(r"(?:--[^=\s]+=)?[A-Za-z][A-Za-z0-9+.-]*://", value)
+    if prefix is not None:
+        start = prefix.end()
+        end = min(
+            (i for i in (value.find(c, start) for c in "/?#") if i >= 0),
+            default=len(value),
+        )
+        authority = value[start:end]
+        if "@" in authority:
+            value = (
+                value[:start]
+                + "<redacted>@"
+                + authority.rsplit("@", 1)[1]
+                + value[end:]
+            )
+    return re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s?#]*@",
+        r"\1<redacted>@",
+        value,
+    )
+
+
+def capture_engine_command(kwargs):
+    """Capture sanitized constructor fields before formatting their repr."""
+    values = redact_config_secrets(kwargs, redact_strings=False)
+    return (
+        "Engine(" + ", ".join(f"{key}={value!r}" for key, value in values.items()) + ")"
+    )
 
 
 def redact_cli_secrets(argv, parser):
@@ -26,7 +62,7 @@ def redact_cli_secrets(argv, parser):
             result.append(name + "=<redacted>" if separator else name)
             redact_next = not separator
         else:
-            result.append(argument)
+            result.append(redact_url_userinfo(argument))
     return result
 
 
@@ -61,18 +97,22 @@ def redact_config_secrets(
                     if key in SECRET_FIELDS and item
                     else clean(
                         item,
-                        scrub_strings or key in ("launch_command", "_launch_command"),
+                        False
+                        if key in ("launch_command", "_launch_command")
+                        else (scrub_strings or key == "command"),
                     )
                 )
                 for key, item in value.items()
             }
         if isinstance(value, (list, tuple)):
             return type(value)(clean(item, scrub_strings) for item in value)
-        if scrub_strings and isinstance(value, str):
-            for key in secrets:
-                value = value.replace(repr(key), "'<redacted>'").replace(
-                    key, "<redacted>"
-                )
+        if isinstance(value, str):
+            value = redact_url_userinfo(value)
+            if scrub_strings:
+                for key in secrets:
+                    value = value.replace(repr(key), "'<redacted>'").replace(
+                        key, "<redacted>"
+                    )
         return value
 
     return clean(snapshot)
@@ -83,4 +123,5 @@ def redact_config_for_dump(snapshot, server_args, updates):
         snapshot,
         secret_values=[getattr(server_args, name, None) for name in SECRET_FIELDS],
         updates=updates,
+        redact_strings=False,
     )
