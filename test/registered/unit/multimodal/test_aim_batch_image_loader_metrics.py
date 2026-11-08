@@ -9,6 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 MODULE_PATH = (
     Path(__file__).resolve().parents[4]
     / "python/sglang/srt/multimodal/aim_image_loader.py"

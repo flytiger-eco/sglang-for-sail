@@ -438,9 +438,26 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
-        manager = getattr(_global_state, "tokenizer_manager", None)
+        await _close_runtime_resources(
+            getattr(_global_state, "tokenizer_manager", None),
+            sidecar,
+            grpc_handle,
+            tool_server,
+            warmup_thread,
+        )
+
+
+async def _close_runtime_resources(
+    manager, sidecar, grpc_handle, tool_server, warmup_thread
+):
+    """Close control tasks without skipping the runtime's remaining teardown."""
+    try:
         if isinstance(manager, TokenizerManager):
-            await manager.close_decode_control()
+            try:
+                await manager.close_decode_control()
+            except Exception:
+                logger.exception("Failed to close Decode control session")
+    finally:
         if sidecar is not None:
             try:
                 sidecar.stop()

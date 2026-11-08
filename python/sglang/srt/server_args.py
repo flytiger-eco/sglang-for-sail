@@ -255,12 +255,9 @@ class ServerArgs:
     @property
     def launch_command(self) -> str | None:
         """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
-        from sglang.srt.utils.config_dump import SECRET_FIELDS, redact_config_secrets
-
-        return redact_config_secrets(
-            getattr(self, "_launch_command", None),
-            secret_values=[getattr(self, name, None) for name in SECRET_FIELDS],
-        )
+        # Both CLI and Engine sanitize parameter values at capture time.
+        # Replacing secret substrings here can corrupt unrelated model paths.
+        return getattr(self, "_launch_command", None)
 
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved configuration without exposing credentials."""

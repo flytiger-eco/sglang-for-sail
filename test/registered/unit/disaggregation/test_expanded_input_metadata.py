@@ -110,6 +110,42 @@ class TestExpandedInputMetadata(CustomTestCase):
         self.q._apply_expanded_input_len(self.req, (2, 0, 2))
         self.assertTrue(self.req.skip_radix_cache_insert)
 
+    def test_disabled_feature_does_not_scan_the_preallocation_queue(self):
+        class NoIteration(list):
+            def __iter__(self):
+                raise AssertionError("disabled feature scanned the request queue")
+
+        self.q.queue = NoIteration([NS(req=self.request(room=99))])
+        self.q._check_if_req_exceed_kv_capacity = Mock(return_value=True)
+        self.req.needs_expanded_input_len = False
+        with (
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(False),
+            patch(
+                "sglang.srt.disaggregation.decode.is_unadmitted_reject",
+                return_value=False,
+            ),
+        ):
+            self.q.add(self.req)
+        self.q._check_if_req_exceed_kv_capacity.assert_called_once_with(self.req)
+
+    def test_preallocation_deadline_uses_bootstrap_not_transfer_timeout(self):
+        self.enqueue()
+        self.req.expanded_input_len = 8
+        self.req._expanded_input_len_wait_start = 0
+        with (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(600),
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.override(300),
+            patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=350),
+        ):
+            self.q._sync_expanded_input_metadata()
+        self.assertIsNone(self.req.finished_reason)
+        with (
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(600),
+            patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=601),
+        ):
+            self.q._sync_expanded_input_metadata()
+        self.assertIsInstance(self.req.finished_reason, FINISH_ABORT)
+
     def test_invalid_values_and_versions_abort(self):
         for i, (length, delta, version) in enumerate(
             [(True, 0, 2), (8, True, 2), (8, 0, 1), (8, -8, 2), (8, 2**80, 2)]

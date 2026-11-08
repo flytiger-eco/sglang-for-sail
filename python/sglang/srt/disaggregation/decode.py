@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.expanded_input import (
     EXPANDED_INPUT_MAX_INFLIGHT,
+    expanded_input_enabled,
     finalize_expanded_input_positions,
 )
 from sglang.srt.disaggregation.utils import (
@@ -766,6 +767,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
+        if expanded_input_enabled() and not is_retracted and not is_rebootstrap:
+            # A client may already have received its error while an old receiver
+            # is still retrying cancellation. Its room must not be republished.
+            if (
+                req.needs_expanded_input_len
+                and len(self.queue) >= EXPANDED_INPUT_MAX_INFLIGHT
+            ) or any(
+                item.req.bootstrap_room == req.bootstrap_room
+                and (req.needs_expanded_input_len or item.req.needs_expanded_input_len)
+                for item in self.queue
+            ):
+                prepare_abort(
+                    req,
+                    "Decode cancellation cleanup is pending; retry later",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.scheduler.retire_unadmitted_request(req)
+                return
         if is_retracted and dsv41_dspark_needs_rebootstrap(
             self.token_to_kv_pool_allocator
         ):
@@ -872,7 +891,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             not isinstance(request_generation, str)
             or not 1 <= len(request_generation) <= 128
         ):
-            raise ValueError("Invalid expanded-input request generation")
+            logger.error("Invalid expanded-input request generation: room=%s", rid)
+            return False
         key = (str(rid), request_generation)
         now = time.monotonic()
         metadata = (expanded_input_len, mrope_position_delta, metadata_version)
@@ -925,9 +945,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self._cleanup_pending_expanded_lens(now)
             decisions = []
             timeout = envs.SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT.get()
+            bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
             for dr in self.queue:
                 req = dr.req
-                if not req.needs_expanded_input_len:
+                if not req.needs_expanded_input_len or isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ):
                     continue
                 generation = getattr(req, "_expanded_input_generation", None)
                 room = str(req.bootstrap_room)
@@ -940,6 +963,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                             generation,
                             None,
                             "Conflicting Prefill multimodal metadata",
+                        )
+                    )
+                    continue
+                if (
+                    now - getattr(req, "_expanded_input_len_wait_start", now)
+                    > bootstrap_timeout
+                ):
+                    # Metadata arrival does not prove a sender was admitted.
+                    # Cover unresolved P-DP routing as well as preallocation.
+                    decisions.append(
+                        (
+                            req.rid,
+                            None,
+                            None,
+                            "Timed out during Decode bootstrap/preallocation",
                         )
                     )
                     continue
@@ -988,6 +1026,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         requests = {dr.req.rid: dr.req for dr in self.queue}
         for rid, generation, metadata, error in decisions:
             req = requests[rid]
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                continue
             if generation is not None:
                 key = (str(req.bootstrap_room), generation)
                 self._pending_expanded_lens.pop(key, None)
@@ -1354,6 +1394,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     # kv_receiver may be None from a prior self.queue cleanup
                     if decode_req.kv_receiver is not None:
                         decode_req.kv_receiver.abort()
+                        if self._needs_prealloc_abort_ack(decode_req):
+                            # Retain route discovery until the paired abort is
+                            # acknowledged or its existing deadline expires.
+                            remaining.append(decode_req)
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -1494,6 +1538,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return bits.tolist()
         return ready
 
+    def _emit_prealloc_abort(self, req: Req) -> None:
+        """Finish the client once; receiver retirement remains ACK-fenced."""
+        if not (
+            getattr(req, "finished_output", False)
+            or getattr(req, "_prealloc_abort_output_sent", False)
+        ):
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            req._prealloc_abort_output_sent = True
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1507,6 +1560,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
+        # Deliver existing terminal results before any route lookup can block.
+        # Keep receivers in the queue until cancellation safely completes.
+        for item in self.queue:
+            if isinstance(item.req.finished_reason, FINISH_ABORT):
+                self._emit_prealloc_abort(item.req)
         self._resolve_pending_reqs()
         self._sync_expanded_input_metadata()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
@@ -1556,7 +1614,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Revalidate the authoritative prompt, not the shorter placeholders.
         for decode_req in self.queue:
             req = decode_req.req
-            if not req.needs_expanded_input_len or req.expanded_input_len is None:
+            if (
+                isinstance(req.finished_reason, FINISH_ABORT)
+                or not req.needs_expanded_input_len
+                or req.expanded_input_len is None
+            ):
                 continue
             if getattr(req, "_expanded_input_len_capacity_checked", False):
                 continue
@@ -1600,6 +1662,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 continue
             has_aborted_request = True
+            self._emit_prealloc_abort(decode_req.req)
             receiver = decode_req.kv_receiver
             if self._needs_prealloc_abort_ack(decode_req):
                 abort_ready[i] = receiver.finish_prealloc_abort()
@@ -1622,11 +1685,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             abort_ready = self._sync_prealloc_abort_ready(abort_ready)
         for i, decode_req in enumerate(self.queue):
             if abort_ready[i]:
-                if not getattr(decode_req.req, "finished_output", False):
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req],
-                        decode_req.req.return_logprob,
-                    )
+                self._emit_prealloc_abort(decode_req.req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -1847,13 +1906,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         reclaim_error,
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     )
+                    self._emit_prealloc_abort(decode_req.req)
                     if self._needs_prealloc_abort_ack(decode_req):
-                        # No destinations were published. Keep the owner until
+                        # No destinations were published. Keep the receiver until
                         # next tick's ACK-gated, TP-consistent abort scan.
                         continue
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
                     decode_req.kv_receiver.ensure_abort_notified()
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None

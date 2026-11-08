@@ -37,6 +37,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.config_dump import capture_engine_command
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.req_double import ReqDouble
 
@@ -313,7 +314,9 @@ class TestExpandedInputBoundaries(CustomTestCase):
         msgspec.Struct.__setattr__(
             args,
             "_launch_command",
-            "serve --disagg-decode-control-key d-secret --api-key p-secret",
+            capture_engine_command(
+                {"disagg_decode_control_key": "d-secret", "api_key": "p-secret"}
+            ),
         )
         tm.server_args = args
         tm.model_path = "dummy"
@@ -338,7 +341,9 @@ class TestExpandedInputBoundaries(CustomTestCase):
             api_key=None,
             admin_api_key=None,
             disagg_decode_control_key="secret",
-            launch_command="serve --disagg-decode-control-key secret",
+            launch_command=capture_engine_command(
+                {"disagg_decode_control_key": "secret"}
+            ),
             resolved_dict=Mock(side_effect=RuntimeError("cannot snapshot")),
         )
         snapshot = tm._dump_configuration()

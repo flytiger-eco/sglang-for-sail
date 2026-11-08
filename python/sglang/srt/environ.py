@@ -721,6 +721,8 @@ class Envs:
     # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    SGLANG_DISAGG_EXPANDED_INPUT_LEN = EnvBool(False)
+    SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT = EnvFloat(180.0)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)

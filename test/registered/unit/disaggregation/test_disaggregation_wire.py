@@ -969,7 +969,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
             )
 
-    def test_decode_input_requires_valid_seed_for_every_request(self):
+    @patch("sglang.srt.speculative.eagle_disaggregation.get_server_args")
+    def test_decode_input_requires_valid_seed_for_every_request(self, server_args):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),
             torch.tensor([4, 5, 6], dtype=torch.int32),
@@ -988,6 +989,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         # The draft-input shape comes from the spec bag.
         override = get_context().override_server_args(
+            attention_backend="dsa",
+            prefill_attention_backend="dsa",
+            decode_attention_backend="dsa",
+            speculative_draft_attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
@@ -995,6 +1000,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
+
+        # Scoped overrides live in resolved bags; this legacy boundary reads
+        # raw ServerArgs, so supply the effective configuration to the helper.
+        server_args.return_value = SimpleNamespace(
+            **get_context().resolved_server_args_dict()
+        )
 
         draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
         self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
@@ -1036,7 +1047,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertIsNone(draft_input.dsa_topk_indices)
         self.assertTrue(draft_input.cuda_graph_compatible)
 
-    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
+    @patch("sglang.srt.speculative.eagle_disaggregation.get_server_args")
+    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(
+        self, server_args
+    ):
         wire_positions = (
             torch.tensor([2, 0, -1], dtype=torch.int32),
             torch.tensor([1, 3, -1], dtype=torch.int32),
@@ -1066,6 +1080,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
         )
         override = get_context().override_server_args(
+            attention_backend="dsa",
+            prefill_attention_backend="dsa",
+            decode_attention_backend="dsa",
+            speculative_draft_attention_backend="dsa",
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
@@ -1077,6 +1095,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
 
         local_slots = [[309, 101, -1], [801, 990, -1]]
         unremapped = [[2, 0, -1], [1, 3, -1]]
+        server_args.return_value = SimpleNamespace(
+            **get_context().resolved_server_args_dict()
+        )
         for platform, cuda, hip, fused, expected in (
             ("cuda", True, False, True, local_slots),
             ("hip", False, True, True, local_slots),

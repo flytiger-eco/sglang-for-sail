@@ -9,11 +9,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 MODULE_PATH = (
     Path(__file__).resolve().parents[4]
     / "python/sglang/srt/multimodal/aim_image_loader.py"
 )
-SPEC = importlib.util.spec_from_file_location("aim_image_loader_under_test", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "aim_image_loader_under_test", MODULE_PATH
+)
 loader = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(loader)
 
@@ -57,7 +63,9 @@ class TestBoundedImageLoader(unittest.TestCase):
             for event in releases:
                 event.set()
             self.assertEqual(future.result(3), [0, 2, 4, 6, 8])
-            self.assertEqual(pool.submit(lambda: "still usable").result(), "still usable")
+            self.assertEqual(
+                pool.submit(lambda: "still usable").result(), "still usable"
+            )
 
     def test_error_stops_submission_and_preserves_error(self):
         failure = ValueError("bad image")
@@ -102,7 +110,9 @@ class TestBoundedImageLoader(unittest.TestCase):
 
     def test_nested_coordinator_is_rejected(self):
         with ThreadPoolExecutor(1) as pool:
-            pool.submit(lambda: None).result()  # Ensure worker membership is registered.
+            pool.submit(
+                lambda: None
+            ).result()  # Ensure worker membership is registered.
             future = pool.submit(
                 loader.bounded_map, str, [1], executor=pool, max_in_flight=1
             )

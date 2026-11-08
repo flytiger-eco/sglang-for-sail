@@ -152,7 +152,12 @@ def _run_tp_abort_rank(rank, init_path, result_path):
         )
         queue.queue.append(healthy)
         ready, failed = queue.pop_preallocated()
-        assert not ready and not failed and len(queue.queue) == 2 and not outputs
+        assert (
+            not ready
+            and not failed
+            and len(queue.queue) == 2
+            and outputs == ["rejected"]
+        )
         assert manager._prealloc_abort_ack_tracker[(83, "pair")] == (
             {0} if rank == 0 else set()
         )
@@ -404,7 +409,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ready, failed = queue.pop_preallocated()
         self.assertEqual((ready, failed), ([], []))
         self.assertEqual(queue.queue, [item])
-        self.assertEqual(events, [])
+        self.assertEqual(events, [("output", req.finished_reason.to_json())])
         # The asynchronous bootstrap lookup finishes on the next scheduler tick.
         receiver.bootstrap_infos = [{"rank_ip": "127.0.0.1", "rank_port": 8998}]
         queue.pending_reqs.clear()
@@ -426,11 +431,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertIsNone(item.kv_receiver)
         self.assertEqual(manager._prealloc_abort_ack_tracker, {})
-        self.assertEqual(events[0][0], "wire")
-        self.assertEqual(events[0][1][:2], [b"ABORT", b"77"])
-        self.assertEqual(events[0][1][4:], [b"WAIT_FOR_ROOM", b"pair"])
         self.assertEqual(events[1][0], "wire")
-        self.assertEqual(events[2], ("output", req.finished_reason.to_json()))
+        self.assertEqual(events[1][1][:2], [b"ABORT", b"77"])
+        self.assertEqual(events[1][1][4:], [b"WAIT_FOR_ROOM", b"pair"])
+        self.assertEqual(events[2][0], "wire")
+        self.assertEqual(events[0], ("output", req.finished_reason.to_json()))
         self.assertEqual(req.finished_reason.to_json()["status_code"], 400)
         self.assertTrue(receiver.abort_notified)
         queue._pre_alloc.assert_not_called()
@@ -535,7 +540,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(manager._prealloc_abort_replays[(room, "pair")].drained)
 
     def test_capacity_rejection_keeps_owner_until_peer_ack(self):
-        """Expanded capacity rejection must not publish completion before cleanup."""
+        """Return a rejection now while retaining the room until cleanup."""
         queue, item, manager, outputs = _pending_abort_queue()
         item.req.finished_reason = None
         item.req.needs_expanded_input_len = True
@@ -544,7 +549,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.token_to_kv_pool_allocator.prealloc_ceiling_fits = lambda full, swa: False
         ready, failed = queue.pop_preallocated()
         self.assertEqual((ready, failed), ([], []))
-        self.assertEqual(outputs, [])
+        self.assertEqual(outputs, ["rejected"])
         self.assertEqual(queue.queue, [item])
         self.assertEqual(item.req.finished_reason.to_json()["status_code"], 400)
         _ack(manager, 83, 0)
@@ -565,7 +570,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             "sglang.srt.disaggregation.mooncake.conn.time.monotonic", return_value=10
         ):
             self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(outputs, [])
+        self.assertEqual(outputs, ["rejected"])
         with patch(
             "sglang.srt.disaggregation.mooncake.conn.time.monotonic", return_value=11
         ):
@@ -723,12 +728,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         """A SWA eviction failure must not retire an unacknowledged room."""
         queue, item, manager, outputs = self._swa_rejection_queue()
         self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(outputs, [])
+        self.assertEqual(outputs, ["rejected"])
         self.assertEqual(queue.queue, [item])
         self.assertIsNotNone(item.kv_receiver)
         self.assertEqual(item.req.finished_reason.to_json()["status_code"], 503)
         self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(outputs, [])
+        self.assertEqual(outputs, ["rejected"])
         _ack(manager, 83, 0)
         self.assertEqual(queue.pop_preallocated(), ([], [item]))
         self.assertEqual(outputs, ["rejected"])
@@ -772,7 +777,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             DecodePreallocQueue._update_handshake_waiters(queue)
         self.assertIsInstance(item.req.finished_reason, FINISH_ABORT)
         self.assertEqual(queue.pop_preallocated(), ([], []))
-        self.assertEqual(outputs, [])
+        self.assertEqual(outputs, ["rejected"])
         prefill = MooncakeKVManager.__new__(MooncakeKVManager)
         prefill._init_prealloc_abort_state()
         prefill.request_status = {}
@@ -1438,6 +1443,177 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_lmcache = False
 
         self.assertFalse(scheduler.is_fully_idle())
+
+
+class TestExpandedInputTermination(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.environ import envs
+
+        self.enterContext(envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(True))
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    @staticmethod
+    def metadata_queue(queue, req):
+        from collections import OrderedDict
+
+        queue._pending_expanded_lens = OrderedDict()
+        queue._seen_expanded_metadata = OrderedDict()
+        queue._expanded_len_cache_max = 4096
+        queue._expanded_len_cache_ttl = 300
+        queue._sync_expanded_input_metadata = lambda: (
+            DecodePreallocQueue._sync_expanded_input_metadata(queue)
+        )
+        req._expanded_input_generation = "generation"
+        req._expanded_input_len_wait_start = 0
+        queue.gloo_group = None
+
+    def test_cancel_replies_once_before_ack_without_retiring_receiver(self):
+        queue, item, manager, outputs = _pending_abort_queue()
+        receiver = item.kv_receiver
+        receiver.clear = MagicMock(wraps=receiver.clear)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(outputs, ["rejected"])
+        self.assertEqual(queue.queue, [item])
+        receiver.clear.assert_not_called()
+        self.assertIn((83, "pair"), manager._prealloc_abort_ack_tracker)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(outputs, ["rejected"])
+        _ack(manager, 83, 0)
+        self.assertEqual(queue.pop_preallocated(), ([], [item]))
+        receiver.clear.assert_called_once()
+        self.assertEqual(outputs, ["rejected"])
+        self.assertFalse(manager._prealloc_abort_ack_tracker)
+
+    def test_reply_precedes_any_pending_route_lookup(self):
+        queue, item, manager, outputs = _pending_abort_queue()
+        queue._resolve_pending_reqs.side_effect = lambda: self.assertEqual(
+            outputs, ["rejected"]
+        )
+        queue.pop_preallocated()
+        self.assertIsNotNone(item.kv_receiver)
+
+    def test_missing_route_keeps_only_cleanup_pending_after_immediate_reply(self):
+        queue, item, manager, outputs = _pending_abort_queue()
+        item.kv_receiver.bootstrap_infos = None
+        del item.kv_receiver._prealloc_abort_started
+        manager.waiting_timeout = 300
+        queue.pending_reqs = [item]
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic", return_value=1000
+        ):
+            self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(outputs, ["rejected"])
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic", return_value=1299
+        ):
+            self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertIsNotNone(item.kv_receiver)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic", return_value=1300
+        ):
+            self.assertEqual(queue.pop_preallocated(), ([], [item]))
+        self.assertEqual(outputs, ["rejected"])
+        self.assertEqual(queue.pending_reqs, [])
+
+    def test_terminal_metadata_decisions_preserve_original_error_and_cache(self):
+        from sglang.srt.environ import envs
+
+        for status in (400, 499, 500):
+            with self.subTest(status=status):
+                queue, item, manager, outputs = _pending_abort_queue()
+                self.metadata_queue(queue, item.req)
+                original = FINISH_ABORT("original error", status)
+                item.req.finished_reason = original
+                queue._seen_expanded_metadata[("83", "generation")] = (None, 1000)
+                before = queue._seen_expanded_metadata.copy()
+                with (
+                    patch("torch.distributed.is_initialized", return_value=False),
+                    patch(
+                        "sglang.srt.disaggregation.decode.time.monotonic",
+                        return_value=1000,
+                    ),
+                    envs.SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT.override(1),
+                ):
+                    queue._sync_expanded_input_metadata()
+                self.assertIs(item.req.finished_reason, original)
+                self.assertEqual(queue._seen_expanded_metadata, before)
+
+    def test_cancel_cannot_be_overwritten_by_late_capacity_validation(self):
+        queue, item, manager, outputs = _pending_abort_queue()
+        item.req.expanded_input_len = 10000
+        original = item.req.finished_reason
+        queue.pop_preallocated()
+        self.assertIs(item.req.finished_reason, original)
+        queue.scheduler.init_req_max_new_tokens.assert_not_called()
+        queue._pre_alloc.assert_not_called()
+
+    def test_deadline_applies_after_metadata_even_with_unknown_route(self):
+        from sglang.srt.environ import envs
+
+        queue, item, manager, outputs = _pending_abort_queue()
+        self.metadata_queue(queue, item.req)
+        item.req.finished_reason = None
+        item.req.expanded_input_len = 100
+        item.kv_receiver.bootstrap_infos = None
+        del item.kv_receiver._prealloc_abort_started
+        manager.request_status[83] = KVPoll.Bootstrapping
+        queue.pending_reqs = [item]
+        with (
+            patch("torch.distributed.is_initialized", return_value=False),
+            patch("sglang.srt.disaggregation.decode.time.monotonic", return_value=11),
+            envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.override(10),
+        ):
+            self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertEqual(item.req.finished_reason.status_code, 504)
+        self.assertIn("bootstrap/preallocation", item.req.finished_reason.message)
+        self.assertEqual(outputs, ["rejected"])
+        self.assertIsNotNone(item.kv_receiver)
+        queue._pre_alloc.assert_not_called()
+
+    def test_reused_room_is_rejected_before_new_receiver_can_clear_old_owner(self):
+        for media in (False, True):
+            with self.subTest(media=media):
+                queue, item, manager, outputs = _pending_abort_queue()
+                queue.pop_preallocated()
+                original_receiver = item.kv_receiver
+                queue.scheduler.retire_unadmitted_request = MagicMock()
+                incoming = ReqDouble(
+                    rid="replacement",
+                    needs_expanded_input_len=media,
+                    bootstrap_room=83,
+                    finished_reason=None,
+                    to_finish=None,
+                    return_logprob=False,
+                )
+                with patch("sglang.srt.disaggregation.decode.get_kv_class") as factory:
+                    queue.add(incoming)
+                factory.assert_not_called()
+                self.assertEqual(incoming.finished_reason.status_code, 503)
+                queue.scheduler.retire_unadmitted_request.assert_called_once_with(
+                    incoming
+                )
+                self.assertIs(item.kv_receiver, original_receiver)
+                self.assertEqual(queue.queue, [item])
+                self.assertIn((83, "pair"), manager._prealloc_abort_ack_tracker)
+
+    def test_retained_cleanup_is_bounded_independently_of_frontend_owners(self):
+        queue, item, manager, outputs = _pending_abort_queue()
+        queue.scheduler.retire_unadmitted_request = MagicMock()
+        incoming = ReqDouble(
+            rid="next-room",
+            needs_expanded_input_len=True,
+            bootstrap_room=84,
+            finished_reason=None,
+            to_finish=None,
+            return_logprob=False,
+        )
+        with patch("sglang.srt.disaggregation.decode.EXPANDED_INPUT_MAX_INFLIGHT", 1):
+            queue.add(incoming)
+        self.assertEqual(incoming.finished_reason.status_code, 503)
+        self.assertEqual(queue.queue, [item])
+        queue.scheduler.retire_unadmitted_request.assert_called_once_with(incoming)
 
 
 if __name__ == "__main__":

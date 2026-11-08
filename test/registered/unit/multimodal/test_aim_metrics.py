@@ -6,6 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 path = (
     Path(__file__).resolve().parents[4] / "python/sglang/srt/multimodal/aim_metrics.py"
 )

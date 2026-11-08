@@ -24,6 +24,19 @@ DELTA_POSITION_ARCHS = frozenset(
 )
 
 
+def expanded_input_pair_key(request, mode):
+    """Only media requests participate in generation-scoped preallocation aborts."""
+    if getattr(request, "needs_expanded_input_len", False) or (
+        getattr(mode, "value", mode) == "prefill"
+        and (
+            getattr(request, "mm_inputs", None) is not None
+            or getattr(request, "need_wait_for_mm_inputs", False)
+        )
+    ):
+        return request.bootstrap_pair_key
+    return None
+
+
 def original_pair_key(request, raw_request=None):
     """Resolve only dispatcher-provided identity, before worker ID generation."""
     key = getattr(request, "bootstrap_pair_key", None)

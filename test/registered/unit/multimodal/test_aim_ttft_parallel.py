@@ -6,6 +6,7 @@ flow instead of merely checking that symbols occur in source.
 """
 
 import __future__
+
 import ast
 import asyncio
 import logging
@@ -18,6 +19,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 from PIL import Image
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -104,7 +109,9 @@ class TestTTFTParallel(unittest.IsolatedAsyncioTestCase):
                 "envs": self.flags,
                 "get_memory": lambda: manager.server_args,
                 "get_disagg": lambda: manager.server_args,
-                "DisaggregationMode": types.SimpleNamespace(PREFILL="prefill", DECODE="decode"),
+                "DisaggregationMode": types.SimpleNamespace(
+                    PREFILL="prefill", DECODE="decode"
+                ),
                 "logger": logging.getLogger(__name__),
             },
         )
@@ -152,7 +159,10 @@ class TestTTFTParallel(unittest.IsolatedAsyncioTestCase):
             _normalize_mm_content_hashes=Mock(),
             _validate_one_request=Mock(),
             _create_tokenized_object=lambda obj, text, ids, embeds, mm, types: (
-                text, ids, types, mm
+                text,
+                ids,
+                types,
+                mm,
             ),
         )
         manager._tokenize_one_request = types.MethodType(method, manager)
@@ -430,9 +440,13 @@ class TestQwenPrefetchForwarding(unittest.IsolatedAsyncioTestCase):
         positions = FakeTensor([1, 2, 3])
         processor = types.SimpleNamespace(
             load_mm_data=AsyncMock(return_value=base_output),
-            process_and_combine_mm_data_async=AsyncMock(return_value=(
-                [], FakeTensor([10, 999, 20]), {"padded_input_ids": [10, 999, 20]}
-            )),
+            process_and_combine_mm_data_async=AsyncMock(
+                return_value=(
+                    [],
+                    FakeTensor([10, 999, 20]),
+                    {"padded_input_ids": [10, 999, 20]},
+                )
+            ),
             _mark_cuda_ipc_features_for_deferred_reconstruction=Mock(),
             _get_processor_output_value=lambda output, key: output.get(key),
             _get_grid_from_output_or_items=lambda *args: None,

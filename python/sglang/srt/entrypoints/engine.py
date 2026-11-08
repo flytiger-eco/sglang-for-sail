@@ -280,10 +280,12 @@ class Engine(EngineScoreMixin, EngineBase):
             # There was no command line, so the call is what the operator
             # asked for. `log_level` is filled in above when absent, so it
             # shows here even when the caller did not pass it.
+            from sglang.srt.utils.config_dump import capture_engine_command
+
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                capture_engine_command(kwargs),
             )
         self.server_args = server_args
         logger.info(f"server_args={server_args.resolved_dict()}")

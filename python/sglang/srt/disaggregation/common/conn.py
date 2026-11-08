@@ -1732,7 +1732,7 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def clear(self) -> None:
+    def clear(self, *, notify_drained: bool = True) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
@@ -1742,7 +1742,8 @@ class CommonKVSender(BaseKVSender):
             if hasattr(self.kv_mgr, "_staging_outstanding"):
                 # Preserve the target until in-flight writes drain, even when
                 # the scheduler has already observed Failed and cleared the room.
-                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+                if notify_drained:
+                    self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
             else:
                 self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
                 self.kv_mgr._deferred_ack_fanout_snapshots.pop(

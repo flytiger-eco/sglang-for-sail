@@ -915,6 +915,10 @@ class GenerateReqInput:
         elif not isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
         elif isinstance(self.bootstrap_pair_key, list):
+            if len(self.bootstrap_pair_key) != self.batch_size:
+                raise ValueError(
+                    "The length of bootstrap_pair_key should equal the batch size."
+                )
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
         # Normalize decode_tp_size
