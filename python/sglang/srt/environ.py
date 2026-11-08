@@ -2021,6 +2021,10 @@ class Envs:
     SGLANG_SAIL_FLA_CUDA = EnvBool(False)
     SGLANG_SAIL_DSV4_USE_INT8 = EnvBool(False)
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
+    # PPU v4.1 flattened prefill logits: one resident buffer per worker/device.
+    # Requires the optional DeepGEMM Python out interface; no kernel change.
+    SGLANG_PPU_INDEXER_PREALLOCATE_LOGITS = EnvBool(False)
+    SGLANG_PPU_INDEXER_PREALLOCATE_MASK = EnvBool(False)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
     SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
     # Enable NaN check on logits valid range before topk_transform (debug/diag).

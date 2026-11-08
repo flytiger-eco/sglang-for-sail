@@ -1,0 +1,56 @@
+diff --git a/jit_kernels/attention.py b/jit_kernels/attention.py
+--- a/jit_kernels/attention.py
++++ b/jit_kernels/attention.py
+@@ -94,7 +94,8 @@
+                       max_seqlen_k: int = 0,
+                       logits_dtype: torch.dtype = torch.float32,
+                       q_sf: Optional[torch.Tensor] = None,
+-                      k_sf: Optional[torch.Tensor] = None):
++                      k_sf: Optional[torch.Tensor] = None,
++                      out: Optional[torch.Tensor] = None):
+     """MQA logits (non-paged) for FP8/BF16/INT8/FP4.
+-
++
+     Args:
+@@ -210,7 +211,14 @@
+     # stride_k may be uint32_t or uint64_t depending on whether q_idx * stride_k
+     # overflows 32-bit. Decided dynamically here and forwarded as a JIT template key.
+     stride_k_type = _select_stride_k_type(aligned_seq_len, aligned_seq_len_kv)
+-    logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=logits_dtype, device=q.device)
++    if out is None:
++        logits = torch.empty(aligned_seq_len, aligned_seq_len_kv, dtype=logits_dtype, device=q.device)
++    else:
++        if (out.shape != (aligned_seq_len, aligned_seq_len_kv)
++                or out.dtype != logits_dtype or out.device != q.device
++                or not out.is_contiguous()):
++            raise ValueError("MQA logits out must match the aligned shape, dtype, device and contiguous layout")
++        logits = out
+     if is_compressed:
+         logits = logits[0:seq_len_q, 0:max_seqlen_k]
+     else:
+@@ -644,7 +652,8 @@
+                       cu_seq_len_k_end: torch.Tensor,
+                       clean_logits: bool = True,
+                       max_seqlen_k: int = 0,
+-                      logits_dtype: torch.dtype = torch.float32):
++                      logits_dtype: torch.dtype = torch.float32,
++                      *, out: Optional[torch.Tensor] = None):
+     q_fp, q_sf = q
+     kv_fp, kv_sf = kv
+     is_fp4 = q_sf is not None
+@@ -652,11 +661,11 @@
+     if is_fp4:
+         return mqa_logits_common(q_fp, kv_fp, torch.empty(0), weights,
+                                 cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k,
+-                                logits_dtype=logits_dtype, q_sf=q_sf, k_sf=kv_sf)
++                                logits_dtype=logits_dtype, q_sf=q_sf, k_sf=kv_sf, out=out)
+     else:
+         return mqa_logits_common(q_fp, kv_fp, kv_sf, weights,
+                                 cu_seq_len_k_start, cu_seq_len_k_end, clean_logits, max_seqlen_k,
+-                                logits_dtype=logits_dtype)
++                                logits_dtype=logits_dtype, out=out)
+-
++
+-
++
+ def fp8_fp4_paged_mqa_logits(q: Tuple,

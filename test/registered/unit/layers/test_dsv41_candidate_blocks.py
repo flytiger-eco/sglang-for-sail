@@ -42,6 +42,56 @@ def masked_topk(scores, lens, blocks, k, block_size):
 
 
 class TestCandidateBlockIds(CustomTestCase):
+    def test_publish_reuses_mask_across_requests_and_partial_tiles(self):
+        from sglang.srt.layers.attention.dsv4 import (
+            ppu_logits_workspace as workspace_module,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks
+
+        arena = workspace_module.LogitsWorkspace(
+            device="cpu", capacity_bytes=8 * 256 * 4, preallocate_mask=True
+        )
+        arena.initialize()
+        data = SimpleNamespace(
+            compress_lens=torch.tensor([0, 1, 9, 19, 3, 8, 13, 17], dtype=torch.int32),
+            rows_per_request=[4, 4],
+            lens_per_request=[19, 17],
+        )
+        for tile in [slice(0, 8), slice(1, 7), slice(4, 8)]:
+            rows = tile.stop - tile.start
+            logits = torch.randn(rows, 24)
+            expected_scores = logits.clone()
+            expected = torch.full((rows, 2), -1, dtype=torch.int32)
+            actual = expected.clone()
+            kwargs = dict(data=data, tile=tile, topk_blocks=2, block_size=8)
+            with patch.object(dense_blocks, "is_ppu", return_value=False):
+                _publish_tile_blocks(logits=expected_scores, blocks=expected, **kwargs)
+            with (
+                patch.object(dense_blocks, "is_ppu", return_value=True),
+                patch.object(
+                    workspace_module.envs.SGLANG_PPU_INDEXER_PREALLOCATE_MASK,
+                    "get",
+                    return_value=True,
+                ),
+                patch.object(
+                    workspace_module.envs.SGLANG_PPU_INDEXER_PREALLOCATE_LOGITS,
+                    "get",
+                    return_value=True,
+                ),
+                patch.object(workspace_module, "_serving", True),
+                patch.object(
+                    workspace_module, "_workspaces", {torch.device("cpu"): arena}
+                ),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.candidate_blocks.F.pad",
+                    side_effect=AssertionError("no padding"),
+                ),
+                arena.lease(rows, 24),
+            ):
+                _publish_tile_blocks(logits=logits, blocks=actual, **kwargs)
+            self.assertTrue(torch.equal(actual, expected))
+            self.assertTrue(torch.equal(logits, expected_scores))
+
     def test_causal_partial_blocks_and_forced_newest_block(self):
         scores = torch.tensor([[100.0] * 8 + [50.0] * 8 + [-10.0] * 3] * 4)
         lengths = torch.tensor([[0], [1], [9], [19]])
