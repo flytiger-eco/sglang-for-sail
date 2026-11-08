@@ -584,6 +584,60 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertIsNone(self.chat._validate_request(multimodal_request))
 
+    def test_expanded_length_decode_accepts_images_without_multimodal_processor(self):
+        self.tm.model_config.is_multimodal = False
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/image.png"},
+                        },
+                    ],
+                }
+            ],
+        )
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode", language_only=True
+            ),
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(True),
+        ):
+            self.assertIsNone(self.chat._validate_request(request))
+
+    def test_expanded_length_decode_accepts_media_without_language_only(self):
+        self.tm.model_config.is_multimodal = False
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode", language_only=False
+            ),
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(True),
+        ):
+            self.assertIsNone(
+                self.chat._validate_request(
+                    ChatCompletionRequest(
+                        model="x",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": "https://example.com/image.png"
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    )
+                )
+            )
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
