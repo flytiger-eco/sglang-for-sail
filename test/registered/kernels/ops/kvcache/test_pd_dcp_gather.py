@@ -140,6 +140,9 @@ class TestPdDcpGather(CustomTestCase):
                 manager._await_transfer_futures = lambda futures: (
                     MooncakeKVManager._await_transfer_futures(manager, futures)
                 )
+                manager._submit_transfer_tasks = lambda executor, tasks: (
+                    MooncakeKVManager._submit_transfer_tasks(manager, executor, tasks)
+                )
                 for start in range(0, tokens, chunk):
                     count = min(chunk, tokens - start)
                     result = MooncakeKVManager.send_kvcache_dcp(

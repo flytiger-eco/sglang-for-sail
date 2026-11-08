@@ -1079,16 +1079,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            return self._await_transfer_futures(futures)
+            return self._submit_transfer_tasks(
+                executor,
+                ((process_layer, parameters) for parameters in layers_params),
+            )
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads. Preserve this legacy path unless
@@ -1197,23 +1191,54 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every submitted write before reporting a status or exception."""
         ret = 0
-        for future in concurrent.futures.as_completed(futures):
+        error = None
+        # result() also handles already-cancelled futures that an executor has
+        # removed from its queue, unlike an as_completed()/wait() waiter.
+        for future in futures:
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
+                if ret == 0:
+                    ret = -1
                 continue
-            if status != 0 and ret == 0:
-                ret = status
-                for f in futures:
-                    f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+                for pending in futures:
+                    pending.cancel()
+            else:
+                if status != 0 and ret == 0:
+                    ret = status
+                    for pending in futures:
+                        pending.cancel()
+        if error is not None:
+            # An interrupted result() wait need not mean that future is done.
+            for future in futures:
+                if not future.done():
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
+            raise error
         return ret
+
+    def _submit_transfer_tasks(self, executor, tasks) -> int:
+        """Keep partial submissions alive until their running writes drain."""
+        futures = []
+        try:
+            for function, arguments in tasks:
+                futures.append(executor.submit(function, *arguments))
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            try:
+                self._await_transfer_futures(futures)
+            except BaseException:
+                pass  # Preserve the submission error after all writes drain.
+            raise
+        return self._await_transfer_futures(futures)
 
     def send_kvcache(
         self,
@@ -1484,19 +1509,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(process_layer, *layer_params)
-                for layer_params in layers_params
-            ]
-            futures.extend(
-                executor.submit(process_sliced_draft, [params])
-                for params in sliced_draft_params
+            tasks = [(process_layer, parameters) for parameters in layers_params]
+            tasks.extend(
+                (process_sliced_draft, ([parameters],))
+                for parameters in sliced_draft_params
             )
-            try:
-                return self._await_transfer_futures(futures)
-            finally:
-                if pack_buffer is not None:
-                    concurrent.futures.wait(futures)
+            # Includes packed-buffer readers, even if submission fails halfway.
+            return self._submit_transfer_tasks(executor, tasks)
 
         transfer_blocks = []
         for layer_params in layers_params:
@@ -1632,12 +1651,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
-            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
-        ]
-
-        return self._await_transfer_futures(futures)
+        return self._submit_transfer_tasks(
+            executor,
+            ((process_layer_tp_aware, parameters) for parameters in layer_ptr_pairs),
+        )
 
     def send_aux(
         self,
@@ -2518,12 +2535,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
-                                state_rc = self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                try:
+                                    state_rc = self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        executor,
+                                        target_rank_registration_info,
+                                    )
+                                except (RuntimeError, ValueError) as exc:
+                                    # A request-local layout mismatch must not
+                                    # strand subsequent work or blacklist a
+                                    # healthy transport session.
+                                    logger.exception(
+                                        "State transfer failed for room %s",
+                                        kv_chunk.room,
+                                    )
+                                    self.conclude_failure(
+                                        bootstrap_room=kv_chunk.room,
+                                        failure_reason=str(exc),
+                                    )
+                                    break
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[

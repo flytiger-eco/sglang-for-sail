@@ -44,6 +44,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
         )
+        manager._submit_transfer_tasks = lambda executor, tasks: (
+            MooncakeKVManager._submit_transfer_tasks(manager, executor, tasks)
+        )
         return manager
 
     @staticmethod
@@ -158,6 +161,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     )
                     manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
                     manager.pp_size = manager.attn_tp_size = 1
+                    manager._mamba_state_cp_sharded = False
                     manager.is_mla_backend = manager.is_hybrid_mla_backend = False
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
@@ -290,6 +294,9 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     _await_transfer_futures=lambda futures: max(
                         f.result() for f in futures
                     ),
+                )
+                manager._submit_transfer_tasks = lambda executor, tasks: (
+                    MooncakeKVManager._submit_transfer_tasks(manager, executor, tasks)
                 )
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     result = MooncakeKVManager.send_kvcache_dcp(
