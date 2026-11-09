@@ -6,7 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kv_cache import normalize_kv_scale as _unit_scale
 
 _FP8_DTYPES = (
@@ -55,36 +54,6 @@ _L20_CONFIGS = [
 def _get_best_config(total_q: int):
     table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
-
-
-def _use_fp8_chunk_pipeline(
-    total_q: int,
-    num_requests: int,
-    kv_dtype: torch.dtype,
-    head_dim: int,
-    group_size: int,
-    topk: int,
-) -> bool:
-    """Whether long FP8-KV chunk prefill keeps Q/K/P in FP8 at the dot boundary.
-
-    Validated on H20 (upstream #41461). Other SM90 parts opt in with
-    SGLANG_QSA_FP8_CHUNK_PIPELINE until they are validated separately.
-    """
-    if not (
-        num_requests > 0
-        and total_q >= 4096 * num_requests
-        and kv_dtype == torch.float8_e4m3fn
-        and head_dim == 256
-        and 1 <= group_size <= 12
-        and topk >= 1024
-    ):
-        return False
-    if "H20" in torch.cuda.get_device_name(0):
-        return True
-    return (
-        envs.SGLANG_QSA_FP8_CHUNK_PIPELINE.get()
-        and torch.cuda.get_device_capability(0) == (9, 0)
-    )
 
 
 @triton.jit
@@ -293,7 +262,6 @@ def _sparse_gqa_chunk_prefill(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     KV_IS_FP8: tl.constexpr,
-    USE_FP8_PIPELINE: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -320,11 +288,6 @@ def _sparse_gqa_chunk_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
-    if USE_FP8_PIPELINE:
-        # Per-row Q quantization; padded rows are zero and keep a unit scale.
-        q_absmax = tl.max(tl.abs(q_values), axis=1)
-        q_scale = tl.where(q_absmax > 0, q_absmax / 448.0, 1.0)
-        q_values_fp8 = (q_values / q_scale[:, None]).to(tl.float8e4nv)
     k_base = k + k_start * sk_n + group * sk_h
     v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
@@ -341,21 +304,16 @@ def _sparse_gqa_chunk_prefill(
             mask=valid[None, :],
             other=0.0,
         )
-        # The FP8 pipeline feeds staged FP8 K/V and probabilities straight into
-        # the dots instead of widening full tiles to Q's dtype first.
-        if KV_IS_FP8 and not USE_FP8_PIPELINE:
+        if KV_IS_FP8:
             keys = keys.to(q_values.dtype)
         values = tl.load(
             v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
             mask=valid[:, None],
             other=0.0,
         )
-        if KV_IS_FP8 and not USE_FP8_PIPELINE:
+        if KV_IS_FP8:
             values = values.to(q_values.dtype)
-        if USE_FP8_PIPELINE:
-            scores = tl.dot(q_values_fp8, keys) * q_scale[:, None]
-        else:
-            scores = tl.dot(q_values, keys)
+        scores = tl.dot(q_values, keys)
         if KV_IS_FP8:
             scores *= k_scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -407,16 +365,6 @@ def sparse_gqa_fwd_interface_triton_ck(
         max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
-    use_fp8_pipeline = _use_fp8_chunk_pipeline(
-        total_q=total_q,
-        num_requests=cu_q.shape[0] - 1,
-        kv_dtype=k.dtype,
-        head_dim=head_dim,
-        group_size=group_size,
-        topk=indices.shape[-1],
-    )
-    if use_fp8_pipeline:
-        block_n = 32
     out = torch.empty_like(q)
     _sparse_gqa_chunk_prefill[(max_q, (cu_q.shape[0] - 1) * num_kv_heads)](
         q,
@@ -452,7 +400,6 @@ def sparse_gqa_fwd_interface_triton_ck(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         KV_IS_FP8=kv_is_fp8,
-        USE_FP8_PIPELINE=use_fp8_pipeline,
         num_warps=warps,
         num_stages=stages,
     )
@@ -520,7 +467,6 @@ def sparse_gqa_packed_decode_triton(
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         KV_IS_FP8=kv_is_fp8,
-        USE_FP8_PIPELINE=False,
         num_warps=warps,
         num_stages=stages,
     )

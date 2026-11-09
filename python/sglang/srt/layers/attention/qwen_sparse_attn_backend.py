@@ -1566,9 +1566,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         # Fused gather in the storage dtype (upstream #41933, minus its BF16
         # widening): no per-request index_select/cat or req_pool_indices D2H
-        # sync, half the traffic for FP8 pools, and FP8 K/V stay eligible for
-        # the FP8 chunk pipeline. Unit scales keep the copy exact; the kernel
-        # still applies the per-layer descales.
+        # sync or BF16 widening. Unit scales keep the copy exact; attention
+        # still widens FP8 tiles and applies the per-layer descales.
         total_k = sum(sequence_lens)
         packed_k = torch.empty(
             (total_k, *k_buffer.shape[1:]), dtype=k_buffer.dtype, device=q.device
