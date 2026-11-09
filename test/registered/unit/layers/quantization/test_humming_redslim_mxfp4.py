@@ -108,15 +108,20 @@ def test_rejects_incompatible_checkpoint(key, value):
 
 
 @pytest.mark.parametrize(
-    "quant_method,intermediate,raises",
+    "quant_method,intermediate,tp,ep,block_size,raises",
     [
-        ("wmxfp4afp8", 640, False),
-        ("fp8", 640, True),
-        ("wmxfp4afp8", 642, True),
+        ("wmxfp4afp8", 640, 4, 1, [128, 128], False),
+        ("wmxfp4afp8", 640, 8, 1, [128, 128], True),
+        ("wmxfp4afp8", 640, 8, 8, [128, 128], False),
+        ("fp8", 640, 4, 1, [128, 128], True),
+        ("wmxfp4afp8", 642, 4, 1, [128, 128], True),
+        ("wmxfp4afp8", 640, 8, 1, None, True),
+        ("wmxfp4afp8", 640, 4, 1, None, False),
+        ("fp8", 640, 4, 1, None, False),
     ],
 )
 def test_moe_check_uses_expert_quantization(
-    quant_method, intermediate, raises, monkeypatch
+    quant_method, intermediate, tp, ep, block_size, raises, monkeypatch
 ):
     from types import SimpleNamespace
 
@@ -124,19 +129,17 @@ def test_moe_check_uses_expert_quantization(
 
     monkeypatch.setattr(moe_ep_setup, "_use_aiter", False)
     monkeypatch.setenv("SGLANG_SHARED_EXPERT_TP1", "0")
+    quantization_config = {"quant_method": quant_method}
+    if block_size is not None:
+        quantization_config["weight_block_size"] = block_size
     model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            quantization_config={
-                "quant_method": quant_method,
-                "weight_block_size": [128, 128],
-            }
-        ),
+        hf_config=SimpleNamespace(quantization_config=quantization_config),
         hf_text_config=SimpleNamespace(moe_intermediate_size=intermediate),
     )
 
     def check():
         moe_ep_setup.check_quantized_moe_compatibility(
-            model_config=model_config, tp_size=4, moe_ep_size=1, moe_dp_size=1
+            model_config=model_config, tp_size=tp, moe_ep_size=ep, moe_dp_size=1
         )
 
     if raises:

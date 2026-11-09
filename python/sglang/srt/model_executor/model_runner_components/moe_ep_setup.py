@@ -110,9 +110,12 @@ def check_quantized_moe_compatibility(
             model_config.hf_config, "quantization_config", None
         )
     ) is not None and (
-        weight_block_size := quantization_config.get("weight_block_size", None)
-    ) is not None:
-        weight_block_size_n = weight_block_size[0]
+        (weight_block_size := quantization_config.get("weight_block_size")) is not None
+        or quantization_config.get("quant_method") == "wmxfp4afp8"
+    ):
+        weight_block_size_n = (
+            weight_block_size[0] if weight_block_size is not None else None
+        )
 
         if tp_size % moe_ep_size != 0:
             raise ValueError(
@@ -133,6 +136,15 @@ def check_quantized_moe_compatibility(
 
         # RedSlim MXFP4 experts use group-32 scales along K. Its
         # weight_block_size describes dense FP8 layers, not expert N alignment.
+        if (
+            quantization_config.get("quant_method") == "wmxfp4afp8"
+            and (moe_intermediate_size // moe_tp_size) % 32 != 0
+        ):
+            raise ValueError(
+                "MXFP4 expert intermediate size per MoE TP rank must be divisible "
+                f"by group_size=32, got {moe_intermediate_size // moe_tp_size}. "
+                "Reduce expert TP sharding by increasing --ep or reducing --tp."
+            )
         if (
             quantization_config.get("quant_method") != "wmxfp4afp8"
             and not envs.SGLANG_SHARED_EXPERT_TP1.get()
