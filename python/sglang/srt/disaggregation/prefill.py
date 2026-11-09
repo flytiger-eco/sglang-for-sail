@@ -63,6 +63,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.kv_cache import qsa_fp8_transfer_contract
 from sglang.srt.managers.schedule_batch import (
@@ -255,6 +256,7 @@ class PrefillBootstrapQueue:
         kv_args.qsa_fp8_contract = qsa_fp8_transfer_contract(
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
+            pp_group=get_pp_group() if self.pp_size > 1 else None,
         )
         kv_args.prefill_start_layer = (
             getattr(
