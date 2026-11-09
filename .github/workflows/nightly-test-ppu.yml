@@ -26,10 +26,6 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
-      model_cache_repair_only:
-        description: 'Validate and repair the temporary GTE model cache; skip test execution and summary'
-        type: boolean
-        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -121,175 +117,6 @@ jobs:
 
           datasets.load_dataset = _load_dataset
           huggingface_hub.hf_hub_download = _hf_hub_download
-          PY
-          cat > .ppu-sweep/repair_gte_cache.py <<'PY'
-          import hashlib
-          import json
-          import os
-          import shutil
-          from pathlib import Path
-
-          from huggingface_hub import hf_hub_download, snapshot_download
-          from safetensors import safe_open
-          from transformers import AutoConfig, AutoTokenizer
-
-          MODEL = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-          SOURCE = Path(
-              "/nas_aisw/datasets/checkpoints/LLM/qwen/v2/gte-Qwen2-1.5B-instruct"
-          )
-          CACHE = Path(os.environ["HF_HUB_CACHE"])
-          REPO = CACHE / "models--Alibaba-NLP--gte-Qwen2-1.5B-instruct"
-
-          def emit(label, value):
-              print(label + "=" + json.dumps(value), flush=True)
-
-          def sha256(path):
-              digest = hashlib.sha256()
-              with path.open("rb") as stream:
-                  for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-                      digest.update(block)
-              return digest.hexdigest()
-
-          def weight_names(directory):
-              index = directory / "model.safetensors.index.json"
-              if index.is_file():
-                  with index.open() as stream:
-                      names = sorted(set(json.load(stream).get("weight_map", {}).values()))
-              else:
-                  names = sorted(path.name for path in directory.glob("*.safetensors"))
-              if not names:
-                  raise RuntimeError(f"No safetensors weights found: {directory}")
-              return names
-
-          def inspect_model(directory):
-              for filename in ("config.json", "tokenizer_config.json"):
-                  if not (directory / filename).is_file():
-                      raise RuntimeError(f"Missing model file: {directory / filename}")
-              AutoConfig.from_pretrained(directory, local_files_only=True)
-              AutoTokenizer.from_pretrained(directory, local_files_only=True)
-              names = weight_names(directory)
-              tensor_count = 0
-              size_bytes = 0
-              for name in names:
-                  relative = Path(name)
-                  if relative.is_absolute() or ".." in relative.parts:
-                      raise RuntimeError(f"Unsafe weight path: {name}")
-                  path = directory / relative
-                  if not path.is_file() or path.stat().st_size == 0:
-                      raise RuntimeError(f"Missing or empty weight: {path}")
-                  with safe_open(str(path), framework="pt", device="cpu") as weights:
-                      tensor_count += len(weights.keys())
-                  size_bytes += path.stat().st_size
-              if tensor_count == 0:
-                  raise RuntimeError(f"No tensors found: {directory}")
-              return {
-                  "path": str(directory),
-                  "weights": names,
-                  "weight_bytes": size_bytes,
-                  "tensor_count": tensor_count,
-              }
-
-          def stage_file(snapshot, name):
-              source = SOURCE / name
-              target = snapshot / name
-              if target.is_file() and target.stat().st_size > 0:
-                  if target.stat().st_size != source.stat().st_size:
-                      raise RuntimeError(f"Cached file size differs from source: {target}")
-                  if source.stat().st_size <= 16 * 1024 * 1024:
-                      if sha256(source) != sha256(target):
-                          raise RuntimeError(f"Cached file content differs from source: {target}")
-                  emit("PPU_GTE_CACHE_EXISTING", {"file": name, "path": str(target)})
-                  return
-              if os.path.lexists(target):
-                  raise RuntimeError(f"Refusing to replace a broken cache entry: {target}")
-
-              digest = sha256(source)
-              blobs = REPO / "blobs"
-              blobs.mkdir(parents=True, exist_ok=True)
-              blob = blobs / digest
-              if not blob.is_file() or blob.stat().st_size != source.stat().st_size:
-                  if os.path.lexists(blob):
-                      raise RuntimeError(f"Refusing to replace an invalid blob: {blob}")
-                  temporary = blobs / f".{digest}.{os.getpid()}.tmp"
-                  try:
-                      try:
-                          os.link(source, temporary)
-                      except OSError:
-                          shutil.copy2(source, temporary)
-                      os.link(temporary, blob)
-                  finally:
-                      temporary.unlink(missing_ok=True)
-
-              target.parent.mkdir(parents=True, exist_ok=True)
-              target.symlink_to(os.path.relpath(blob, target.parent))
-              emit(
-                  "PPU_GTE_CACHE_REPAIRED",
-                  {
-                      "file": name,
-                      "source": str(source),
-                      "snapshot": str(target),
-                      "blob": str(blob),
-                      "sha256": digest,
-                      "size_bytes": source.stat().st_size,
-                  },
-              )
-
-          if not SOURCE.is_dir():
-              raise RuntimeError(f"NAS source model directory not found: {SOURCE}")
-          emit(
-              "PPU_GTE_SOURCE_FILES",
-              [
-                  {
-                      "name": path.name,
-                      "size_bytes": path.stat().st_size if path.is_file() else None,
-                  }
-                  for path in sorted(SOURCE.iterdir())
-              ],
-          )
-          source_result = inspect_model(SOURCE)
-          emit("PPU_GTE_SOURCE_OK", source_result)
-
-          snapshot = Path(
-              snapshot_download(MODEL, cache_dir=CACHE, local_files_only=True)
-          )
-          for filename in ("config.json", "tokenizer_config.json", "tokenizer.json"):
-              source_file = SOURCE / filename
-              cached_file = snapshot / filename
-              if source_file.is_file() and cached_file.is_file():
-                  if sha256(source_file) != sha256(cached_file):
-                      raise RuntimeError(
-                          f"Source and cached model metadata differ: {filename}"
-                      )
-
-          source_files = sorted(
-              str(path.relative_to(SOURCE))
-              for path in SOURCE.rglob("*")
-              if path.is_file()
-          )
-          for name in source_files:
-              stage_file(snapshot, name)
-
-          AutoConfig.from_pretrained(MODEL, cache_dir=CACHE, local_files_only=True)
-          AutoTokenizer.from_pretrained(MODEL, cache_dir=CACHE, local_files_only=True)
-          resolved_names = ["model.safetensors.index.json", *source_result["weights"]]
-          resolved = [
-              hf_hub_download(
-                  MODEL,
-                  name,
-                  cache_dir=CACHE,
-                  local_files_only=True,
-              )
-              for name in resolved_names
-          ]
-          cached_result = inspect_model(snapshot)
-          missing = [name for name in source_files if not (snapshot / name).is_file()]
-          if missing:
-              raise RuntimeError(f"Cache is still missing source files: {missing}")
-          emit("PPU_GTE_CACHE_OK", cached_result)
-          emit(
-              "PPU_GTE_REPO_ID_RESOLUTION_OK",
-              {"index_and_weights": resolved, "source_file_count": len(source_files)},
-          )
           PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
@@ -1144,12 +971,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'model_cache_repair_only'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.model_cache_repair_only != true')
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.model_cache_repair_only != true')
+                      self.assertNotIn('if', jobs['sweep-execute'])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1451,7 +1278,6 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
-          timeout --signal=TERM --kill-after=30s 900s python3 .ppu-sweep/repair_gte_cache.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1583,7 +1409,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: inputs.model_cache_repair_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1673,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && inputs.model_cache_repair_only != true
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
