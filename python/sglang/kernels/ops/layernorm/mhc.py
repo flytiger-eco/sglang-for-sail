@@ -2835,7 +2835,9 @@ def hc_mix_stats_sinkhorn_deepgemm(
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
+    # PPU DeepGEMM's prenorm gemm does not support split-k (n_splits must be 1),
+    # so there is nothing to reduce across slices.
+    slices = 1 if _is_sail else _HC_MIX_COMPENSATED_SLICES
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
@@ -2845,9 +2847,13 @@ def hc_mix_stats_sinkhorn_deepgemm(
     if m == 0:
         return pre, post, comb
 
-    mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
-    mix_lo = torch.empty_like(mix_hi)
-    sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
+    # PPU's prenorm gemm can leave parts of its output untouched (see the
+    # mhc_pre PPU fix), so start from zeros there; with 16 slices the extra
+    # zeroing would cost far more than it protects.
+    alloc = torch.zeros if _is_sail else torch.empty
+    mix_hi = alloc((slices, m, mix), dtype=torch.float32, device=dev)
+    mix_lo = alloc((slices, m, mix), dtype=torch.float32, device=dev)
+    sq = alloc((slices, m), dtype=torch.float32, device=dev)
     tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
     # sq depends only on x_flat, so the second projection recomputes the same
     # values; overwriting it avoids a throwaway (slices, m) scratch, 4 MiB at m=65536.
