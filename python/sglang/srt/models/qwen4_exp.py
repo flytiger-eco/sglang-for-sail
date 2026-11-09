@@ -1611,7 +1611,12 @@ class Qwen4ExpAttentionDecoderLayer(
                 topk_indices = self._compute_qsa_topk_indices(
                     hidden_states, positions, forward_batch
                 )
-            current_stream.wait_stream(self.alt_stream)
+            if envs.SGLANG_QSA_DEFER_INDEXER_WAIT.get():
+                # Pass a handle through the attention custom-op schema; the
+                # backend waits after storing KV, before reading sparse indices.
+                attention_kwargs["qsa_indexer_stream"] = self.alt_stream.cuda_stream
+            else:
+                current_stream.wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed by attention on the current
             # stream; tell the caching allocator before alt_stream is reused.
             topk_indices.record_stream(current_stream)

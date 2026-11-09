@@ -1968,6 +1968,8 @@ class Envs:
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 
+    SGLANG_QSA_DEFER_INDEXER_WAIT = EnvBool(False)
+
     # ===================================================================
     # Weight Cache Daemon
     # ===================================================================

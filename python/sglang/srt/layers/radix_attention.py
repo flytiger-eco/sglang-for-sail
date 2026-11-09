@@ -323,6 +323,7 @@ def _unified_attention_with_output_impl(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    qsa_indexer_stream: Optional[int] = None,
 ) -> Optional[torch.Tensor]:
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
@@ -379,6 +380,8 @@ def _unified_attention_with_output_impl(
         kwargs["llama_4_scaling"] = llama_4_scaling
     if topk_indices is not None:
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
+    if qsa_indexer_stream is not None:
+        kwargs["qsa_indexer_stream"] = qsa_indexer_stream
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_positions = forward_batch.positions
@@ -450,6 +453,7 @@ def unified_attention_with_output(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    qsa_indexer_stream: Optional[int] = None,
 ) -> None:
     _unified_attention_with_output_impl(
         query,
@@ -469,6 +473,7 @@ def unified_attention_with_output(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        qsa_indexer_stream=qsa_indexer_stream,
     )
 
 
@@ -500,6 +505,7 @@ def unified_attention_with_output_and_lse(
     is_neox: Optional[bool] = None,
     llama_4_scaling: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    qsa_indexer_stream: Optional[int] = None,
 ) -> torch.Tensor:
     lse = _unified_attention_with_output_impl(
         query,
@@ -519,6 +525,7 @@ def unified_attention_with_output_and_lse(
         is_neox=is_neox,
         llama_4_scaling=llama_4_scaling,
         topk_indices=topk_indices,
+        qsa_indexer_stream=qsa_indexer_stream,
     )
     assert lse is not None
     return lse
