@@ -2,6 +2,7 @@
 
 import ast
 import copy
+import csv
 import hashlib
 import importlib.util
 import json
@@ -106,6 +107,162 @@ class StrictRunnerTest(unittest.TestCase):
         result, report = self.run_fixture("import missing_ppu_fixture_dependency\n")
         self.assertEqual(result, 1)
         self.assertGreater(report["files"][0]["failures"], 0)
+
+    def test_dependency_manifest_has_43_registrations_and_39_unique_files(self):
+        with (ROOT / "scripts/ci/ppu/test_dependency_manifest.tsv").open() as stream:
+            rows = list(csv.DictReader(
+                (line for line in stream if not line.startswith("#")), delimiter="\t"
+            ))
+        files = [row["file"] for row in rows]
+        registrations = {(row["file"], row["source_suite"]) for row in rows}
+        self.assertEqual(len(rows), 43)
+        self.assertEqual(len(registrations), 43)
+        self.assertEqual(len(set(files)), 39)
+        self.assertEqual(
+            {row["action"] for row in rows},
+            {"pip", "build-rust", "build-kernel", "pythonpath"},
+        )
+        self.assertEqual(
+            {
+                suite: sum(row["nightly_suite"] == suite for row in rows)
+                for suite in ("nightly-1-ppu", "nightly-2-ppu", "nightly-4-ppu")
+            },
+            {"nightly-1-ppu": 40, "nightly-2-ppu": 1, "nightly-4-ppu": 2},
+        )
+        actions = {}
+        for row in rows:
+            action = (row["action"], row["packages"])
+            self.assertEqual(actions.setdefault(row["file"], action), action)
+
+    def test_manifest_selects_exact_source_registrations(self):
+        manifest = self.root / "selection.tsv"
+        manifest.write_text(
+            "file\tsource_suite\tnightly_suite\taction\tpackages\tsolution\n"
+            "test/a.py\tbase-a\tnightly-1-ppu\tpip\t\t\n"
+            "test/a.py\tnightly-a\tnightly-1-ppu\tpip\t\t\n"
+            "test/b.py\tbase-b\tnightly-2-ppu\tpip\t\t\n"
+            "test/missing.py\tbase-c\tnightly-4-ppu\tpip\t\t\n"
+        )
+
+        def registration(filename, suite):
+            test = Mock()
+            test.filename = str(self.root / filename)
+            test.effective_suite = suite
+            test.est_time = 1
+            test.disabled = None
+            return test
+
+        tests = [
+            registration("test/a.py", "base-a"),
+            registration("test/a.py", "nightly-a"),
+            registration("test/b.py", "base-b"),
+        ]
+        enabled, skipped = RUNNER.select_manifest_registrations(
+            tests, self.root, manifest, "nightly-1-ppu"
+        )
+        self.assertEqual(len(enabled), 2)
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            {test.effective_suite for test in enabled}, {"base-a", "nightly-a"}
+        )
+        partitions = RUNNER.partition_manifest_registrations(enabled, 2)
+        self.assertEqual([len(partition) for partition in partitions], [1, 1])
+        enabled, skipped = RUNNER.select_manifest_registrations(
+            tests, self.root, manifest, "nightly-2-ppu"
+        )
+        self.assertEqual(len(enabled), 1)
+        self.assertEqual(skipped, [])
+        with self.assertRaisesRegex(ValueError, "test/missing.py"):
+            RUNNER.select_manifest_registrations(
+                tests, self.root, manifest, "nightly-4-ppu"
+            )
+
+    def test_dependency_preflight_only_runs_for_listed_file(self):
+        with patch.object(RUNNER.subprocess, "run") as run:
+            self.run_fixture("def test_ok(): pass\n")
+        run.assert_not_called()
+
+        listed = self.root / "test/registered/kernels/ops/diffusion/test_qknorm_rope.py"
+        listed.parent.mkdir(parents=True)
+        listed.write_text("def test_ok(): pass\n")
+        with patch.object(RUNNER, "ensure_test_dependencies") as ensure:
+            with patch.object(RUNNER.subprocess, "Popen") as popen:
+                with patch.object(RUNNER, "stop_process"), patch.object(
+                    RUNNER,
+                    "inspect_junit",
+                    return_value={
+                        "collected": 1,
+                        "executed": 1,
+                        "skipped": 0,
+                        "failures": 0,
+                    },
+                ):
+                    popen.return_value.wait.return_value = 0
+                    result = RUNNER.run_pytest_files(
+                        [listed], self.root / "listed_results", 15
+                    )
+        self.assertEqual(result, 0)
+        ensure.assert_called_once_with(str(listed.resolve()))
+
+    def test_pip_install_only_missing_distribution(self):
+        listed = self.root / "test/registered/kernels/ops/diffusion/test_qknorm_rope.py"
+        versions = {
+            "imageio": "2.36.0",
+            "pillow": "12.0.0",
+        }
+        with patch.dict(os.environ, {"GITHUB_WORKSPACE": str(ROOT)}):
+            with patch.object(
+                RUNNER.importlib.metadata,
+                "version",
+                side_effect=lambda name: versions.setdefault(
+                    name, RUNNER.importlib.metadata.PackageNotFoundError(name)
+                ),
+            ):
+                with patch.object(RUNNER.subprocess, "run") as run:
+                    RUNNER.ensure_test_dependencies(str(listed))
+        install = run.call_args_list[0].args[0]
+        self.assertIn("--no-deps", install)
+        self.assertEqual(install[-1], "imageio-ffmpeg==0.5.1")
+        self.assertNotIn("imageio==2.36.0", install)
+        self.assertNotIn("pillow", install)
+
+    def test_git_dependency_spec_is_not_treated_as_installed(self):
+        spec = (
+            "sgl-eval@git+https://github.com/sgl-project/sgl-eval.git@"
+            "6690895609dcbc5df1e7b00dd57c9502b868ec4d"
+        )
+        self.assertFalse(RUNNER._package_installed(spec))
+
+    def test_build_actions_are_deduplicated_and_pythonpath_is_scoped(self):
+        with patch.dict(os.environ, {"GITHUB_WORKSPACE": str(ROOT)}):
+            RUNNER._COMPLETED_BUILDS.clear()
+            rust = Mock()
+            with patch.dict("sys.modules", {"sglang.srt.rust_extensions": rust}):
+                RUNNER.ensure_test_dependencies(
+                    "test/registered/vlm/test_rust_native_mm_mmmu.py"
+                )
+                RUNNER.ensure_test_dependencies(
+                    "test/registered/vlm/test_rust_native_mm_mmmu.py"
+                )
+            rust.load_rust_extension.assert_called_once_with(
+                "sglang.srt.rust_extensions._server"
+            )
+
+            with patch.object(RUNNER.subprocess, "run") as run:
+                RUNNER.ensure_test_dependencies(
+                    "test/registered/attention/unittests/mla/test_flashmla.py"
+                )
+                RUNNER.ensure_test_dependencies(
+                    "test/registered/attention/unittests/mla/test_flashmla.py"
+                )
+            run.assert_called_once_with(
+                ["bash", str(ROOT / "scripts/ci/ppu/ppu_build_kernel.sh")], check=True
+            )
+
+            env = RUNNER.ensure_test_dependencies(
+                "test/registered/openai_server/basic/test_openai_server.py"
+            )
+            self.assertTrue(env["PYTHONPATH"].startswith(str(ROOT / "test")))
 
     def test_continue_after_collection_error_stays_red(self):
         broken = self.root / "test_broken.py"

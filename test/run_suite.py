@@ -14,6 +14,10 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
+from sglang.test.ci.pr_runner import (
+    partition_manifest_registrations,
+    select_manifest_registrations,
+)
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -428,25 +432,35 @@ def run_a_suite(args):
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
-    ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+    if args.registration_manifest:
+        ci_tests, skipped_tests = select_manifest_registrations(
+            all_tests, repo_root, args.registration_manifest, suite
+        )
+    else:
+        ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
     if getattr(args, "require_nonempty", False) and skipped_tests:
         raise ValueError("Strict PR selection contains disabled registrations")
 
     if auto_partition_size:
-        live_est = load_live_est(args.partition_model_file, suite, repo_root)
-        if live_est is not None:
-            print(
-                f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
-                flush=True,
-            )
+        if args.registration_manifest:
+            ci_tests = partition_manifest_registrations(
+                ci_tests, auto_partition_size
+            )[auto_partition_id]
         else:
-            print(
-                f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
-                flush=True,
+            live_est = load_live_est(args.partition_model_file, suite, repo_root)
+            if live_est is not None:
+                print(
+                    f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
+                    flush=True,
+                )
+            ci_tests = auto_partition(
+                ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
             )
-        ci_tests = auto_partition(
-            ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
-        )
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -491,6 +505,13 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument(
+        "--registration-manifest",
+        help=(
+            "Select exact (file, source_suite) registrations assigned to the "
+            "requested suite in nightly_suite."
+        ),
+    )
     parser.add_argument(
         "--nightly",
         action="store_true",

@@ -1,9 +1,12 @@
 """Opt-in, fail-closed pytest execution. Stdlib-only for cheap contract tests."""
 
+import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -79,6 +82,147 @@ def stop_process(process):
     except ProcessLookupError:
         pass
     process.wait()
+
+
+def _version_tuple(version):
+    return tuple(int(part) for part in re.findall(r"\d+", version)[:4])
+
+
+def _package_installed(spec):
+    if "--force-reinstall" in spec:
+        return False
+    match = re.match(r"^([A-Za-z0-9_.-]+)(?:(==|>=)([0-9.]+))?$", spec)
+    if not match:
+        return False
+    name, comparator, required = match.groups()
+    try:
+        installed = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    if comparator == "==":
+        return installed == required
+    if comparator == ">=":
+        return _version_tuple(installed) >= _version_tuple(required)
+    return True
+
+
+def _dependency_action(root, filename):
+    manifest = root / "scripts/ci/ppu/test_dependency_manifest.tsv"
+    with manifest.open(newline="") as stream:
+        rows = csv.DictReader(
+            (line for line in stream if not line.startswith("#")), delimiter="\t"
+        )
+        for row in rows:
+            if str(filename).endswith(row["file"]):
+                return row
+    return None
+
+
+def select_manifest_registrations(all_tests, repo_root, manifest_path, nightly_suite):
+    """Select exact source registrations assigned to a nightly suite."""
+    root = Path(repo_root).resolve()
+    with Path(manifest_path).open(newline="") as stream:
+        rows = csv.DictReader(
+            (line for line in stream if not line.startswith("#")), delimiter="\t"
+        )
+        wanted = {
+            (row["file"], row["source_suite"])
+            for row in rows
+            if row["nightly_suite"] == nightly_suite
+        }
+
+    selected = []
+    found = set()
+    for test in all_tests:
+        relative = Path(
+            os.path.relpath(Path(test.filename).resolve(), root)
+        ).as_posix()
+        key = (relative, test.effective_suite)
+        if key in wanted:
+            selected.append(test)
+            found.add(key)
+
+    missing = wanted - found
+    if missing:
+        formatted = ", ".join(f"{suite}:{filename}" for filename, suite in missing)
+        raise ValueError(f"Manifest registrations not found: {formatted}")
+
+    enabled = [test for test in selected if test.disabled is None]
+    skipped = [test for test in selected if test.disabled is not None]
+    return enabled, skipped
+
+
+def partition_manifest_registrations(all_tests, size):
+    """Balance estimated time without repeating a filename in one partition."""
+    partitions = [[] for _ in range(size)]
+    totals = [0.0] * size
+    filenames = [set() for _ in range(size)]
+    for test in sorted(all_tests, key=lambda item: item.est_time, reverse=True):
+        candidates = [
+            index for index in range(size) if test.filename not in filenames[index]
+        ]
+        if not candidates:
+            raise ValueError(
+                f"Cannot place duplicate manifest registration: {test.filename}"
+            )
+        index = min(
+            candidates, key=lambda item: (totals[item], len(partitions[item]), item)
+        )
+        partitions[index].append(test)
+        totals[index] += test.est_time
+        filenames[index].add(test.filename)
+    return partitions
+
+
+_COMPLETED_BUILDS = set()
+
+
+def ensure_test_dependencies(filename):
+    root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[4]))
+    record = _dependency_action(root, filename)
+    if record is None:
+        return {}
+    action = record["action"]
+    if action == "pythonpath":
+        return {
+            "PYTHONPATH": str(root / "test")
+            + os.pathsep
+            + os.environ.get("PYTHONPATH", "")
+        }
+    if action == "build-rust":
+        key = (action, root)
+        if key not in _COMPLETED_BUILDS:
+            from sglang.srt.rust_extensions import load_rust_extension
+
+            load_rust_extension("sglang.srt.rust_extensions._server")
+            _COMPLETED_BUILDS.add(key)
+        return {}
+    if action == "build-kernel":
+        key = (action, root)
+        if key not in _COMPLETED_BUILDS:
+            subprocess.run(
+                ["bash", str(root / "scripts/ci/ppu/ppu_build_kernel.sh")], check=True
+            )
+            _COMPLETED_BUILDS.add(key)
+        return {}
+    if action != "pip":
+        raise ValueError(f"Unsupported test dependency action: {action}")
+    packages = shlex.split(record["packages"])
+    missing = [package for package in packages if not _package_installed(package)]
+    if missing:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-cache-dir",
+                "--no-deps",
+                *missing,
+            ],
+            check=True,
+        )
+    return {}
 
 
 def run_pytest_files(
@@ -159,6 +303,7 @@ def run_pytest_files(
                 "junit_family=xunit2",
                 f"--junitxml={junit}",
             ]
+            env.update(ensure_test_dependencies(filename))
             with log.open("w+", errors="replace") as output:
                 process = subprocess.Popen(
                     command,
