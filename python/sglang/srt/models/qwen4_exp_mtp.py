@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
+    @torch.no_grad()
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        from sglang.srt.layers.attention.qsa.kv_cache import load_qsa_kv_scales
+
+        load_qsa_kv_scales(
+            self,
+            quantization_param_path,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=get_parallel().attn_tp_size,
+            is_draft=True,
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,

@@ -33,6 +33,9 @@ from sglang.srt.disaggregation.utils import (
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.kv_cache import (
+    validate_qsa_fp8_transfer_contract,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
@@ -103,6 +106,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    qsa_fp8_contract: Optional[str] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -975,6 +979,10 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        validate_qsa_fp8_transfer_contract(
+            getattr(self.kv_args, "qsa_fp8_contract", None), info.qsa_fp8_contract
+        )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1185,6 +1193,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "qsa_fp8_contract": getattr(self.kv_args, "qsa_fp8_contract", None),
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             # Self-register the HTTP API port so the decode can derive the PD
@@ -2120,6 +2129,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.qsa_fp8_contract: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
@@ -2238,6 +2248,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         # Add lock to make sure thread-safe
         async with self.lock:
+            contract = data.get("qsa_fp8_contract")
+            if self._registered_count:
+                try:
+                    validate_qsa_fp8_transfer_contract(self.qsa_fp8_contract, contract)
+                except RuntimeError as exc:
+                    return web.Response(text=str(exc), status=409)
+            else:
+                self.qsa_fp8_contract = contract
             dp_group_table = self.prefill_port_table.setdefault(dp_group, {})
             cp_group_table = dp_group_table.setdefault(attn_cp_rank, {})
             tp_group_table = cp_group_table.setdefault(attn_tp_rank, {})
@@ -2290,6 +2308,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                qsa_fp8_contract=self.qsa_fp8_contract,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -2301,6 +2320,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.qsa_fp8_contract is None:
+                # Old BF16 decode workers do not accept new dataclass fields.
+                payload.pop("qsa_fp8_contract")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

@@ -73,6 +73,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.kv_cache import qsa_fp8_transfer_contract
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
@@ -597,6 +598,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
+        )
+        kv_args.qsa_fp8_contract = qsa_fp8_transfer_contract(
+            self.token_to_kv_pool, self.draft_token_to_kv_pool
         )
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
