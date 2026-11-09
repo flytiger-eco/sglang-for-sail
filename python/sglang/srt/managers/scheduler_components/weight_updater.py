@@ -126,10 +126,16 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        runners = self._select_runners()
+        error = self._validate_weight_update_runners(runners)
+        if error is not None:
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=error, num_paused_requests=0
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -171,6 +177,15 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    @staticmethod
+    def _validate_weight_update_runners(runners):
+        try:
+            for _, runner in runners:
+                runner.weight_updater.validate_weight_update()
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -182,6 +197,11 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        error = self._validate_weight_update_runners(
+            self._select_runners(recv_req.selector)
+        )
+        if error is not None:
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=error)
         with self._observe_weight_load("distributed"):
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
@@ -222,6 +242,11 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_tensor must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        error = self._validate_weight_update_runners(
+            self._select_runners(recv_req.selector)
+        )
+        if error is not None:
+            return UpdateWeightsFromTensorReqOutput(success=False, message=error)
         with self._observe_weight_load("tensor"):
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
@@ -247,10 +272,14 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        runners = self._select_runners()
+        error = self._validate_weight_update_runners(runners)
+        if error is not None:
+            return UpdateWeightsFromIPCReqOutput(success=False, message=error)
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_ipc(
                     recv_req
                 )
@@ -295,7 +324,12 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        for _, runner in self._select_runners(recv_req.selector):
+        runners = self._select_runners(recv_req.selector)
+        # 先验证 target/draft 全部 runner，再还原任何一个模型的已打包权重。
+        error = self._validate_weight_update_runners(runners)
+        if error is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=error)
+        for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)

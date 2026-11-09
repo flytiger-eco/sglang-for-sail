@@ -144,6 +144,14 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
     return scales_interleaved.contiguous()
 
 
+def _replace_weight_parameter(layer, name, tensor):
+    """保留 loader 元数据；派生布局的在线重载另由更新入口拒绝。"""
+    previous = getattr(layer, name)
+    parameter = Parameter(tensor, requires_grad=False)
+    set_weight_attrs(parameter, previous.__dict__.copy())
+    setattr(layer, name, parameter)
+
+
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
@@ -319,10 +327,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             else:
                 # Commit both transformations together. A failed gate/down validation
                 # must never leave one projection in a different encoding.
-                layer.w13_weight = Parameter(gate.weight, requires_grad=False)
-                layer.w2_weight = Parameter(down.weight, requires_grad=False)
-                layer.w13_weight_scale_inv = Parameter(gate.scales, requires_grad=False)
-                layer.w2_weight_scale_inv = Parameter(down.scales, requires_grad=False)
+                _replace_weight_parameter(layer, "w13_weight", gate.weight)
+                _replace_weight_parameter(layer, "w2_weight", down.weight)
+                _replace_weight_parameter(layer, "w13_weight_scale_inv", gate.scales)
+                _replace_weight_parameter(layer, "w2_weight_scale_inv", down.scales)
                 layer.register_buffer(
                     "w13_weight_scale_sm_k512", gate.scales_k512, persistent=False
                 )
@@ -331,13 +339,15 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                     "Using Ours Qwen38 W4A8: tiling, packed-K conversion and fused SwiGLU/FP8"
                 )
         if not self.use_sm:
-            layer.w13_weight_scale_inv = Parameter(
+            _replace_weight_parameter(
+                layer,
+                "w13_weight_scale_inv",
                 interleave_scales(layer.w13_weight_scale_inv.to(torch.bfloat16)),
-                requires_grad=False,
             )
-            layer.w2_weight_scale_inv = Parameter(
+            _replace_weight_parameter(
+                layer,
+                "w2_weight_scale_inv",
                 interleave_scales(layer.w2_weight_scale_inv.to(torch.bfloat16)),
-                requires_grad=False,
             )
 
         # Process input scales
@@ -347,13 +357,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             dtype=torch.float32,
             device=device,
         )
-        layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
+        _replace_weight_parameter(layer, "w13_input_scale", new_w13_input_scale)
 
         w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
         new_w2_input_scale = torch.tensor(
             [w2_input_scale_max], dtype=torch.float32, device=device
         )
-        layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
+        _replace_weight_parameter(layer, "w2_input_scale", new_w2_input_scale)
 
         if hasattr(layer, "dispatcher"):
             # The normal kernel requantizes BF16 inputs with the checkpoint's
@@ -366,6 +376,12 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 }
             )
 
+        # 所有 rank 都禁止已处理 W4AFP8 的在线更新，包括 auto 的回退分支。
+        # 单独保留 loader 不能恢复原始布局或使已捕获 graph 引用新的派生 scales。
+        layer._derived_weight_cache_error = (
+            "Online weight updates are not supported for prepared W4AFP8 weights; "
+            "restart the model to rebuild packed weights, scales and CUDA graphs."
+        )
         self._weights_processed = True
 
     def create_moe_runner(

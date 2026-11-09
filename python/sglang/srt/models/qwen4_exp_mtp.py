@@ -37,6 +37,34 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             is_draft=True,
         )
 
+    @torch.no_grad()
+    def load_weights(self, weights, is_mtp: bool = False):
+        from sglang.srt.layers.attention.qsa.kv_cache import (
+            apply_qsa_kv_scale_weights,
+            collect_qsa_kv_scale,
+            qsa_attention_layers,
+        )
+
+        layers = qsa_attention_layers(self)
+        scales = {}
+        loaded_scale_names = set()
+
+        def without_baked_scales():
+            for name, weight in weights:
+                # 融合 checkpoint 也包含目标层权重，不能把目标的 scales 当成 draft。
+                if "mtp" in name.split(".") and collect_qsa_kv_scale(
+                    name, weight, layers, scales
+                ):
+                    loaded_scale_names.add(name)
+                else:
+                    yield name, weight
+
+        loaded = super().load_weights(without_baked_scales(), is_mtp=is_mtp)
+        if scales:
+            apply_qsa_kv_scale_weights(layers, scales)
+            self._kv_scales_loaded_from_checkpoint = True
+        return loaded | loaded_scale_names
+
     def __init__(
         self,
         config: PretrainedConfig,

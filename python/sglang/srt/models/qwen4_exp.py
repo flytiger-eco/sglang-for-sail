@@ -1939,6 +1939,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         from sglang.srt.layers.attention.qsa.kv_cache import (
             apply_qsa_kv_scale_weights,
+            collect_qsa_kv_scale,
             qsa_attention_layers,
         )
 
@@ -2186,16 +2187,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     f"mlp.experts.{num_experts}.",
                 )
 
-            if layer_id in qsa_layers and name.endswith(
-                (".attn.k_scale", ".attn.v_scale")
-            ):
-                kind = name.rsplit(".", 1)[-1][0]
-                key = (layer_id, kind)
-                if key in baked_kv_scales:
-                    raise ValueError(f"Duplicate QSA KV scale for {key}")
-                if loaded_weight.numel() != 1:
-                    raise ValueError(f"QSA KV scale {name} must be a scalar")
-                baked_kv_scales[key] = loaded_weight.item()
+            if collect_qsa_kv_scale(name, loaded_weight, qsa_layers, baked_kv_scales):
                 loaded_params.add(name)
                 continue
 

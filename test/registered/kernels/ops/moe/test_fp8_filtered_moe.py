@@ -1,6 +1,7 @@
 """Regression: allocator contents in nonlocal EP rows must not alter local output."""
 
 import importlib
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -77,3 +78,7 @@ def test_filtered_rows_do_not_change_local_expert_output(fp8, poison):
     assert torch.isfinite(reference).all()
     assert torch.isfinite(actual).all(), "unused EP rows poisoned local FP8 output"
     torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

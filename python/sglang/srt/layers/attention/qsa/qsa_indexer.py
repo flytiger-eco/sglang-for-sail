@@ -604,7 +604,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
-            rope_max_position=indexer_metadata.rope_max_position,
+            rope_max_position=getattr(indexer_metadata, "rope_max_position", None),
         )
         self.update_key_state_and_compress(
             token_k,

@@ -55,9 +55,17 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-option(SGL_KERNEL_BUILD_W4A8_SM "Build Qwen38 Hopper W4A8 kernels" ON)
+# 沿用仓库 SM90a 的保守支持下限；不把旧 CUDA 构建默认带入可选模块。
+set(DEFAULT_SGL_KERNEL_BUILD_W4A8_SM OFF)
+if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.4" AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.4")
+    set(DEFAULT_SGL_KERNEL_BUILD_W4A8_SM ON)
+endif()
+option(SGL_KERNEL_BUILD_W4A8_SM "Build Qwen38 Hopper W4A8 kernels" ${DEFAULT_SGL_KERNEL_BUILD_W4A8_SM})
 option(SGL_KERNEL_W4A8_SM_ONLY "Build only the Qwen38 W4A8 module for focused validation" OFF)
 if(SGL_KERNEL_BUILD_W4A8_SM)
+    if(NOT DEFAULT_SGL_KERNEL_BUILD_W4A8_SM)
+        message(FATAL_ERROR "SGL_KERNEL_BUILD_W4A8_SM requires a CUDA compiler and toolkit >= 12.4; disable it for older CUDA builds")
+    endif()
     include(${CMAKE_CURRENT_LIST_DIR}/cmake/w4a8_sm.cmake)
 endif()
 if(SGL_KERNEL_W4A8_SM_ONLY)
