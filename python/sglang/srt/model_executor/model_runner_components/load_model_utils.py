@@ -130,10 +130,13 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
                     model.__class__,
                 )
         else:
-            logger.warning(
-                "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0."
-            )
+            if getattr(model, "_kv_scales_loaded_from_checkpoint", False):
+                logger.info("Using KV cache scaling factors from model weights")
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0."
+                )
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> int | None:

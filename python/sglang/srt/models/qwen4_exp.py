@@ -1932,6 +1932,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        from sglang.srt.layers.attention.qsa.kv_cache import (
+            apply_qsa_kv_scale_weights,
+            qsa_attention_layers,
+        )
+
+        qsa_layers = qsa_attention_layers(self)
+        baked_kv_scales = {}
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -2174,6 +2181,19 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     f"mlp.experts.{num_experts}.",
                 )
 
+            if layer_id in qsa_layers and name.endswith(
+                (".attn.k_scale", ".attn.v_scale")
+            ):
+                kind = name.rsplit(".", 1)[-1][0]
+                key = (layer_id, kind)
+                if key in baked_kv_scales:
+                    raise ValueError(f"Duplicate QSA KV scale for {key}")
+                if loaded_weight.numel() != 1:
+                    raise ValueError(f"QSA KV scale {name} must be a scalar")
+                baked_kv_scales[key] = loaded_weight.item()
+                loaded_params.add(name)
+                continue
+
             is_fused_expert = (
                 "experts.gate_up_proj" in name or "experts.down_proj" in name
             )
@@ -2281,6 +2301,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         )
                         continue
             loaded_params.add(name)
+
+        if baked_kv_scales:
+            apply_qsa_kv_scale_weights(qsa_layers, baked_kv_scales)
+            self._kv_scales_loaded_from_checkpoint = True
+            logger.info(
+                "Loaded %d baked QSA KV scales from model weights",
+                len(baked_kv_scales),
+            )
 
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
