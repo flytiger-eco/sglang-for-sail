@@ -346,3 +346,19 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+# Qwen38 W4AFP8 decode: stable expert sort, EP -1 normalization, src2dst,
+# expert offsets and CUTLASS problem sizes fused into one launch.
+register_kernel(
+    KernelSpec(
+        op="moe.w4a8_decode_preprocess",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.w4a8_decode_preprocess:w4a8_decode_preprocess",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="stable E128 decode layout, normalized ids, and CUTLASS metadata; 1..1024 routed slots",
+        ),
+        description="W4A8 Standard decode preprocessing in one bounded launch.",
+    )
+)

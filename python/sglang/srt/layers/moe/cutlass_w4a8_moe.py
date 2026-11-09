@@ -144,6 +144,7 @@ def cutlass_w4a8_moe(
     use_sm: bool = False,
     sm_gate_scales_k512: Optional[torch.Tensor] = None,
     sm_local_rows_hint: Optional[int] = None,
+    decode_fused_preprocess: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -208,15 +209,30 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_parallel().moe_ep_size > 1:
-        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
-    # The C++ metadata kernel reads int32 pointers. Standard routers can return
-    # int64 ids; passing them through counts the upper 32 bits as expert zero.
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    use_fused_layout = False
+    if decode_fused_preprocess and use_sm and a1_scale is not None and topk == 10:
+        from sglang.kernels.ops.moe.w4a8_decode_preprocess import (
+            supports_w4a8_decode_preprocess,
+            w4a8_decode_preprocess,
+        )
 
-    src2dst = cutlass_w4_run_moe_ep_preproess(
-        topk_ids,
-    )
+        use_fused_layout = (
+            k == 2560
+            and n == 640
+            and get_parallel().moe_ep_size > 1
+            and supports_w4a8_decode_preprocess(topk_ids, num_local_experts)
+        )
+    if use_fused_layout:
+        topk_ids, src2dst = w4a8_decode_preprocess(
+            topk_ids, expert_offsets, problem_sizes1, problem_sizes2, k, n
+        )
+    else:
+        if get_parallel().moe_ep_size > 1:
+            topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+        # The C++ metadata kernel reads int32 pointers. Standard routers can
+        # return int64 ids, which must be normalized before the original path.
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+        src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
 
     gateup_input = torch.empty(
         (m * topk, k),
@@ -244,19 +260,20 @@ def cutlass_w4a8_moe(
     # NOTE: a_map and c_map are not used in the get_cutlass_w4a8_moe_mm_data kernel,
     # they are kept to allow for a quick switch of the permutation logic
     # from the current triton kernel implementation to the cutlass-based one if needed.
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    get_cutlass_w4a8_moe_mm_data(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a_map,
-        c_map,
-        num_local_experts,
-        n,
-        k,
-    )
+    if not use_fused_layout:
+        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        get_cutlass_w4a8_moe_mm_data(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_map,
+            c_map,
+            num_local_experts,
+            n,
+            k,
+        )
 
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
 

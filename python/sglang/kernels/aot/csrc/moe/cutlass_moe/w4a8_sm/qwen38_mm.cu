@@ -99,7 +99,7 @@ void qwen38_w4a8_sm_mm(
     torch::Tensor const& s_strides,
     int64_t config_id) {
   c10::cuda::CUDAGuard guard(a_tensors.device());
-  TORCH_CHECK(config_id >= 0 && config_id < 5, "invalid Qwen38 W4A8 config id");
+  TORCH_CHECK(config_id >= 0 && config_id < 6, "invalid Qwen38 W4A8 config id");
   check_qwen38_w4a8(
       d_tensors,
       a_tensors,
@@ -131,6 +131,9 @@ void qwen38_w4a8_sm_mm(
       break;
     case 4:
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
+      break;
+    case 5:
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<256, 64, 128, 1, 1, 1>));
       break;
   }
 }

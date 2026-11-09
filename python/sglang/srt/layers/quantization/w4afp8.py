@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -148,6 +149,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         self.quant_config = quant_config
         self.use_sm = False
         self._weights_processed = False
+        self.use_decode_fused_preprocess = (
+            envs.SGLANG_ENABLE_W4AFP8_DECODE_PREPROCESS.get()
+            and get_disagg().disaggregation_mode == "decode"
+        )
 
     def create_weights(
         self,
@@ -404,6 +409,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
             use_sm=self.use_sm,
+            decode_fused_preprocess=self.use_decode_fused_preprocess,
             sm_gate_scales_k512=getattr(layer, "w13_weight_scale_sm_k512", None),
             sm_local_rows_hint=(
                 topk_ids.numel()

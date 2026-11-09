@@ -116,7 +116,7 @@ void qwen38_w4a8_sm_swiglu(
     torch::Tensor const& s_strides,
     int64_t config_id) {
   c10::cuda::CUDAGuard guard(a_tensors.device());
-  TORCH_CHECK(config_id >= 0 && config_id < 7, "invalid Qwen38 W4A8 config id");
+  TORCH_CHECK(config_id >= 0 && config_id < 8, "invalid Qwen38 W4A8 config id");
   check_qwen38_w4a8(
       d_tensors,
       a_tensors,
@@ -158,6 +158,9 @@ void qwen38_w4a8_sm_swiglu(
       break;
     case 6:
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+      break;
+    case 7:
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 256, 2, 1, 1>));
       break;
   }
 }
