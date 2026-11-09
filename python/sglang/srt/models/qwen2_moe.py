@@ -349,6 +349,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
+        self.shared_expert_output_scale = 1.0
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -356,6 +357,33 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
+            # W4AFp8 checkpoints keep the shared MLP in block-FP8. Some
+            # shared widths (e.g. 640 / TP4 = 160) cannot be block-sharded.
+            # Replicate only this MLP, then pre-scale its contribution because
+            # the standard MoE path sums every TP rank's output.
+            replicate_shared = (
+                get_moe_a2a_backend().is_none()
+                and self.tp_size > 1
+                and quant_config is not None
+                and quant_config.get_name() == "w4afp8"
+                and config.shared_expert_intermediate_size % self.tp_size == 0
+                and any(
+                    (config.shared_expert_intermediate_size // self.tp_size) % block
+                    for block in quant_config.weight_block_size
+                )
+                and all(
+                    config.shared_expert_intermediate_size % block == 0
+                    for block in quant_config.weight_block_size
+                )
+            )
+            if replicate_shared:
+                self.shared_expert_output_scale = 1.0 / self.tp_size
+                logger.warning_once(
+                    "Replicating block-FP8 shared expert because width %d / TP%d "
+                    "is not block-aligned; pre-scaling its output by 1/TP.",
+                    config.shared_expert_intermediate_size,
+                    self.tp_size,
+                )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -366,7 +394,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if (
-                        get_moe_a2a_backend().is_deepep()
+                        replicate_shared
+                        or get_moe_a2a_backend().is_deepep()
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
@@ -517,6 +546,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
+            if self.shared_expert_output_scale != 1.0:
+                shared_output = shared_output * self.shared_expert_output_scale
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
