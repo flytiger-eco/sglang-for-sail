@@ -41,6 +41,27 @@ def get_qsa_kv_scales(model):
     }
 
 
+def apply_qsa_kv_scale_weights(layers, scales):
+    """Apply baked checkpoint K/V descales after verifying every local QSA layer."""
+    expected = {(layer_id, kind) for layer_id in layers for kind in ("k", "v")}
+    missing = expected - scales.keys()
+    unexpected = scales.keys() - expected
+    if missing or unexpected:
+        raise ValueError(
+            f"Incomplete QSA KV scales: missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
+    validated = {key: normalize_kv_scale(value) for key, value in scales.items()}
+    for (layer_id, kind), value in validated.items():
+        layer = layers[layer_id]
+        setattr(layer, f"{kind}_scale_float", value)
+        current = getattr(layer, f"{kind}_scale", None)
+        if hasattr(current, "fill_"):
+            current.fill_(value)
+        else:
+            setattr(layer, f"{kind}_scale", value)
+
+
 def load_qsa_kv_scales(model, filename, *, tp_rank, tp_size, is_draft=False):
     """Load SGLang-style rank/layer scales, with optional separate K/V values.
 
