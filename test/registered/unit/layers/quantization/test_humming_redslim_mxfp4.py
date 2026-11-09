@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+import sys
+
 import pytest
 import torch
 
@@ -6,7 +8,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-pytest.importorskip("humming")
+
+@pytest.fixture(scope="module", autouse=True)
+def humming_dependency():
+    # 在 pytest 管理的 fixture 内跳过，避免直接执行报错或零用例假绿。
+    pytest.importorskip("humming")
+
 
 from sglang.srt.layers.linear import LinearBase  # noqa: E402
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE  # noqa: E402
@@ -147,3 +154,66 @@ def test_moe_check_uses_expert_quantization(
             check()
     else:
         check()
+
+
+@pytest.mark.parametrize("key", ["ignore", "ignored_layers", "modules_to_not_convert"])
+def test_dense_exclusion_aliases_and_null_ignore(key):
+    class DummyLinear(LinearBase):
+        def forward(self, x):
+            return x
+
+    overrides = {"ignore": None}
+    overrides[key] = [
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+        "model.language_model.layers.0.linear_attn.in_proj_b",
+    ]
+    cfg = config(**overrides)
+    layer = DummyLinear.__new__(DummyLinear)
+    torch.nn.Module.__init__(layer)
+    assert isinstance(
+        cfg.get_quant_method(layer, "model.layers.0.linear_attn.in_proj_ba"),
+        UnquantizedLinearMethod,
+    )
+
+
+def test_null_exclusions_preserve_block_fp8_shared_layout():
+    cfg = config(ignore=None)
+    dense = cfg.get_wmxfp4afp8_dense_config()
+    assert dense.ignored_layers == []
+    assert dense.weight_block_size == [128, 128]
+
+
+def test_shared_expert_replication_uses_humming_dense_not_expert_block_size():
+    from sglang.srt.models.qwen2_moe import (
+        _shared_block_fp8_config,
+        _should_replicate_shared_fp8,
+    )
+
+    cfg = config(ignore=None)
+    assert not getattr(cfg, "weight_block_size", None)
+    dense = _shared_block_fp8_config(cfg)
+    assert dense is cfg.get_wmxfp4afp8_dense_config()
+    assert _should_replicate_shared_fp8(4, 640, dense, "model.layers.0.mlp")
+    assert not _should_replicate_shared_fp8(4, 1024, dense, "model.layers.0.mlp")
+    assert not _should_replicate_shared_fp8(1, 640, dense, "model.layers.0.mlp")
+
+
+def test_ignored_shared_projections_do_not_force_replication():
+    from sglang.srt.models.qwen2_moe import (
+        _shared_block_fp8_config,
+        _should_replicate_shared_fp8,
+    )
+
+    cfg = config(
+        ignore=[
+            "model.language_model.layers.0.mlp.shared_expert.gate_up_proj",
+            "model.language_model.layers.0.mlp.shared_expert.down_proj",
+        ]
+    )
+    assert not _should_replicate_shared_fp8(
+        4, 640, _shared_block_fp8_config(cfg), "model.layers.0.mlp"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.attention.qsa.kv_cache import (
+    is_qsa_fp8_pool,
+    qsa_fp8_pd_weight_update_error,
+)
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -16,7 +20,7 @@ from sglang.srt.model_loader.loader import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_disagg, get_model
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 def _unsupported_derived_weight_cache_error(
     model: Optional[torch.nn.Module] = None,
+    runner: Optional[ModelRunner] = None,
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
@@ -66,6 +71,12 @@ def _unsupported_derived_weight_cache_error(
             reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
+    # 入口直接检查实际 pool，空 QSA 的 PP 分片及独立 draft 也不能绕过保护。
+    pool = getattr(runner, "token_to_kv_pool", None)
+    if is_qsa_fp8_pool(pool):
+        reason = qsa_fp8_pd_weight_update_error(pool, get_disagg().disaggregation_mode)
+        if reason is not None:
+            return reason
     from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled
 
     if hpc_bf16xfp32_gemm_enabled():
@@ -173,7 +184,9 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
-        error = _unsupported_derived_weight_cache_error(self.get_model())
+        error = _unsupported_derived_weight_cache_error(
+            self.get_model(), self.get_model_runner()
+        )
         if error is not None:
             return False, error
 
@@ -305,7 +318,16 @@ class WeightUpdater:
         )
         return bucket.reconstruct_tensors()
 
+    def validate_weight_update(self: WeightUpdater) -> None:
+        self._assert_weight_cache_inactive("begin_weight_update")
+        error = _unsupported_derived_weight_cache_error(
+            self.get_model(), self.get_model_runner()
+        )
+        if error is not None:
+            raise RuntimeError(error)
+
     def begin_weight_update(self: WeightUpdater) -> None:
+        self.validate_weight_update()
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
@@ -321,7 +343,9 @@ class WeightUpdater:
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
     ) -> Tuple[bool, str]:
         self._assert_weight_cache_inactive("update_weights_from_distributed")
-        error = _unsupported_derived_weight_cache_error(self.get_model())
+        error = _unsupported_derived_weight_cache_error(
+            self.get_model(), self.get_model_runner()
+        )
         if error is not None:
             return False, error
         try:
@@ -341,7 +365,9 @@ class WeightUpdater:
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
     ):
-        error = _unsupported_derived_weight_cache_error(self.get_model())
+        error = _unsupported_derived_weight_cache_error(
+            self.get_model(), self.get_model_runner()
+        )
         if error is not None:
             return False, error
 
@@ -407,7 +433,9 @@ class WeightUpdater:
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
-        error = _unsupported_derived_weight_cache_error(self.get_model())
+        error = _unsupported_derived_weight_cache_error(
+            self.get_model(), self.get_model_runner()
+        )
         if error is not None:
             return False, error
 

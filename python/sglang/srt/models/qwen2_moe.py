@@ -73,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    post_experts_output_is_complete,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -168,6 +169,48 @@ def can_fuse_shared_expert(
                 return False
 
     return True
+
+
+def _shared_block_fp8_config(quant_config):
+    if quant_config is None:
+        return None
+    if quant_config.get_name() == "w4afp8":
+        return quant_config
+    if (
+        quant_config.get_name() == "humming"
+        and quant_config.full_config.get("quant_method") == "wmxfp4afp8"
+    ):
+        return quant_config.get_wmxfp4afp8_dense_config()
+    return None
+
+
+def _should_replicate_shared_fp8(tp_size, shared_width, quant_config, prefix):
+    """只根据 shared 投影的实际 block-FP8 布局决定是否复制。"""
+    from sglang.srt.layers.quantization.utils import is_layer_skipped
+
+    if tp_size <= 1 or quant_config is None or shared_width % tp_size:
+        return False
+    block_size = quant_config.weight_block_size
+    if block_size is None:
+        return False
+    shared_prefix = add_prefix("shared_expert", prefix)
+    blocks = [
+        block_size[dimension]
+        for projection, dimension in (("gate_up_proj", 0), ("down_proj", 1))
+        if not is_layer_skipped(
+            add_prefix(projection, shared_prefix),
+            quant_config.ignored_layers,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+    ]
+    return any((shared_width // tp_size) % block for block in blocks) and all(
+        shared_width % block == 0 for block in blocks
+    )
+
+
+def _replicated_shared_output_scale(tp_size):
+    # DWDP 的输出已完整；延后到下一层的 TP sum 仍然需要 1/TP 补偿。
+    return 1.0 if post_experts_output_is_complete(is_tp_path=True) else 1.0 / tp_size
 
 
 def _can_pad_shared_fp8(
@@ -470,35 +513,34 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # shared widths (e.g. 640 / TP4 = 160) cannot be block-sharded.
             # Replicate only this MLP, then pre-scale its contribution because
             # the standard MoE path sums every TP rank's output.
+            shared_quant_config = _shared_block_fp8_config(quant_config)
+            shared_width = config.shared_expert_intermediate_size
             replicate_shared = (
                 get_moe_a2a_backend().is_none()
-                and self.tp_size > 1
-                and quant_config is not None
-                and quant_config.get_name() == "w4afp8"
-                and config.shared_expert_intermediate_size % self.tp_size == 0
-                and any(
-                    (config.shared_expert_intermediate_size // self.tp_size) % block
-                    for block in quant_config.weight_block_size
-                )
-                and all(
-                    config.shared_expert_intermediate_size % block == 0
-                    for block in quant_config.weight_block_size
+                and _should_replicate_shared_fp8(
+                    self.tp_size, shared_width, shared_quant_config, prefix
                 )
             )
-            shared_width = config.shared_expert_intermediate_size
             padded_shared = _can_pad_shared_fp8(
-                replicate_shared, self.tp_size, shared_width, quant_config, prefix
+                replicate_shared,
+                self.tp_size,
+                shared_width,
+                shared_quant_config,
+                prefix,
             )
             if padded_shared:
                 shared_width = 1024
                 replicate_shared = False
             if replicate_shared:
-                self.shared_expert_output_scale = 1.0 / self.tp_size
+                self.shared_expert_output_scale = _replicated_shared_output_scale(
+                    self.tp_size
+                )
                 logger.warning_once(
-                    "Replicating block-FP8 shared expert because width %d / TP%d "
-                    "is not block-aligned; pre-scaling its output by 1/TP.",
+                    "Replicating block-FP8 shared expert: width %d / TP%d is not "
+                    "block-aligned; output scale=%s.",
                     config.shared_expert_intermediate_size,
                     self.tp_size,
+                    self.shared_expert_output_scale,
                 )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,

@@ -1,5 +1,7 @@
 """DeepEP requantization for 128-aligned hidden sizes, including Qwen4's 2560."""
 
+import sys
+
 import pytest
 import torch
 
@@ -61,3 +63,7 @@ def test_requant_matches_reference_and_graph_replay(hidden_size):
     graph.replay()
     torch.cuda.synchronize()
     check()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

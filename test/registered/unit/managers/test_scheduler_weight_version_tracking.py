@@ -311,6 +311,44 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         draft.weight_updater.begin_weight_update.assert_called_once_with()
         draft.weight_updater.end_weight_update.assert_called_once()
 
+    def test_begin_checks_draft_before_restoring_target(self):
+        target, draft = _runner(), _runner()
+        draft.weight_updater.validate_weight_update.side_effect = RuntimeError(
+            "FP8 QSA PD requires restart"
+        )
+        manager = self._manager(target, draft, session=False)
+        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+        self.assertFalse(output.success)
+        self.assertIn("requires restart", output.message)
+        self.assertIsNone(manager._session)
+        target.weight_updater.begin_weight_update.assert_not_called()
+        draft.weight_updater.begin_weight_update.assert_not_called()
+
+    def test_all_update_sources_preflight_draft_before_mutation(self):
+        for method in (
+            "update_weights_from_disk",
+            "update_weights_from_ipc",
+            "update_weights_from_tensor",
+            "update_weights_from_distributed",
+        ):
+            with self.subTest(method=method):
+                target, draft = _runner(), _runner()
+                draft.weight_updater.validate_weight_update.side_effect = RuntimeError(
+                    "prepared weights require restart"
+                )
+                manager = self._manager(target, draft)
+                output = getattr(manager, method)(_request())
+                self.assertFalse(output.success)
+                self.assertEqual(self.recorded, [])
+                for mutation in (
+                    "update_weights_from_disk",
+                    "update_weights_from_ipc",
+                    "update_weights_from_tensor",
+                    "load_weights_from_distributed",
+                    "receive_weights_from_distributed",
+                ):
+                    getattr(target.weight_updater, mutation).assert_not_called()
+
     def test_begin_rejects_reentry(self):
         """A second begin would leave the first session's runners unfinalized."""
         target = _runner()

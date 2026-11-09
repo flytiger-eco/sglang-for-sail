@@ -1,5 +1,6 @@
 """Regression coverage for padded QSA compression groups and short extends."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnB
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 RATIO = 4
 DIM = 128
@@ -189,3 +191,7 @@ def test_fallback_placeholder_gathers(lengths, prefixes, graph_mode):
     valid = writes != 0
     expected = keys[groups[valid].long()].float().mean(dim=1).to(keys.dtype)
     torch.testing.assert_close(output[writes[valid].long()], expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

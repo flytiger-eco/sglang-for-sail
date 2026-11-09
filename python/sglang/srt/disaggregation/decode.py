@@ -600,7 +600,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.qsa_fp8_contract = qsa_fp8_transfer_contract(
-            self.token_to_kv_pool, self.draft_token_to_kv_pool
+            self.token_to_kv_pool,
+            self.draft_token_to_kv_pool,
+            pp_group=get_parallel().pp_group if self.pp_size > 1 else None,
         )
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host

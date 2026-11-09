@@ -695,7 +695,6 @@ class HummingConfig(QuantizationConfig):
     def _get_wmxfp4afp8_method(self, layer, prefix):
         """Load RedSlim MXFP4 experts without requantizing their packed bits."""
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         config = self.full_config
         if (
@@ -721,13 +720,24 @@ class HummingConfig(QuantizationConfig):
             quant_config.is_redslim_mxfp4 = True
             return HummingMoEMethod(quant_config)
 
-        # Dense projections in this mixed checkpoint remain block-FP8.
-        # Apply the same checkpoint-to-runtime mapping as Qwen4's W4A8 loader.
+        return self.get_wmxfp4afp8_dense_config().get_quant_method(layer, prefix)
+
+    def get_wmxfp4afp8_dense_config(self):
+        """供加载器和 shared-expert TP 决策复用真实 dense FP8 配置。"""
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        config = self.full_config
         if not hasattr(self, "_wmxfp4afp8_dense_config"):
             ignored = []
-            for name in config.get("ignore", []):
-                mapped = name.replace("model.language_model.", "model.")
-                ignored.extend([name, mapped, mapped.replace(".self_attn.", ".")])
+            for key in ("ignored_layers", "modules_to_not_convert", "ignore"):
+                names = config.get(key) or []
+                if not isinstance(names, (list, tuple)) or any(
+                    not isinstance(n, str) for n in names
+                ):
+                    raise ValueError(f"{key} must be a list of layer names or null")
+                for name in names:
+                    mapped = name.replace("model.language_model.", "model.")
+                    ignored.extend([name, mapped, mapped.replace(".self_attn.", ".")])
             self._wmxfp4afp8_dense_config = Fp8Config.from_config(
                 {
                     "quant_method": "fp8",
@@ -739,7 +749,7 @@ class HummingConfig(QuantizationConfig):
         self._wmxfp4afp8_dense_config.packed_modules_mapping = (
             self.packed_modules_mapping
         )
-        return self._wmxfp4afp8_dense_config.get_quant_method(layer, prefix)
+        return self._wmxfp4afp8_dense_config
 
 
 class HummingLayerQuantizationConfig(HummingConfig):

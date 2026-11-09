@@ -23,7 +23,11 @@ from sglang.srt.layers.attention.qsa.config import (
     parse_qsa_profile,
 )
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
-from sglang.srt.layers.attention.qsa.kv_cache import get_qsa_kv_scales
+from sglang.srt.layers.attention.qsa.kv_cache import (
+    get_qsa_kv_scales,
+    is_qsa_fp8_pool,
+    protect_qsa_fp8_pd_weight_updates,
+)
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     QSAPrefillMQAPlan,
@@ -48,6 +52,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -224,8 +229,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Scales are loaded before backend/graph construction. Keep the
             # effective values on each main/draft pool for PD registration.
             scales = get_qsa_kv_scales(model)
-            if scales:
-                self.token_to_kv_pool.qsa_kv_scales = scales
+            self.token_to_kv_pool.qsa_kv_scales = scales
+            if is_qsa_fp8_pool(self.token_to_kv_pool):
+                protect_qsa_fp8_pd_weight_updates(
+                    model, self.token_to_kv_pool, get_disagg().disaggregation_mode
+                )
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
