@@ -94,7 +94,7 @@ dependencies = [
   "flash_attn_3==2.8.2",
   "flash_mla==2.0.0",
   "flashinfer_python[cu13]==0.6.17",
-  "fmha_ppu==0.1.1",
+  "msa_for_sail==0.1.1",
   "mooncake-transfer-engine==0.3.12.post1",
   "nvidia-dali-cuda130==1.53.0",
   "pla==1.0.0",
@@ -134,6 +134,7 @@ flash_attn_3 = { index = "flytiger" }
 flash_mla = { index = "flytiger" }
 flashinfer-python = { index = "flytiger" }
 mooncake-transfer-engine = { index = "flytiger" }
+msa_for_sail = { index = "flytiger" }
 nvidia-dali-cuda130 = { index = "flytiger" }
 pla = { index = "flytiger" }
 sglang-kernel = { index = "flytiger" }
