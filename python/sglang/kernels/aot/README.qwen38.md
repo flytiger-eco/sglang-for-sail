@@ -26,12 +26,19 @@ The prefill dispatch table uses channel/token/K tile dimensions:
 
 | Global chunk | Gate-up tile | Gate schedule / cluster | Down tile |
 |---|---|---|---|
+| 2048 (E512, 20480 routed rows) | 128/64/256 | cooperative / 2x1x1 | 128/64/128 |
 | 4096 | 128/80/256 | cooperative / 2x1x1 | 256/80/128 |
 | 5120 | 128/112/256 | cooperative / 1x1x1 | 128/128/128 |
 | 6144 | 128/128/256 | cooperative / 1x1x1 | 128/128/128 |
 | 7168 | 128/144/256 | cooperative / 1x1x1 | 128/160/128 |
 | 8192 | 128/160/256 | cooperative / 1x1x1 | 128/160/128 |
 | Decode batch about 32 | 64/32/256 | ping-pong / 1x1x1 | 128/32/128 (ping-pong) |
+
+The 2K configuration is selected only for E=512 and a host-known routed-row
+hint of 20480 (2048 tokens at top-k=10), using gate-up config 7 and down
+config 5. Other hints keep their existing configuration selection. Deploying
+this candidate requires rebuilding `w4a8_sm_ops.so` together with the updated
+Python adapter; this change does not alter the service's chunk size.
 
 Down prefill tiles use cooperative scheduling and a 1x1x1 cluster. The
 smallest decode cases additionally retain a K512 gate variant and a
@@ -73,6 +80,28 @@ this loader. Normal dispatch consumes BF16 and quantizes to the checkpoint's
 static scale. Low-latency dispatch consumes FP8 plus per-token-group scales
 and requantizes to that static scale. Standard route metadata is normalized
 to int32 before the C++ metadata kernel.
+
+## Decode runtime optimizations
+
+Two opt-in flags extend the Standard W4AFP8 decode path:
+
+- `SGLANG_ENABLE_W4AFP8_DECODE_PREPROCESS=1` fuses stable expert sorting,
+  EP `-1` normalization, `src2dst`, expert offsets, and CUTLASS problem sizes
+  into one Triton launch. It requires the Ours kernel, static input scales,
+  H=2560/I=640, top-k=10, EP>1, 128 local experts, and 1..1024 contiguous
+  int32/int64 routed slots. Other shapes retain the original preprocessing.
+- `SGLANG_ENABLE_W4AFP8_DECODE_SHARED_PADDING=1` pads a block-FP8 shared
+  expert from logical I=640 to physical I=1024 before TP4 sharding, giving
+  each rank 256 aligned channels instead of replicating the shared expert.
+  The loader pads gate and up independently, uses zero weights/unit scales
+  for added channels, and preserves the original logical computation.
+  Already sharded checkpoints are not supported by this padding path.
+
+Both flags default to false and apply only to the disaggregated decode role.
+Shared padding changes load-time layout, so toggling it requires reloading
+weights. Neither flag enables a new Prefill path or changes checkpoint files.
+The preprocessing kernel is Triton JIT; it does not require rebuilding
+`w4a8_sm_ops.so`.
 
 ## Building
 

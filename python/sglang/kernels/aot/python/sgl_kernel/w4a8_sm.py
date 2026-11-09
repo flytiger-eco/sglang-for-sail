@@ -124,6 +124,9 @@ def select_w4a8_sm_config(
         raise ValueError("invalid routing shape hint")
     if projection not in ("gate_up", "down"):
         raise ValueError("projection must be gate_up or down")
+    # Measured PP2/EP1 2K-token point; other shapes retain the existing table.
+    if num_experts == 512 and local_rows == 20480:
+        return (7, 2) if projection == "gate_up" else (5, 1)
     mean_rows = local_rows / num_experts
     if projection == "gate_up":
         if mean_rows <= 32:

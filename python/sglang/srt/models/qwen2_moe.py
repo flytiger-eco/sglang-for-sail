@@ -95,6 +95,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_stream,
@@ -167,6 +168,114 @@ def can_fuse_shared_expert(
                 return False
 
     return True
+
+
+def _can_pad_shared_fp8(
+    replicate_shared: bool,
+    tp_size: int,
+    shared_width: int,
+    quant_config,
+    prefix: str,
+) -> bool:
+    if (
+        not envs.SGLANG_ENABLE_W4AFP8_DECODE_SHARED_PADDING.get()
+        or not replicate_shared
+        or tp_size != 4
+        or shared_width != 640
+        or quant_config.weight_block_size != [128, 128]
+        or get_disagg().disaggregation_mode != "decode"
+    ):
+        return False
+    from sglang.srt.layers.quantization.utils import is_layer_skipped
+
+    shared_prefix = add_prefix("shared_expert", prefix)
+    return not any(
+        is_layer_skipped(
+            add_prefix(projection, shared_prefix),
+            quant_config.ignored_layers,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+        for projection in ("gate_up_proj", "down_proj")
+    )
+
+
+def _padded_shared_fp8_loader(
+    original_loader,
+    logical_width: int,
+    padded_width: int,
+    dimension: int,
+    merged: bool,
+    is_scale: bool,
+):
+    """Pad checkpoint blocks before the existing TP loader slices them.
+
+    Gate and up must be padded independently; padding a fused matrix only at
+    its tail would move the gate/up split and corrupt both the activation and
+    its scales. This runs only at load time, never during forward/graph replay.
+    """
+
+    def load(param, loaded_weight, *args, **kwargs):
+        shard_id = args[0] if args else kwargs.get("loaded_shard_id")
+        sections = 2 if merged and not isinstance(shard_id, int) else 1
+        expected = sections * logical_width
+        padded = sections * padded_width
+        size = loaded_weight.shape[dimension]
+        if size == padded:
+            return original_loader(param, loaded_weight, *args, **kwargs)
+        if size != expected:
+            raise ValueError(
+                f"Shared FP8 checkpoint axis {dimension} must be {expected} "
+                f"(logical) or {padded} (padded), got {size}"
+            )
+        shape = list(loaded_weight.shape)
+        shape[dimension] = padded
+        # A zero FP8 code times a positive unit scale contributes exactly zero.
+        weight = torch.full(
+            shape,
+            1 if is_scale else 0,
+            dtype=loaded_weight.dtype,
+            device=loaded_weight.device,
+        )
+        for section in range(sections):
+            weight.narrow(dimension, section * padded_width, logical_width).copy_(
+                loaded_weight.narrow(dimension, section * logical_width, logical_width)
+            )
+        return original_loader(param, weight, *args, **kwargs)
+
+    return load
+
+
+def _install_padded_shared_fp8_loaders(
+    mlp: nn.Module, logical_width: int, padded_width: int
+) -> None:
+    """Keep checkpoint FP8/scales while sharding block-aligned shared channels."""
+    for layer, dimension, merged in (
+        (mlp.gate_up_proj, 0, True),
+        (mlp.down_proj, 1, False),
+    ):
+        if layer.use_presharded_weights:
+            raise ValueError("Padded shared FP8 requires an unsharded checkpoint")
+        if not getattr(layer.quant_method, "block_quant", False):
+            raise ValueError("Padded shared loader requires block-FP8 linears")
+        block = layer.quant_method.weight_block_size[dimension]
+        if logical_width % block or padded_width % (block * layer.tp_size):
+            raise ValueError("Shared physical width must align on every TP rank")
+        for name in ("weight", "weight_scale_inv"):
+            param = getattr(layer, name)
+            is_scale = name == "weight_scale_inv"
+            unit = block if is_scale else 1
+            # BasevLLMParameter exposes its loader through a read-only property.
+            # Preserve the parameter type and delegate actual slicing/copying.
+            param._weight_loader = _padded_shared_fp8_loader(
+                param.weight_loader,
+                logical_width // unit,
+                padded_width // unit,
+                dimension,
+                merged,
+                is_scale,
+            )
+    mlp.logical_intermediate_size = logical_width
+    mlp.physical_intermediate_size = padded_width
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -376,6 +485,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     for block in quant_config.weight_block_size
                 )
             )
+            shared_width = config.shared_expert_intermediate_size
+            padded_shared = _can_pad_shared_fp8(
+                replicate_shared, self.tp_size, shared_width, quant_config, prefix
+            )
+            if padded_shared:
+                shared_width = 1024
+                replicate_shared = False
             if replicate_shared:
                 self.shared_expert_output_scale = 1.0 / self.tp_size
                 logger.warning_once(
@@ -386,7 +502,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
-                intermediate_size=config.shared_expert_intermediate_size,
+                intermediate_size=shared_width,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
@@ -405,6 +521,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     else {}
                 ),
             )
+            if padded_shared:
+                _install_padded_shared_fp8_loaders(
+                    self.shared_expert,
+                    config.shared_expert_intermediate_size,
+                    shared_width,
+                )
+                logger.warning_once(
+                    "Using padded block-FP8 shared expert: logical I=640, "
+                    "physical I=1024, local I=256, TP=4, output_scale=1."
+                )
         else:
             self.shared_expert = None
         if _is_cpu and _is_cpu_amx_available:

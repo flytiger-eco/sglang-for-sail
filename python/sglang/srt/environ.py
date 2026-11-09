@@ -1063,6 +1063,9 @@ class Envs:
     # ===================================================================
     # auto selects the Qwen38 Hopper kernel for compatible W4AFP8 checkpoints.
     SGLANG_W4AFP8_MOE_BACKEND = EnvStr("auto")
+    # Decode-only layout fusion and block-aligned shared TP padding.
+    SGLANG_ENABLE_W4AFP8_DECODE_PREPROCESS = EnvBool(False)
+    SGLANG_ENABLE_W4AFP8_DECODE_SHARED_PADDING = EnvBool(False)
 
     SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
