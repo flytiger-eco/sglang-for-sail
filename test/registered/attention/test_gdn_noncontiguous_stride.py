@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import (
     register_ppu_ci,
 )
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=7, stage="stage-b", runner_config="1-gpu-large-amd")
 register_ppu_ci(est_time=18, suite="nightly-1-ppu", nightly=True)
 
