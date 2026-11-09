@@ -114,12 +114,60 @@ def load_qsa_kv_scales(model, filename, *, tp_rank, tp_size, is_draft=False):
                 setattr(layer, name, scale)
 
 
-def qsa_fp8_transfer_contract(main_pool, draft_pool=None):
+def merge_qsa_pp_components(parts):
+    """Reconstruct the full layer contract; keep all scale/layout checks."""
+    if not parts or any(len(part) != len(parts[0]) for part in parts):
+        raise ValueError("QSA PP contract component count mismatch")
+    merged = []
+    for component_idx in range(len(parts[0])):
+        components = [part[component_idx] for part in parts]
+        if all(c is None for c in components):
+            merged.append(None)
+            continue
+        if any(c is None for c in components):
+            raise ValueError("QSA PP contract missing component")
+        variable = {"layer_ids", "item_lens", "scales"}
+        common = {k: v for k, v in components[0].items() if k not in variable}
+        rows = {}
+        has_scales = components[0]["scales"] is not None
+        for c in components:
+            if {k: v for k, v in c.items() if k not in variable} != common:
+                raise ValueError("QSA PP layout mismatch")
+            ids = c["layer_ids"]
+            n = len(ids)
+            if not n or len(c["item_lens"]) != 2 * n:
+                raise ValueError("QSA PP requires layer-first K/V entries")
+            if (c["scales"] is not None) != has_scales:
+                raise ValueError("QSA PP scale presence mismatch")
+            scales = {row[0]: row for row in c["scales"]} if has_scales else {}
+            if has_scales and set(scales) != set(ids):
+                raise ValueError("QSA PP scale coverage mismatch")
+            for i, layer_id in enumerate(ids):
+                if layer_id in rows:
+                    raise ValueError("QSA PP layer overlap")
+                rows[layer_id] = (
+                    c["item_lens"][i],
+                    c["item_lens"][n + i],
+                    scales.get(layer_id),
+                )
+        ids = sorted(rows)
+        merged.append(
+            dict(
+                common,
+                layer_ids=ids,
+                item_lens=[rows[i][0] for i in ids] + [rows[i][1] for i in ids],
+                scales=[rows[i][2] for i in ids] if has_scales else None,
+            )
+        )
+    return merged
+
+
+def qsa_fp8_transfer_contract(main_pool, draft_pool=None, pp_group=None):
     """Fingerprint effective scales/layouts, excluding addresses and capacity.
 
-    The first PD implementation requires identical per-rank QSA layouts and
-    scales. Differing PP shards or rank-specific scales fail at bootstrap,
-    rather than interpreting transferred FP8 bytes with the wrong descales.
+    PP shards are reconstructed into the same global layer contract as PP1.
+    Layout or scale differences still fail at bootstrap, before transferred
+    FP8 bytes can be interpreted with the wrong descales.
     """
     pools = [main_pool, draft_pool]
     if not any(
@@ -164,6 +212,12 @@ def qsa_fp8_transfer_contract(main_pool, draft_pool=None):
                 "scales": scales,
             }
         )
+    if pp_group is not None and pp_group.world_size > 1:
+        parts = [
+            pp_group.broadcast_object(components, src=i)
+            for i in range(pp_group.world_size)
+        ]
+        components = merge_qsa_pp_components(parts)
     payload = json.dumps(components, sort_keys=True, separators=(",", ":"))
     return "qsa-fp8-v1:" + hashlib.sha256(payload.encode()).hexdigest()
 
