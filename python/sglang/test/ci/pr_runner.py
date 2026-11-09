@@ -177,6 +177,27 @@ def partition_manifest_registrations(all_tests, size):
 _COMPLETED_BUILDS = set()
 
 
+def _ensure_rust_toolchain(root):
+    key = ("rust-toolchain", root)
+    if key in _COMPLETED_BUILDS:
+        return
+    subprocess.run(
+        ["bash", str(root / "scripts/ci/utils/install_rustup.sh")], check=True
+    )
+    cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
+    os.environ["PATH"] = (
+        str(cargo_home / "bin") + os.pathsep + os.environ.get("PATH", "")
+    )
+    toolchain = root / "rust/rust-toolchain.toml"
+    match = re.search(
+        r'^channel\s*=\s*"([^"]+)"',
+        toolchain.read_text() if toolchain.is_file() else "",
+        re.MULTILINE,
+    )
+    os.environ["RUSTUP_TOOLCHAIN"] = match.group(1) if match else "stable"
+    _COMPLETED_BUILDS.add(key)
+
+
 def ensure_test_dependencies(filename):
     root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[4]))
     record = _dependency_action(root, filename)
@@ -192,6 +213,7 @@ def ensure_test_dependencies(filename):
     if action == "build-rust":
         key = (action, root)
         if key not in _COMPLETED_BUILDS:
+            _ensure_rust_toolchain(root)
             from sglang.srt.rust_extensions import load_rust_extension
 
             load_rust_extension("sglang.srt.rust_extensions._server")

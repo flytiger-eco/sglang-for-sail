@@ -237,15 +237,20 @@ class StrictRunnerTest(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_WORKSPACE": str(ROOT)}):
             RUNNER._COMPLETED_BUILDS.clear()
             rust = Mock()
-            with patch.dict("sys.modules", {"sglang.srt.rust_extensions": rust}):
-                RUNNER.ensure_test_dependencies(
-                    "test/registered/vlm/test_rust_native_mm_mmmu.py"
-                )
-                RUNNER.ensure_test_dependencies(
-                    "test/registered/vlm/test_rust_native_mm_mmmu.py"
-                )
+            with patch.object(RUNNER.subprocess, "run") as rust_run:
+                with patch.dict("sys.modules", {"sglang.srt.rust_extensions": rust}):
+                    RUNNER.ensure_test_dependencies(
+                        "test/registered/vlm/test_rust_native_mm_mmmu.py"
+                    )
+                    RUNNER.ensure_test_dependencies(
+                        "test/registered/vlm/test_rust_native_mm_mmmu.py"
+                    )
             rust.load_rust_extension.assert_called_once_with(
                 "sglang.srt.rust_extensions._server"
+            )
+            rust_run.assert_called_once_with(
+                ["bash", str(ROOT / "scripts/ci/utils/install_rustup.sh")],
+                check=True,
             )
 
             with patch.object(RUNNER.subprocess, "run") as run:
