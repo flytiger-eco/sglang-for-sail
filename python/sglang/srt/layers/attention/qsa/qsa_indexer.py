@@ -348,6 +348,10 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope=source_rope,
             )
             return
+        # Padded groups target the reserved dump slot, but their expanded
+        # source indices can exceed a short extend. Keep the fixed shape
+        # while gathering a safe row for every member of an inactive group.
+        group_locs = torch.where(compressed_locs[:, None] != 0, group_locs, 0)
         key_groups = source_keys[group_locs]
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
@@ -370,6 +374,7 @@ class QSAIndexer(MultiPlatformOp):
                 metadata.graph_write_locs,
             )
             return
+        group_locs = torch.where(metadata.graph_write_locs[:, None] != 0, group_locs, 0)
         key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
         compressed = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(

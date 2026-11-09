@@ -82,13 +82,28 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
-        return cls(
+        ignored_layers = (
+            cls.get_from_keys_or(
+                config, ["ignored_layers", "modules_to_not_convert", "ignore"], []
+            )
+            or []
+        )
+        # Match Qwen4's checkpoint-to-runtime language model name mapping.
+        normalized = []
+        for layer in ignored_layers:
+            normalized.append(layer)
+            mapped = layer.replace("model.language_model.", "model.")
+            normalized.extend([mapped, mapped.replace(".self_attn.", ".")])
+        result = cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            ignored_layers=list(dict.fromkeys(normalized)),
         )
+        result.update_packed_modules_mapping(config.get("packed_modules_mapping") or {})
+        return result
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -97,7 +112,9 @@ class W4AFp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
