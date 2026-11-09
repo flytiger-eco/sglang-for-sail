@@ -18,6 +18,10 @@ on:
         description: 'Optional comma-separated exact CUDA suites within the selected scope'
         type: string
         default: ''
+      files:
+        description: 'Optional comma-separated exact registered test files within selected suites'
+        type: string
+        default: ''
       max_parallel:
         description: 'Concurrent test tasks (1-4); each task requests its required PPU cards'
         type: number
@@ -214,7 +218,7 @@ jobs:
               paths = sorted(str(p.resolve()) for p in (ROOT / 'test/registered').rglob('*.py') if p.name not in {'conftest.py', '__init__.py'})
               return module, module.collect_tests(paths, sanity_check=True)
 
-          def make_plan(scope, suites, timeout, parallel, hardware, *, partition_model=None, partition_model_sha=''):
+          def make_plan(scope, suites, timeout, parallel, hardware, *, files='', partition_model=None, partition_model_sha=''):
               require(scope in STAGES, 'Unknown scope')
               require((partition_model is None and partition_model_sha == '') or (isinstance(partition_model, dict) and re.fullmatch(r'[0-9a-f]{40}', partition_model_sha)), 'Partition model must have an immutable identity')
               require(type(parallel) is int and 1 <= parallel <= 4, 'max_parallel must be between 1 and 4')
@@ -236,6 +240,10 @@ jobs:
               selected = sorted(set(s.strip() for s in suites.split(',') if s.strip())) if suites.strip() else sorted(s for s in groups if s.split('-test-', 1)[0] in STAGES[scope])
               require(selected and all(s in groups for s in selected), 'Empty selection or unknown suite')
               require(all(s.split('-test-', 1)[0] in STAGES[scope] for s in selected), 'Requested suites must belong to the selected scope')
+              selected_files = sorted(set(f.strip() for f in files.split(',') if f.strip()))
+              require(all(re.fullmatch(r'test/registered/[A-Za-z0-9_./-]+\.py', f) and '..' not in Path(f).parts for f in selected_files), 'Invalid registered file selection')
+              enabled_files = {str(Path(r.filename).relative_to(ROOT)) for s in selected for r in groups[s] if r.disabled is None}
+              require(set(selected_files) <= enabled_files, 'Requested files must be enabled registrations within selected suites')
               sizes, native_timeouts, whole_suites = native_layout([r for s in selected for r in groups[s]], partition_model)
               entries = []
               for suite in selected:
@@ -266,7 +274,12 @@ jobs:
                   partitions = [module.auto_partition(enabled, i, size, live_est=live_est) for i in range(size)] if policy == 'cuda' else [enabled]
                   require(all(partitions), 'Native CUDA partition is empty')
                   for i, part in enumerate(partitions):
-                      entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'partition_policy': policy, 'timeout': limit, 'test_budget_seconds': test_budget, 'worker_minutes': worker_minutes, 'job_minutes': job_minutes, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in part]})
+                      chosen = [r for r in part if not selected_files or str(Path(r.filename).relative_to(ROOT)) in selected_files]
+                      if not chosen:
+                          continue
+                      chosen_names = {r.filename for r in chosen}
+                      excluded = [str(Path(r.filename).relative_to(ROOT)) for r in part if r.filename not in chosen_names]
+                      entries.append({'id': f'e{len(entries):03d}', 'suite': suite, 'runner_config': config, 'n_devices': devices, 'partition_id': i, 'partition_size': size, 'partition_policy': policy, 'timeout': limit, 'test_budget_seconds': test_budget, 'worker_minutes': worker_minutes, 'job_minutes': job_minutes, 'files': [str(Path(r.filename).relative_to(ROOT)) for r in chosen], 'excluded_files': excluded})
               require(0 < len(entries) <= 256, 'Matrix exceeds 256 entries; select one scope or fewer suites')
               sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
               plan = {'schema_version': 1, 'sha': sha, 'workflow_sha': os.environ['WORKFLOW_SHA'], 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'scope': scope, 'parallel': parallel, 'hardware': hardware, 'partition_model': partition_model, 'partition_model_sha': partition_model_sha, 'entries': entries, 'disabled': disabled}
@@ -276,7 +289,7 @@ jobs:
           def plan_command():
               require(os.environ['SCOPE'] in STAGES, 'Unknown scope')
               model, model_sha = resolve_partition_model()
-              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), partition_model=model, partition_model_sha=model_sha)
+              plan = make_plan(os.environ['SCOPE'], os.environ.get('SUITES', ''), int(os.environ['FILE_TIMEOUT']), int(os.environ['PARALLEL']), read(BUNDLE / 'hardware.json'), files=os.environ.get('FILES', ''), partition_model=model, partition_model_sha=model_sha)
               save(BUNDLE / 'plan.json', plan)
               output('sha', plan['sha'])
               output('parallel', plan['parallel'])
@@ -495,7 +508,7 @@ jobs:
               command = [sys.executable, 'test/run_suite.py', '--hw', 'cuda', '--suite', entry['suite'], '--pytest', '--junit-dir', str(directory / 'pytest'), '--continue-on-error', '--timeout-per-file', str(entry['timeout']), '--suite-timeout', str(entry['test_budget_seconds'])]
               if entry['partition_policy'] == 'cuda':
                   command += ['--auto-partition-id', str(entry['partition_id']), '--auto-partition-size', str(entry['partition_size']), '--partition-model-file', str(BUNDLE / 'partition-model.json')]
-              for filename in blocked:
+              for filename in [*entry.get('excluded_files', []), *blocked]:
                   command += ['--exclude-file', filename]
               return command
 
@@ -971,7 +984,7 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'files', 'max_parallel', 'timeout_per_file'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
@@ -1040,6 +1053,16 @@ jobs:
                       self.assertEqual({e['suite'] for e in selected['entries']}, {'base-a-test-1-gpu-small'})
                       kernel = make_plan('base', 'base-b-kernel-unit-test-1-gpu-b200', 600, 1, hardware)
                       self.assertEqual({e['suite'] for e in kernel['entries']}, {'base-b-kernel-unit-test-1-gpu-b200'})
+                      target = 'test/registered/gb300/test_deepseek_v4_pro_fp4_balanced.py'
+                      isolated = make_plan('nightly', 'nightly-test-4-gpu-gb300', 3600, 1, hardware, files=target)
+                      self.assertEqual(len(isolated['entries']), 1)
+                      self.assertEqual(isolated['entries'][0]['files'], [target])
+                      self.assertEqual(isolated['entries'][0]['n_devices'], 8)
+                      command = worker_command(isolated['entries'][0], self.directory)
+                      self.assertEqual(command.count('--exclude-file'), len(isolated['entries'][0]['excluded_files']))
+                      self.assertNotIn(target, isolated['entries'][0]['excluded_files'])
+                      with self.assertRaisesRegex(ValueError, 'Invalid registered file selection'):
+                          make_plan('nightly', 'nightly-test-4-gpu-gb300', 3600, 1, hardware, files='../outside.py')
                       synthetic = [module.CIRegistry(module.HWBackend.CUDA, str(ROOT / f'test/registered/zero{i}.py'), 0, stage='base-a', runner_config='1-gpu-small') for i in range(20)]
                       with patch.dict(globals(), registry=lambda: (module, synthetic)):
                           zero = make_plan('base', '', 600, 1, hardware)
@@ -1117,7 +1140,7 @@ jobs:
                       with self.assertRaisesRegex(ValueError, 'selected scope'):
                           make_plan('base', extra, 0, 2, hardware)
                       save(self.directory / 'hardware.json', hardware)
-                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2'}
+                      inputs = {'SCOPE': 'all', 'SUITES': '', 'FILES': '', 'FILE_TIMEOUT': '0', 'PARALLEL': '2'}
                       outputs = {}
                       with patch.dict(globals(), BUNDLE=self.directory, resolve_partition_model=lambda: (None, ''), output=lambda k, v: outputs.update({k: v})), patch.dict(os.environ, inputs):
                           with self.assertRaisesRegex(ValueError, 'Unknown scope'):
@@ -1304,6 +1327,7 @@ jobs:
         env:
           SCOPE: ${{ inputs.scope }}
           SUITES: ${{ inputs.suites }}
+          FILES: ${{ inputs.files }}
           FILE_TIMEOUT: ${{ inputs.timeout_per_file }}
           PARALLEL: ${{ inputs.max_parallel }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}

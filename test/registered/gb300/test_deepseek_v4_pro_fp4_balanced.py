@@ -16,7 +16,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 BALANCED_ARGS = [
     "--trust-remote-code",
     "--dp",
-    "4",
+    "8",
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
@@ -53,7 +53,7 @@ class TestDeepSeekV4ProFp4Balanced(CustomTestCase):
             models=[
                 ModelLaunchSettings(
                     MODEL_PATH,
-                    tp_size=4,
+                    tp_size=8,
                     extra_args=BALANCED_ARGS,
                     env=BALANCED_ENV,
                     variant="balanced",
