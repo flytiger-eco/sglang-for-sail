@@ -283,14 +283,17 @@ class QwenSparseAttnBackend(AttentionBackend):
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
         cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
         k_scale, v_scale = self._kv_descales(layer, cache_dtype)
-        if k_scale == 1.0 and v_scale == 1.0:
+        if not is_fp8_kv_dtype(cache_dtype):
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
             return
-        # The pool divides in-place before casting. The first prefill chunk
-        # still consumes the original BF16 tensors after this cache write.
-        self.token_to_kv_pool.set_kv_buffer(
-            layer, loc, k.clone(), v.clone(), k_scale, v_scale
-        )
+        # Explicitly saturate before the fp8 cast. PyTorch's e4m3fn cast can
+        # produce NaN for values beyond the finite range instead of clamping.
+        # Keep the caller's BF16 tensors intact because the first prefill chunk
+        # still consumes them after this cache write.
+        fp8_max = torch.finfo(cache_dtype).max
+        cache_k = k.clone().div_(k_scale).clamp_(min=-fp8_max, max=fp8_max)
+        cache_v = v.clone().div_(v_scale).clamp_(min=-fp8_max, max=fp8_max)
+        self.token_to_kv_pool.set_kv_buffer(layer, loc, cache_k, cache_v)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:

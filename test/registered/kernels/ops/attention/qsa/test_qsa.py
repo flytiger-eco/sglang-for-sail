@@ -99,6 +99,63 @@ def test_qsa_chunk_prefill_accepts_fp8_cached_prefix():
 
 
 @pytest.mark.parametrize(
+    ("fp8_dtype", "fp8_max"),
+    [
+        (torch.float8_e4m3fn, 448.0),
+        (torch.float8_e4m3fnuz, 240.0),
+    ],
+)
+def test_qsa_fp8_kv_store_clamps_before_cast(fp8_dtype, fp8_max):
+    captured = {}
+
+    class _Pool:
+        dtype = fp8_dtype
+
+        def set_kv_buffer(self, layer, loc, k, v):
+            captured["k"] = k
+            captured["v"] = v
+
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = _Pool()
+    layer = SimpleNamespace(k_scale_float=0.01, v_scale_float=0.02)
+    k = torch.tensor([-10.0, 0.0, 10.0], dtype=torch.bfloat16)
+    v = torch.tensor([-20.0, 0.0, 20.0], dtype=torch.bfloat16)
+
+    backend._store_kv(layer, torch.tensor([0]), k, v)
+
+    torch.testing.assert_close(
+        captured["k"].float(), torch.tensor([-fp8_max, 0.0, fp8_max])
+    )
+    torch.testing.assert_close(
+        captured["v"].float(), torch.tensor([-fp8_max, 0.0, fp8_max])
+    )
+    torch.testing.assert_close(k.float(), torch.tensor([-10.0, 0.0, 10.0]))
+    torch.testing.assert_close(v.float(), torch.tensor([-20.0, 0.0, 20.0]))
+
+
+def test_qsa_non_fp8_kv_store_passes_original_tensors():
+    captured = {}
+
+    class _Pool:
+        dtype = torch.bfloat16
+
+        def set_kv_buffer(self, layer, loc, k, v):
+            captured["k"] = k
+            captured["v"] = v
+
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = _Pool()
+    layer = SimpleNamespace(k_scale_float=0.01, v_scale_float=0.02)
+    k = torch.tensor([-10.0, 10.0], dtype=torch.bfloat16)
+    v = torch.tensor([-20.0, 20.0], dtype=torch.bfloat16)
+
+    backend._store_kv(layer, torch.tensor([0]), k, v)
+
+    assert captured["k"] is k
+    assert captured["v"] is v
+
+
+@pytest.mark.parametrize(
     ("capability", "expected"),
     [((12, 0), True), ((12, 1), False), ((10, 0), False)],
 )
