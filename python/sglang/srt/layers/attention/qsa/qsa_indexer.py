@@ -157,6 +157,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        rope_max_position: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -175,9 +176,11 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                # The backend resolves the bound once per forward; reading it
+                # off the device here would sync every QSA layer.
+                if rope_max_position is None:
+                    rope_max_position = int(positions.max().item())
+                self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -460,11 +463,15 @@ class QSAIndexer(MultiPlatformOp):
                 )
                 logits = None
             else:
+                # Only the selected block ids leave this loop, and the top-k
+                # reads each row's [start, end) span alone, so the scorer can
+                # skip its fill/scale/mask passes over the FP32 logits.
                 logits = qsa_mqa_prefill(
                     q[chunk_slice],
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
+                    rank_only=True,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -597,6 +604,7 @@ class QSAIndexer(MultiPlatformOp):
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
+            rope_max_position=indexer_metadata.rope_max_position,
         )
         self.update_key_state_and_compress(
             token_k,
@@ -620,12 +628,8 @@ class QSAIndexer(MultiPlatformOp):
                 indexer_metadata.get_seqlens_int32(),
             )
 
-        compressed_keys, row_starts, row_ends, sequence_lengths = (
+        compressed_keys, row_starts, row_ends, row_sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
-        )
-        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-        row_sequence_lengths = sequence_lengths.index_select(
-            0, query_sequence_ids.long()
         )
         return self.select_prefill_tokens(
             q,

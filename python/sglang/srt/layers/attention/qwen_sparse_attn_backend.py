@@ -26,8 +26,10 @@ from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.kv_cache import get_qsa_kv_scales
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
+    QSAPrefillMQAPlan,
     build_group_ring_slots,
     build_pending_ring_slots,
+    build_qsa_prefill_mqa_plan,
     build_rope_position_matrix,
     compressed_decode_view,
 )
@@ -104,6 +106,35 @@ def _resolve_flash_attn_varlen_func():
         ) from exc
 
 
+class QSAExtendAttnInputs(msgspec.Struct, frozen=True):
+    """Chunk-prefill launch inputs shared by every QSA layer of a forward.
+
+    ``lengths_key`` holds the host-side (extend, sequence) lengths they were
+    built from; a layer only reuses them when its batch reports the same.
+    """
+
+    lengths_key: Tuple[Tuple[int, ...], Tuple[int, ...]]
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    kv_lens: torch.Tensor
+    max_q: int
+
+
+def _build_extend_attn_inputs(
+    *, extend_lens, sequence_lens, extend_seq_lens, device
+) -> QSAExtendAttnInputs:
+    kv_lens = torch.tensor(sequence_lens, dtype=torch.int32, device=device)
+    return QSAExtendAttnInputs(
+        lengths_key=(tuple(extend_lens), tuple(sequence_lens)),
+        cu_seqlens_q=F.pad(
+            extend_seq_lens.to(device, dtype=torch.int32).cumsum(0), (1, 0)
+        ).contiguous(),
+        cu_seqlens_k=F.pad(kv_lens.cumsum(0), (1, 0)).contiguous(),
+        kv_lens=kv_lens,
+        max_q=max(extend_lens, default=0),
+    )
+
+
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     """Per-forward metadata consumed by core sparse attention."""
 
@@ -116,6 +147,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    extend_attn_inputs: Optional[QSAExtendAttnInputs] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -676,6 +708,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         pending_ring_slots = None
         compress_group_ring_locs = None
         extend_rope_matrix = None
+        prefill_mqa_plan = None
         write_locs, group_positions, group_sequence_ids, group_member_rows = (
             self._qsa_build_write_plan(
                 forward_batch=forward_batch,
@@ -716,6 +749,14 @@ class QwenSparseAttnBackend(AttentionBackend):
                 compress_ratio=self.compress_ratio,
                 is_extend=group_member_rows is not None,
             )
+            if not decode_like:
+                prefill_mqa_plan = self._prefill_mqa_plan(
+                    forward_batch=forward_batch,
+                    sequence_lengths=sequence_lengths,
+                    token_slot_table=token_slot_table,
+                    query_positions=ring_logical_positions,
+                    token_to_batch_idx=token_to_batch_idx,
+                )
             if write_locs.numel():
                 if group_member_rows is not None:
                     rope_source = (
@@ -752,6 +793,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            prefill_mqa_plan=prefill_mqa_plan,
+            rope_max_position=self._rope_max_position(
+                forward_batch, speculative_paged=speculative_paged
+            ),
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -759,6 +804,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
             row_req_pool_indices=row_req_pool_indices,
+            extend_attn_inputs=(
+                None
+                if speculative_paged or forward_batch.forward_mode.is_decode()
+                else self._extend_attn_inputs_from_batch(forward_batch)
+            ),
         )
 
     def init_forward_metadata(self, forward_batch):
@@ -766,6 +816,92 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.forward_metadata = None
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+
+    def _prefill_mqa_plan(
+        self,
+        *,
+        forward_batch,
+        sequence_lengths,
+        token_slot_table,
+        query_positions,
+        token_to_batch_idx,
+    ) -> Optional[QSAPrefillMQAPlan]:
+        """Indexer scoring inputs shared by every QSA layer of this forward.
+
+        Built from the host-side lengths, so neither this nor the layers that
+        read it sync on ``sequence_lengths``.
+        """
+        if forward_batch.seq_lens_cpu is None:
+            return None
+        batch_size = sequence_lengths.numel()
+        return build_qsa_prefill_mqa_plan(
+            sequence_lengths=sequence_lengths,
+            sequence_lengths_cpu=[
+                int(x) for x in forward_batch.seq_lens_cpu[:batch_size]
+            ],
+            token_slot_table=token_slot_table,
+            query_positions=query_positions,
+            query_sequence_ids=token_to_batch_idx,
+            compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
+        )
+
+    @staticmethod
+    def _rope_max_position(forward_batch, *, speculative_paged: bool) -> int:
+        """Largest RoPE coordinate of this forward, resolved once per forward.
+
+        Plain extend/decode text positions run up to ``seq_len - 1``, known on
+        the host. MRoPE and speculative coordinates are not, so read them off
+        the device here once instead of once per QSA layer.
+        """
+        text_positions = (
+            forward_batch.mrope_positions is None
+            and not speculative_paged
+            and forward_batch.seq_lens_cpu is not None
+            and forward_batch.forward_mode
+            in (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.DECODE)
+        )
+        if text_positions:
+            return int(forward_batch.seq_lens_cpu.max()) - 1
+        source = (
+            forward_batch.mrope_positions
+            if forward_batch.mrope_positions is not None
+            else forward_batch.positions
+        )
+        return int(source.max().item()) if source.numel() else 0
+
+    @staticmethod
+    def _extend_attn_inputs_from_batch(forward_batch) -> Optional[QSAExtendAttnInputs]:
+        if (
+            forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.extend_seq_lens is None
+        ):
+            return None
+        return _build_extend_attn_inputs(
+            extend_lens=[int(x) for x in forward_batch.extend_seq_lens_cpu],
+            sequence_lens=[int(x) for x in forward_batch.seq_lens_cpu],
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            device=forward_batch.seq_lens.device,
+        )
+
+    def _extend_attn_inputs(
+        self, forward_batch, extend_lens, sequence_lens, device
+    ) -> QSAExtendAttnInputs:
+        """Reuse this forward's launch inputs; rebuild if the lengths differ."""
+        metadata = self.forward_metadata
+        if (
+            metadata is not None
+            and metadata.extend_attn_inputs is not None
+            and metadata.extend_attn_inputs.lengths_key
+            == (tuple(extend_lens), tuple(sequence_lens))
+        ):
+            return metadata.extend_attn_inputs
+        return _build_extend_attn_inputs(
+            extend_lens=extend_lens,
+            sequence_lens=sequence_lens,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            device=device,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -1357,10 +1493,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         prefix_lens = [
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
-        cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-            (1, 0),
-        ).contiguous()
+        attn_inputs = self._extend_attn_inputs(
+            forward_batch, extend_lens, sequence_lens, q.device
+        )
+        cu_seqlens_q = attn_inputs.cu_seqlens_q
         if not any(prefix_lens):
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
@@ -1380,10 +1516,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         v_buffer = pool.get_value_buffer(layer.layer_id)
         k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
         req_to_token = self.req_to_token_pool.req_to_token
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        sequence_lens_tensor = attn_inputs.kv_lens
+        cu_seqlens_k = attn_inputs.cu_seqlens_k
         packed_kv = None
         if k_buffer.dtype == torch.float8_e4m3fn:
             # Some component callers construct the backend without a runner.
@@ -1426,26 +1560,34 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
                 k_scale=1.0,
                 v_scale=1.0,
+                max_q=attn_inputs.max_q,
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
+        # Fused gather in the storage dtype (upstream #41933, minus its BF16
+        # widening): no per-request index_select/cat or req_pool_indices D2H
+        # sync, half the traffic for FP8 pools, and FP8 K/V stay eligible for
+        # the FP8 chunk pipeline. Unit scales keep the copy exact; the kernel
+        # still applies the per-layer descales.
+        total_k = sum(sequence_lens)
+        packed_k = torch.empty(
+            (total_k, *k_buffer.shape[1:]), dtype=k_buffer.dtype, device=q.device
+        )
+        packed_v = torch.empty_like(packed_k)
+        gather_dequantize_prefill_kv(
+            k_buffer,
+            v_buffer,
+            req_to_token,
+            forward_batch.req_pool_indices[: len(sequence_lens)].contiguous(),
+            cu_seqlens_k,
+            max(sequence_lens),
+            packed_k,
+            packed_v,
+        )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1453,6 +1595,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             layer.scaling,
             k_scale=k_scale,
             v_scale=v_scale,
+            max_q=attn_inputs.max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
 
