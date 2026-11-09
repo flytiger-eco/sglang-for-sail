@@ -41,6 +41,82 @@ from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
 )
 
 
+def _run_w4a8_sm_pair(
+    gateup_input,
+    c2,
+    w1_q,
+    w2_q,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a2_scale,
+    expert_offsets,
+    problem_sizes1,
+    problem_sizes2,
+    a_strides1,
+    b_strides1,
+    a_strides2,
+    b_strides2,
+    c_strides2,
+    s_strides13,
+    s_strides2,
+    sm_gate_scales_k512,
+    sm_local_rows_hint,
+):
+    """Run prepared Ours weights; all layout conversion happens at load time."""
+    from sgl_kernel.w4a8_sm import (
+        cutlass_w4a8_sm_moe_mm,
+        cutlass_w4a8_sm_moe_mm_swiglu,
+        select_w4a8_sm_config,
+    )
+
+    if a1_scale is None or a2_scale is None:
+        raise ValueError("Ours W4A8 requires static activation scales")
+    experts = w1_q.shape[0]
+    rows = gateup_input.numel() // gateup_input.shape[-1]
+    if sm_local_rows_hint is not None:
+        rows = sm_local_rows_hint
+    gate_config, alignment = select_w4a8_sm_config("gate_up", rows, experts)
+    down_config, _ = select_w4a8_sm_config("down", rows, experts)
+    scales = sm_gate_scales_k512 if alignment == 4 else w1_scale
+    if scales is None:
+        raise ValueError("Ours gate-up K=512 tile requires load-time scale packing")
+    intermediate_q = torch.empty(
+        (*gateup_input.shape[:-1], w2_q.shape[-1] * 2),
+        device=gateup_input.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    cutlass_w4a8_sm_moe_mm_swiglu(
+        intermediate_q,
+        gateup_input,
+        w1_q,
+        a1_scale,
+        scales,
+        a2_scale,
+        expert_offsets[:-1],
+        problem_sizes1,
+        a_strides1,
+        b_strides1,
+        a_strides2,
+        s_strides13,
+        config_id=gate_config,
+    )
+    cutlass_w4a8_sm_moe_mm(
+        c2,
+        intermediate_q,
+        w2_q,
+        a2_scale,
+        w2_scale,
+        expert_offsets[:-1],
+        problem_sizes2,
+        a_strides2,
+        b_strides2,
+        c_strides2,
+        s_strides2,
+        config_id=down_config,
+    )
+
+
 def cutlass_w4a8_moe(
     a: torch.Tensor,
     w1_q: torch.Tensor,
@@ -64,6 +140,10 @@ def cutlass_w4a8_moe(
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
     routed_scaling_factor: float = 1.0,
+    *,
+    use_sm: bool = False,
+    sm_gate_scales_k512: Optional[torch.Tensor] = None,
+    sm_local_rows_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -130,6 +210,9 @@ def cutlass_w4a8_moe(
     device = a.device
     if get_parallel().moe_ep_size > 1:
         topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    # The C++ metadata kernel reads int32 pointers. Standard routers can return
+    # int64 ids; passing them through counts the upper 32 bits as expert zero.
+    topk_ids = topk_ids.to(torch.int32).contiguous()
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
@@ -175,54 +258,79 @@ def cutlass_w4a8_moe(
         k,
     )
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.bfloat16)
 
-    cutlass_w4a8_moe_mm(
-        c1,
-        gateup_input,
-        w1_q,
-        a1_scale.float(),
-        w1_scale,
-        expert_offsets[:-1],
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides13,
-        128,
-        topk,
-    )
-
-    intermediate_q = torch.empty(
-        (m * topk, n), dtype=torch.float8_e4m3fn, device=device
-    )
-
-    if a2_scale is None:
-        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
-            c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+    if use_sm:
+        _run_w4a8_sm_pair(
+            gateup_input,
+            c2,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_strides1,
+            b_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            sm_gate_scales_k512,
+            sm_local_rows_hint,
         )
     else:
-        silu_mul_static_tensorwise_quant_for_cutlass_moe(
-            c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
+
+        cutlass_w4a8_moe_mm(
+            c1,
+            gateup_input,
+            w1_q,
+            a1_scale.float(),
+            w1_scale,
+            expert_offsets[:-1],
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides13,
+            128,
+            topk,
         )
 
-    cutlass_w4a8_moe_mm(
-        c2,
-        intermediate_q,
-        w2_q,
-        a2_scale.float(),
-        w2_scale,
-        expert_offsets[:-1],
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
-        128,
-        topk,
-    )
+        intermediate_q = torch.empty(
+            (m * topk, n), dtype=torch.float8_e4m3fn, device=device
+        )
+
+        if a2_scale is None:
+            a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+            silu_mul_dynamic_tensorwise_quant_for_cutlass_moe(
+                c1, intermediate_q, a2_scale, expert_offsets[-1:], m * topk, n
+            )
+        else:
+            silu_mul_static_tensorwise_quant_for_cutlass_moe(
+                c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+            )
+
+        cutlass_w4a8_moe_mm(
+            c2,
+            intermediate_q,
+            w2_q,
+            a2_scale.float(),
+            w2_scale,
+            expert_offsets[:-1],
+            problem_sizes2,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides2,
+            128,
+            topk,
+        )
 
     output = torch.empty_like(a)
 
@@ -262,6 +370,10 @@ def cutlass_w4a8_moe_deepep_normal(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    *,
+    use_sm: bool = False,
+    sm_gate_scales_k512: Optional[torch.Tensor] = None,
+    sm_local_rows_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -328,11 +440,22 @@ def cutlass_w4a8_moe_deepep_normal(
     topk = topk_ids_.size(1)
     device = a.device
 
-    reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
-        topk_ids_, num_experts
+    local_topk_ids = (
+        torch.where(topk_ids_ == -1, num_experts, topk_ids_)
+        .to(torch.int32)
+        .contiguous()
     )
-    num_total_tokens = reorder_topk_ids.numel()
-    gateup_input_pre_reorder = torch.empty(
+    if use_sm:
+        # Keep a fixed buffer capacity and place filtered routes at the end.
+        # Slicing by a CUDA count would read it on the host and break graph replay.
+        src2dst = cutlass_w4_run_moe_ep_preproess(local_topk_ids).to(torch.int64)
+        num_total_tokens = topk_ids_.numel()
+    else:
+        reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
+            topk_ids_, num_experts
+        )
+        num_total_tokens = reorder_topk_ids.numel()
+    gateup_input_pre_reorder = (torch.zeros if use_sm else torch.empty)(
         (int(num_total_tokens), a.shape[1]),
         device=device,
         dtype=a.dtype,
@@ -352,10 +475,6 @@ def cutlass_w4a8_moe_deepep_normal(
     )
     per_tensor_quant_fp8(gateup_input_pre_reorder, gateup_input, a1_scale.float(), True)
     del gateup_input_pre_reorder
-    local_topk_ids = topk_ids_
-    local_topk_ids = (
-        torch.where(local_topk_ids == -1, num_experts, topk_ids_).to(torch.int32)
-    ).contiguous()
 
     a_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
     c_map = torch.empty((local_topk_ids.numel()), dtype=torch.int32, device=device)
@@ -370,47 +489,72 @@ def cutlass_w4a8_moe_deepep_normal(
         n,
         k,
     )
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.zeros((m * topk, k), device=device, dtype=torch.bfloat16)
 
-    cutlass_w4a8_moe_mm(
-        c1,
-        gateup_input,
-        w1_q,
-        a1_scale.float(),
-        w1_scale,
-        expert_offsets[:-1],
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides13,
-        128,
-        topk,
-    )
-    intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
-    silu_and_mul(c1, intermediate)
+    if use_sm:
+        _run_w4a8_sm_pair(
+            gateup_input,
+            c2,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_strides1,
+            b_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            sm_gate_scales_k512,
+            sm_local_rows_hint,
+        )
+    else:
+        c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.bfloat16)
 
-    intermediate_q = torch.empty(
-        intermediate.shape, dtype=torch.float8_e4m3fn, device=device
-    )
-    per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+        cutlass_w4a8_moe_mm(
+            c1,
+            gateup_input,
+            w1_q,
+            a1_scale.float(),
+            w1_scale,
+            expert_offsets[:-1],
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides13,
+            128,
+            topk,
+        )
+        intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
+        silu_and_mul(c1, intermediate)
 
-    cutlass_w4a8_moe_mm(
-        c2,
-        intermediate_q,
-        w2_q,
-        a2_scale.float(),
-        w2_scale,
-        expert_offsets[:-1],
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
-        128,
-        topk,
-    )
+        intermediate_q = torch.empty(
+            intermediate.shape, dtype=torch.float8_e4m3fn, device=device
+        )
+        per_tensor_quant_fp8(intermediate, intermediate_q, a2_scale.float(), True)
+
+        cutlass_w4a8_moe_mm(
+            c2,
+            intermediate_q,
+            w2_q,
+            a2_scale.float(),
+            w2_scale,
+            expert_offsets[:-1],
+            problem_sizes2,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides2,
+            128,
+            topk,
+        )
     num_tokens = src2dst.shape[0] // topk
     output = torch.empty(
         (num_tokens, c2.shape[1]),
@@ -457,6 +601,10 @@ def cutlass_w4a8_moe_deepep_ll(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     expected_m: Optional[int] = None,
+    *,
+    use_sm: bool = False,
+    sm_gate_scales_k512: Optional[torch.Tensor] = None,
+    sm_local_rows_hint: Optional[int] = None,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -537,45 +685,70 @@ def cutlass_w4a8_moe_deepep_ll(
         output=gateup_input,
         expected_rows=expected_m,
     )
-    c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
-    cutlass_w4a8_moe_mm(
-        c1,
-        gateup_input,
-        w1_q,
-        a1_scale.float(),
-        w1_scale,
-        expert_offsets[:-1],
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides13,
-        128,
-        topk,
-    )
+    if use_sm:
+        _run_w4a8_sm_pair(
+            gateup_input,
+            c2,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a_strides1,
+            b_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            sm_gate_scales_k512,
+            sm_local_rows_hint,
+        )
+    else:
+        c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
 
-    intermediate_q = torch.empty(
-        (num_experts, m, n), device=a_states.device, dtype=torch.float8_e4m3fn
-    )
-    silu_and_mul_masked_post_per_tensor_quant_fwd(
-        c1, intermediate_q, masked_m, a2_scale
-    )
-    cutlass_w4a8_moe_mm(
-        c2,
-        intermediate_q,
-        w2_q,
-        a2_scale.float(),
-        w2_scale,
-        expert_offsets[:-1],
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
-        128,
-        topk,
-    )
+        cutlass_w4a8_moe_mm(
+            c1,
+            gateup_input,
+            w1_q,
+            a1_scale.float(),
+            w1_scale,
+            expert_offsets[:-1],
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides13,
+            128,
+            topk,
+        )
+
+        intermediate_q = torch.empty(
+            (num_experts, m, n), device=a_states.device, dtype=torch.float8_e4m3fn
+        )
+        silu_and_mul_masked_post_per_tensor_quant_fwd(
+            c1, intermediate_q, masked_m, a2_scale
+        )
+        cutlass_w4a8_moe_mm(
+            c2,
+            intermediate_q,
+            w2_q,
+            a2_scale.float(),
+            w2_scale,
+            expert_offsets[:-1],
+            problem_sizes2,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides2,
+            128,
+            topk,
+        )
 
     return c2

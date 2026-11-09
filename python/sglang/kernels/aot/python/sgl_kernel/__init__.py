@@ -113,6 +113,11 @@ else:
         rotate_input_ids_cpu,
         verify_tree_greedy_cpu,
     )
+    from sgl_kernel.w4a8_sm import (
+        cutlass_w4a8_sm_moe_mm,
+        cutlass_w4a8_sm_moe_mm_swiglu,
+        prepare_w4a8_sm_weight,
+    )
 
     # CUDA and ROCm route these through sglang.kernels.ops.speculative (JIT).
     if torch.version.cuda is None:

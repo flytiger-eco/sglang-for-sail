@@ -1056,8 +1056,11 @@ class Envs:
     SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
     # ===================================================================
-    # Humming quantization
+    # W4AFP8 and Humming quantization
     # ===================================================================
+    # auto selects the Qwen38 Hopper kernel for compatible W4AFP8 checkpoints.
+    SGLANG_W4AFP8_MOE_BACKEND = EnvStr("auto")
+
     SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
     SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
