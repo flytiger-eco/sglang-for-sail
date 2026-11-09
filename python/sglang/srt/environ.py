@@ -316,6 +316,9 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Opt-in packed BF16/FP16 workspace for cached QSA prefill with FP8 KV.
+    # MiB per backend, shared across layers; 0 retains tile-local widening.
+    SGLANG_QSA_FP8_PREFILL_WORKSPACE_MB = EnvInt(0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

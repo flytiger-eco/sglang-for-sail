@@ -274,6 +274,8 @@ def qsa_sparse_attention(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Torch reference for sparse GQA over physical token slots."""
 
@@ -289,7 +291,7 @@ def qsa_sparse_attention(
     if q.shape[1] % k_cache.shape[1] != 0:
         raise ValueError("query heads must be divisible by KV heads")
     return qsa_sparse_attention_reference(
-        q, k_cache, v_cache, token_slots, softmax_scale
+        q, k_cache, v_cache, token_slots, softmax_scale, k_scale, v_scale
     )
 
 
@@ -299,10 +301,15 @@ def qsa_sparse_attention_reference(
     v_cache: torch.Tensor,
     token_slots: torch.Tensor,
     softmax_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Device-agnostic sparse GQA reference."""
 
+    from sglang.srt.layers.attention.qsa.sparse_attn import _unit_scale
+
     scale = softmax_scale or q.shape[-1] ** -0.5
+    k_scale, v_scale = _unit_scale(k_scale), _unit_scale(v_scale)
     outputs = []
     repeats = q.shape[1] // k_cache.shape[1]
     for row in range(q.shape[0]):
@@ -311,13 +318,17 @@ def qsa_sparse_attention_reference(
         if slots.numel() == 0:
             outputs.append(torch.zeros_like(q[row]))
             continue
-        keys = k_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
-        values = v_cache.index_select(0, slots).repeat_interleave(repeats, dim=1)
-        scores = torch.einsum("hd,khd->hk", q[row].float(), keys.float()) * scale
-        probabilities = torch.softmax(scores, dim=-1)
-        outputs.append(
-            torch.einsum("hk,khd->hd", probabilities, values.float()).to(q.dtype)
+        keys = (
+            k_cache.index_select(0, slots).float().repeat_interleave(repeats, dim=1)
+            * k_scale
         )
+        values = (
+            v_cache.index_select(0, slots).float().repeat_interleave(repeats, dim=1)
+            * v_scale
+        )
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * scale
+        probabilities = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hk,khd->hd", probabilities, values).to(q.dtype))
     return torch.stack(outputs)
 
 

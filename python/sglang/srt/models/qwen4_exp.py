@@ -1920,6 +1920,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_buffers.add(name)
         return True
 
+    @torch.no_grad()
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        from sglang.srt.layers.attention.qsa.kv_cache import load_qsa_kv_scales
+
+        load_qsa_kv_scales(
+            self,
+            quantization_param_path,
+            tp_rank=get_parallel().attn_tp_rank,
+            tp_size=get_parallel().attn_tp_size,
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),

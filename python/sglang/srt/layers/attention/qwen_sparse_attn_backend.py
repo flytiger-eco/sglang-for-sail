@@ -16,12 +16,14 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.layers.attention.qsa.kv_cache import get_qsa_kv_scales
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
@@ -29,7 +31,13 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
     compressed_decode_view,
 )
+from sglang.srt.layers.attention.qsa.prefill_workspace import (
+    QsaPrefillWorkspace,
+    gather_dequantize_prefill_kv,
+)
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    _unit_scale,
+    is_fp8_kv_dtype,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -179,6 +187,13 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+        model = getattr(runner, "model", None)
+        if model is not None and self.token_to_kv_pool is not None:
+            # Scales are loaded before backend/graph construction. Keep the
+            # effective values on each main/draft pool for PD registration.
+            scales = get_qsa_kv_scales(model)
+            if scales:
+                self.token_to_kv_pool.qsa_kv_scales = scales
         self.device = getattr(runner, "device", None)
         model_config = getattr(runner, "model_config", None)
         config = getattr(model_config, "hf_text_config", None)
@@ -218,8 +233,32 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
+        self._prefill_workspace = QsaPrefillWorkspace(
+            envs.SGLANG_QSA_FP8_PREFILL_WORKSPACE_MB.get() * 1024 * 1024
+        )
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    @staticmethod
+    def _kv_descales(layer, kv_dtype: torch.dtype) -> Tuple[float, float]:
+        if not is_fp8_kv_dtype(kv_dtype):
+            return 1.0, 1.0
+        return (
+            _unit_scale(getattr(layer, "k_scale_float", None)),
+            _unit_scale(getattr(layer, "v_scale_float", None)),
+        )
+
+    def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
+        cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
+        k_scale, v_scale = self._kv_descales(layer, cache_dtype)
+        if k_scale == 1.0 and v_scale == 1.0:
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        # The pool divides in-place before casting. The first prefill chunk
+        # still consumes the original BF16 tensors after this cache write.
+        self.token_to_kv_pool.set_kv_buffer(
+            layer, loc, k.clone(), v.clone(), k_scale, v_scale
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1274,9 +1313,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1297,12 +1334,20 @@ class QwenSparseAttnBackend(AttentionBackend):
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
+            k_scale, v_scale = self._kv_descales(
+                layer, pool.get_key_buffer(layer.layer_id).dtype
+            )
             output = qsa_sparse_attention(
                 q,
                 pool.get_key_buffer(layer.layer_id),
                 pool.get_value_buffer(layer.layer_id),
                 slots,
                 layer.scaling,
+                **(
+                    {"k_scale": k_scale, "v_scale": v_scale}
+                    if is_fp8_kv_dtype(pool.get_key_buffer(layer.layer_id).dtype)
+                    else {}
+                ),
             )
             return self._pad_extend_output(output, num_output_rows)
 
@@ -1333,7 +1378,57 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
         req_to_token = self.req_to_token_pool.req_to_token
+        sequence_lens_tensor = torch.tensor(
+            sequence_lens, dtype=torch.int32, device=q.device
+        )
+        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        packed_kv = None
+        if k_buffer.dtype == torch.float8_e4m3fn:
+            # Some component callers construct the backend without a runner.
+            if not hasattr(self, "_prefill_workspace"):
+                self._prefill_workspace = QsaPrefillWorkspace(
+                    envs.SGLANG_QSA_FP8_PREFILL_WORKSPACE_MB.get() * 1024 * 1024
+                )
+            if self._prefill_workspace.max_bytes:
+                packed_kv = self._prefill_workspace.acquire(
+                    sum(sequence_lens),
+                    k_buffer.shape[1],
+                    k_buffer.shape[2],
+                    q.dtype,
+                    q.device,
+                    stream=torch.cuda.current_stream(q.device).cuda_stream,
+                )
+        if packed_kv is not None:
+            packed_k, packed_v = packed_kv
+            gather_dequantize_prefill_kv(
+                k_buffer,
+                v_buffer,
+                req_to_token,
+                forward_batch.req_pool_indices[: len(sequence_lens)].contiguous(),
+                cu_seqlens_k,
+                max(sequence_lens),
+                packed_k,
+                packed_v,
+                k_scale,
+                v_scale,
+            )
+            # The packed values already contain the per-layer descales.
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                packed_k,
+                packed_v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                sequence_lens_tensor,
+                layer.scaling,
+                k_scale=1.0,
+                v_scale=1.0,
+            )
+            return self._pad_extend_output(output, num_output_rows)
+
         req_indices = forward_batch.req_pool_indices.tolist()
         k_parts = [
             k_buffer.index_select(
@@ -1347,10 +1442,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             for i in range(len(sequence_lens))
         ]
-        sequence_lens_tensor = torch.tensor(
-            sequence_lens, dtype=torch.int32, device=q.device
-        )
-        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
             torch.cat(k_parts),
@@ -1360,6 +1451,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_seqlens_k,
             sequence_lens_tensor,
             layer.scaling,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
         return self._pad_extend_output(output, num_output_rows)
 
@@ -1486,6 +1579,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
             )
+        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
         output = trtllm_decode(
             query=q.contiguous(),
             kv_cache=(kc, vc),
@@ -1493,8 +1587,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             block_tables=block_tables,
             seq_lens=valid_counts,
             max_seq_len=stride,
-            bmm1_scale=layer.scaling,
-            bmm2_scale=1.0,
+            bmm1_scale=layer.scaling * k_scale,
+            bmm2_scale=v_scale,
         )
         return output.reshape(q.shape[0], -1)
 
@@ -1512,9 +1606,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1528,10 +1620,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
         if not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            output = qsa_sparse_attention(
+                q,
+                k_buffer,
+                v_buffer,
+                slots,
+                layer.scaling,
+                **(
+                    {"k_scale": k_scale, "v_scale": v_scale}
+                    if is_fp8_kv_dtype(k_buffer.dtype)
+                    else {}
+                ),
+            )
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)
@@ -1597,6 +1701,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
         if is_hip():
             relative_indices = torch.arange(
