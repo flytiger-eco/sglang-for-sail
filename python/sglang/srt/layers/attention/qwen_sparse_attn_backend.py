@@ -296,6 +296,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.token_to_kv_pool.set_kv_buffer(layer, loc, cache_k, cache_v)
 
     @staticmethod
+    def _wait_for_qsa_indexer(q: torch.Tensor, stream_handle: int) -> None:
+        indexer_stream = torch.cuda.ExternalStream(stream_handle, device=q.device)
+        torch.cuda.current_stream(q.device).wait_stream(indexer_stream)
+
+    @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
         if forward_mode is None:
             return False
@@ -1447,12 +1452,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         save_kv_cache: bool = True,
         topk_indices: Optional[torch.Tensor] = None,
+        qsa_indexer_stream: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
             self._store_kv(layer, forward_batch.out_cache_loc, k, v)
+        if qsa_indexer_stream is not None:
+            self._wait_for_qsa_indexer(q, qsa_indexer_stream)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1746,12 +1754,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         save_kv_cache: bool = True,
         topk_indices: Optional[torch.Tensor] = None,
+        qsa_indexer_stream: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
             self._store_kv(layer, forward_batch.out_cache_loc, k, v)
+        if qsa_indexer_stream is not None:
+            self._wait_for_qsa_indexer(q, qsa_indexer_stream)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
