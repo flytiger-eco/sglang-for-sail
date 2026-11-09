@@ -1,5 +1,7 @@
 """V1 runtime top-k: cover top-2048 output, raw mode, and all length paths."""
 
+import sys
+
 import pytest
 import torch
 
@@ -150,3 +152,7 @@ def test_v1_top2048_cuda_graph_replay():
         torch.cuda.synchronize()
         for row, size in enumerate(lens):
             _check_row(scores[row], output[row], size, 2048)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

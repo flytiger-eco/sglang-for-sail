@@ -526,3 +526,7 @@ def test_w4a8_none_uses_fused_or_nopad_without_changing_combine(fused, activatio
     assert quantize.call_args.kwargs["scale_multiplier"] == 2.0
     act.assert_called_once()
     gather.assert_called_once()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
