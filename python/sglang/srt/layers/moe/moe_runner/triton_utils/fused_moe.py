@@ -734,6 +734,16 @@ def _fused_moe_kernel_sequence(
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        if (
+            filter_expert
+            and use_fp8_w8a8
+            and block_shape is None
+            and not per_channel_quant
+        ):
+            # Filtered activations leave nonlocal EP rows untouched. Tensor-wise
+            # FP8 scaling reads every row before the down GEMM filters them, so
+            # stale values here can corrupt the scale for valid local experts.
+            intermediate_cache2.zero_()
 
     # Activation function with multiplication
     if fuse_swiglu_interleaved:
