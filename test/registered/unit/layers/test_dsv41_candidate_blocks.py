@@ -70,6 +70,7 @@ class TestCandidateBlockIds(CustomTestCase):
                 self.assertEqual(id_sets(blocks), [expected, expected])
 
     def test_publish_tile_uses_aligned_view_without_pad(self):
+        """Partial final blocks must not copy the full logits tile and OOM (#244)."""
         rows, lc = 4, 19
         lens = torch.tensor([19, 18, 9, 1], dtype=torch.int32)
         original = torch.randn(rows, 24)
