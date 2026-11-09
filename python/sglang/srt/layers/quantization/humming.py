@@ -494,7 +494,9 @@ class HummingConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "HummingConfig":
-        return cls(full_config=config)
+        result = cls(full_config=config)
+        result.update_packed_modules_mapping(config.get("packed_modules_mapping") or {})
+        return result
 
     def get_scaled_act_names(self) -> List[str]:
         raise NotImplementedError
@@ -675,6 +677,9 @@ class HummingConfig(QuantizationConfig):
             fp8_config.is_fp4_experts = True
             return fp8_config.get_quant_method(layer, prefix)
 
+        if self.full_config.get("quant_method") == "wmxfp4afp8":
+            return self._get_wmxfp4afp8_method(layer, prefix)
+
         quant_config = self.get_quant_config_for_layer(prefix, layer_type)
         if quant_config is None:
             if isinstance(layer, FusedMoE):
@@ -686,6 +691,55 @@ class HummingConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             return HummingMoEMethod(quant_config)
         return None
+
+    def _get_wmxfp4afp8_method(self, layer, prefix):
+        """Load RedSlim MXFP4 experts without requantizing their packed bits."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        config = self.full_config
+        if (
+            config.get("weight_dtype") != "mxfp4"
+            or config.get("group_size") != 32
+            or config.get("activation_dtype") != "fp8_e4m3"
+            or config.get("activation_scheme") != "dynamic"
+        ):
+            raise ValueError("Unsupported wmxfp4afp8 checkpoint schema for Humming")
+
+        if isinstance(layer, FusedMoE):
+            quant_config = HummingLayerQuantizationConfig(
+                weight_schema=HummingWeightSchema(
+                    b_dtype="float4e2m1",
+                    bs_dtype="float8e8m0",
+                    weight_scale_group_size=32,
+                ),
+                input_schema=HummingInputSchema(
+                    a_dtype="float8e4m3",
+                    input_scale_group_size=0,
+                ),
+            )
+            quant_config.is_redslim_mxfp4 = True
+            return HummingMoEMethod(quant_config)
+
+        # Dense projections in this mixed checkpoint remain block-FP8.
+        # Apply the same checkpoint-to-runtime mapping as Qwen4's W4A8 loader.
+        if not hasattr(self, "_wmxfp4afp8_dense_config"):
+            ignored = []
+            for name in config.get("ignore", []):
+                mapped = name.replace("model.language_model.", "model.")
+                ignored.extend([name, mapped, mapped.replace(".self_attn.", ".")])
+            self._wmxfp4afp8_dense_config = Fp8Config.from_config(
+                {
+                    "quant_method": "fp8",
+                    "activation_scheme": "dynamic",
+                    "weight_block_size": config.get("weight_block_size", [128, 128]),
+                    "ignored_layers": list(dict.fromkeys(ignored)),
+                }
+            )
+        self._wmxfp4afp8_dense_config.packed_modules_mapping = (
+            self.packed_modules_mapping
+        )
+        return self._wmxfp4afp8_dense_config.get_quant_method(layer, prefix)
 
 
 class HummingLayerQuantizationConfig(HummingConfig):
@@ -1001,6 +1055,17 @@ class HummingMoEMethod(FusedMoEMethodBase):
             expert_id: int | None = None,
         ):
             name = param.param_name
+            if getattr(self.quant_config, "is_redslim_mxfp4", False):
+                if name not in ("weight", "weight_scale"):
+                    raise ValueError(f"Unexpected MXFP4 tensor {weight_name}")
+                if loaded_weight.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Expected native uint8 MXFP4 {weight_name}, "
+                        f"got {loaded_weight.dtype}"
+                    )
+                # Reinterpret E2M1 nibbles / E8M0 exponent bytes, never cast them.
+                dtype = torch.int32 if name == "weight" else torch.float8_e8m0fnu
+                loaded_weight = loaded_weight.contiguous().view(dtype)
             float_dtypes = [torch.float16, torch.bfloat16, torch.float32]
             is_unquantized = name == "weight" and loaded_weight.dtype in float_dtypes
             # online quant (fp16/bf16 -> quant_type)
