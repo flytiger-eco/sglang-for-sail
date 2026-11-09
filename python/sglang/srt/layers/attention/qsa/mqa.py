@@ -281,8 +281,17 @@ def tilelang_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    rank_only: bool = False,
 ) -> torch.Tensor:
-    """Validated TileLang packed prefill kernel with weights removed."""
+    """Validated TileLang packed prefill kernel with weights removed.
+
+    ``rank_only`` returns logits that are only meaningful for ranking inside
+    each row's ``[start, end)`` span: they are unscaled (a positive scale does
+    not change the order) and the rest of the row is left undefined. This
+    skips the zero-fill, the in-place scale and the mask passes, each a full
+    read/write of the ``[rows, keys]`` FP32 matrix. Ranges-aware top-k
+    consumers such as ``fast_topk`` read only that span.
+    """
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -300,7 +309,10 @@ def tilelang_qsa_mqa_prefill(
     padded_rows = rows + padding
     # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
     # doubling the dominant prefill buffer; allocate pre-padded instead.
-    logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
+    # The kernel writes every column inside each row's [start, end) span, so
+    # rank-only callers need no fill.
+    alloc = torch.empty if rank_only else torch.zeros
+    logits = alloc((padded_rows, keys), dtype=torch.float32, device=q.device)
     q_padded = q.to(torch.bfloat16).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
@@ -319,6 +331,8 @@ def tilelang_qsa_mqa_prefill(
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
+    if rank_only:
+        return logits
     logits.div_(score_scale or math.sqrt(head_dim))
     _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
     return logits
@@ -387,9 +401,13 @@ def qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    rank_only: bool = False,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        return tilelang_qsa_mqa_prefill(
+            q, k, row_starts, row_ends, score_scale, rank_only=rank_only
+        )
+    # The reference's scaled, masked logits already satisfy the rank-only contract.
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 

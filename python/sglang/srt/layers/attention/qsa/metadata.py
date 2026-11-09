@@ -43,6 +43,71 @@ def build_qsa_row_ranges(
     return row_starts, row_ends, compressed_cu_seqlens
 
 
+class QSAPrefillMQAPlan(msgspec.Struct, frozen=True):
+    """Layer-independent prefill scoring inputs, built once per forward.
+
+    Every QSA layer of a forward reads the same compressed slots, row ranges
+    and per-row lengths; only the per-layer compressed buffer differs.
+    """
+
+    compressed_locs: torch.Tensor
+    row_starts: torch.Tensor
+    row_ends: torch.Tensor
+    row_sequence_lengths: torch.Tensor
+
+
+def build_qsa_prefill_mqa_plan(
+    *,
+    sequence_lengths: torch.Tensor,
+    sequence_lengths_cpu: list[int],
+    token_slot_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    query_sequence_ids: torch.Tensor,
+    compress_ratio: int,
+) -> QSAPrefillMQAPlan:
+    """Compressed slots and ranges for prefill MQA, from host-side lengths.
+
+    Compressed slots come straight from the token-slot rows: each sequence's
+    complete blocks live at ``page * page_size + offset`` of its assigned
+    pages, in block order. DSV4-style addressing: a group's compressed slot
+    is its first raw slot // ratio (the page-aligned allocator keeps the group
+    contiguous in one page).
+    """
+
+    parts = []
+    for sequence_id, length in enumerate(sequence_lengths_cpu):
+        complete_blocks = int(length) // compress_ratio
+        if complete_blocks == 0:
+            continue
+        parts.append(
+            token_slot_table[
+                sequence_id, : complete_blocks * compress_ratio : compress_ratio
+            ].long()
+            // compress_ratio
+        )
+    compressed_locs = (
+        torch.cat(parts)
+        if parts
+        else torch.empty(0, dtype=torch.long, device=token_slot_table.device)
+    )
+    sequence_lengths = sequence_lengths.to(torch.int32)
+    query_sequence_ids = query_sequence_ids.to(sequence_lengths.device)
+    row_starts, row_ends, _ = build_qsa_row_ranges(
+        sequence_lengths,
+        query_positions.to(sequence_lengths.device),
+        query_sequence_ids,
+        compress_ratio,
+    )
+    return QSAPrefillMQAPlan(
+        compressed_locs=compressed_locs,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        row_sequence_lengths=sequence_lengths.index_select(
+            0, query_sequence_ids.long()
+        ),
+    )
+
+
 class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     """All per-forward metadata consumed specifically by ``QSAIndexer``.
 
@@ -87,6 +152,12 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # Built once per eager extend forward from host-side lengths; when absent
+    # (component callers, tests), get_prefill_mqa_inputs derives it per layer.
+    prefill_mqa_plan: Optional[QSAPrefillMQAPlan] = None
+    # Upper bound of this forward's RoPE coordinates for the cos/sin cache
+    # length check; None makes the indexer read it off the device per layer.
+    rope_max_position: Optional[int] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -123,48 +194,42 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         layer_id: int,
         positions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather packed compressed K and ragged ranges for prefill MQA."""
+        """Gather packed compressed K and ragged ranges for prefill MQA.
+
+        Returns ``(compressed_keys, row_starts, row_ends, row_sequence_lengths)``
+        where the last is already expanded to one entry per query row.
+        """
 
         pool = self.token_to_kv_pool
-        ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
-        sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # compressed slot = first raw slot // ratio; the allocator is page-aligned,
-            # so each group is contiguous in one page (see QSATokenToKVPool).
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
+        plan = self.prefill_mqa_plan
+        if plan is None:
+            num_valid_tokens = self.token_to_batch_idx.numel()
+            if positions.numel() < num_valid_tokens:
+                raise ValueError(
+                    "QSA prefill positions are shorter than the request mapping: "
+                    f"positions={positions.numel()}, mapping={num_valid_tokens}"
+                )
+            plan = build_qsa_prefill_mqa_plan(
+                sequence_lengths=self.sequence_lengths,
+                sequence_lengths_cpu=self.sequence_lengths.tolist(),
+                token_slot_table=self.token_slot_table,
+                query_positions=positions[:num_valid_tokens],
+                query_sequence_ids=self.token_to_batch_idx,
+                compress_ratio=self.compress_ratio,
             )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
-        compressed_keys = (
-            torch.cat(parts, dim=0)
-            if parts
-            else compressed_buffer.new_empty(
+        if plan.compressed_locs.numel():
+            compressed_keys = compressed_buffer.index_select(0, plan.compressed_locs)
+        else:
+            compressed_keys = compressed_buffer.new_empty(
                 (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
             )
+        return (
+            compressed_keys,
+            plan.row_starts,
+            plan.row_ends,
+            plan.row_sequence_lengths,
         )
-        num_valid_tokens = self.token_to_batch_idx.numel()
-        if positions.numel() < num_valid_tokens:
-            raise ValueError(
-                "QSA prefill positions are shorter than the request mapping: "
-                f"positions={positions.numel()}, mapping={num_valid_tokens}"
-            )
-        positions = positions[:num_valid_tokens]
-        row_starts, row_ends, _ = build_qsa_row_ranges(
-            sequence_lengths,
-            positions.to(sequence_lengths.device),
-            self.token_to_batch_idx.to(sequence_lengths.device),
-            self.compress_ratio,
-        )
-        return compressed_keys, row_starts, row_ends, sequence_lengths
 
     def get_decode_mqa_inputs(
         self, layer_id: int
@@ -305,6 +370,8 @@ def compressed_decode_view(
 
 __all__ = [
     "QSAIndexerMetadata",
+    "QSAPrefillMQAPlan",
+    "build_qsa_prefill_mqa_plan",
     "build_qsa_row_ranges",
     "build_pending_ring_slots",
     "build_group_ring_slots",
