@@ -133,6 +133,11 @@ class StrictRunnerTest(unittest.TestCase):
         for row in rows:
             action = (row["action"], row["packages"])
             self.assertEqual(actions.setdefault(row["file"], action), action)
+        deep_gemm = [row["packages"] for row in rows if "deep_gemm@" in row["packages"]]
+        self.assertEqual(len(deep_gemm), 4)
+        for spec in deep_gemm:
+            self.assertIn("--no-build-isolation", spec)
+            self.assertIn("674cfa53dce10c28ee8f7f0bc1c4d40f887fd52e", spec)
 
     def test_manifest_selects_exact_source_registrations(self):
         manifest = self.root / "selection.tsv"
