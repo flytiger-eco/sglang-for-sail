@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -145,6 +146,8 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        self.use_sm = False
+        self._weights_processed = False
 
     def create_weights(
         self,
@@ -272,18 +275,65 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         return
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        dtype = torch.bfloat16
+        if self._weights_processed:
+            return
         device = layer.w2_weight.device
+        backend = envs.SGLANG_W4AFP8_MOE_BACKEND.get()
+        if backend not in ("auto", "ours", "upstream"):
+            raise ValueError("SGLANG_W4AFP8_MOE_BACKEND must be auto, ours or upstream")
+        compatible = (
+            device.type == "cuda"
+            and torch.cuda.get_device_capability(device)[0] == 9
+            and tuple(layer.w13_weight.shape[1:]) == (1280, 1280)
+            and tuple(layer.w2_weight.shape[1:]) == (2560, 320)
+            and self.quant_config.group_size == 128
+            and self.quant_config.moe_activation_scheme == "static"
+        )
+        if backend == "ours" and not compatible:
+            raise ValueError(
+                "Ours W4A8 requires Hopper, Qwen38 (H=2560,I=640) and static group-128 quantization"
+            )
+        if backend != "upstream" and compatible:
+            try:
+                from sgl_kernel.w4a8_sm import load_w4a8_sm_ops, prepare_w4a8_sm_weight
 
-        # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
-
-        # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
+                load_w4a8_sm_ops()
+                gate = prepare_w4a8_sm_weight(
+                    layer.w13_weight, layer.w13_weight_scale_inv, fused_gate_up=True
+                )
+                down = prepare_w4a8_sm_weight(
+                    layer.w2_weight, layer.w2_weight_scale_inv
+                )
+            except (ImportError, OSError, ValueError, RuntimeError) as exc:
+                if backend == "ours":
+                    raise
+                logger.warning(
+                    "Ours W4A8 unavailable; retaining upstream checkpoint layout: %s",
+                    exc,
+                )
+            else:
+                # Commit both transformations together. A failed gate/down validation
+                # must never leave one projection in a different encoding.
+                layer.w13_weight = Parameter(gate.weight, requires_grad=False)
+                layer.w2_weight = Parameter(down.weight, requires_grad=False)
+                layer.w13_weight_scale_inv = Parameter(gate.scales, requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(down.scales, requires_grad=False)
+                layer.register_buffer(
+                    "w13_weight_scale_sm_k512", gate.scales_k512, persistent=False
+                )
+                self.use_sm = True
+                logger.info(
+                    "Using Ours Qwen38 W4A8: tiling, packed-K conversion and fused SwiGLU/FP8"
+                )
+        if not self.use_sm:
+            layer.w13_weight_scale_inv = Parameter(
+                interleave_scales(layer.w13_weight_scale_inv.to(torch.bfloat16)),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                interleave_scales(layer.w2_weight_scale_inv.to(torch.bfloat16)),
+                requires_grad=False,
+            )
 
         # Process input scales
         w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
@@ -310,6 +360,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                     "low_latency_dispatcher_output_dtype": "fp8",
                 }
             )
+
+        self._weights_processed = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -351,6 +403,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            use_sm=self.use_sm,
+            sm_gate_scales_k512=getattr(layer, "w13_weight_scale_sm_k512", None),
+            sm_local_rows_hint=(
+                topk_ids.numel()
+                * layer.w13_weight.shape[0]
+                // (self.moe_runner_config.num_experts or layer.w13_weight.shape[0])
+            ),
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -396,6 +455,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
             expected_m=expected_m,
+            use_sm=self.use_sm,
+            sm_gate_scales_k512=getattr(layer, "w13_weight_scale_sm_k512", None),
+            sm_local_rows_hint=expected_m * layer.w13_weight.shape[0],
         )
 
         return output
@@ -446,6 +508,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 layer.w13_input_scale,
                 layer.w2_input_scale,
+                use_sm=self.use_sm,
+                sm_gate_scales_k512=getattr(layer, "w13_weight_scale_sm_k512", None),
+                sm_local_rows_hint=sum(dispatch_output.num_recv_tokens_per_expert),
             )
         else:
             return hidden_states

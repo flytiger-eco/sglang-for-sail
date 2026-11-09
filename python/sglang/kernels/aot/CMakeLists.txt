@@ -55,6 +55,18 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
+option(SGL_KERNEL_BUILD_W4A8_SM "Build Qwen38 Hopper W4A8 kernels" ON)
+option(SGL_KERNEL_W4A8_SM_ONLY "Build only the Qwen38 W4A8 module for focused validation" OFF)
+if(SGL_KERNEL_BUILD_W4A8_SM)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/w4a8_sm.cmake)
+endif()
+if(SGL_KERNEL_W4A8_SM_ONLY)
+    if(NOT SGL_KERNEL_BUILD_W4A8_SM)
+        message(FATAL_ERROR "SGL_KERNEL_W4A8_SM_ONLY requires SGL_KERNEL_BUILD_W4A8_SM")
+    endif()
+    return()
+endif()
+
 # fmt
 FetchContent_Declare(
     repo-fmt
