@@ -37,6 +37,7 @@ ARG PPU_PACKAGES="\
     flash_mla==2.0.0+v0.2.0.ppu2.2.0 \
     flashinfer_python==0.6.17+v0.1.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
+    msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     pla==1.0.0+v0.1.0.ppu2.2.0 \
     tilelang==0.1.11+v0.1.0.ppu2.2.0 \
