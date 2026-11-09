@@ -26,10 +26,6 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
-      asset_preflight_only:
-        description: 'Run only the temporary model and ShareGPT checks; skip test execution and summary'
-        type: boolean
-        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -121,103 +117,6 @@ jobs:
 
           datasets.load_dataset = _load_dataset
           huggingface_hub.hf_hub_download = _hf_hub_download
-          PY
-          cat > .ppu-sweep/asset_preflight.py <<'PY'
-          import json
-          import os
-          import traceback
-          from pathlib import Path
-
-          MODEL = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
-          SHAREGPT = Path(
-              "/nas_aisw/datasets/datasets/LLM/anon8231489123/v1.0/"
-              "ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"
-          )
-
-          def check_model():
-              from huggingface_hub import snapshot_download
-              from safetensors import safe_open
-              from transformers import AutoConfig, AutoTokenizer
-
-              snapshot = Path(
-                  snapshot_download(
-                      MODEL,
-                      cache_dir=os.environ["HF_HUB_CACHE"],
-                      local_files_only=True,
-                  )
-              )
-              for filename in ("config.json", "tokenizer_config.json"):
-                  if not (snapshot / filename).is_file():
-                      raise RuntimeError(f"Missing model file: {snapshot / filename}")
-              AutoConfig.from_pretrained(snapshot, local_files_only=True)
-              AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
-
-              index = snapshot / "model.safetensors.index.json"
-              if index.is_file():
-                  with index.open() as stream:
-                      weight_map = json.load(stream).get("weight_map", {})
-                  shards = sorted(set(weight_map.values()))
-              else:
-                  shards = ["model.safetensors"]
-              if not shards:
-                  raise RuntimeError(f"No model weight shards listed: {index}")
-
-              tensor_count = 0
-              size_bytes = 0
-              for shard in shards:
-                  path = Path(shard)
-                  if path.is_absolute() or ".." in path.parts:
-                      raise RuntimeError(f"Unsafe weight shard path: {shard}")
-                  path = snapshot / path
-                  if not path.is_file() or path.stat().st_size == 0:
-                      raise RuntimeError(f"Missing or empty weight shard: {path}")
-                  with safe_open(str(path), framework="pt") as weights:
-                      tensor_count += len(weights.keys())
-                  size_bytes += path.stat().st_size
-              if tensor_count == 0:
-                  raise RuntimeError(f"No tensors found in model weights: {snapshot}")
-              return {
-                  "model": MODEL,
-                  "snapshot": str(snapshot),
-                  "weight_shards": shards,
-                  "weight_bytes": size_bytes,
-                  "tensor_count": tensor_count,
-              }
-
-          def check_dataset():
-              if not SHAREGPT.is_file() or SHAREGPT.stat().st_size == 0:
-                  raise RuntimeError(f"Missing or empty ShareGPT dataset: {SHAREGPT}")
-              return {
-                  "dataset": "anon8231489123/ShareGPT_Vicuna_unfiltered",
-                  "path": str(SHAREGPT),
-                  "size_bytes": SHAREGPT.stat().st_size,
-              }
-
-          failures = []
-          for label, check in (("model", check_model), ("dataset", check_dataset)):
-              try:
-                  result = check()
-                  print(
-                      "PPU_ASSET_CHECK="
-                      + json.dumps({"check": label, "ok": True, **result}),
-                      flush=True,
-                  )
-              except Exception as error:
-                  failures.append(label)
-                  print(
-                      "PPU_ASSET_CHECK="
-                      + json.dumps(
-                          {
-                              "check": label,
-                              "ok": False,
-                              "error": f"{type(error).__name__}: {error}",
-                          }
-                      ),
-                      flush=True,
-                  )
-                  traceback.print_exc()
-          if failures:
-              raise RuntimeError("Asset preflight failed: " + ", ".join(failures))
           PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
@@ -1072,12 +971,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'asset_preflight_only'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.asset_preflight_only != true')
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.asset_preflight_only != true')
+                      self.assertNotIn('if', jobs['sweep-execute'])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1379,7 +1278,6 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
-          timeout --signal=TERM --kill-after=30s 300s python3 .ppu-sweep/asset_preflight.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1511,7 +1409,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: inputs.asset_preflight_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1601,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && inputs.asset_preflight_only != true
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
