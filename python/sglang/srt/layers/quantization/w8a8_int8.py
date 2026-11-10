@@ -43,8 +43,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
-import logging
-
 logger = logging.getLogger(__name__)
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -262,7 +260,14 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-        x_q, x_scale = per_token_quant_int8(x)
+        if isinstance(x, tuple):
+            # Pre-quantized activation from a fused RMSNorm+int8 quant kernel:
+            # x = (int8_input, per_token_input_scale[, orig_dtype]).
+            x_q, x_scale = x[0], x[1]
+            out_dtype = x[2] if len(x) > 2 else torch.bfloat16
+        else:
+            x_q, x_scale = per_token_quant_int8(x)
+            out_dtype = x.dtype
 
         if envs.SGLANG_SAIL_DEEPGEMM_DENSE.get() and _is_sail and bias is None:
             out = torch.empty(
@@ -271,11 +276,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 device=x_q.device,
             )
             gemm_nt_i8i8bf16(x_q, x_scale, layer.weight.t(), layer.weight_scale, out)
-            return out.to(x.dtype)
+            return out.to(out_dtype)
 
         if _is_sail and envs.SGLANG_SAIL_USE_ACEXT_CUDA.get():
             return acext_int8_gemm(
-                x_q, layer.weight.t(), layer.weight_scale, x_scale, bias, x.dtype
+                x_q, layer.weight.t(), layer.weight_scale, x_scale, bias, out_dtype
             )
 
         x_q_2d = x_q.view(-1, x_q.shape[-1])
@@ -287,7 +292,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             layer.weight,
             x_scale_2d,
             layer.weight_scale,
-            out_dtype=x.dtype,
+            out_dtype=out_dtype,
             bias=bias,
         )
 

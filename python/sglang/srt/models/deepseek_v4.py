@@ -217,6 +217,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_device_sm,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
@@ -1777,6 +1778,36 @@ class MQALayer(MqaAttentionBase):
         self._accepts_mxfp8_swizzled_input = ok
         return ok
 
+    def _wq_b_quant_kind(self) -> Optional[str]:
+        """How ``wq_b`` quantizes its activation per token, if it does.
+
+        Only then can a fused rmsnorm+quant producer hand it an already
+        quantized ``(payload, scale)`` pair instead of the bf16 row.
+        """
+        cached = self.__dict__.get("_wq_b_quant_kind_cache")
+        if cached is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+
+            method = getattr(self.wq_b, "quant_method", None)
+            if isinstance(method, W8A8Int8LinearMethod):
+                cached = "int8"
+            # W8A8 fp8 always quantizes the activation per token; the generic fp8
+            # method only does so for the dynamic (non-block, non-mxfp8) variant.
+            elif isinstance(method, W8A8Fp8LinearMethod) or (
+                isinstance(method, Fp8LinearMethod)
+                and not getattr(method, "use_mxfp8", False)
+                and not getattr(method, "block_quant", False)
+                and not getattr(method, "use_marlin", False)
+                and getattr(self.wq_b, "input_scale", None) is None
+            ):
+                cached = "fp8"
+            else:
+                cached = ""
+            self.__dict__["_wq_b_quant_kind_cache"] = cached
+        return cached or None
+
     def _normalize_q_lora(
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
@@ -1784,6 +1815,39 @@ class MQALayer(MqaAttentionBase):
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
         method = self.wq_b.quant_method
+        quant_kind = self._wq_b_quant_kind() if _is_sail else None
+        if (
+            quant_kind is not None
+            and envs.SGLANG_OPT_FUSED_Q_A_RMSNORM_QUANT.get()
+            # The fp8 producer feeds the deepgemm branch, which needs sm >= 89.
+            and (quant_kind == "int8" or get_device_sm() >= 89)
+            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
+            and q.ndim == 2
+            and q.shape[0] > 0
+            and q.shape[1] % 16 == 0
+            and q.stride(1) == 1
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            if not (
+                is_batch_invariant_mode_enabled()
+                or get_exec().deterministic.enable_deterministic_inference
+            ):
+                from sglang.kernels.ops.quantization.per_token_quant_fp8 import (
+                    fused_rmsnorm_per_token_quant_fp8,
+                    fused_rmsnorm_per_token_quant_int8,
+                )
+
+                produce = (
+                    fused_rmsnorm_per_token_quant_int8
+                    if quant_kind == "int8"
+                    else fused_rmsnorm_per_token_quant_fp8
+                )
+                y, quant, scale = produce(
+                    q, self.q_norm.weight, self.q_norm.variance_epsilon
+                )
+                return y, (quant, scale, torch.bfloat16)
         if (
             _is_cuda
             and self.is_dsv41

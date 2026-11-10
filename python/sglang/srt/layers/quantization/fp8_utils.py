@@ -2597,7 +2597,7 @@ def apply_fp8_linear(
             and not native_scalar_a_scale
         ):
             # Unsupported CUTLASS epilogues require one A scale per row.
-            x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+            x_scale = input_scale.reshape(1).repeat(input_2d.shape[0]).view(-1, 1)
         else:
             x_scale = input_scale
     elif compressed_tensor_quant:
@@ -2685,7 +2685,7 @@ def apply_fp8_linear(
             weight_scale,
             out,
         )
-        return out.view(*output_shape).to(input.dtype)
+        return out.view(*output_shape).to(output_dtype)
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the

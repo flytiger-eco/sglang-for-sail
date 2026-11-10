@@ -66,6 +66,12 @@ if SGLANG_PROFILE_NVTX:
 logger = logging.getLogger(__name__)
 
 
+def _nvtx_gemm_input(x):
+    # A fused producer may hand the linear an already quantized (q, scale) pair;
+    # the annotation only describes the activation tile.
+    return x[0] if isinstance(x, tuple) else x
+
+
 class ReplicatedParallelGroup(msgspec.Struct, frozen=True):
     """Share weight partitions across consecutive ranks; collectives stay separate."""
 
@@ -391,7 +397,12 @@ class ReplicatedLinear(LinearBase):
         if SGLANG_PROFILE_NVTX:
             tmp_weight = getattr(self, "weight", None)
             nvtx_push_range_for_gemm(
-                "ReplicatedLinear", x, tmp_weight, None, None, bias
+                "ReplicatedLinear",
+                _nvtx_gemm_input(x),
+                tmp_weight,
+                None,
+                None,
+                bias,
             )
         output = self.quant_method.apply(self, x, bias)
         if SGLANG_PROFILE_NVTX:
@@ -640,7 +651,12 @@ class ColumnParallelLinear(LinearBase):
         if SGLANG_PROFILE_NVTX:
             tmp_weight = getattr(self, "weight", None)
             nvtx_push_range_for_gemm(
-                "ColumnParallelLinear", input_, tmp_weight, None, None, bias
+                "ColumnParallelLinear",
+                _nvtx_gemm_input(input_),
+                tmp_weight,
+                None,
+                None,
+                bias,
             )
         output_parallel = self.quant_method.apply(self, input_, bias)
         if SGLANG_PROFILE_NVTX:
