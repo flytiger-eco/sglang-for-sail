@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 
 import torch
@@ -16,6 +17,8 @@ from sglang.kernels.jit.utils import (
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+logger = logging.getLogger(__name__)
 
 # NOTE: see the comments in `entry.cuh`
 _INPUT_STRIDE_ALIGNMENT_BYTES = 128
@@ -205,6 +208,212 @@ def is_deep_select_supported() -> bool:
     return (major, minor) in SUPPORTED_CUDA_ARCHS
 
 
+@functools.cache
+def _wheel_available() -> bool:
+    """Whether the precompiled PPU DeepSelect wheel exposes its top-k entry.
+
+    The JIT cannot build on PPU (its cluster probe requires sm90), so the wheel
+    is the DeepSelect backend there; every entry point below prefers it."""
+    try:
+        from deep_select.interface import topk  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@functools.cache
+def _wheel_stride_requirement() -> Tuple[int, int]:
+    from deep_select.interface import get_stride_requirement
+
+    return get_stride_requirement()
+
+
+def _wheel_scores(input: torch.Tensor) -> torch.Tensor:
+    """Rows the wheel can read: it wants a row stride that is a multiple of its
+    1024 B run, so pad when the tile does not fit."""
+    # The wheel ranks bf16 only; rounding fp32 scores here would silently reorder
+    # near-ties, so refuse them instead of converting.
+    if input.dtype != torch.bfloat16:
+        raise TypeError(
+            f"the PPU DeepSelect wheel ranks bf16 scores only, got {input.dtype}; "
+            "produce bf16 index logits or rank fp32 on the top-k v2 kernel"
+        )
+    run_bytes = _wheel_stride_requirement()[0]
+    if input.stride(-1) == 1 and input.stride(0) * input.element_size() % run_bytes == 0:
+        return input
+    step = run_bytes // input.element_size()
+    width = input.shape[1]
+    padded = (width + step - 1) // step * step
+    buf = torch.empty((input.shape[0], padded), dtype=input.dtype, device=input.device)
+    buf[:, :width] = input
+    return buf[:, :width]
+
+
+def _wheel_topk(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    sorted: bool,
+    end: Optional[torch.Tensor],
+    sorted_index: bool,
+    output_idx: Optional[torch.Tensor],
+    output_idx_offset: Optional[torch.Tensor],
+    idx_oob_fill_value: int,
+    return_value: bool,
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+    from deep_select.interface import topk as wheel_topk
+
+    scores = _wheel_scores(input)
+    if end is not None:
+        end = end.reshape(-1).to(torch.int32)
+        if end.stride(0) != 1:
+            end = end.contiguous()
+    # Let the wheel allocate: a caller buffer whose k is not a multiple of 8
+    # would be rejected by its row-stride contract.
+    values, indices = wheel_topk(
+        scores,
+        topk,
+        sorted=sorted,
+        end=end,
+        indices_type=torch.int32,
+        sorted_index=sorted_index,
+        output_idx=None,
+        output_idx_offset=output_idx_offset,
+        idx_oob_fill_value=idx_oob_fill_value,
+        return_value=return_value,
+    )
+    if output_idx is not None:
+        output_idx.copy_(indices)
+        indices = output_idx
+    return values, indices
+
+
+def _wheel_page_transform(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    page_table: torch.Tensor,
+    page_size: int,
+    end: Optional[torch.Tensor],
+    sorted_index: bool,
+    output_idx: Optional[torch.Tensor],
+    idx_oob_fill_value: int,
+) -> torch.Tensor:
+    from deep_select.interface import topk as wheel_topk
+
+    scores = _wheel_scores(input)
+    if end is not None:
+        end = end.reshape(-1).to(torch.int32)
+        if end.stride(0) != 1:
+            end = end.contiguous()
+    _, raw = wheel_topk(
+        scores,
+        topk,
+        sorted=False,
+        end=end,
+        indices_type=torch.int32,
+        sorted_index=sorted_index,
+        output_idx=None,
+        output_idx_offset=None,
+        idx_oob_fill_value=-1,
+        return_value=False,
+    )
+    valid = raw >= 0
+    cols = raw.clamp_min(0).to(torch.int64)
+    slots = page_table.gather(1, cols // page_size) * page_size + cols % page_size
+    result = torch.where(
+        valid, slots, torch.full_like(slots, idx_oob_fill_value)
+    ).to(torch.int32)
+    if output_idx is not None:
+        output_idx.copy_(result)
+        return output_idx
+    return result
+
+
+def _rank_fp32(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    end: Optional[torch.Tensor],
+    output_idx: Optional[torch.Tensor],
+    output_idx_offset: Optional[torch.Tensor],
+    idx_oob_fill_value: int,
+) -> Tuple[None, torch.Tensor]:
+    """Device without a DeepSelect backend (PPU without the wheel, unsupported
+    arch): rank the exact fp32 values on the top-k v2 kernel instead of JIT."""
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+
+    warn_no_backend()
+    rows, width = input.shape
+    scores = input.float()
+    lens = (
+        end.reshape(-1).to(torch.int32)
+        if end is not None
+        else torch.full((rows,), width, dtype=torch.int32, device=input.device)
+    )
+    if lens.stride(0) != 1:
+        lens = lens.contiguous()
+    offsets = (
+        output_idx_offset.reshape(-1).to(torch.int32)
+        if output_idx_offset is not None
+        else torch.zeros(rows, dtype=torch.int32, device=input.device)
+    )
+    if offsets.stride(0) != 1:
+        offsets = offsets.contiguous()
+    out = (
+        output_idx
+        if output_idx is not None
+        else torch.empty((rows, topk), dtype=torch.int32, device=input.device)
+    )
+    topk_transform_ragged_v2(scores, lens, out_offsets=offsets, out_indices=out)
+    if idx_oob_fill_value != -1:
+        out.masked_fill_(out < 0, idx_oob_fill_value)
+    return None, out
+
+
+def _paged_fp32(
+    input: torch.Tensor,
+    topk: int,
+    *,
+    page_table: torch.Tensor,
+    page_size: int,
+    end: Optional[torch.Tensor],
+    output_idx: Optional[torch.Tensor],
+    idx_oob_fill_value: int,
+) -> torch.Tensor:
+    """Page-table counterpart of :func:`_rank_fp32` (V1 fp32 kernel)."""
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_paged
+
+    warn_no_backend()
+    rows, width = input.shape
+    lens = (
+        end.reshape(-1).to(torch.int32)
+        if end is not None
+        else torch.full((rows,), width, dtype=torch.int32, device=input.device)
+    )
+    if lens.stride(0) != 1:
+        lens = lens.contiguous()
+    out = (
+        output_idx
+        if output_idx is not None
+        else torch.empty((rows, topk), dtype=torch.int32, device=input.device)
+    )
+    topk_transform_paged(input.float(), lens, page_table, out, page_size)
+    if idx_oob_fill_value != -1:
+        out.masked_fill_(out < 0, idx_oob_fill_value)
+    return out
+
+
+@cache_once
+def warn_no_backend() -> None:
+    """One log per process: no DeepSelect backend here, so top-k runs on fp32."""
+    logger.warning(
+        "DeepSelect has no backend on this device (no wheel and no supported "
+        "JIT arch); the top-k ranks exact fp32 values instead."
+    )
+
+
+
 class _CachedModuleDispatch:
     def __init__(self, mods: list[Module], rows: list[int], fallback: Module):
         self._clusters = tuple(zip(rows, mods, strict=True))
@@ -273,6 +482,42 @@ def topk(
     False, which skips writing them and is about 10% faster.
     """
     assert hint is None, "hint is not supported"
+    if _wheel_available():
+        if (
+            begin is not None
+            or indices_type != torch.int32
+            or abort_when_nan_found
+            or value_oob_fill_value != float("-inf")
+        ):
+            raise NotImplementedError(
+                "the DeepSelect wheel supports no begin, non-int32 indices, "
+                "NaN abort or a value fill"
+            )
+        return _wheel_topk(
+            input,
+            topk,
+            sorted=sorted,
+            end=end,
+            sorted_index=sorted_index,
+            output_idx=output_idx,
+            output_idx_offset=output_idx_offset,
+            idx_oob_fill_value=idx_oob_fill_value,
+            return_value=return_value,
+        )
+    if not is_deep_select_supported():
+        if begin is not None or indices_type != torch.int32 or return_value:
+            raise NotImplementedError(
+                "the DeepSelect fp32 fallback supports no begin, non-int32 "
+                "indices or values"
+            )
+        return _rank_fp32(
+            input,
+            topk,
+            end=end,
+            output_idx=output_idx,
+            output_idx_offset=output_idx_offset,
+            idx_oob_fill_value=idx_oob_fill_value,
+        )
     return _launch_topk_impl(
         input,
         topk,
@@ -315,6 +560,31 @@ def topk_page_transform(
     This is the narrow case of :func:`topk`: int32 indices, no values, no
     value sort. Returns the int32 ``[rows, topk]`` indices.
     """
+    if _wheel_available():
+        if abort_when_nan_found:
+            raise NotImplementedError("the DeepSelect wheel cannot abort on NaN")
+        return _wheel_page_transform(
+            input,
+            topk,
+            page_table=page_table,
+            page_size=page_size,
+            end=end,
+            sorted_index=sorted_index,
+            output_idx=output_idx,
+            idx_oob_fill_value=idx_oob_fill_value,
+        )
+    if not is_deep_select_supported():
+        if abort_when_nan_found:
+            raise NotImplementedError("the DeepSelect fp32 fallback cannot abort on NaN")
+        return _paged_fp32(
+            input,
+            topk,
+            page_table=page_table,
+            page_size=page_size,
+            end=end,
+            output_idx=output_idx,
+            idx_oob_fill_value=idx_oob_fill_value,
+        )
     _, indices = _launch_topk_impl(
         input,
         topk,

@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
-from sglang.srt.utils.common import ceil_align, is_sail
+from sglang.srt.utils.common import ceil_align, get_device_sm, is_sail
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
@@ -29,11 +29,20 @@ def _is_sm100() -> bool:
 
 
 @functools.cache
+def _auto_bf16_index_logits() -> bool:
+    """bf16 where the ranking kernels take bf16 scores: SM100, and SAIL/PPU from
+    sm89, where the precompiled DeepSelect wheel is the bf16 top-k."""
+    if is_sail():
+        return get_device_sm() >= 89
+    return _is_sm100()
+
+
+@functools.cache
 def index_logits_dtype() -> torch.dtype:
-    """bf16 on SM100, where the reference kernels score in bf16; fp32 elsewhere.
+    """bf16 where the reference kernels score in bf16; fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS, when set, overrides the choice."""
     forced = envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get()
-    bf16 = _is_sm100() if forced is None else forced
+    bf16 = _auto_bf16_index_logits() if forced is None else forced
     return torch.bfloat16 if bf16 else torch.float32
 
 
@@ -98,8 +107,8 @@ def flat_index_logits_tiles(
         if max_logits_mb <= 0:
             raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
         # PPU obeys the same MB knob as the INT8 indexer in place of the
-        # caller's generic budget; the sliced FP32 tile is its only live
-        # logits tensor, so the planner's row accounting applies as-is.
+        # caller's generic budget; the sliced tile is its only live logits
+        # tensor, so the planner's row accounting applies as-is.
         budget_bytes = max_logits_mb * 1024 * 1024
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
