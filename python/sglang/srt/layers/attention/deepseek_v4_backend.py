@@ -231,6 +231,29 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+@functools.lru_cache(maxsize=1)
+def _q8kv8_ppu_supported() -> bool:
+    """PPU only runs the Q8KV8 sparse prefill on sm89+ (the 890P family)."""
+    if not get_platform().is_ppu:
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return (major, minor) >= (8, 9)
+
+
+def _require_q8kv8_flashmla_interface() -> None:
+    """Fail at startup when the PPU Q8KV8 path needs an API flash_mla lacks."""
+    try:
+        import flash_mla
+    except ImportError:
+        available = False
+    else:
+        available = hasattr(flash_mla, "flash_mla_sparse_quantized_fwd")
+    assert available, (
+        "DeepSeek-V4 flashmla_sparse_q8 prefill on PPU requires a flash_mla "
+        "build that exports flash_mla_sparse_quantized_fwd."
+    )
+
+
 def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
     return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
 
@@ -1343,10 +1366,13 @@ class DeepseekV4AttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
-            if not get_platform().is_sm90:
+            if not (get_platform().is_sm90 or _q8kv8_ppu_supported()):
                 raise ValueError(
-                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs."
+                    "DeepSeek-V4 flashmla_sparse_q8 prefill requires SM90 CUDA GPUs "
+                    "or PPU sm89+ devices."
                 )
+            if _q8kv8_ppu_supported():
+                _require_q8kv8_flashmla_interface()
             if self.head_dim_v != 512:
                 raise ValueError(
                     "DeepSeek-V4 flashmla_sparse_q8 prefill requires d_v=512, "
@@ -4459,7 +4485,10 @@ class DeepseekV4AttnBackend(
                 self._use_sparse_prefill(forward_batch, num_qo_tokens=q.shape[0])
                 and not use_mega_paged
             ):
-                if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
+                if (
+                    use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+                    and not _q8kv8_ppu_supported()
+                ):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
                         layer_id=layer_id,
@@ -4469,6 +4498,9 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
+                # PPU has no CUTLASS Q8KV8 kernel: it reuses this layout-aware
+                # gather and switches the attention call to flash_mla's sparse
+                # quantized (Q8/KV8) prefill when Q8 is enabled.
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -4689,6 +4721,37 @@ class DeepseekV4AttnBackend(
                 topk_length=combined_lens,
             )
 
+        if (
+            use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend)
+            and _q8kv8_ppu_supported()
+        ):
+            # flash_mla quantizes this BF16 gather to E4M3 inside the kernel
+            # (saturating RN), so the persistent cache is left untouched.
+            from flash_mla import flash_mla_sparse_quantized_fwd
+
+            if not getattr(self, "_q8kv8_sparse_prefill_log_emitted", False):
+                logger.info(
+                    "DSV4_Q8KV8_SPARSE_PREFILL_HIT backend=flashmla_quantized "
+                    "layer_id=%s compress_ratio=%s q_shape=%s d_v=%s",
+                    layer_id,
+                    compress_ratio,
+                    tuple(q_flat.shape),
+                    self.head_dim_v,
+                )
+                self._q8kv8_sparse_prefill_log_emitted = True
+
+            o, _, _ = flash_mla_sparse_quantized_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                quantization=None,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+                compute_aux=False,
+            )
+            return o
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,

@@ -1884,6 +1884,10 @@ class Envs:
     SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Force the Q8KV8 sparse prefill on/off regardless of --dsv4-prefill-backend.
+    # Registered so the value reaches the DP scheduler processes; an unregistered
+    # variable would only exist in the launcher process.
+    SGLANG_DSV4_Q8KV8_PREFILL = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
