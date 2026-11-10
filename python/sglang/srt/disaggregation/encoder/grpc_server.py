@@ -8,6 +8,7 @@ Usage:
 """
 
 import asyncio
+from sglang.srt.multimodal.aim_cuda_health import cuda_failure_detected, record_cuda_failure
 import logging
 import multiprocessing as mp
 import traceback
@@ -66,7 +67,7 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         self._serving = False
 
     async def Check(self, request, context) -> health_pb2.HealthCheckResponse:
-        if self._serving:
+        if self._serving and not cuda_failure_detected():
             return health_pb2.HealthCheckResponse(
                 status=health_pb2.HealthCheckResponse.SERVING
             )
@@ -102,6 +103,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
         try:
+            if cuda_failure_detected():
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                context.set_details("Encoder CUDA context is unhealthy")
+                return sglang_encoder_pb2.EncodeResponse()
             request_dict = {
                 "mm_items": list(request.mm_items),
                 "modality": Modality.IMAGE.name,
@@ -118,6 +123,10 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             # cache and transfer backend. Keep TP dispatch and rank-0 collective
             # launch order identical when gRPC handlers run concurrently.
             async with self.encoder.encode_dispatch_lock:
+                if cuda_failure_detected():
+                    context.set_code(grpc.StatusCode.UNAVAILABLE)
+                    context.set_details("Encoder CUDA context is unhealthy")
+                    return sglang_encoder_pb2.EncodeResponse()
                 encode_task = asyncio.create_task(self._dispatch_encode(request_dict))
                 result = await await_task_completion_on_cancel(
                     encode_task, f"Encoder request {request.req_id}"
@@ -186,6 +195,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 )
             raise
         except Exception as e:
+            record_cuda_failure(e, encoder=True)
             logger.error(f"Encode error: {e}")
             traceback.print_exc()
             await self.encoder.release_request(request.req_id)
@@ -218,6 +228,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 )
             raise
         except Exception as e:
+            record_cuda_failure(e, encoder=True)
             logger.error(f"Send error: {e}")
             traceback.print_exc()
             await self.encoder.release_request(request.req_id)

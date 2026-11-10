@@ -41,6 +41,9 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.aim_cuda_health import (
+    cuda_failure_detected, record_cuda_failure,
+)
 from sglang.srt.multimodal.aim_metrics import record_image_event
 from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
@@ -1195,7 +1198,8 @@ class MMEncoder:
         except (TypeError, ValueError) as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         except Exception as e:
-            raise InternalError(f"Failed to process mm items: {str(e)}")
+            record_cuda_failure(e, encoder=True)
+            raise InternalError(f"Failed to process mm items: {str(e)}") from e
 
         if len(items_per_req) != len(requests) or any(n <= 0 for n in items_per_req):
             raise InternalError(
@@ -2290,8 +2294,10 @@ class MMEncoder:
         self, requests: List[dict], modality: Modality, exc: Exception
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Stage one error EmbeddingData per request so /send reports the failure."""
+        fatal = record_cuda_failure(exc, encoder=True)
         code = (
-            exc.code if isinstance(exc, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR
+            HTTPStatus.INTERNAL_SERVER_ERROR if fatal else
+            (exc.code if isinstance(exc, MMError) else HTTPStatus.INTERNAL_SERVER_ERROR)
         )
         msg = str(exc)
         logger.error(f"Rank {self.rank} encode failed: {msg} {code = }", exc_info=True)

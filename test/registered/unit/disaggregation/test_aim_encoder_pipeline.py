@@ -60,6 +60,7 @@ def load_scheduler():
     namespace = dict(globals())
     namespace.update(
         logger=logging.getLogger("aim-encoder-test"),
+        cuda_failure_detected=lambda: False,
         _BATCHABLE_MODALITIES={Modality.IMAGE, Modality.AUDIO},
         zmq=SimpleNamespace(Socket=object), MMEncoder=object,
         ProfileReq=type("ProfileReq", (), {}),

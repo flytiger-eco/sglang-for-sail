@@ -36,6 +36,9 @@ from sglang.srt.disaggregation.encoder.server import (
     launch_encoder,
 )
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.aim_cuda_health import (
+    cuda_failure_detected, record_cuda_failure,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -410,17 +413,19 @@ class EncoderScheduler:
                     max(0.0, start - p.submit_time), modality=modality_str
                 )
         try:
-            if prepared_batch_id is not None:
-                try:
-                    await self.encoder._aim_preparation.wait_ready(prepared_batch_id)
-                except Exception:
-                    # Consume errors on all TP ranks inside ordered execution.
-                    pass
             # The scheduler is the sole owner of batched dispatch order. Keep
             # the collective broadcast and rank-0 execution under the same
             # lock, while allowing concurrent HTTP handlers to enqueue before
             # waiting on their individual futures.
             async with self.encoder.encode_dispatch_lock:
+                self._check_dispatch_health()
+                if prepared_batch_id is not None:
+                    try:
+                        await self.encoder._aim_preparation.wait_ready(prepared_batch_id)
+                    except Exception:
+                        # Consume errors on all TP ranks inside ordered execution.
+                        pass
+                self._check_dispatch_health()
                 for sock in self.send_sockets:
                     sock_send(
                         sock,
@@ -497,6 +502,20 @@ class EncoderScheduler:
                 await self.encoder.release_request(p.request["req_id"])
                 self.encoder.clear_abandoned_request(p.request["req_id"])
 
+    def _check_dispatch_health(self):
+        # Only the dispatch owner may reject, under encode_dispatch_lock and
+        # before broadcasting execution. Rank-local checks after the broadcast
+        # would leave healthy TP peers entering collectives alone.
+        if not cuda_failure_detected():
+            return
+        if self.pipeline_enabled:
+            self.encoder._aim_preparation.close()
+            for sock in self.send_sockets:
+                sock_send(sock, wrap_as_pickle({"type": "close_preparation"}))
+        raise server_module.MMError(
+            "Encoder CUDA context is unhealthy", code=HTTPStatus.SERVICE_UNAVAILABLE
+        )
+
     async def _dispatch_per_request(
         self,
         group: List[PendingRequest],
@@ -515,16 +534,18 @@ class EncoderScheduler:
                     server_module.encoder_metrics_collector.observe_queue_wait(
                         max(0.0, start - p.submit_time), modality=modality_str
                     )
-                for sock in self.send_sockets:
-                    sock_send(sock, wrap_as_pickle(req))
-                result = await self.encoder.encode(
-                    mm_items=req["mm_items"],
-                    modality=modality,
-                    req_id=req["req_id"],
-                    num_parts=req["num_parts"],
-                    part_idx=req["part_idx"],
-                    hashes=req.get("hashes"),
-                )
+                async with self.encoder.encode_dispatch_lock:
+                    self._check_dispatch_health()
+                    for sock in self.send_sockets:
+                        sock_send(sock, wrap_as_pickle(req))
+                    result = await self.encoder.encode(
+                        mm_items=req["mm_items"],
+                        modality=modality,
+                        req_id=req["req_id"],
+                        num_parts=req["num_parts"],
+                        part_idx=req["part_idx"],
+                        hashes=req.get("hashes"),
+                    )
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
@@ -1389,6 +1410,8 @@ async def execute_encode_pipeline(
     and keeps the result until follow-up /send calls complete. ZMQ has no early
     consumer: it waits for encode, sends the embedding, releases it, then returns.
     """
+    if cuda_failure_detected():
+        raise server_module.MMError("Encoder CUDA context is unhealthy", code=HTTPStatus.SERVICE_UNAVAILABLE)
     if err := validate_encode_request(request):
         raise server_module.BadRequestError(err)
     req_id = request["req_id"]
@@ -1418,6 +1441,8 @@ async def execute_encode_pipeline(
             # Locking direct dispatch together with the rank0 await keeps its
             # NCCL launch order matching the ZMQ dispatch order rank>0 sees.
             async with enc.encode_dispatch_lock:
+                if cuda_failure_detected():
+                    raise server_module.MMError("Encoder CUDA context is unhealthy", code=HTTPStatus.SERVICE_UNAVAILABLE)
                 for socket in send_sockets:
                     sock_send(socket, wrap_as_pickle(request))
                 result = await _run_dispatched_encode(enc, request, modality)
@@ -1451,6 +1476,7 @@ async def execute_encode_pipeline(
         _record_pipeline_result(modality, "error")
         raise
     except Exception as e:
+        record_cuda_failure(e, encoder=True)
         error_msg = str(e)
         time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         error_published = await _publish_pipeline_error(req_id, error_msg)
@@ -1508,6 +1534,7 @@ async def execute_encode_pipeline(
             await _push_embedding_to_prefill(enc, request)
             content = None
     except Exception as e:
+        record_cuda_failure(e, encoder=True)
         time_stats.trace_ctx.abort(abort_info={"reason": str(e)})
         await enc.release_request(req_id)
         _record_pipeline_result(modality, "error")
@@ -1527,6 +1554,8 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
     the non-DP /health path. Raises on encode failure so the worker envelope
     carries ``_error`` back to the dispatcher.
     """
+    if cuda_failure_detected():
+        raise server_module.MMError("Encoder CUDA context is unhealthy", code=HTTPStatus.SERVICE_UNAVAILABLE)
     if enc.supports_modality(Modality.IMAGE):
         mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
         modality = Modality.IMAGE
