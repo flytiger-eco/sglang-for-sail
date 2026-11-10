@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import index_logits
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
@@ -392,6 +393,10 @@ class TestDensePrefillTopkTwoLevel(CustomTestCase):
     while this path also runs (and is what the PPU prefill uses) on PPU.
     """
 
+    # The candidate level ranks fp32 logits only; with the bf16 default (SM100,
+    # PPU) both sides would take DeepSelect, whose pick among tied bf16 scores is
+    # unspecified, so pin fp32 to compare the two levels on untied values.
+    @patch.object(index_logits, "index_logits_dtype", lambda: torch.float32)
     def test_two_level_matches_dense(self):
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
