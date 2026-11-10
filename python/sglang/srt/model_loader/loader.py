@@ -50,6 +50,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_mm,
     get_model,
     get_parallel,
     get_server_args,
@@ -97,6 +98,11 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
+)
+from sglang.srt.multimodal.aim_vision_policy import (
+    replace_vision_weights,
+    validate_online_vision_weights,
+    validate_vision_options,
 )
 from sglang.srt.utils.common import is_cuda_alike
 
@@ -284,6 +290,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
+    _validate_aim_vision_load(model_config, load_config, model_class)
     # Decide the shared-experts-fusion question here, once per runner, before any
     # layer exists: this is the only place a model class is instantiated, and it
     # is the last point that still knows both the checkpoint's quantization and
@@ -305,6 +312,43 @@ def _initialize_model(
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
     return model_class(**kwargs)
+
+
+def _validate_aim_vision_load(model_config, load_config, model_class):
+    """Reject loaders/towers that would silently ignore requested AIM options."""
+    if getattr(model_config, "is_draft_model", False):
+        return
+    mm_config = get_mm()
+    inherit_model = envs.SGLANG_QUANTIZE_VIT.get()
+    if (
+        mm_config.vision_quantization is None
+        and mm_config.vision_model_path is None
+        and not inherit_model
+    ):
+        return
+    runtime_model = get_model()
+    validate_vision_options(
+        mm_config.vision_quantization,
+        mm_config.vision_model_path,
+        inherit_model=inherit_model,
+        load_format=load_config.load_format,
+        startup_mode=runtime_model.startup_weight_load_mode,
+        weight_cache_mode=runtime_model.weight_cache_mode,
+        enable_multimodal=mm_config.enable_multimodal,
+        model_impl=runtime_model.model_impl,
+        modelopt_quant=getattr(model_config, "modelopt_quant", None),
+        model_quantization=getattr(model_config, "quantization", None),
+        pp_size=(
+            get_parallel().pp_size if mm_config.vision_model_path is not None else 1
+        ),
+    )
+    if not getattr(model_class, "supports_aim_vision_policy", False):
+        raise ValueError(
+            "AIM vision options currently support only the Qwen3VL-derived visual tower"
+        )
+    if getattr(model_config.hf_config, "language_model_only", False):
+        raise ValueError("AIM vision options require a checkpoint with a visual tower")
+
 
 
 def post_load_weights(model: nn.Module) -> None:
@@ -745,14 +789,70 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
-        primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        def primary_iterator():
+            primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
+            yield from self._get_weights_iterator(primary_weights)
 
-        secondary_weights = cast(
-            Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
+            secondary_weights = cast(
+                Iterable[DefaultModelLoader.Source],
+                getattr(model, "secondary_weights", ()),
+            )
+            for source in secondary_weights:
+                yield from self._get_weights_iterator(source)
+
+        vision_path = (
+            None
+            if getattr(model_config, "is_draft_model", False)
+            else get_mm().vision_model_path
         )
-        for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+        online_vision_fp8 = (
+            not getattr(model_config, "is_draft_model", False)
+            and get_mm().vision_quantization == "fp8"
+        )
+        if vision_path is None:
+            weights = primary_iterator()
+            if online_vision_fp8:
+                weights = validate_online_vision_weights(weights)
+            yield from weights
+            return
+
+        _validate_aim_vision_load(model_config, self.load_config, type(model))
+        if getattr(model, "visual", None) is None:
+            raise ValueError(
+                "Separate vision weights require an initialized visual tower"
+            )
+        # Separate checkpoints have their own revision; never reuse the main
+        # checkpoint's commit/tag or ask it to supply the main model's MTP shards.
+        source = DefaultModelLoader.Source(
+            vision_path,
+            revision=None,
+            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+        )
+        visual_parameters = {
+            name
+            for name, _ in model.named_parameters(remove_duplicate=False)
+            if name.startswith("visual.")
+        }
+        visual_buffers = {
+            name for name, _ in model.named_buffers() if name.startswith("visual.")
+        }
+        # Online FP8 creates scale parameters during initialization; those are
+        # generated after loading. The source must still supply every weight
+        # and bias, not merely one recognizable tensor.
+        required = {
+            name for name in visual_parameters if name.endswith((".weight", ".bias"))
+        }
+        replacement_weights = self._get_weights_iterator(source)
+        if online_vision_fp8:
+            replacement_weights = validate_online_vision_weights(
+                replacement_weights, allow_bare=True
+            )
+        yield from replace_vision_weights(
+            primary_iterator(),
+            replacement_weights,
+            expected_names=visual_parameters | visual_buffers,
+            required_names=required,
+        )
 
     def resolve_model_weights(
         self,

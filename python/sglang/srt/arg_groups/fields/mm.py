@@ -60,6 +60,14 @@ class Mm(msgspec.Struct):
         bool,
         "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
     ] = False
+    vision_quantization: A[
+        Optional[Literal["fp8"]],
+        "Explicit online FP8 quantization for the Qwen visual tower; unset preserves BF16.",
+    ] = None
+    vision_model_path: A[
+        Optional[str],
+        "Separate visual checkpoint; requires serial native loading and pp_size=1.",
+    ] = None
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(

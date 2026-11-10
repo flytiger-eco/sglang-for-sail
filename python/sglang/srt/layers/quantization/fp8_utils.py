@@ -7,6 +7,8 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.elementwise.channel_bias import add_channel_bias_
+
 from sglang.kernels.ops.gemm.fp8_kernel import (
     get_w8a8_channelwise_fp8_config,
     triton_scaled_mm,
@@ -2223,25 +2225,26 @@ def apply_fp8_linear(
                     qinput, x_scale = per_token_group_quant_fp8(
                         input_2d, group_size=input_2d.shape[1]
                     )
-    # PPU: use deepgemm for channelwise fp8 (no bias support)
+    # PPU: DeepGEMM handles channelwise FP8, including biased vision linears.
     if (
         _is_ppu
         and get_device_sm() >= 89
         and weight_scale.numel() == weight.shape[1]
-        and bias is None
     ):
         out = torch.empty(
-            output_shape,
+            (qinput.shape[0], weight.shape[1]),
             dtype=torch.bfloat16,
             device=qinput.device,
         )
         gemm_nt_f8f8bf16(
             qinput,
-            x_scale,
+            x_scale.reshape(-1, 1).expand(qinput.shape[0], 1).contiguous(),
             weight.t(),
-            weight_scale,
+            weight_scale.reshape(-1, 1).contiguous(),
             out,
         )
+        if bias is not None:
+            add_channel_bias_(out, bias)
         return out.view(*output_shape).to(input.dtype)
 
     if channelwise_cutlass:

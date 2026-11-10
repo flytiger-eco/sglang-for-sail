@@ -113,6 +113,26 @@ def handle_asr_validation(server_args: Any):
         )
 
 
+def handle_vision_policy(server_args: Any):
+    cfg = resolving_view(server_args)
+    from sglang.srt.multimodal.aim_vision_policy import validate_vision_options
+
+    validate_vision_options(
+        cfg.vision_quantization,
+        cfg.vision_model_path,
+        inherit_model=envs.SGLANG_QUANTIZE_VIT.get(),
+        load_format=cfg.load_format,
+        startup_mode=cfg.startup_weight_load_mode,
+        weight_cache_mode=cfg.weight_cache_mode,
+        enable_multimodal=cfg.enable_multimodal,
+        model_impl=cfg.model_impl,
+        modelopt_quant=cfg.modelopt_quant,
+        model_quantization=cfg.quantization,
+        pp_size=cfg.pp_size,
+    )
+
+
+
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
