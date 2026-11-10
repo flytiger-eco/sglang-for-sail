@@ -231,6 +231,47 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertNotIn("imageio==2.36.0", install)
         self.assertNotIn("pillow", install)
 
+    def test_deep_gemm_build_env_includes_cuda_headers(self):
+        with patch.dict(
+            os.environ,
+            {"CPLUS_INCLUDE_PATH": "/usr/local/PPU_SDK/targets/x86_64-linux/include"},
+        ):
+            env = RUNNER._pip_install_env(["deep_gemm@git+DeepGEMM-for-sail"])
+        self.assertEqual(
+            env["CPLUS_INCLUDE_PATH"],
+            "/usr/local/PPU_SDK/CUDA_SDK/include:"
+            "/usr/local/PPU_SDK/targets/x86_64-linux/include",
+        )
+
+    def test_dependency_failure_is_recorded_and_continues(self):
+        first = self.root / "first.py"
+        second = self.root / "second.py"
+        first.write_text("def test_first(): pass\n")
+        second.write_text("def test_second(): pass\n")
+        with patch.object(
+            RUNNER,
+            "ensure_test_dependencies",
+            side_effect=subprocess.CalledProcessError(1, ["pip"]),
+        ):
+            result = RUNNER.run_pytest_files(
+                [first, second],
+                self.root / "dependency_failures",
+                15,
+                continue_on_error=True,
+            )
+        report = json.loads(
+            (self.root / "dependency_failures/summary.json").read_text()
+        )
+        self.assertEqual(result, 1)
+        self.assertEqual(len(report["files"]), 2)
+        self.assertFalse(report["success"])
+        self.assertTrue(
+            all(
+                "returned non-zero exit status" in row["error"]
+                for row in report["files"]
+            )
+        )
+
     def test_git_dependency_spec_is_not_treated_as_installed(self):
         spec = (
             "sgl-eval@git+https://github.com/sgl-project/sgl-eval.git@"
