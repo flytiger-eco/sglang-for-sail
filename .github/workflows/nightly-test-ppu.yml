@@ -26,6 +26,10 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
+      model_cache_repair_only:
+        description: 'TEMPORARY: Search checkpoints, repair HF cache mappings, validate offline loading, and skip tests'
+        type: boolean
+        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -971,12 +975,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'model_cache_repair_only'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertNotIn('if', jobs['sweep-execute'])
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.model_cache_repair_only != true')
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.model_cache_repair_only != true')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -986,7 +990,7 @@ jobs:
                       driver = next(s for s in jobs['sweep-prepare']['steps'] if s.get('name') == 'Build self-contained sweep driver')['run']
                       self.assertIn('export CUDA_VISIBLE_DEVICES=0\n', driver)
                       self.assertEqual(probe['with']['node_selector'], 'board-type=ZW-M890P')
-                      self.assertEqual(probe['with']['timeout_minutes'], 20)
+                      self.assertEqual(probe['with']['timeout_minutes'], 40)
                       self.assertNotIn('secrets.', probe['with']['extra_env'])
                       collector = next(s for s in jobs['sweep-models']['steps'] if s.get('name') == 'Validate and publish PPU model preflight')
                       self.assertEqual(collector['if'], 'always()')
@@ -1269,6 +1273,363 @@ jobs:
           bash scripts/ci/ppu/ppu_install_dependency.sh
           python3 -m pip install pytest==8.3.5 tabulate
           SH
+          cat > .ppu-sweep/repair_models.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import struct
+          import tempfile
+          import time
+          from pathlib import Path
+
+          from huggingface_hub import hf_hub_download, snapshot_download
+          from transformers import AutoConfig, AutoTokenizer
+
+          MODELS = [
+              'Qwen/Qwen3-30B-A3B-Instruct-2507-FP8',
+              'RadixArk/Kimi-K3-DSpark',
+              'deepseek-ai/DeepSeek-V4-Flash-DSpark',
+              'lightseekorg/kimi-k2.5-eagle3-mla',
+              'lmsys/sglang-ci-dsv3-channel-int8-test',
+              'lmsys/sglang-ci-dsv3-channel-int8-test-NextN',
+              'lmsys/sglang-ci-dsv3-test',
+              'lmsys/sglang-ci-dsv3-test-NextN',
+              'meta-llama/Llama-2-7b-hf',
+              'opherlie/lora-test-case-NVIDIA-Nemotron-3-Super-120B-A12B-BF16',
+              'opherlie/lora-test-case-Qwen3.5-35B-A3B',
+              'opherlie/lora-test-case-Qwen3.5-4B',
+              'shanearora/2025-sep-a-base-model',
+              'swiss-ai/Apertus-8B',
+              'thinkingmachines/Inkling',
+              'thinkingmachines/Inkling-NVFP4',
+              'thinkingmachines/Inkling-Small-NVFP4',
+              'yushengsu/lora-diff-DeepSeek-V3.1-Base',
+              'yushengsu/lora-diff-Kimi-K2.5',
+              'yushengsu/lora-diff-Qwen3-30B-A3B-Instruct-2507',
+              'yushengsu/lora-diff-Qwen3-8B',
+              'yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct',
+              'yushengsu/lora-diff-gpt-oss-20b',
+          ]
+          CACHE = Path('/nas_aisw/datasets/hf_cache/hub')
+          CHECKPOINTS = Path('/nas_aisw/datasets/checkpoints/LLM')
+          DESTINATION = Path('/ppu-models')
+          WEIGHT_SUFFIXES = {'.safetensors', '.bin', '.pt', '.pth', '.gguf'}
+          IGNORED_WEIGHT_PARTS = {'optimizer', 'scheduler', 'training_args', 'rng_state'}
+
+          def emit(name, value):
+              print(name + '=' + json.dumps(value, ensure_ascii=False), flush=True)
+
+          def normalized(name):
+              return re.sub(r'[^a-z0-9]+', '', name.lower())
+
+          def verify_layout_contract():
+              with tempfile.TemporaryDirectory(prefix='hf-symlink-selftest-') as temporary:
+                  root = Path(temporary)
+                  source = root / 'checkpoint'
+                  source.mkdir()
+                  (source / 'config.json').write_text('{}')
+                  (source / 'model.bin').write_bytes(b'weights')
+                  revision = 'a' * 40
+                  repo = root / 'cache/models--org--model'
+                  (repo / 'refs').mkdir(parents=True)
+                  (repo / 'snapshots').mkdir()
+                  (repo / 'refs/main').write_text(revision)
+                  (repo / 'snapshots' / revision).symlink_to(source, target_is_directory=True)
+                  resolved = snapshot_download('org/model', cache_dir=root / 'cache', local_files_only=True)
+                  weight = hf_hub_download('org/model', 'model.bin', cache_dir=root / 'cache', local_files_only=True)
+                  assert Path(resolved).resolve() == source.resolve(), resolved
+                  assert Path(weight).read_bytes() == b'weights'
+
+          def inspect_model(directory, validate_headers=True):
+              directory = Path(directory)
+              result = {
+                  'path': str(directory), 'complete': False, 'metadata': None,
+                  'file_count': 0, 'weight_count': 0, 'weight_bytes': 0,
+                  'broken_weights': [], 'missing_shards_count': 0,
+                  'missing_shards_sample': [], 'invalid_indexes': [],
+                  'invalid_safetensors': [], 'error': None,
+              }
+              names = set()
+              if not directory.is_dir():
+                  result['error'] = 'not_a_directory'
+                  return result, names
+              try:
+                  entries = list(directory.rglob('*'))
+                  files = [path for path in entries if path.is_file()]
+                  result['file_count'] = len(files)
+                  adapter = (directory / 'adapter_config.json').is_file()
+                  metadata = 'adapter_config.json' if adapter else 'config.json'
+                  if not (directory / metadata).is_file():
+                      result['error'] = 'missing_' + metadata
+                  else:
+                      result['metadata'] = metadata
+                      names.add(metadata)
+                  candidates = []
+                  for path in entries:
+                      if path.suffix not in WEIGHT_SUFFIXES:
+                          continue
+                      if any(part in path.name for part in IGNORED_WEIGHT_PARTS):
+                          continue
+                      if adapter and not path.name.startswith('adapter_model'):
+                          continue
+                      candidates.append(path)
+                  weights = []
+                  for path in candidates:
+                      if not path.is_file() or path.stat().st_size == 0:
+                          result['broken_weights'].append(str(path.relative_to(directory)))
+                      else:
+                          weights.append(path)
+                  result['weight_count'] = len(weights)
+                  result['weight_bytes'] = sum(path.stat().st_size for path in weights)
+                  names.update(str(path.relative_to(directory)) for path in weights)
+                  indexes = [path for path in files if path.name.endswith(('.safetensors.index.json', '.bin.index.json'))]
+                  for index in indexes:
+                      relative_index = str(index.relative_to(directory))
+                      names.add(relative_index)
+                      try:
+                          shards = sorted(set(json.loads(index.read_text())['weight_map'].values()))
+                          if not shards:
+                              raise ValueError('empty weight_map')
+                          for shard in shards:
+                              if Path(shard).is_absolute() or '..' in Path(shard).parts:
+                                  raise ValueError('unsafe shard path: ' + shard)
+                              target = index.parent / shard
+                              if not target.is_file() or target.stat().st_size == 0:
+                                  result['missing_shards_count'] += 1
+                                  if len(result['missing_shards_sample']) < 20:
+                                      result['missing_shards_sample'].append(shard)
+                      except (ValueError, KeyError, TypeError) as error:
+                          result['invalid_indexes'].append(relative_index + ': ' + str(error))
+                  if validate_headers:
+                      for path in weights:
+                          if path.suffix != '.safetensors':
+                              continue
+                          try:
+                              with path.open('rb') as stream:
+                                  raw = stream.read(8)
+                                  if len(raw) != 8:
+                                      raise ValueError('short safetensors header')
+                                  size = struct.unpack('<Q', raw)[0]
+                                  if size == 0 or size > 100 * 1024 * 1024:
+                                      raise ValueError('invalid header length: ' + str(size))
+                                  json.loads(stream.read(size))
+                          except (OSError, ValueError, struct.error) as error:
+                              relative = str(path.relative_to(directory))
+                              if len(result['invalid_safetensors']) < 20:
+                                  result['invalid_safetensors'].append(relative + ': ' + str(error))
+                  result['complete'] = bool(
+                      result['metadata'] and weights
+                      and not result['broken_weights'] and not result['missing_shards_count']
+                      and not result['invalid_indexes'] and not result['invalid_safetensors']
+                  )
+              except OSError as error:
+                  result['error'] = str(error)
+              return result, names
+
+          def cache_state(model):
+              try:
+                  snapshot = snapshot_download(model, cache_dir=CACHE, local_files_only=True)
+                  inspection, _ = inspect_model(snapshot, validate_headers=False)
+                  return {'resolved': True, 'snapshot': str(snapshot), **inspection}
+              except Exception as error:
+                  return {'resolved': False, 'complete': False, 'error': type(error).__name__ + ': ' + str(error)}
+
+          def find_checkpoints():
+              by_name = {}
+              for model in MODELS:
+                  by_name.setdefault(normalized(model.split('/')[-1]), []).append(model)
+              matches = {model: [] for model in MODELS}
+              errors, visited = [], 0
+              completed = True
+              deadline = time.monotonic() + 900
+              def onerror(error):
+                  if len(errors) < 20:
+                      errors.append(str(error))
+              for directory, subdirectories, _ in os.walk(CHECKPOINTS, onerror=onerror, followlinks=False):
+                  visited += 1
+                  if visited % 50000 == 0:
+                      print('CHECKPOINT_SCAN_PROGRESS', visited, flush=True)
+                  if time.monotonic() > deadline:
+                      completed = False
+                      break
+                  subdirectories[:] = [name for name in subdirectories if name not in {'.git', 'blobs', '__pycache__'}]
+                  current = Path(directory)
+                  for model in by_name.get(normalized(current.name), []):
+                      snapshots = current / 'snapshots'
+                      if snapshots.is_dir() and not (current / 'config.json').is_file() and not (current / 'adapter_config.json').is_file():
+                          candidates = [path for path in snapshots.iterdir() if path.is_dir()]
+                          matches[model].extend(str(path) for path in candidates)
+                      else:
+                          matches[model].append(str(current))
+                      if (current / 'config.json').is_file() or (current / 'adapter_config.json').is_file():
+                          subdirectories[:] = []
+              emit('PPU_CHECKPOINT_SCAN', {
+                  'root': str(CHECKPOINTS), 'completed': completed,
+                  'visited_directories': visited, 'errors': errors,
+                  'matches': {model: len(paths) for model, paths in matches.items()},
+              })
+              return matches, completed
+
+          def offline_validate(model):
+              result = {'core_ok': False, 'config_ok': False, 'tokenizer_ok': None, 'load_ok': False}
+              try:
+                  snapshot = snapshot_download(model, cache_dir=CACHE, local_files_only=True)
+                  inspection, names = inspect_model(snapshot, validate_headers=True)
+                  resolved_failures = []
+                  for name in sorted(names):
+                      try:
+                          resolved = hf_hub_download(model, name, cache_dir=CACHE, local_files_only=True)
+                          if not Path(resolved).is_file():
+                              raise FileNotFoundError(resolved)
+                      except Exception as error:
+                          if len(resolved_failures) < 20:
+                              resolved_failures.append(name + ': ' + str(error))
+                  result.update({
+                      'snapshot': str(snapshot), 'inspection': inspection,
+                      'resolved_file_count': len(names) - len(resolved_failures),
+                      'resolution_failures': resolved_failures,
+                      'core_ok': inspection['complete'] and not resolved_failures,
+                  })
+              except Exception as error:
+                  result['core_error'] = type(error).__name__ + ': ' + str(error)
+                  return result
+              metadata = result['inspection']['metadata']
+              try:
+                  if metadata == 'adapter_config.json':
+                      config_path = hf_hub_download(model, metadata, cache_dir=CACHE, local_files_only=True)
+                      json.loads(Path(config_path).read_text())
+                      result['config_class'] = 'LoRAAdapterConfigJSON'
+                  else:
+                      config = AutoConfig.from_pretrained(model, cache_dir=CACHE, local_files_only=True)
+                      result['config_class'] = type(config).__name__
+                  result['config_ok'] = True
+              except Exception as error:
+                  result['config_error'] = type(error).__name__ + ': ' + str(error)
+              snapshot = Path(result['snapshot'])
+              if metadata != 'adapter_config.json' and any((snapshot / name).is_file() for name in ('tokenizer_config.json', 'tokenizer.json', 'tokenizer.model')):
+                  try:
+                      tokenizer = AutoTokenizer.from_pretrained(model, cache_dir=CACHE, local_files_only=True)
+                      result['tokenizer_class'] = type(tokenizer).__name__
+                      result['tokenizer_ok'] = True
+                  except Exception as error:
+                      result['tokenizer_ok'] = False
+                      result['tokenizer_error'] = type(error).__name__ + ': ' + str(error)
+              result['load_ok'] = result['core_ok'] and result['config_ok'] and result['tokenizer_ok'] is not False
+              return result
+
+          def write_revision(main, revision):
+              temporary = main.parent / ('.main.' + str(os.getpid()) + '.tmp')
+              temporary.write_text(revision)
+              os.replace(temporary, main)
+
+          def repair_mapping(model, source):
+              repo = CACHE / ('models--' + model.replace('/', '--'))
+              main = repo / 'refs/main'
+              revision = hashlib.sha256(str(Path(source).resolve()).encode()).hexdigest()[:40]
+              snapshot = repo / 'snapshots' / revision
+              previous = main.read_text().strip() if main.is_file() else None
+              had_main = os.path.lexists(main)
+              created = False
+              changed = False
+              final = None
+              try:
+                  if repo.is_symlink() and not (repo / 'snapshots').is_dir():
+                      raise RuntimeError('Refusing to modify plain checkpoint through repo symlink')
+                  (repo / 'refs').mkdir(parents=True, exist_ok=True)
+                  (repo / 'snapshots').mkdir(parents=True, exist_ok=True)
+                  if os.path.lexists(snapshot):
+                      if not snapshot.is_symlink() or snapshot.resolve() != Path(source).resolve():
+                          raise RuntimeError('Conflicting existing snapshot: ' + str(snapshot))
+                  else:
+                      snapshot.symlink_to(Path(source).resolve(), target_is_directory=True)
+                      created = True
+                  write_revision(main, revision)
+                  changed = True
+                  final = offline_validate(model)
+                  if not final['core_ok']:
+                      raise RuntimeError('Offline file validation failed; rolling back mapping')
+                  return {'repaired': True, 'rolled_back': False, 'revision': revision,
+                          'previous_revision': previous, 'snapshot': str(snapshot), 'final': final}
+              except Exception as error:
+                  rollback_errors = []
+                  if changed:
+                      try:
+                          if had_main:
+                              write_revision(main, previous or '')
+                          elif os.path.lexists(main):
+                              main.unlink()
+                      except OSError as rollback_error:
+                          rollback_errors.append(str(rollback_error))
+                  if created:
+                      try:
+                          snapshot.unlink()
+                      except OSError as rollback_error:
+                          rollback_errors.append(str(rollback_error))
+                  return {'repaired': False, 'rolled_back': True, 'error': str(error),
+                          'rollback_errors': rollback_errors, 'final': final}
+
+          verify_layout_contract()
+          emit('PPU_SYMLINK_LAYOUT_SELFTEST', {'ok': True})
+          checkpoint_matches, search_completed = find_checkpoints()
+          rows = []
+          for model in MODELS:
+              print('PROCESSING_MODEL', model, flush=True)
+              before = cache_state(model)
+              candidates = []
+              complete_sources = []
+              for path in checkpoint_matches[model]:
+                  inspection, _ = inspect_model(path, validate_headers=True)
+                  candidates.append(inspection)
+                  if inspection['complete']:
+                      complete_sources.append(inspection)
+              selected = sorted(complete_sources, key=lambda row: (-row['weight_bytes'], row['path']))
+              repair = None
+              if before['complete']:
+                  action = 'existing_hf_cache'
+                  final = offline_validate(model)
+              elif selected:
+                  action = 'repair_from_checkpoint'
+                  repair = repair_mapping(model, selected[0]['path'])
+                  final = repair['final']
+              else:
+                  action = 'checkpoint_not_found' if not candidates else 'checkpoint_incomplete'
+                  final = offline_validate(model)
+              row = {
+                  'model': model, 'action': action, 'before': before,
+                  'checkpoint_candidates': candidates,
+                  'selected_checkpoint': selected[0]['path'] if selected else None,
+                  'repair': repair, 'final': final,
+              }
+              rows.append(row)
+              emit('PPU_MODEL_REPAIR_RESULT', row)
+          report = {
+              'checkpoint_root': str(CHECKPOINTS), 'hf_cache': str(CACHE),
+              'checkpoint_search_completed': search_completed, 'models': rows,
+          }
+          DESTINATION.mkdir(parents=True, exist_ok=True)
+          (DESTINATION / 'model_cache_repair.json').write_text(json.dumps(report, indent=2))
+          summary = {
+              'total': len(rows),
+              'checkpoint_complete': sum(bool(row['selected_checkpoint']) for row in rows),
+              'hf_complete_before': sum(row['before']['complete'] for row in rows),
+              'mappings_repaired': sum(bool(row['repair'] and row['repair']['repaired']) for row in rows),
+              'offline_core_ok': sum(row['final'] is not None and row['final']['core_ok'] for row in rows),
+              'offline_load_ok': sum(row['final'] is not None and row['final']['load_ok'] for row in rows),
+              'still_unusable': [row['model'] for row in rows if row['final'] is None or not row['final']['core_ok']],
+          }
+          emit('PPU_MODEL_REPAIR_SUMMARY', summary)
+          with (DESTINATION / 'summary.log').open('a') as stream:
+              stream.write('## NAS checkpoint to HF cache repair\n\n')
+              stream.write('| Model | Action | Checkpoint | Offline files | Offline config |\n| --- | --- | --- | --- | --- |\n')
+              for row in rows:
+                  final = row['final'] or {}
+                  stream.write('| %s | %s | %s | %s | %s |\n' % (
+                      row['model'], row['action'],
+                      row['selected_checkpoint'] or 'none',
+                      final.get('core_ok', False), final.get('config_ok', False),
+                  ))
+          PY
           cat > .ppu-sweep/models.sh <<'SH'
           set -euo pipefail
           umask 022
@@ -1278,6 +1639,7 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          timeout --signal=TERM --kill-after=30s 1800s python3 .ppu-sweep/repair_models.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1324,7 +1686,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     env:
       PPU_BASE_IMAGE_REF: ${{ needs.sweep-image.outputs.image }}
       PPU_BASE_IMAGE_DIGEST: ${{ needs.sweep-image.outputs.digest }}
@@ -1368,7 +1730,7 @@ jobs:
             cpus: '2'
             memory: 8Gi
             shm_size: 64Mi
-          timeout_minutes: 20
+          timeout_minutes: 40
           cleanup_policy: always
       - name: Validate and publish PPU model preflight
         if: always()
@@ -1408,6 +1770,7 @@ jobs:
           printf 'image=%s\ndigest=%s\n' "$PPU_BASE_IMAGE_REF" "$PPU_BASE_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
   sweep-execute:
+    if: inputs.model_cache_repair_only != true
     needs: [sweep-prepare, sweep-models, sweep-image]
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1498,7 +1861,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always()
+    if: always() && inputs.model_cache_repair_only != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
