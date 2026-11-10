@@ -1,6 +1,4 @@
-import tempfile
 import unittest
-from pathlib import Path
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -11,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=600, stage="nightly", runner_config="4-gpu-gb300")
 
-MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Pro-MXFP4-FP8"
+MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Pro"
 SERVER_LAUNCH_TIMEOUT = 5400
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
@@ -47,44 +45,6 @@ BALANCED_ENV = {
 }
 
 
-def _model_launch_path():
-    model_dir = Path(MODEL_PATH)
-    config_path = model_dir / "config.json"
-    print(
-        f"Local model preflight: directory={model_dir.is_dir()} "
-        f"config={config_path.is_file()} path={model_dir}",
-        flush=True,
-    )
-    if config_path.is_file() or not model_dir.is_dir():
-        if not model_dir.is_dir() and model_dir.parent.is_dir():
-            candidates = sorted(
-                path.name
-                for path in model_dir.parent.iterdir()
-                if "deepseek" in path.name.lower() and "v4" in path.name.lower()
-            )
-            print(f"Nearby DeepSeek V4 directories: {candidates}", flush=True)
-        return str(model_dir)
-
-    cached_configs = sorted(
-        Path("/nas_aisw/datasets/hf_cache/hub").glob(
-            "models--deepseek-ai--DeepSeek-V4-Pro/snapshots/*/config.json"
-        )
-    )
-    if not cached_configs:
-        return str(model_dir)
-
-    merged_dir = Path(tempfile.mkdtemp(prefix="deepseek-v4-pro-local-"))
-    for source in model_dir.iterdir():
-        (merged_dir / source.name).symlink_to(source)
-    (merged_dir / "config.json").symlink_to(cached_configs[-1])
-    print(
-        f"Using local weights with cached config {cached_configs[-1]} "
-        f"through {merged_dir}",
-        flush=True,
-    )
-    return str(merged_dir)
-
-
 class TestDeepSeekV4ProFp4Balanced(CustomTestCase):
     """DeepSeek-V4-Pro FP4 balanced config on GB300."""
 
@@ -92,7 +52,7 @@ class TestDeepSeekV4ProFp4Balanced(CustomTestCase):
         run_combined_tests(
             models=[
                 ModelLaunchSettings(
-                    _model_launch_path(),
+                    MODEL_PATH,
                     tp_size=8,
                     extra_args=BALANCED_ARGS,
                     env=BALANCED_ENV,
