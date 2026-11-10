@@ -1881,6 +1881,10 @@ class Envs:
     SGLANG_SAIL_ACEXT_MOE_DEBUG = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_DENSE = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE = EnvBool(False)
+    # MiMo native MXFP4 W4A8: opt into group-128 FP8 activation scales.
+    # Disabled keeps one FP8 activation scale per token across the complete K.
+    # This does not change checkpoint weights or their scales.
+    SGLANG_PPU_W4A8_A_PER_GROUP_QUANT = EnvBool(False)
     # Repack MXFP4 MoE weights into the INT4 layout consumed by the PPU
     # DeepGEMM W4A16 kernel. This is distinct from native MXFP4 W4A4.
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16 = EnvBool(False)
