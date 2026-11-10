@@ -137,7 +137,7 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertEqual(len(deep_gemm), 4)
         for spec in deep_gemm:
             self.assertIn("--no-build-isolation", spec)
-            self.assertIn("674cfa53dce10c28ee8f7f0bc1c4d40f887fd52e", spec)
+            self.assertIn("deep_gemm-1.1.0%2Bv0.1.0.ppu2.2.0.tar.gz", spec)
 
     def test_manifest_selects_exact_source_registrations(self):
         manifest = self.root / "selection.tsv"
@@ -230,18 +230,6 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertEqual(install[-1], "imageio-ffmpeg==0.5.1")
         self.assertNotIn("imageio==2.36.0", install)
         self.assertNotIn("pillow", install)
-
-    def test_deep_gemm_build_env_includes_cuda_headers(self):
-        with patch.dict(
-            os.environ,
-            {"CPLUS_INCLUDE_PATH": "/usr/local/PPU_SDK/targets/x86_64-linux/include"},
-        ):
-            env = RUNNER._pip_install_env(["deep_gemm@git+DeepGEMM-for-sail"])
-        self.assertEqual(
-            env["CPLUS_INCLUDE_PATH"],
-            "/usr/local/PPU_SDK/CUDA_SDK/include:"
-            "/usr/local/PPU_SDK/targets/x86_64-linux/include",
-        )
 
     def test_dependency_failure_is_recorded_and_continues(self):
         first = self.root / "first.py"

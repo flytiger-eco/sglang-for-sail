@@ -198,16 +198,6 @@ def _ensure_rust_toolchain(root):
     _COMPLETED_BUILDS.add(key)
 
 
-def _pip_install_env(packages):
-    env = os.environ.copy()
-    if any("DeepGEMM-for-sail" in package for package in packages):
-        cuda_include = "/usr/local/PPU_SDK/CUDA_SDK/include"
-        env["CPLUS_INCLUDE_PATH"] = (
-            cuda_include + os.pathsep + env.get("CPLUS_INCLUDE_PATH", "")
-        )
-    return env
-
-
 def ensure_test_dependencies(filename):
     root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[4]))
     record = _dependency_action(root, filename)
@@ -253,7 +243,6 @@ def ensure_test_dependencies(filename):
                 *missing,
             ],
             check=True,
-            env=_pip_install_env(packages),
         )
     return {}
 
