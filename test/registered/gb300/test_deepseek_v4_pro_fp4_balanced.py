@@ -9,14 +9,14 @@ from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=600, stage="nightly", runner_config="4-gpu-gb300")
 
-MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Pro"
-SERVER_LAUNCH_TIMEOUT = 5400
+MODEL_PATH = "deepseek-ai/DeepSeek-V4-Pro"
+SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 BALANCED_ARGS = [
     "--trust-remote-code",
     "--dp",
-    "8",
+    "4",
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
@@ -53,7 +53,7 @@ class TestDeepSeekV4ProFp4Balanced(CustomTestCase):
             models=[
                 ModelLaunchSettings(
                     MODEL_PATH,
-                    tp_size=8,
+                    tp_size=4,
                     extra_args=BALANCED_ARGS,
                     env=BALANCED_ENV,
                     variant="balanced",
