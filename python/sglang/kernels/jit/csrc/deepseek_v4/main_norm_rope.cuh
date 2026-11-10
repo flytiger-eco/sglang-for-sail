@@ -281,9 +281,25 @@ struct FusedKNormRopeFlashMLAParams {
   uint32_t num_q_heads = 0;
 };
 
+// SAIL's fmaf (and __fmaf_rn) is not fused: it rounds the product before the add, so the
+// bitwise contract with the torch reference needs the double-precision emulation.
+SGL_DEVICE float sgl_fmaf(float x, float y, float z) {
+#if defined(SGL_SAIL) || defined(__HGGCCC__)
+  return static_cast<float>(static_cast<double>(x) * static_cast<double>(y) + static_cast<double>(z));
+#else
+  return fmaf(x, y, z);
+#endif
+}
+
 // The V4.1 K RoPE with its fma pinned, so the two K kernels below round it the same way.
 SGL_DEVICE fp32x2_t v41_rope_pair(float x_real, float x_imag, float freq_real, float freq_imag) {
+#if defined(SGL_SAIL) || defined(__HGGCCC__)
+  // On SAIL the reference's complex multiply fuses the second product into the add for
+  // the imaginary part, so keep its order and emulate both fused ops with sgl_fmaf.
+  return {sgl_fmaf(x_real, freq_real, -(x_imag * freq_imag)), sgl_fmaf(x_imag, freq_real, x_real * freq_imag)};
+#else
   return {fmaf(x_real, freq_real, -(x_imag * freq_imag)), fmaf(x_real, freq_imag, x_imag * freq_real)};
+#endif
 }
 
 template <

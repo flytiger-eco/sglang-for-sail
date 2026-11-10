@@ -56,9 +56,11 @@ SGL_DEVICE uint32_t e2m1x2_code(fp32x2_t x) {
 }
 #endif
 
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(SGL_SAIL) || defined(__HGGCCC__)
 /// \brief `float(__nv_fp8_e4m3(raw))` for `raw` in `[2^-9, 448]`: RNE onto the E4M3FN
 /// grid, gfx950's `v_cvt_pk_fp8_f32` in hardware, software elsewhere (gfx942's fp8 is FNUZ).
+/// SAIL's hgcc scalar e4m3 conversion rounds ties toward zero instead of to even, so it
+/// takes the software path as well.
 SGL_DEVICE float e4m3_round_rn(float raw) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
   const auto packed = __builtin_amdgcn_cvt_pk_fp8_f32(raw, raw, 0, false);
@@ -66,7 +68,13 @@ SGL_DEVICE float e4m3_round_rn(float raw) {
 #else
   const int exponent = ilogbf(raw);
   const float step = exponent < -6 ? 0x1p-9f : ldexpf(1.0f, exponent - 3);
-  return rintf(raw / step) * step;
+  // `raw / step` is exact (step is a power of two). Round the integer quotient by
+  // hand: `rintf` is not ties-to-even on every target (SAIL rounds 13.5 to 13).
+  const float scaled = raw / step;
+  const int lo = static_cast<int>(scaled);
+  const float frac = scaled - static_cast<float>(lo);
+  const int round_up = frac > 0.5f || (frac == 0.5f && (lo & 1));
+  return static_cast<float>(lo + round_up) * step;
 #endif
 }
 #endif
@@ -74,7 +82,7 @@ SGL_DEVICE float e4m3_round_rn(float raw) {
 /// \brief Round amax / 6 to a positive finite E4M3 scale, ties to even.
 SGL_DEVICE float compressed_kv_scale(float amax) {
   const auto raw = fminf(fmaxf(amax * (1.0f / kMax), 0x1p-9f), 448.0f);
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || defined(SGL_SAIL) || defined(__HGGCCC__)
   return e4m3_round_rn(raw);
 #else
   return static_cast<float>(__nv_fp8_e4m3(raw));
