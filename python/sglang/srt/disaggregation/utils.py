@@ -1961,15 +1961,12 @@ def set_draft_kv_transfer_metadata(
 def get_draft_total_num_kv_heads(scheduler) -> Optional[int]:
     """Read unsharded draft heads from its own model, never the target model."""
     worker = getattr(scheduler, "draft_worker", None)
-    if worker is None or scheduler.spec_algorithm.is_ngram():
+    if worker is None:
         return None
-    worker = worker.draft_worker
-    runner = (
-        worker.draft_runner_list[0]
-        if scheduler.server_args.enable_multi_layer_eagle
-        else worker.draft_runner
-    )
-    return int(runner.model_config.get_total_num_kv_heads())
+    runners = worker._draft_model_runners()
+    if not runners:
+        return None
+    return int(runners[0].model_config.get_total_num_kv_heads())
 
 
 def get_transfer_kv_layer_ids(target_pool, draft_pool, target_layers: int) -> List[int]:

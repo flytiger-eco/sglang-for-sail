@@ -16,10 +16,74 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
 )
+from sglang.srt.disaggregation.utils import get_draft_total_num_kv_heads
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestPDDraftModelRunners(CustomTestCase):
+    @staticmethod
+    def _runner(total_heads):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(get_total_num_kv_heads=lambda: total_heads)
+        )
+
+    def _scheduler(self, algorithm, draft_worker):
+        worker = BaseSpecWorker()
+        target_runner = self._runner(128)
+        target_runner.spec_algorithm = algorithm
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = draft_worker
+        return SimpleNamespace(draft_worker=worker)
+
+    def test_no_speculative_worker(self):
+        for scheduler in (SimpleNamespace(), SimpleNamespace(draft_worker=None)):
+            with self.subTest(scheduler=scheduler):
+                self.assertIsNone(get_draft_total_num_kv_heads(scheduler))
+
+    def test_dflash_family_uses_draft_model_runner(self):
+        for algorithm in (SpeculativeAlgorithm.DSPARK, SpeculativeAlgorithm.DFLASH):
+            for compatibility_alias in (False, True):
+                with self.subTest(
+                    algorithm=algorithm, compatibility_alias=compatibility_alias
+                ):
+                    runner = self._runner(16)
+                    draft_worker = SimpleNamespace(model_runner=runner)
+                    # The current builder installs this alias. The shared runner
+                    # interface must not require it to determine draft geometry.
+                    if compatibility_alias:
+                        draft_worker.draft_runner = runner
+                    scheduler = self._scheduler(algorithm, draft_worker)
+                    self.assertEqual(get_draft_total_num_kv_heads(scheduler), 16)
+
+    def test_eagle_uses_resolved_draft_runners(self):
+        for algorithm in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3):
+            for num_layers in (1, 3):
+                with self.subTest(algorithm=algorithm, num_layers=num_layers):
+                    draft_worker = SimpleNamespace(
+                        draft_runners=tuple(self._runner(16) for _ in range(num_layers))
+                    )
+                    scheduler = self._scheduler(algorithm, draft_worker)
+                    self.assertEqual(get_draft_total_num_kv_heads(scheduler), 16)
+
+    def test_no_draft_kv_runners(self):
+        cases = (
+            (SpeculativeAlgorithm.DSPARK, None),
+            (SpeculativeAlgorithm.DFLASH, None),
+            (SpeculativeAlgorithm.NGRAM, None),
+            (
+                SpeculativeAlgorithm.FROZEN_KV_MTP,
+                SimpleNamespace(model_runner=self._runner(16)),
+            ),
+        )
+        for algorithm, draft_worker in cases:
+            with self.subTest(algorithm=algorithm):
+                scheduler = self._scheduler(algorithm, draft_worker)
+                self.assertIsNone(get_draft_total_num_kv_heads(scheduler))
 
 
 class TestPDDraftGeometry(CustomTestCase):
@@ -60,6 +124,9 @@ class TestPDDraftGeometry(CustomTestCase):
                     )
                     draft_dest = torch.zeros((1280, 2, 2), dtype=torch.uint8)
                     mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+                    mgr.enable_custom_mem_pool = False
+                    mgr.custom_mem_pool_type = ""
+                    mgr.max_transfer_batch_indices = 0
                     mgr.attn_tp_size = 16
                     mgr.is_mla_backend = True
                     mgr.is_hybrid_mla_backend = False
@@ -183,6 +250,9 @@ class TestPDDraftGeometry(CustomTestCase):
                 sources.append(draft)
                 destinations.append(draft_dest)
                 mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+                mgr.enable_custom_mem_pool = False
+                mgr.custom_mem_pool_type = ""
+                mgr.max_transfer_batch_indices = 0
                 mgr.attn_tp_size = src_tp
                 mgr.is_mla_backend = True
                 mgr.is_hybrid_mla_backend = False
@@ -552,6 +622,7 @@ class TestPDDraftGeometry(CustomTestCase):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.attn_tp_size = 16
         mgr.attn_cp_size = 1
+        mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = True
         mgr.kv_args = SimpleNamespace(engine_rank=1, draft_kv_entry_count=1)
         info = SimpleNamespace(dst_attn_tp_size=8)
@@ -571,6 +642,9 @@ class TestPDDraftGeometry(CustomTestCase):
 
     def test_failure_status_reaches_transfer_caller(self):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.enable_custom_mem_pool = False
+        mgr.custom_mem_pool_type = ""
+        mgr.max_transfer_batch_indices = 0
         mgr.attn_tp_size = 16
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = True
@@ -647,6 +721,7 @@ class TestPDDraftGeometry(CustomTestCase):
             kv_item_lens=[24],
             kv_layer_ids=[],
             draft_kv_entry_count=0,
+            num_draft_entries=0,
         )
         mgr.prepare_dcp_entry_geometry(info)
         self.assertEqual(info.dcp_token_item_lens, [6])
@@ -730,6 +805,9 @@ class TestPDDraftGeometry(CustomTestCase):
                 target_writes, draft_writes = {}, {}
                 for src_rank in range(dst_rank * 2, dst_rank * 2 + 2):
                     mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+                    mgr.enable_custom_mem_pool = False
+                    mgr.custom_mem_pool_type = ""
+                    mgr.max_transfer_batch_indices = 0
                     mgr.attn_tp_size = 16
                     mgr.attn_cp_size = 1
                     mgr.is_mla_backend = False

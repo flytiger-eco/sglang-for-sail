@@ -159,6 +159,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
                     manager.pp_size = manager.attn_tp_size = 1
                     manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                    manager._mamba_state_cp_sharded = False
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
                     peer = SimpleNamespace(

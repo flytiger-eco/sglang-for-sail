@@ -15,7 +15,11 @@ import sglang.srt.disaggregation.mooncake.conn as mc
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import PrefillServerInfo
 from sglang.srt.disaggregation.utils import set_draft_kv_transfer_metadata
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,6 +71,7 @@ def manager(draft=2, tp=16):
         kv_data_ptrs=[10000, 20000, 30000],
         kv_layer_ids=[0, 1, 1],
         draft_kv_entry_count=draft,
+        num_draft_entries=draft,
         draft_kv_head_num=1,
         draft_total_kv_head_num=16,
         draft_kv_token_major=True,
@@ -102,6 +107,9 @@ def manager(draft=2, tp=16):
     m.failure_records = {}
     m.request_status = {}
     m.enable_staging = False
+    m.enable_custom_mem_pool = False
+    m.custom_mem_pool_type = ""
+    m.max_transfer_batch_indices = 0
     m.send_kv_status_message = Mock()
     m._start_heartbeat_checker_thread = Mock()
     m.required_prefill_response_num_table = {}
@@ -582,14 +590,17 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                         observed = []
                         for pages in chunks:
                             count = min(pages * 64, max(0, total_tokens - start * 64))
-                            with patch.object(
-                                common,
-                                "get_parallel",
-                                return_value=NS(enable_dsa_cache_layer_split=False),
-                            ), patch.object(
-                                mc,
-                                "get_parallel",
-                                return_value=NS(enable_dsa_cache_layer_split=False),
+                            with (
+                                patch.object(
+                                    common,
+                                    "get_parallel",
+                                    return_value=NS(enable_dsa_cache_layer_split=False),
+                                ),
+                                patch.object(
+                                    mc,
+                                    "get_parallel",
+                                    return_value=NS(enable_dsa_cache_layer_split=False),
+                                ),
                             ):
                                 send(
                                     sender,
@@ -948,15 +959,18 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 info = m.decode_kv_args_table["ok"]
                 m._validate_envelope_kv_layout = Mock()
                 m._transfer_data = Mock(return_value=0)
-                with patch.object(
-                    mc,
-                    "group_concurrent_contiguous",
-                    wraps=mc.group_concurrent_contiguous,
-                ) as grouping, patch.object(
-                    mc,
-                    "build_dcp_token_transfer_plan",
-                    wraps=mc.build_dcp_token_transfer_plan,
-                ) as planning:
+                with (
+                    patch.object(
+                        mc,
+                        "group_concurrent_contiguous",
+                        wraps=mc.group_concurrent_contiguous,
+                    ) as grouping,
+                    patch.object(
+                        mc,
+                        "build_dcp_token_transfer_plan",
+                        wraps=mc.build_dcp_token_transfer_plan,
+                    ) as planning,
+                ):
                     m.send_kvcache_mixed(
                         "ok",
                         np.array([1, 3]),
@@ -996,11 +1010,14 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 m.decode_kv_args_table = RemovedAfterRead(
                     {"s": NS(dst_attn_tp_size=8)} if present else {}
                 )
-                with patch.object(
-                    mc, "get_schedule", return_value=NS(chunked_prefill_size=64)
-                ), patch(
-                    "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
-                ) as prefetch:
+                with (
+                    patch.object(
+                        mc, "get_schedule", return_value=NS(chunked_prefill_size=64)
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
+                    ) as prefetch,
+                ):
                     m._prefetch_staging_reqs(1)
                 self.assertEqual(prefetch.call_count, int(present))
 
@@ -1036,9 +1053,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
             state_indices=[],
             prefill_aux_index=0,
         )
-        with patch.object(
-            m, "send_kvcache_mixed", wraps=m.send_kvcache_mixed
-        ) as mixed:
+        with patch.object(m, "send_kvcache_mixed", wraps=m.send_kvcache_mixed) as mixed:
             m.transfer_worker(NS(get=Mock(side_effect=[chunk, None])), None)
 
         mixed.assert_called_once()
@@ -1086,9 +1101,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     self.assertEqual(info.dcp_token_item_lens[0], 1)
                     if has_draft:
                         self.assertEqual(info.dcp_token_item_lens[1:], [16, 16])
-                        self.assertEqual(
-                            info.dcp_dst_token_item_lens[1:], [32, 32]
-                        )
+                        self.assertEqual(info.dcp_dst_token_item_lens[1:], [32, 32])
                         m._init_dcp_pack_buffers_once.assert_not_called()
                     else:
                         m._init_dcp_pack_buffers_once.assert_called_once_with(
@@ -1294,11 +1307,11 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 src = pool("vectorized_5d", heads=2)
                 dst = pool("vectorized_5d", heads=2)
                 for t in src.k_buffer + src.v_buffer:
-                    t.fill_(7)
+                    t.copy_(torch.arange(t.numel()).reshape_as(t) % 251)
                 for t in dst.k_buffer + dst.v_buffer:
                     t.fill_(-1)
-                target = torch.zeros(192, dtype=torch.uint8)
-                source_target = target.clone()
+                target = torch.full((192,), 255, dtype=torch.uint8)
+                source_target = torch.arange(192, dtype=torch.uint8)
                 m = manager(tp=8)
                 sp, sl, si = src.get_contiguous_buf_infos()
                 dp, dl, di = dst.get_contiguous_buf_infos()
@@ -1316,12 +1329,10 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 wire[4] = struct.pack("3Q", target.data_ptr(), *dp)
                 wire[18] = struct.pack("3Q", 64, *di)
                 wire[23] = b"1" if getattr(da, "draft_kv_token_major", True) else b"0"
-                reg = mc.KVArgsRegisterInfo.from_zmq(wire)
-                try:
-                    m.prepare_dcp_entry_geometry(reg)
-                except ValueError as exc:
-                    self.assertIn("token-major", str(exc))
-                    continue
+                m._register_decode_peer(wire, "ok")
+                self.assertNotIn("ok", m.rejected_registrations)
+                reg = m.decode_kv_args_table["ok"]
+                self.assertFalse(m._uses_mixed_kv_transfer(reg))
                 m._validate_envelope_kv_layout = lambda *a: None
 
                 def transfer(session, blocks):
@@ -1330,27 +1341,153 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     return 0
 
                 m._transfer_data = transfer
-                m.send_kvcache_mixed(
-                    "s",
-                    np.array([0, 1]),
-                    np.array([1, 2]),
-                    info=reg,
-                    src_page_offset=0,
-                    decode_prefix_len=0,
-                    num_kv_tokens=count,
-                )
-                missing = 0
-                for token in range(count):
-                    slot = token + 64
-                    missing += int(
-                        (
-                            dst.v_buffer[0][slot // 64, :, slot % 64 // 8, :, slot % 8]
-                            != 7
-                        ).sum()
+                num_pages = (count + 63) // 64
+                with patch.object(
+                    mc, "get_memory", return_value=NS(enable_unified_memory=False)
+                ):
+                    result = m.send_kvcache(
+                        "s",
+                        np.arange(num_pages, dtype=np.int32),
+                        reg.dst_kv_ptrs,
+                        np.arange(1, 1 + num_pages, dtype=np.int32),
+                        None,
+                        dst_layer_ids=reg.dst_kv_layer_ids,
+                        dst_attn_tp_size=reg.dst_attn_tp_size,
                     )
-                self.fail(
-                    f"Packed layout accepted: {missing} required V elements missing for {count} tokens at equal TP8"
-                )
+                self.assertEqual(result, 0)
+                expected_target = torch.full_like(target, 255)
+                expected_target[64 : 64 * (1 + num_pages)] = source_target[
+                    : 64 * num_pages
+                ]
+                torch.testing.assert_close(target, expected_target)
+                for src_tensor, dst_tensor in zip(
+                    src.k_buffer + src.v_buffer, dst.k_buffer + dst.v_buffer
+                ):
+                    expected = torch.full_like(dst_tensor, -1)
+                    expected[1 : 1 + num_pages] = src_tensor[:num_pages]
+                    torch.testing.assert_close(dst_tensor, expected)
+
+    def test_equal_tp_page_transfer_still_validates_peer_geometry(self):
+        for field, value in (
+            (19, b"1"),
+            (20, b"1"),
+            (21, b"32"),
+            (22, b"32"),
+            (23, b"1"),
+            (18, struct.pack("3Q", 64, 4096, 2048)),
+        ):
+            with self.subTest(field=field):
+                m = manager(tp=8)
+                m.kv_args.draft_kv_head_num = 2
+                m.kv_args.kv_item_lens = [64, 2048, 2048]
+                m.kv_args.draft_kv_token_major = False
+                wire = registration(token_major=False)
+                wire[field] = value
+                m._register_decode_peer(wire, "bad")
+                self.assertIn("bad", m.rejected_registrations)
+                self.assertNotIn("bad", m.decode_kv_args_table)
+        # Matching peer metadata must still describe a valid TP head partition.
+        m = manager(tp=8)
+        m.kv_args.draft_kv_head_num = 2
+        m.kv_args.draft_total_kv_head_num = 18
+        m.kv_args.kv_item_lens = [64, 2048, 2048]
+        m.kv_args.draft_kv_token_major = False
+        wire = registration(token_major=False)
+        wire[21] = b"18"
+        m._register_decode_peer(wire, "bad")
+        self.assertIn("must divide each other", m.rejected_registrations["bad"])
+
+    def test_native_mla_dsa_draft_virtual_page_geometry_and_transfer(self):
+        import ctypes
+
+        def native_pool(pool_class, page_size):
+            p = pool_class.__new__(pool_class)
+            p.size = page_size * 3
+            p.page_size = page_size
+            p.layer_num = 1
+            p.kv_cache_dim = 16
+            p.store_dtype = torch.uint8
+            p.device = "cpu"
+            p.custom_mem_pool = None
+            p.memory_saver_adapter = NS(region=lambda *args: nullcontext())
+            p._create_buffers()
+            return p
+
+        for pool_class in (MLATokenToKVPool, DSATokenToKVPool):
+            for dcp in (1, 4, 8):
+                for rank in range(dcp):
+                    with self.subTest(pool=pool_class.__name__, dcp=dcp, rank=rank):
+                        src = native_pool(pool_class, 64)
+                        dst = native_pool(pool_class, 64 * dcp)
+                        source = src.kv_buffer[0]
+                        source.copy_(
+                            torch.arange(source.numel()).reshape_as(source) % 251
+                        )
+                        target_src = torch.full((256, 1, 16), 17, dtype=torch.uint8)
+                        target_dst = torch.full_like(target_src, 255)
+                        dst.kv_buffer[0].fill_(255)
+                        sp, _, si = src.get_contiguous_buf_infos()
+                        dp, _, di = dst.get_contiguous_buf_infos()
+                        m = manager(draft=0, tp=8)
+                        m.kv_args.num_draft_entries = 1
+                        m.kv_args.kv_data_ptrs = [target_src.data_ptr(), *sp]
+                        m.kv_args.kv_item_lens = [1024, *si]
+                        m.kv_args.kv_layer_ids = [0, 1]
+                        set_draft_kv_transfer_metadata(
+                            m.kv_args, src, draft_kv_entry_count=1, tp_size=8
+                        )
+                        self.assertEqual(m.kv_args.draft_kv_entry_count, 0)
+                        m._init_dcp_pack_buffers_once = Mock()
+                        wire = registration(count=0, token_major=False)
+                        wire[4] = struct.pack("2Q", target_dst.data_ptr(), *dp)
+                        wire[12] = struct.pack("2I", 0, 1)
+                        wire[16:18] = [str(dcp).encode(), str(rank).encode()]
+                        wire[18] = struct.pack("2Q", 1024, *di)
+                        wire[20:22] = [b"0", b"0"]
+                        m._register_decode_peer(wire, "ok")
+                        self.assertNotIn("ok", m.rejected_registrations)
+                        info = m.decode_kv_args_table["ok"]
+                        self.assertFalse(m._uses_mixed_kv_transfer(info))
+                        if dcp == 1:
+                            m._init_dcp_pack_buffers_once.assert_not_called()
+                            continue
+                        self.assertEqual(info.dcp_token_item_lens, [16, 16])
+                        self.assertEqual(info.dcp_dst_token_item_lens, [16, 16])
+                        m._init_dcp_pack_buffers_once.assert_called_once_with(
+                            dcp, include_draft=True
+                        )
+
+                        def transfer(session, blocks):
+                            for src_ptr, dst_ptr, size in blocks:
+                                ctypes.memmove(dst_ptr, src_ptr, size)
+                            return 0
+
+                        m._transfer_data = transfer
+                        result = m.send_kvcache_dcp(
+                            "s",
+                            np.array([0, 1]),
+                            info.dst_kv_ptrs,
+                            np.array([1]),
+                            dcp_token_item_lens=info.dcp_token_item_lens,
+                            dst_dcp_size=dcp,
+                            dst_dcp_rank=rank,
+                            src_page_offset=0,
+                            decode_prefix_len=0,
+                            num_kv_tokens=65,
+                            executor=None,
+                            dst_layer_ids=info.dst_kv_layer_ids,
+                            dst_kv_item_lens=info.dst_kv_item_lens,
+                            dst_attn_tp_size=8,
+                        )
+                        self.assertEqual(result, 0)
+                        expected_target = torch.full_like(target_dst, 255)
+                        for token in range(65):
+                            if token % dcp == rank:
+                                expected_target[64 + token // dcp] = target_src[token]
+                        expected_draft = torch.full_like(dst.kv_buffer[0], 255)
+                        expected_draft[64 * dcp : 64 * dcp + 65] = source[:65]
+                        torch.testing.assert_close(target_dst, expected_target)
+                        torch.testing.assert_close(dst.kv_buffer[0], expected_draft)
 
     def test_real_pool_transfer_heads_and_tail(self):
         import ctypes
