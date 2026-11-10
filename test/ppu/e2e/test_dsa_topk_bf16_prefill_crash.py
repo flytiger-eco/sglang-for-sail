@@ -3,7 +3,7 @@ E2E test: verify DSA topk_prefill_bf16 kernel does not crash with
 illegal memory access when kTopK > old kMaxTies (bug 85883409).
 
 Run:
-    # Requires 8× ZW-M890P GPUs with a GLM-5.1 FP8-Channelwise model
+    # Requires 8× 890 GPUs with a GLM-5.1 FP8-Channelwise model
     export MODEL_PATH=<path-to-GLM-5.1-FP8-Channelwise>
     export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
     pytest test/ppu/e2e/test_dsa_topk_bf16_prefill_crash.py -v
@@ -14,7 +14,7 @@ Prerequisites:
 
 Affected models/dtypes/platforms:
     - GLM-5.1 FP8-Channelwise / GLM-5.2 MXFP4-FP8 (index_topk=2048)
-    - ZW-M890P (PPU 890P, 8×144GB)
+    - 890 (PPU 890P, 8×144GB)
     - DSA attention backend with flashmla_sparse prefill
 """
 

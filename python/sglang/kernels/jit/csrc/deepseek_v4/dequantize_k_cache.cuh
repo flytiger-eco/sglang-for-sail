@@ -172,7 +172,7 @@ __global__ __launch_bounds__(dequant_k_cache::kBlockSize, 1) void dequantize_k_c
 // v2: vectorized, multi-thread-per-token variant.
 //
 // v1 runs one thread per token, so a token costs 448 single-byte loads
-// and 512 single-bf16 stores. On ZW-M890P acu reports DRAM 2.2% and
+// and 512 single-bf16 stores. On 890 acu reports DRAM 2.2% and
 // compute 2.7% but Mem Busy 89%, occupancy 25% (0.25 waves/CU) and 96.6%
 // of scheduler cycles with no eligible warp: the kernel is limited by
 // memory-request issue rate and unhidden latency, not by bandwidth.

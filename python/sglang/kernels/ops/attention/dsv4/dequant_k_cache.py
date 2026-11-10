@@ -32,7 +32,7 @@ PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 # One warp per token: the warp then reads that token's 576 cache bytes and
 # writes its 1024 output bytes as contiguous 16-byte vectors. Fastest of
-# 8/16/32 measured on ZW-M890P.
+# 8/16/32 measured on 890.
 VECTORIZED_THREADS_PER_TOKEN = 32
 
 
@@ -168,6 +168,9 @@ def dequantize_k_cache_paged_v41(
     assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
         supported = is_gfx95_supported()
+    elif is_sail():
+        # SAIL (PPU) runs the same Triton dequant on sm89; verified bit-exact.
+        supported = get_jit_cuda_arch().major >= 8
     else:
         supported = get_jit_cuda_arch().major >= 10
     if not supported:
@@ -427,6 +430,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
     token_data_base = page_byte_base + in_page * DATA_STRIDE
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
@@ -465,6 +471,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
     token_data_base = page_byte_base + in_page * DATA_STRIDE
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
