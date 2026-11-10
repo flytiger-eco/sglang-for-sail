@@ -181,6 +181,7 @@ jobs:
           cat > .ppu-resource/compat/sitecustomize.py <<'PY'
           import json
           import os
+          import sys
           import time
 
           import datasets
@@ -284,6 +285,12 @@ jobs:
           huggingface_hub.snapshot_download = _snapshot_download
           huggingface_hub.hf_hub_download = _hf_hub_download
           requests.get = _requests_get
+          resource_event(
+              'interpreter', 'sitecustomize_loaded',
+              executable=sys.executable,
+              sitecustomize=__file__,
+              pythonpath=sys.path,
+          )
           PY
           cat > .ppu-resource/compat/resource_pytest_plugin.py <<'PY'
           import os
@@ -291,36 +298,58 @@ jobs:
           from sitecustomize import resource_event
 
 
+          def _is_target(nodeid):
+              target = os.environ.get('TEST_TARGET', '')
+              return nodeid == target or target == f'test/{nodeid}'
+
+
           def _clear_skip(item):
-              if os.environ.get('FORCE_UNSKIP') != '1' or item.nodeid != os.environ.get('TEST_TARGET'):
+              if os.environ.get('FORCE_UNSKIP') != '1' or not _is_target(item.nodeid):
                   return
-              item.own_markers[:] = [mark for mark in item.own_markers if mark.name != 'skip']
+              item.own_markers[:] = [
+                  mark for mark in item.own_markers
+                  if mark.name not in ('skip', 'skipif')
+              ]
               for obj in (getattr(item, 'cls', None), getattr(item, 'obj', None)):
                   if obj is not None:
                       obj.__unittest_skip__ = False
                       obj.__unittest_skip_why__ = ''
 
 
+          def pytest_configure(config):
+              resource_event(
+                  'plugin', 'configure',
+                  plugin=__file__,
+                  target=os.environ.get('TEST_TARGET'),
+                  force_unskip=os.environ.get('FORCE_UNSKIP'),
+              )
+
+
           @pytest.hookimpl(tryfirst=True)
           def pytest_collection_modifyitems(items):
               for item in items:
                   _clear_skip(item)
+                  if _is_target(item.nodeid):
+                      resource_event(
+                          'pytest', 'collected', nodeid=item.nodeid,
+                          markers=[mark.name for mark in item.own_markers],
+                      )
 
 
           @pytest.hookimpl(tryfirst=True)
           def pytest_runtest_setup(item):
               _clear_skip(item)
-              if item.nodeid == os.environ.get('TEST_TARGET'):
+              if _is_target(item.nodeid):
                   resource_event('pytest', 'setup', nodeid=item.nodeid)
 
 
           def pytest_runtest_call(item):
-              if item.nodeid == os.environ.get('TEST_TARGET'):
+              if _is_target(item.nodeid):
                   resource_event('pytest', 'call', nodeid=item.nodeid)
 
 
           def pytest_runtest_logreport(report):
-              if report.nodeid == os.environ.get('TEST_TARGET'):
+              if _is_target(report.nodeid):
                   resource_event('pytest_report', report.when, nodeid=report.nodeid, outcome=report.outcome)
           PY
           cat > .ppu-resource/install.sh <<'SH'
@@ -372,6 +401,7 @@ jobs:
           import argparse
           import json
           import shutil
+          import xml.etree.ElementTree as ET
           from collections import Counter
           from pathlib import Path
 
@@ -397,7 +427,6 @@ jobs:
               result_path = destination / 'test-result.json'
               test_result = json.loads(result_path.read_text()) if result_path.is_file() else {}
               rc = test_result.get('returncode')
-              status = 'NOT_EXECUTED' if rc is None else ('PASS' if rc == 0 else ('TIMEOUT' if rc in (124, 137) else 'FAIL'))
               events = []
               if (destination / 'events.jsonl').is_file():
                   for line in (destination / 'events.jsonl').read_text().splitlines():
@@ -405,7 +434,53 @@ jobs:
                           events.append(json.loads(line))
                       except json.JSONDecodeError:
                           pass
-              result = {'id': args.test_id, 'status': status, 'worker_outcome': args.worker_outcome, 'returncode': rc, 'events': events}
+              junit_path = destination / 'junit.xml'
+              junit = None
+              if junit_path.is_file():
+                  root = ET.parse(junit_path).getroot()
+                  suites = [root] if root.tag == 'testsuite' else list(root.iter('testsuite'))
+                  junit = {
+                      key: sum(int(suite.get(key, '0')) for suite in suites)
+                      for key in ('tests', 'failures', 'errors', 'skipped')
+                  }
+              target = test_result.get('target', '')
+              passed_call = any(
+                  event.get('kind') == 'pytest_report'
+                  and event.get('phase') == 'call'
+                  and event.get('outcome') == 'passed'
+                  and (event.get('nodeid') == target or target == f"test/{event.get('nodeid')}")
+                  for event in events
+              )
+              plugin_loaded = any(
+                  event.get('kind') == 'plugin' and event.get('phase') == 'configure'
+                  for event in events
+              )
+              if rc is None:
+                  status = 'NOT_EXECUTED'
+              elif rc in (124, 137):
+                  status = 'TIMEOUT'
+              elif rc != 0:
+                  status = 'FAIL'
+              elif junit is None or junit['tests'] != 1:
+                  status = 'INVALID_EVIDENCE'
+              elif junit['skipped']:
+                  status = 'ALL_SKIPPED'
+              elif junit['failures'] or junit['errors']:
+                  status = 'FAIL'
+              elif not plugin_loaded or not passed_call:
+                  status = 'INVALID_EVIDENCE'
+              else:
+                  status = 'PASS'
+              result = {
+                  'id': args.test_id,
+                  'status': status,
+                  'worker_outcome': args.worker_outcome,
+                  'returncode': rc,
+                  'junit': junit,
+                  'plugin_loaded': plugin_loaded,
+                  'passed_call': passed_call,
+                  'events': events,
+              }
               write(destination / 'result.json', result)
 
 
