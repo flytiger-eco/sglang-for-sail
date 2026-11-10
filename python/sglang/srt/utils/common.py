@@ -1949,11 +1949,17 @@ def _load_image(
 
 
 def _decode_image_bytes(image_bytes, gpu_image_decode):
+    from sglang.srt.multimodal.aim_cuda_health import (
+        cuda_failure_detected,
+        record_cuda_failure,
+    )
     from sglang.srt.multimodal.aim_image import is_fatal_cuda_error, open_image_bytes
 
     if not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get():
         gpu_image_decode = False
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        if cuda_failure_detected():
+            raise RuntimeError("GPU image decode refused: CUDA context is unhealthy")
         try:
             if gpu_image_decode == "nvjpeg_fancy":
                 from sglang.srt.utils.nvjpeg_decoder import (
@@ -1970,9 +1976,9 @@ def _decode_image_bytes(image_bytes, gpu_image_decode):
             )
             return image_tensor
         except Exception as e:
-            if isinstance(
-                e, (MemoryError, torch.OutOfMemoryError)
-            ) or is_fatal_cuda_error(e):
+            if isinstance(e, (MemoryError, torch.OutOfMemoryError)):
+                raise
+            if record_cuda_failure(e) or is_fatal_cuda_error(e):
                 raise
             if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")

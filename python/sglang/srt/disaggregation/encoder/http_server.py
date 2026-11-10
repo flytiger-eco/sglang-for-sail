@@ -9,6 +9,7 @@ GPU tensor operations remain in :mod:`server.MMEncoder`.
 """
 
 import asyncio
+from sglang.srt.multimodal.aim_cuda_health import cuda_failure_detected, record_cuda_failure
 import contextlib
 import logging
 import threading
@@ -285,6 +286,8 @@ async def _drain_health_encode(
 
 @app.post("/encode")
 async def handle_encode_request(request: dict):
+    if cuda_failure_detected():
+        return ORJSONResponse(status_code=503, content={"status": "error", "message": "Encoder CUDA context is unhealthy"})
     if err := validate_encode_request(request):
         return ORJSONResponse(
             status_code=HTTPStatus.BAD_REQUEST,
@@ -366,6 +369,7 @@ async def handle_encode_request(request: dict):
             content={"status": "error", "message": str(e), "req_id": req_id},
         )
     except Exception as e:
+        record_cuda_failure(e, encoder=True)
         error_msg = str(e)
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         return ORJSONResponse(
@@ -548,6 +552,8 @@ async def health_generate():
     Performs a dummy encode to verify the encoder is functional.
     Returns 200 if the encoder is healthy, 503 otherwise.
     """
+    if cuda_failure_detected():
+        return Response(status_code=503)
     if dp_dispatcher is not None:
         # Strict: any dead (exited) rank fails health → orchestrator restarts.
         if not dp_dispatcher.all_ranks_alive:
@@ -598,6 +604,8 @@ async def health_generate():
         # unnecessary while it waited for the lock.
         await encoder.encode_dispatch_lock.acquire()
         owns_dispatch_lock = True
+        if cuda_failure_detected():
+            return Response(status_code=503)
         if encoder.has_pending_embeddings():
             return Response(status_code=200)
         for socket in send_sockets:

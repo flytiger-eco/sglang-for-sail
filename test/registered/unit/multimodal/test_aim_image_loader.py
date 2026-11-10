@@ -10,6 +10,7 @@ from PIL import Image
 from torchvision.io import ImageReadMode
 
 from sglang.srt.connector import redkv
+from sglang.srt.multimodal import aim_cuda_health
 from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -23,6 +24,18 @@ def jpeg_bytes(mode="L"):
 
 
 class TestAIMImageLoader(unittest.TestCase):
+    def setUp(self):
+        # Fault injections in separate cases represent independent workers.
+        state = patch.object(aim_cuda_health, "_state", aim_cuda_health.CudaFailureState())
+        state.start()
+        self.addCleanup(state.stop)
+        policy = patch.dict(os.environ, {
+            "SGLANG_EXIT_ON_CUDA_FATAL": "false",
+            "SGLANG_ENCODER_EXIT_ON_CUDA_FATAL": "false",
+        })
+        policy.start()
+        self.addCleanup(policy.stop)
+
     def test_gpu_disable_flag_is_shared_by_ordinary_and_encoder_callers(self):
         with (
             patch.dict(os.environ, {"SGLANG_ENABLE_JPEG_GPU_DECODE": "false"}),

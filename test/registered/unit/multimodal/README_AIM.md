@@ -119,3 +119,24 @@ Validation: 76 CPU/runtime tests passed; one optional real HEIF round-trip was
 skipped because the image lacks pillow-heif. Real PPU PNG/JPEG workloads and
 serving /metrics snapshots are tested per frozen deployment revision. External
 EDS/RedKV live service is not assumed; cache outcomes use controlled fixtures.
+
+## Fatal CUDA state at Encoder boundaries
+
+Adapted from 4921713a2d to the split HTTP/gRPC Encoder runtime. Fatal native
+CUDA diagnostics mark the process unhealthy before later CPU preparation, TP
+dispatch and busy health shortcuts. Input errors and recoverable OOM remain
+request failures. Exception causes are inspected without trusting URL contents.
+The marker resets after fork. Optional process exit is enabled with
+SGLANG_ENCODER_EXIT_ON_CUDA_FATAL=1 (or SGLANG_EXIT_ON_CUDA_FATAL=1); delay is
+configured by the corresponding CUDA_FATAL_EXIT_DELAY_S variable. Defaults
+leave exit disabled.
+
+Health and admission return unavailable after a fatal error. Pending CPU
+preparation is closed before new dispatch; no rank-local check is inserted
+after a TP broadcast. HTTP and gRPC share the same process state.
+
+Validation: combined image/metrics/health suite passes 100 tests with one
+optional HEIF skip. Coverage includes cause chains, nonfatal URL/OOM, fork
+reset, single scheduled exit, dispatch-lock races and both protocol guards.
+Real serving validation records ordinary performance/correctness separately
+from controlled native-error injection; injected faults do not poison hardware.
