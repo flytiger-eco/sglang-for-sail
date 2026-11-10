@@ -26,10 +26,6 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
-      asset_preflight_only:
-        description: 'Check the previously missing models and datasets; skip test execution and summary'
-        type: boolean
-        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -121,218 +117,6 @@ jobs:
 
           datasets.load_dataset = _load_dataset
           huggingface_hub.hf_hub_download = _hf_hub_download
-          PY
-          cat > .ppu-sweep/asset_preflight.py <<'PY'
-          import json
-          import os
-          import time
-          import traceback
-          from pathlib import Path
-
-          from datasets import load_dataset
-          from huggingface_hub import hf_hub_download, snapshot_download
-
-          MODELS = [
-              "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
-              "RadixArk/Kimi-K3-DSpark",
-              "deepseek-ai/DeepSeek-V4-Flash-DSpark",
-              "lightseekorg/kimi-k2.5-eagle3-mla",
-              "lmsys/sglang-ci-dsv3-channel-int8-test",
-              "lmsys/sglang-ci-dsv3-channel-int8-test-NextN",
-              "lmsys/sglang-ci-dsv3-test",
-              "lmsys/sglang-ci-dsv3-test-NextN",
-              "meta-llama/Llama-2-7b-hf",
-              "opherlie/lora-test-case-NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-              "opherlie/lora-test-case-Qwen3.5-35B-A3B",
-              "opherlie/lora-test-case-Qwen3.5-4B",
-              "shanearora/2025-sep-a-base-model",
-              "swiss-ai/Apertus-8B",
-              "thinkingmachines/Inkling",
-              "thinkingmachines/Inkling-NVFP4",
-              "thinkingmachines/Inkling-Small-NVFP4",
-              "yushengsu/lora-diff-DeepSeek-V3.1-Base",
-              "yushengsu/lora-diff-Kimi-K2.5",
-              "yushengsu/lora-diff-Qwen3-30B-A3B-Instruct-2507",
-              "yushengsu/lora-diff-Qwen3-8B",
-              "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct",
-              "yushengsu/lora-diff-gpt-oss-20b",
-          ]
-          CACHE = Path(os.environ["HF_HUB_CACHE"])
-          REPORT = Path("/ppu-models/missing_resource_checks.json")
-          WEIGHT_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth", ".gguf"}
-
-          def emit(label, value):
-              print(label + "=" + json.dumps(value, ensure_ascii=False), flush=True)
-
-          def inspect_snapshot(snapshot):
-              files = [path for path in snapshot.rglob("*") if path.is_file()]
-              weights = [
-                  path for path in files
-                  if path.suffix in WEIGHT_SUFFIXES and path.stat().st_size > 0
-              ]
-              empty_weights = [
-                  str(path.relative_to(snapshot)) for path in files
-                  if path.suffix in WEIGHT_SUFFIXES and path.stat().st_size == 0
-              ]
-              missing_shards = []
-              for index in snapshot.rglob("*.index.json"):
-                  try:
-                      weight_map = json.loads(index.read_text())["weight_map"]
-                      shards = sorted(set(weight_map.values()))
-                      if not shards:
-                          raise ValueError("empty weight_map")
-                      for shard in shards:
-                          path = Path(shard)
-                          if path.is_absolute() or ".." in path.parts:
-                              raise ValueError(f"unsafe shard path: {shard}")
-                          target = index.parent / path
-                          if not target.is_file() or target.stat().st_size == 0:
-                              missing_shards.append(str(target))
-                  except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                      missing_shards.append(f"{index}: {error}")
-              metadata = [
-                  name for name in ("config.json", "adapter_config.json")
-                  if (snapshot / name).is_file()
-              ]
-              return {
-                  "snapshot": str(snapshot),
-                  "metadata": metadata,
-                  "file_count": len(files),
-                  "weight_count": len(weights),
-                  "weight_bytes": sum(path.stat().st_size for path in weights),
-                  "empty_weights": empty_weights,
-                  "missing_shards": missing_shards,
-                  "usable": bool(metadata and weights and not empty_weights and not missing_shards),
-              }
-
-          def check_model(model):
-              repo = CACHE / ("models--" + model.replace("/", "--"))
-              result = {
-                  "resource": model,
-                  "type": "model",
-                  "cache_repo": str(repo),
-                  "cache_repo_exists": repo.is_dir(),
-                  "cache_repo_is_symlink": repo.is_symlink(),
-                  "cache_repo_target": os.path.realpath(repo) if repo.is_symlink() else None,
-              }
-              try:
-                  snapshot = snapshot_download(
-                      model, cache_dir=CACHE, local_files_only=True
-                  )
-                  result.update(inspect_snapshot(Path(snapshot)))
-                  result["ok"] = result["usable"]
-                  if not result["ok"]:
-                      result["error"] = "Snapshot is missing metadata, non-empty weights, or indexed shards"
-              except Exception as error:
-                  result.update(ok=False, error=f"{type(error).__name__}: {error}")
-              emit("PPU_MISSING_RESOURCE_CHECK", result)
-              return result
-
-          def first_dataset_row(repo_id, name, split, required):
-              args = (repo_id,) if name is None else (repo_id, name)
-              dataset = load_dataset(*args, split=split, streaming=True)
-              try:
-                  row = next(iter(dataset))
-              except StopIteration as error:
-                  raise RuntimeError(f"Empty dataset: {repo_id} {name} {split}") from error
-              missing = sorted(set(required) - set(row))
-              if missing:
-                  raise RuntimeError(f"Missing columns for {repo_id} {name} {split}: {missing}")
-              return {"repo_id": repo_id, "name": name, "split": split, "columns": sorted(row)}
-
-          def check_longbench():
-              return first_dataset_row(
-                  "THUDM/LongBench-v2", None, "train",
-                  {"context", "question", "choice_A", "choice_B", "choice_C", "choice_D"},
-              )
-
-          def check_mmmu():
-              return [
-                  first_dataset_row("MMMU/MMMU", "Math", "test", {"question", "image_1"}),
-                  first_dataset_row("MMMU/MMMU", "Accounting", "validation", {"question", "image_1"}),
-                  first_dataset_row("lmms-lab/MMMU", "Accounting", "validation", {"question", "image_1"}),
-              ]
-
-          def check_sharegpt():
-              path = Path(hf_hub_download(
-                  repo_id="anon8231489123/ShareGPT_Vicuna_unfiltered",
-                  filename="ShareGPT_V3_unfiltered_cleaned_split.json",
-                  repo_type="dataset",
-              ))
-              if not path.is_file() or path.stat().st_size == 0:
-                  raise RuntimeError(f"Missing or empty ShareGPT file: {path}")
-              with path.open("rb") as stream:
-                  prefix = stream.read(1024).lstrip()
-              if not prefix.startswith(b"["):
-                  raise RuntimeError(f"ShareGPT file is not a JSON array: {path}")
-              return {"path": str(path), "size_bytes": path.stat().st_size}
-
-          def valid_hellaswag(path):
-              if not path.is_file() or path.stat().st_size == 0:
-                  return False
-              try:
-                  with path.open() as stream:
-                      row = json.loads(stream.readline())
-                  return {"activity_label", "ctx", "endings"} <= set(row)
-              except (OSError, ValueError):
-                  return False
-
-          def check_hellaswag():
-              runtime_path = Path("/tmp/hellaswag_val.jsonl")
-              candidates = [
-                  runtime_path,
-                  Path("/nas_aisw/datasets/datasets/LLM/HellaSwag/hellaswag_val.jsonl"),
-                  Path("/nas_aisw/datasets/datasets/LLM/hellaswag/hellaswag_val.jsonl"),
-                  Path("/nas_aisw/datasets/hellaswag/hellaswag_val.jsonl"),
-              ]
-              matches = []
-              deadline = time.monotonic() + 30
-              root = Path("/nas_aisw/datasets/datasets")
-              for current, directories, files in os.walk(root):
-                  if "hellaswag_val.jsonl" in files:
-                      matches.append(str(Path(current) / "hellaswag_val.jsonl"))
-                  if time.monotonic() >= deadline:
-                      break
-              matches = sorted(set(matches + [str(path) for path in candidates if path.is_file()]))
-              if not valid_hellaswag(runtime_path):
-                  raise RuntimeError(
-                      f"No valid dataset at the runtime path {runtime_path}; NAS matches: {matches}"
-                  )
-              return {"path": str(runtime_path), "size_bytes": runtime_path.stat().st_size}
-
-          def check_dataset(resource, check):
-              result = {"resource": resource, "type": "dataset"}
-              try:
-                  result.update(ok=True, details=check())
-              except Exception as error:
-                  result.update(ok=False, error=f"{type(error).__name__}: {error}")
-                  traceback.print_exc()
-              emit("PPU_MISSING_RESOURCE_CHECK", result)
-              return result
-
-          results = [check_model(model) for model in MODELS]
-          results.extend([
-              check_dataset("THUDM/LongBench-v2", check_longbench),
-              check_dataset("MMMU/MMMU", check_mmmu),
-              check_dataset("HellaSwag validation", check_hellaswag),
-              check_dataset("anon8231489123/ShareGPT_Vicuna_unfiltered", check_sharegpt),
-          ])
-          available = sum(result["ok"] for result in results)
-          summary = {
-              "total": len(results),
-              "available": available,
-              "missing_or_unusable": len(results) - available,
-          }
-          REPORT.write_text(json.dumps({"summary": summary, "results": results}, indent=2) + "\n")
-          emit("PPU_MISSING_RESOURCE_SUMMARY", summary)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:
-              stream.write("# Previously missing resource verification\n\n")
-              stream.write(f"Available: {available}/{len(results)}; missing or unusable: {len(results) - available}.\n\n")
-              stream.write("| Resource | Type | Status | Detail |\n| --- | --- | --- | --- |\n")
-              for result in results:
-                  detail = result.get("snapshot") or result.get("error") or json.dumps(result.get("details"))
-                  detail = detail.replace("|", "\\|")[:500]
-                  stream.write(f"| `{result['resource']}` | {result['type']} | {'OK' if result['ok'] else 'MISSING/UNUSABLE'} | {detail} |\n")
           PY
           cat > .ppu-sweep/sweep.py <<'PY'
           import argparse
@@ -1187,12 +971,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'asset_preflight_only'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.asset_preflight_only != true')
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.asset_preflight_only != true')
+                      self.assertNotIn('if', jobs['sweep-execute'])
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1491,11 +1275,9 @@ jobs:
           cd /workspace/source
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/workspace/source
           export CUDA_VISIBLE_DEVICES=0
-          export PYTHONPATH="/workspace/source/.ppu-sweep/compat${PYTHONPATH:+:$PYTHONPATH}"
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
-          timeout --signal=TERM --kill-after=30s 900s python3 .ppu-sweep/asset_preflight.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1627,7 +1409,6 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
-    if: inputs.asset_preflight_only != true
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1717,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always() && inputs.asset_preflight_only != true
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
