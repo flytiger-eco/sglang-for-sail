@@ -256,6 +256,7 @@ jobs:
 
 
           def _snapshot_download(repo_id, *args, **kwargs):
+              kwargs['local_files_only'] = True
               fields = {'repo_id': repo_id, 'repo_type': kwargs.get('repo_type', 'model'), 'revision': kwargs.get('revision')}
               resource_event('snapshot', 'start', **fields)
               try:
@@ -268,6 +269,7 @@ jobs:
 
 
           def _hf_hub_download(repo_id, filename, *args, **kwargs):
+              kwargs['local_files_only'] = True
               if repo_id == _SHAREGPT_REPO and filename == _SHAREGPT_FILENAME:
                   resource_event('dataset_file', 'start', repo_id=repo_id, filename=filename, actual=_SHAREGPT_PATH)
                   if not os.path.isfile(_SHAREGPT_PATH):
@@ -290,14 +292,12 @@ jobs:
               if 'hellaswag' not in str(url).lower():
                   return _original_requests_get(url, *args, **kwargs)
               resource_event('hellaswag_http', 'start', url=str(url))
-              try:
-                  response = _original_requests_get(url, *args, **kwargs)
-                  resource_event('hellaswag_http', 'response', url=str(url), status=response.status_code)
-                  response.raise_for_status()
-                  return response
-              except Exception as error:
-                  resource_event('hellaswag_http', 'error', url=str(url), error=f'{type(error).__name__}: {error}'[:2000])
-                  raise
+              error = requests.ConnectionError(
+                  'Offline validation found no usable /tmp/hellaswag_val.jsonl; '
+                  'network download is disabled for this diagnostic.'
+              )
+              resource_event('hellaswag_http', 'error', url=str(url), error=str(error))
+              raise error
 
 
           datasets.load_dataset = _load_dataset
