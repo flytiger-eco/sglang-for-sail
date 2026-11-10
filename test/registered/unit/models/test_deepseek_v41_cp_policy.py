@@ -63,14 +63,38 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
                     )
                 )
 
-    def test_rejects_unsupported_prefill_topologies(self):
+    def test_accepts_attention_dp_on_both_roles(self):
+        # Upstream admits attention DP on either PD role; the PD handshake
+        # requires both servers to agree on the block size and KV layout.
+        for mode in ("prefill", "decode"):
+            for override in (
+                dict(tp_size=8, attn_dp_size=8, ep_size=8),
+                dict(tp_size=8, dp_size=8, ep_size=8),
+                dict(tp_size=8, attn_dp_size=8),
+            ):
+                with self.subTest(mode=mode, override=override):
+                    self.assertTrue(
+                        _dsv41_dspark_pd_parallelism_supported(
+                            self.parallel_config(
+                                disaggregation_mode=mode,
+                                enable_prefill_cp=False,
+                                **override,
+                            )
+                        )
+                    )
+
+    def test_rejects_unsupported_topologies(self):
         for override in (
             dict(cp_strategy="zigzag", attn_cp_size=4),
             dict(enable_prefill_cp=False, attn_cp_size=4),
             dict(disaggregation_mode="null"),
-            dict(attn_dp_size=2),
-            dict(dp_size=2),
             dict(dcp_size=2),
+            dict(disaggregation_mode="decode"),
+            dict(
+                disaggregation_mode="decode",
+                enable_prefill_cp=False,
+                attn_cp_size=4,
+            ),
         ):
             with self.subTest(override=override):
                 self.assertFalse(
@@ -78,37 +102,6 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
                         self.parallel_config(**override)
                     )
                 )
-
-    def test_decode_attention_dp_is_independent_of_system_dp(self):
-        for attn_dp_size in (1, 4):
-            base = dict(
-                disaggregation_mode="decode",
-                enable_prefill_cp=False,
-                attn_dp_size=attn_dp_size,
-            )
-            self.assertTrue(
-                _dsv41_dspark_pd_parallelism_supported(self.parallel_config(**base))
-            )
-            for override in (
-                dict(enable_prefill_cp=True),
-                dict(attn_cp_size=4),
-                dict(dp_size=2),
-            ):
-                with self.subTest(attn_dp_size=attn_dp_size, override=override):
-                    self.assertFalse(
-                        _dsv41_dspark_pd_parallelism_supported(
-                            self.parallel_config(**(base | override))
-                        )
-                    )
-        self.assertFalse(
-            _dsv41_dspark_pd_parallelism_supported(
-                self.parallel_config(
-                    disaggregation_mode="decode",
-                    enable_prefill_cp=False,
-                    attn_dp_size=2,
-                )
-            )
-        )
 
     def test_cp_breakable_graph_preserves_live_context_budget(self):
         for cp, backend, limit, expected in (
