@@ -1940,8 +1940,12 @@ def _load_image(
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
+    from sglang.srt.multimodal.aim_image import is_fatal_cuda_error, open_image_bytes
+
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
+    if not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get():
+        gpu_image_decode = False
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             if gpu_image_decode == "nvjpeg_fancy":
@@ -1950,12 +1954,19 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
-
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            from torchvision.io import ImageReadMode, decode_jpeg
+            encoded_image = torch.frombuffer(bytearray(image_bytes), dtype=torch.uint8)
+            # Grayscale JPEGs must have the same three-channel contract as the
+            # processor's CPU PIL -> RGB path.
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
+            if isinstance(e, (MemoryError, torch.OutOfMemoryError)) or is_fatal_cuda_error(
+                e
+            ):
+                raise
             if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
             else:
@@ -1963,11 +1974,7 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    try:
-        image = Image.open(BytesIO(image_bytes))
-    except (OSError, SyntaxError) as e:
-        raise ValueError(f"Could not decode image: {e}") from e
-    return _fully_load_pil_image(image)
+    return open_image_bytes(image_bytes)
 
 
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
@@ -1987,6 +1994,18 @@ def load_image(
     Load image from multiple input formats, including:
     ImageData, PIL Image, bytes, URL, file path, or base64 string.
     """
+    from sglang.srt.multimodal.aim_image import load_image_with_fallback
+
+    return load_image_with_fallback(
+        lambda: _load_image_input(image_file, gpu_image_decode),
+        enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
+    )
+
+
+def _load_image_input(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+    gpu_image_decode: GPUImageDecodeMode,
+) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
@@ -2016,37 +2035,23 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-    if image_size is not None and isinstance(image, Image.Image):
-        image_size = (image.width, image.height)
     return image, image_size
 
 
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
-    if isinstance(image_file, bytes):
-        return image_file
-    if isinstance(image_file, str) and image_file.startswith(
-        ("imagetransfer_http://", "imagetransfer_https://")
-    ):
+    from sglang.srt.multimodal.aim_image import image_bytes_from_source
+
+    def http_fetch(url):
+        return download_remote_media(url, timeout=int(os.getenv("REQUEST_TIMEOUT", "3")))
+
+    if isinstance(image_file, str) and image_file.startswith("imagetransfer_http"):
         from sglang.srt.connector.redkv import resolve_image_bytes
 
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        return resolve_image_bytes(
-            image_file,
-            http_fetch=lambda url: download_remote_media(url, timeout=timeout),
-        )
-    if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
-    if isinstance(image_file, str) and image_file.startswith("data:"):
-        _, encoded = image_file.split(",", 1)
-        return pybase64.b64decode(encoded, validate=True)
-    if isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
-    raise NotImplementedError(f"Invalid image: {image_file}")
+        return resolve_image_bytes(image_file, http_fetch=http_fetch)
+    return image_bytes_from_source(
+        image_file, http_fetch=http_fetch, base64_decode=pybase64.b64decode
+    )
 
 
 def _normalize_video_input(

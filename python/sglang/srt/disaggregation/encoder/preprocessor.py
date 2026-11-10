@@ -10,6 +10,7 @@ import asyncio
 import concurrent.futures
 import functools
 import logging
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Callable, List, Optional, Tuple, Union
@@ -305,6 +306,7 @@ class EncoderPreprocessor:
         modality: Modality,
         frame_count_limit=None,
         discard_alpha_channel=True,
+        force_cpu_image_decode=False,
     ):
         from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
 
@@ -329,6 +331,8 @@ class EncoderPreprocessor:
                 gpu_image_decode = (
                     self.encoder_media_processor_config.image_decode_mode
                     if self.use_image_processor_gpu
+                    and not force_cpu_image_decode
+                    and envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get()
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -422,7 +426,69 @@ class EncoderPreprocessor:
             return await asyncio.gather(*async_futures)
 
     async def _flatten_and_load_images(self, mm_items):
-        return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+        """
+        Flatten mm_items structure, load images concurrently, and restore original structure.
+        """
+        enable_mget = envs.SGLANG_ENABLE_REDKV_MGET.get()
+        cpu_decode = (
+            envs.SGLANG_ENABLE_BATCH_JPEG_DECODE.get()
+            and not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get()
+        )
+        if not (enable_mget or cpu_decode):
+            return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+
+        from sglang.srt.multimodal.aim_image import image_load_error_fallback
+        from sglang.srt.multimodal.aim_image_loader import load_images_batch
+
+        scalar = not isinstance(mm_items, (list, tuple))
+        items = [mm_items] if scalar else mm_items
+        nested = bool(items) and isinstance(items[0], (list, tuple))
+        flat_items = [item for group in items for item in group] if nested else items
+        # Dict inputs carry content hashes or model-owned media metadata. Keep
+        # their existing validation/loading contract instead of unwrapping them.
+        if any(isinstance(item, dict) for item in flat_items):
+            return await self._flatten_and_load_data_by_modality(mm_items, Modality.IMAGE)
+
+        cancel_event = threading.Event()
+        load_batch = functools.partial(
+            load_images_batch,
+            flat_items,
+            executor=self.io_executor,
+            max_in_flight=self.io_executor._max_workers,
+            load_one=functools.partial(
+                self._load_single_item,
+                modality=Modality.IMAGE,
+                force_cpu_image_decode=cpu_decode,
+            ),
+            enable_mget=enable_mget,
+            cancel_event=cancel_event,
+            record=getattr(self, "aim_image_metrics", None),
+            cpu_jpeg_decode=cpu_decode,
+            decode_max_in_flight=max(1, envs.SGLANG_JPEG_CPU_DECODE_WORKERS.get()),
+            on_error=lambda _source, error: image_load_error_fallback(
+                error,
+                enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
+            )[0],
+        )
+        try:
+            # This coordinator waits only on io_executor. The subsequent HF
+            # processor call is submitted after it returns, so one preprocessing
+            # worker is sufficient and there is no nested same-pool wait.
+            images = await asyncio.get_running_loop().run_in_executor(
+                self.preproc_executor, load_batch
+            )
+        except asyncio.CancelledError:
+            cancel_event.set()
+            raise
+        if scalar:
+            return images[0]
+        if not nested:
+            return images
+        restored, offset = [], 0
+        for group in items:
+            restored.append(images[offset : offset + len(group)])
+            offset += len(group)
+        return restored
 
     @staticmethod
     def _close_video_decoders(video_items) -> None:
