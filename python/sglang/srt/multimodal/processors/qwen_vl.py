@@ -362,6 +362,7 @@ def _select_epd_image_tokens(input_ids, offsets, modalities, positions, delta, i
 
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
+    supports_aim_image_prefetch = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
     models = [
@@ -1076,6 +1077,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            _preloaded_images=kwargs.get("_preloaded_images"),
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
@@ -1229,6 +1231,24 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             audio_token_id=self.mm_tokens.audio_token_id,
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
+        )
+
+    def can_prefetch_images(self, prompt: str, image_count: int) -> bool:
+        """Only prefetch when the normal loader would consume every image.
+
+        With fewer placeholders, the legacy loader intentionally ignores extra
+        inputs. Fetching those extras early could turn an unused bad URL into
+        a request failure.
+        """
+        if self.mm_preprocess_cache.enabled or self.uses_media_artifacts_without_cache:
+            return False
+        text_parts = self.mm_tokens.get_combined_regex().split(prompt)
+        return (
+            sum(
+                self.mm_tokens.get_modality_of_token(part) == Modality.IMAGE
+                for part in text_parts
+            )
+            == image_count
         )
 
     async def process_mm_data_async(

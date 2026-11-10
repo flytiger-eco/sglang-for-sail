@@ -55,6 +55,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from PIL import Image
 
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
@@ -164,6 +165,7 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.utils import (
+    ImageData,
     configure_gc_warning,
     freeze_gc,
     get_bool_env_var,
@@ -1096,6 +1098,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        preloaded_images = None
+        mm_input_validated = False
         contains_mm_input = obj.contains_mm_input()
         if (
             isinstance(obj, GenerateReqInput)
@@ -1156,10 +1160,70 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids = []
             else:
                 from sglang.srt.multimodal.aim_metrics import image_stage
-                with image_stage("image_tokenization", enabled=contains_mm_input):
-                    input_ids, token_type_ids = await self._tokenize_texts(
-                        input_text, is_cross_encoder_request
+                image_sources = (
+                    obj.image_data
+                    if isinstance(obj.image_data, list)
+                    else [obj.image_data]
+                )
+                preload_task = None
+                if (
+                    envs.SGLANG_ENABLE_TTFT_PARALLEL.get()
+                    and not deferred_mm_decode
+                    and isinstance(input_text, str)
+                    and input_text
+                    and self.mm_processor is not None
+                    and getattr(self.mm_processor, "supports_aim_image_prefetch", False)
+                    and not get_disagg().language_only
+                    and not get_disagg().language_model_only
+                    and (
+                        obj.video_data is None
+                        or (isinstance(obj.video_data, list) and not obj.video_data)
                     )
+                    and (
+                        obj.audio_data is None
+                        or (isinstance(obj.audio_data, list) and not obj.audio_data)
+                    )
+                    # Keep content-verified/cached requests on their existing
+                    # path until prefetch can carry a verified byte snapshot.
+                    and not any(getattr(obj, "mm_content_hashes", None) or [])
+                    and image_sources
+                    and all(
+                        isinstance(image, (str, bytes, ImageData, Image.Image))
+                        and not getattr(image, "content_hash", None)
+                        for image in image_sources
+                    )
+                    and self.mm_processor.can_prefetch_images(
+                        input_text, len(image_sources)
+                    )
+                ):
+                    obj.image_data = image_sources
+                    self._validate_mm_limits(obj)
+                    if isinstance(obj, GenerateReqInput):
+                        self._normalize_mm_content_hashes(obj)
+                    mm_input_validated = True
+                    preload_task = asyncio.create_task(
+                        self.mm_processor.load_images_only_async(
+                            image_data=obj.image_data
+                        )
+                    )
+                try:
+                    if preload_task is not None:
+                        # The regular tokenizer can run synchronously inside its
+                        # async method. Let preload submit its I/O workers first.
+                        await asyncio.sleep(0)
+                    with image_stage("image_tokenization", enabled=contains_mm_input):
+                        input_ids, token_type_ids = await self._tokenize_texts(
+                            input_text, is_cross_encoder_request
+                        )
+                    if preload_task is not None:
+                        preloaded_images = await preload_task
+                except BaseException:
+                    if preload_task is not None:
+                        preload_task.cancel()
+                        # Retrieve a completed exception and drain cancellation
+                        # before unwinding the request; never orphan a task.
+                        await asyncio.gather(preload_task, return_exceptions=True)
+                    raise
 
         if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(
@@ -1186,7 +1250,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            if contains_mm_input:
+            if contains_mm_input and not mm_input_validated:
                 self._validate_mm_limits(obj)
                 # mm_content_hashes is a GenerateReqInput field; EmbeddingReqInput
                 # has no such attribute.
@@ -1224,6 +1288,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         input_text=mm_processor_input,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
+                        **({"_preloaded_images": preloaded_images} if preloaded_images is not None else {}),
                     )
             elif (
                 get_disagg().language_only
