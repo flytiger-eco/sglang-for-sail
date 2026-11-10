@@ -73,7 +73,16 @@ def image_bytes_from_source(
         return base64_decode(encoded, validate=True)
 
     path = unquote(urlparse(source).path) if source.startswith("file://") else source
-    if source.startswith(("file://", "/")) or os.path.isfile(path):
+    is_file = os.path.isfile(path)
+    # Bare JPEG base64 starts with /9j. A leading slash alone must not
+    # classify a valid content payload as an absolute file path. Existing
+    # files and explicit file:// URIs retain their original precedence.
+    if source.startswith("/") and not is_file:
+        try:
+            return base64_decode(source, validate=True)
+        except ValueError:
+            pass
+    if source.startswith(("file://", "/")) or is_file:
         try:
             with open(path, "rb") as image_file:
                 return image_file.read()

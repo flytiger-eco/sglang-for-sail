@@ -108,6 +108,8 @@ url = "https://pypi.org/simple"
 default = true
 
 [project.optional-dependencies]
+# AIM HEIF decoding; EDS/RedKV dependencies come from the company runtime.
+aim = ["pillow-heif==1.4.0"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
