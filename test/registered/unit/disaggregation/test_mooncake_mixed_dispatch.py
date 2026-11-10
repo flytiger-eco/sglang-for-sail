@@ -72,6 +72,43 @@ def byte_pairs(calls):
     )
 
 
+def worker_manager(*, compressed=False):
+    m, info = mixed_manager(cap=0, compressed=compressed)
+    m.enable_trace = False
+    m.bootstrap_port = 8998
+    m._staging_outstanding = defaultdict(int)
+    m._transfer_data = Mock(return_value=0)
+    m.send_kvcache_mixed = Mock(wraps=m.send_kvcache_mixed)
+    m.maybe_send_extra = Mock(return_value=0)
+    m.send_aux = Mock(return_value=0)
+    return m, info
+
+
+def add_peer(m, info, session, room, pages, *, device_pages=None, required=1):
+    req = mc.TransferInfo.from_zmq(request(session, room))
+    req.dst_kv_indices = np.array(pages, dtype=np.int32)
+    req.dst_device_kv_indices = (
+        np.array(device_pages, dtype=np.int32) if device_pages is not None else None
+    )
+    req.required_dst_info_num = required
+    m.decode_kv_args_table[session] = info
+    m.request_status[room] = KVPoll.WaitingForInput
+    m.transfer_infos.setdefault(room, {})[session] = req
+    return req
+
+
+def worker_chunk(room, tokens):
+    return mc.TransferKVChunk(
+        room=room,
+        prefill_kv_indices=np.array([1, 3], dtype=np.int32),
+        index_slice=slice(0, 2),
+        is_last_chunk=True,
+        prefill_aux_index=0,
+        state_indices=[],
+        num_kv_tokens=tokens,
+    )
+
+
 class TestMooncakeMixedDispatch(CustomTestCase):
     def test_index_batches_preserve_every_byte_once(self):
         for compressed in (False, True):
@@ -276,6 +313,156 @@ class TestMooncakeMixedDispatch(CustomTestCase):
             self.assertFalse(thread.is_alive())
         self.assertEqual(result, [-17])
 
+    def test_padding_trim_is_peer_local_and_preserves_the_queued_chunk(self):
+        m, info = worker_manager()
+        add_peer(m, info, "short", 1, [4], required=2)
+        add_peer(m, info, "full", 1, [7, 9], required=2)
+        chunk = worker_chunk(1, 64)
+        original_pages = chunk.prefill_kv_indices
+        queue = NS(get=Mock(side_effect=[chunk, None]))
+        with get_context().override_server_args(enable_unified_memory=False):
+            m.transfer_worker(queue, Mock())
+
+        calls = m.send_kvcache_mixed.call_args_list
+        self.assertEqual([call.args[0] for call in calls], ["short", "full"])
+        np.testing.assert_array_equal(calls[0].args[1], [1])
+        np.testing.assert_array_equal(calls[1].args[1], [1, 3])
+        self.assertIs(calls[1].args[1], original_pages)
+        self.assertIs(chunk.prefill_kv_indices, original_pages)
+        np.testing.assert_array_equal(original_pages, [1, 3])
+        self.assertEqual(chunk.num_kv_tokens, 64)
+        self.assertEqual([call.kwargs["num_kv_tokens"] for call in calls], [64, 64])
+        writes = m._transfer_data.call_args_list
+        self.assertEqual(len(writes), 2)
+        self.assertIn((10064, 40256, 64), writes[0].args[1])
+        self.assertIn((10064, 40448, 64), writes[1].args[1])
+        for call in writes:
+            self.assertEqual(sum(size for _, _, size in call.args[1]), 64 + 2 * 64 * 16)
+        self.assertEqual(m.check_status(1), KVPoll.Success)
+        self.assertFalse(m._staging_outstanding)
+
+    def test_missing_peer_pages_fail_one_room_and_worker_serves_the_next(self):
+        cases = (
+            ([4], None, "tokens=65, capacity=64"),
+            ([4, 7], [8], "Insufficient destination device KV pages"),
+        )
+        for pages, device_pages, reason in cases:
+            with self.subTest(pages=pages, device_pages=device_pages):
+                m, info = worker_manager(compressed=device_pages is not None)
+                add_peer(m, info, "bad", 1, pages, device_pages=device_pages)
+                add_peer(m, info, "healthy", 2, [7, 9])
+                bad, healthy = worker_chunk(1, 65), worker_chunk(2, 65)
+                original_pages = bad.prefill_kv_indices
+                queue = NS(get=Mock(side_effect=[bad, healthy, None]))
+                with get_context().override_server_args(enable_unified_memory=False):
+                    m.transfer_worker(queue, Mock())
+
+                self.assertEqual(m.check_status(1), KVPoll.Failed)
+                self.assertIn(reason, m.failure_records[1])
+                self.assertEqual(m.check_status(2), KVPoll.Success)
+                self.assertNotIn(2, m.failure_records)
+                self.assertEqual(m.send_kvcache_mixed.call_count, 1)
+                self.assertEqual(m.send_kvcache_mixed.call_args.args[0], "healthy")
+                self.assertEqual(
+                    {call.args[0] for call in m._transfer_data.call_args_list},
+                    {"healthy"},
+                )
+                self.assertIs(bad.prefill_kv_indices, original_pages)
+                np.testing.assert_array_equal(original_pages, [1, 3])
+                self.assertEqual(bad.num_kv_tokens, 65)
+                statuses = {
+                    (call.kwargs["bootstrap_room"], call.kwargs["status"])
+                    for call in m.send_kv_status_message.call_args_list
+                }
+                self.assertEqual(statuses, {(1, KVPoll.Failed), (2, KVPoll.Success)})
+                self.assertFalse(m._staging_outstanding)
+
+    def test_staging_defer_requeues_original_chunk_after_peer_local_trim(self):
+        m, info = worker_manager()
+        m.is_mla_backend = m.is_hybrid_mla_backend = False
+        m.enable_staging = True
+        m._staging_ctx = NS(
+            watermark_cv=threading.Condition(),
+            prefetch_requested=set(),
+            prefetched_rooms=set(),
+        )
+        info.staging_base_ptr = 1000000
+        info.staging_total_size = 4096
+        req = add_peer(m, info, "staging", 1, [4])
+        strategy = NS(
+            check_ready=Mock(side_effect=[(False, 0, 0, 0, 0), (True, 7, 16, 0, 0)]),
+            transfer=Mock(return_value=0),
+        )
+        m._try_create_staging_strategy = Mock(return_value=strategy)
+        m._send_chunk_ready = Mock()
+        m.send_kvcache_slice = Mock()
+        chunk = worker_chunk(1, 64)
+        original_pages = chunk.prefill_kv_indices
+        pending = [chunk]
+        requeued = []
+
+        def put(item):
+            requeued.append(item)
+            pending.append(item)
+
+        queue = NS(get=lambda: pending.pop(0) if pending else None, put=put)
+        with get_context().override_server_args(enable_unified_memory=False):
+            m.transfer_worker(queue, Mock(), staging_buffer=object())
+
+        self.assertEqual(len(requeued), 1)
+        self.assertIs(requeued[0], chunk)
+        self.assertIs(chunk.prefill_kv_indices, original_pages)
+        np.testing.assert_array_equal(original_pages, [1, 3])
+        self.assertEqual(chunk.num_kv_tokens, 64)
+        self.assertEqual(strategy.check_ready.call_count, 2)
+        for call in strategy.check_ready.call_args_list:
+            self.assertIs(call.args[0], req)
+            self.assertEqual(call.args[1:], (0, 1))
+        strategy.transfer.assert_called_once()
+        np.testing.assert_array_equal(strategy.transfer.call_args.args[1], [1])
+        m._send_chunk_ready.assert_called_once()
+        sent_chunk = m._send_chunk_ready.call_args.args[2]
+        self.assertIsNot(sent_chunk, chunk)
+        np.testing.assert_array_equal(sent_chunk.prefill_kv_indices, [1])
+        m.send_kvcache_slice.assert_not_called()
+        m.send_kvcache_mixed.assert_not_called()
+        self.assertEqual(m.check_status(1), KVPoll.Success)
+        self.assertFalse(m._staging_outstanding)
+
+    def test_state_only_cp_rank_does_not_require_destination_kv_pages(self):
+        for mode in ("replicated_target", "empty_pool"):
+            with self.subTest(mode=mode):
+                m, info = worker_manager()
+                m.attn_cp_size, m.attn_cp_rank = 2, 1
+                if mode == "replicated_target":
+                    m.kv_args.draft_kv_entry_count = 0
+                    m.kv_args.num_draft_entries = 0
+                    m.kv_args.kv_data_ptrs = m.kv_args.kv_data_ptrs[:1]
+                    m.kv_args.kv_item_lens = m.kv_args.kv_item_lens[:1]
+                    m.kv_args.kv_layer_ids = [0]
+                    m.kv_args.engine_rank = m.attn_tp_rank = 1
+                else:
+                    m.kv_args.kv_data_ptrs = []
+                m._get_peer_chunk_indices = Mock(wraps=m._get_peer_chunk_indices)
+                add_peer(m, info, "state_only", 1, [])
+                chunk = worker_chunk(1, 65)
+                chunk.state_indices = [0]
+                queue = NS(get=Mock(side_effect=[chunk, None]))
+                with get_context().override_server_args(
+                    enable_unified_memory=False, enable_dsa_cache_layer_split=True
+                ):
+                    m.transfer_worker(queue, Mock())
+
+                m._get_peer_chunk_indices.assert_not_called()
+                m._transfer_data.assert_not_called()
+                m.send_kvcache_mixed.assert_not_called()
+                m.maybe_send_extra.assert_called_once()
+                self.assertEqual(m.maybe_send_extra.call_args.args[1], [0])
+                m.send_aux.assert_called_once()
+                self.assertEqual(m.check_status(1), KVPoll.Success)
+                self.assertNotIn(1, m.failure_records)
+                self.assertFalse(m._staging_outstanding)
+
     def test_cp_without_local_draft_skips_target_not_state_or_completion(self):
         # Bootstrap keeps both TP senders on every CP rank when the last CP
         # owns drafts. CP0 must still send replicated targets only once.
@@ -298,6 +485,8 @@ class TestMooncakeMixedDispatch(CustomTestCase):
                             m.kv_args.kv_data_ptrs = m.kv_args.kv_data_ptrs[:1]
                             m.kv_args.kv_item_lens = m.kv_args.kv_item_lens[:1]
                             m.kv_args.kv_layer_ids = [0]
+                        else:
+                            m.prepare_dcp_entry_geometry(info)
                         m._should_skip_cp_replicated_state_transfer = Mock(
                             return_value=False
                         )

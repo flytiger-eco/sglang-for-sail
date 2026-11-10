@@ -16,7 +16,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
 )
-from sglang.srt.disaggregation.utils import get_draft_total_num_kv_heads
+from sglang.srt.disaggregation.utils import (
+    build_kv_layer_ids,
+    get_draft_total_num_kv_heads,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -84,6 +87,73 @@ class TestPDDraftModelRunners(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 scheduler = self._scheduler(algorithm, draft_worker)
                 self.assertIsNone(get_draft_total_num_kv_heads(scheduler))
+
+
+class TestPDLayerMetadataScope(CustomTestCase):
+    def test_non_hybrid_npu_keeps_legacy_metadata(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        for has_draft in (False, True):
+            with self.subTest(has_draft=has_draft):
+                pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+                # A packed FP8 DSA pool can export six buffers while its
+                # backend-specific getter still describes eight entries.
+                pool.get_kv_layer_ids = Mock(return_value=[0, 1] * 4)
+                pool.get_contiguous_buf_infos = Mock(
+                    return_value=(list(range(6)), [1024] * 6, [256] * 6)
+                )
+                draft = (
+                    SimpleNamespace(get_kv_layer_ids=lambda: [0, 0])
+                    if has_draft
+                    else None
+                )
+                with patch("sglang.srt.disaggregation.utils.is_npu", return_value=True):
+                    ids = build_kv_layer_ids(
+                        token_to_kv_pool=pool,
+                        draft_token_to_kv_pool=draft,
+                        num_draft_entries=2 if has_draft else 0,
+                        num_hidden_layers=2,
+                    )
+                self.assertEqual(ids, [])
+                pool.get_kv_layer_ids.assert_not_called()
+                pool.get_contiguous_buf_infos.assert_not_called()
+
+    def test_non_npu_mla_keeps_target_and_draft_metadata(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        pool.start_layer = 2
+        pool.layer_num = 2
+        pool.get_contiguous_buf_infos = Mock(
+            return_value=(list(range(6)), [1024] * 6, [256] * 6)
+        )
+        draft = SimpleNamespace(
+            start_layer=0,
+            layer_num=1,
+            get_contiguous_buf_infos=lambda: ([20, 21], [1024, 1024], [256, 256]),
+        )
+        with patch("sglang.srt.disaggregation.utils.is_npu", return_value=False):
+            ids = build_kv_layer_ids(
+                token_to_kv_pool=pool,
+                draft_token_to_kv_pool=draft,
+                num_draft_entries=2,
+                num_hidden_layers=4,
+            )
+        self.assertEqual(ids, [2, 3] * 3 + [4, 4])
+
+    def test_hybrid_npu_keeps_existing_metadata(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.get_kv_layer_ids = Mock(return_value=[2, 3, 2, 3])
+        with patch("sglang.srt.disaggregation.utils.is_npu", return_value=True):
+            ids = build_kv_layer_ids(
+                token_to_kv_pool=pool,
+                draft_token_to_kv_pool=None,
+                num_draft_entries=0,
+                num_hidden_layers=4,
+            )
+        self.assertEqual(ids, [2, 3, 2, 3])
 
 
 class TestPDDraftGeometry(CustomTestCase):
@@ -664,8 +734,8 @@ class TestPDDraftGeometry(CustomTestCase):
             dst_tp_rank=0,
             dst_dcp_size=8,
             dst_dcp_rank=7,
-            dst_kv_layer_ids=[],
             target_page_transfer=False,
+            dcp_dst_entry_indices=[0, 1],
             dcp_token_item_lens=[6, 3],
             dcp_dst_token_item_lens=[6, 6],
         )

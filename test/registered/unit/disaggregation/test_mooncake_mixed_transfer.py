@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,7 +97,6 @@ def manager(draft=2, tp=16):
     m.session_failures = defaultdict(int)
     m.session_lock = threading.Lock()
     m.failure_lock = threading.Lock()
-    m._status_lock = threading.Lock()
     m.connection_lock = threading.Lock()
     m._socket_lock = threading.Lock()
     m.server_args = NS(enable_pd_role_switch=False)
@@ -106,6 +106,7 @@ def manager(draft=2, tp=16):
     m.kv_args.kv_transfer_metrics = None
     m.failure_records = {}
     m.request_status = {}
+    m._pending_status_notifications = {}
     m.enable_staging = False
     m.enable_custom_mem_pool = False
     m.custom_mem_pool_type = ""
@@ -390,8 +391,13 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 num_draft_entries=2,
                 num_hidden_layers=4,
             )
+            m = manager(draft=0)
+            m.kv_args.kv_data_ptrs, _, _ = st.get_contiguous_buf_infos()
+            m.kv_args.kv_layer_ids = src_ids
             self.assertEqual(
-                mc.resolve_dcp_dst_entry_indices(src_ids, dst_ids, 2, 6),
+                m._resolve_kv_entry_indices(
+                    dst_ids, len(dst_ids), dst_draft_entry_count=2
+                ),
                 [2 * shard, 2 * shard + 1],
             )
 
@@ -402,7 +408,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
 
         from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 
-        for count in (0, 2):
+        for count in (None, 0, 2):
             with patch.object(CommonKVBootstrapServer, "run"):
                 server = CommonKVBootstrapServer("127.0.0.1", 0)
             data = dict(
@@ -421,8 +427,9 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                 page_size=64,
                 kv_cache_dtype="float16",
                 load_balance_method="follow_bootstrap_room",
-                draft_kv_entry_count=count,
             )
+            if count is not None:
+                data["draft_kv_entry_count"] = count
             response = asyncio.run(
                 server._handle_route_put(NS(json=AsyncMock(return_value=data)))
             )
@@ -442,8 +449,14 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     )
                 )
             )
-            info = PrefillServerInfo(**json.loads(response.text))
-            self.assertEqual(getattr(info, "draft_kv_entry_count", None), count)
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.text)
+            if count:
+                self.assertEqual(payload["draft_kv_entry_count"], count)
+            else:
+                self.assertNotIn("draft_kv_entry_count", payload)
+            info = PrefillServerInfo(**payload)
+            self.assertEqual(info.draft_kv_entry_count, count or None)
 
     def test_layer_split_draft_presence_is_registration_order_independent(self):
         import asyncio
@@ -499,14 +512,22 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     )
                 )
                 self.assertEqual(response.status, 200)
-                info = PrefillServerInfo(**json.loads(response.text))
-                self.assertEqual(info.draft_kv_entry_count, max(counts))
+                payload = json.loads(response.text)
+                if any(counts):
+                    self.assertEqual(payload["draft_kv_entry_count"], max(counts))
+                else:
+                    self.assertNotIn("draft_kv_entry_count", payload)
+                info = PrefillServerInfo(**payload)
+                self.assertEqual(info.draft_kv_entry_count, max(counts) or None)
                 for plain in (True, False):
                     m = manager(tp=8)
                     m.is_mla_backend = plain
                     m.is_hybrid_mla_backend = not plain
                     m._resolve_rank_mapping(info)
-                    expected = 2 if plain and not any(counts) else 4
+                    # An omitted zero is indistinguishable from an older peer.
+                    # The local draft therefore conservatively retains all TP
+                    # senders, including when every source CP rank reports zero.
+                    expected = 4
                     self.assertEqual(info.required_prefill_response_num, expected)
                     r = mc.MooncakeKVReceiver.__new__(mc.MooncakeKVReceiver)
                     r.kv_mgr = m
@@ -532,9 +553,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     r._register_kv_args = Mock(return_value=True)
                     r._setup_bootstrap_infos()
                     real = [b["sender"] for b in r.bootstrap_infos if not b["is_dummy"]]
-                    self.assertEqual(
-                        set(real), {0, 1} if expected == 2 else {0, 1, 2, 3}
-                    )
+                    self.assertEqual(set(real), {0, 1, 2, 3})
                     m.request_status[99] = KVPoll.WaitingForInput
                     m.required_prefill_response_num_table[99] = expected
                     states = []
@@ -559,8 +578,6 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     self.assertEqual(states[-1], KVPoll.Success)
 
     def test_cp_filtered_chunks_keep_token_count_and_destination_alignment(self):
-        import sglang.srt.disaggregation.common.conn as common
-
         for total_tokens in (450, 512):
             for chunks in ((8,), (3, 5), (5, 3), (1,) * 8):
                 for cp in (0, 1):
@@ -590,17 +607,8 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                         observed = []
                         for pages in chunks:
                             count = min(pages * 64, max(0, total_tokens - start * 64))
-                            with (
-                                patch.object(
-                                    common,
-                                    "get_parallel",
-                                    return_value=NS(enable_dsa_cache_layer_split=False),
-                                ),
-                                patch.object(
-                                    mc,
-                                    "get_parallel",
-                                    return_value=NS(enable_dsa_cache_layer_split=False),
-                                ),
+                            with get_context().override_server_args(
+                                enable_dsa_cache_layer_split=False
                             ):
                                 send(
                                     sender,
@@ -1011,9 +1019,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     {"s": NS(dst_attn_tp_size=8)} if present else {}
                 )
                 with (
-                    patch.object(
-                        mc, "get_schedule", return_value=NS(chunked_prefill_size=64)
-                    ),
+                    get_context().override_server_args(chunked_prefill_size=64),
                     patch(
                         "sglang.srt.disaggregation.common.staging_handler.prefetch_staging_reqs"
                     ) as prefetch,
@@ -1256,8 +1262,6 @@ class TestMooncakeMixedTransfer(CustomTestCase):
         self.assertNotIn(1, m.transfer_infos)
 
     def test_rejection_before_sender_creation_fails_without_timeout(self):
-        import sglang.srt.disaggregation.common.conn as common
-
         m = manager()
         m.is_dummy_cp_rank = False
         m.enable_trace = False
@@ -1266,7 +1270,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
         )
         self.assertEqual(errors, [])
         self.assertIn(7, m.failure_records)
-        with patch.object(common, "get_parallel", return_value=NS(dp_size=1)):
+        with get_context().override_server_args(dp_size=1):
             sender = mc.MooncakeKVSender(m, "localhost", 7, [0], 0)
         self.assertEqual(sender.poll(), KVPoll.Failed)
 
@@ -1342,9 +1346,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
 
                 m._transfer_data = transfer
                 num_pages = (count + 63) // 64
-                with patch.object(
-                    mc, "get_memory", return_value=NS(enable_unified_memory=False)
-                ):
+                with get_context().override_server_args(enable_unified_memory=False):
                     result = m.send_kvcache(
                         "s",
                         np.arange(num_pages, dtype=np.int32),

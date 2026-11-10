@@ -1020,7 +1020,9 @@ def build_kv_layer_ids(
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
-        if is_mla_backend(token_to_kv_pool):
+        # Keep the legacy positional registration for non-hybrid NPU pools.
+        # Their layer IDs do not necessarily match the exported buffer groups.
+        if not is_npu() and is_mla_backend(token_to_kv_pool):
             return get_transfer_kv_layer_ids(
                 token_to_kv_pool, draft_token_to_kv_pool, num_hidden_layers
             )
