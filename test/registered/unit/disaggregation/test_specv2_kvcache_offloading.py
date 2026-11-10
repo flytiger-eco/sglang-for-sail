@@ -45,6 +45,7 @@ def _make_mock_req(
 ):
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
+    req.skip_radix_cache_insert = False
     req.rid = rid
     req.extra_key = None  # base traffic: storage hashes chain from tokens alone
     req.cache_salt = None

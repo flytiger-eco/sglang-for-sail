@@ -255,15 +255,24 @@ class ServerArgs:
     @property
     def launch_command(self) -> str | None:
         """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
-        return getattr(self, "_launch_command", None)
+        from sglang.srt.utils.config_dump import SECRET_FIELDS, redact_config_secrets
+
+        return redact_config_secrets(
+            getattr(self, "_launch_command", None),
+            secret_values=[getattr(self, name, None) for name in SECRET_FIELDS],
+        )
 
     def resolved_dict(self) -> dict[str, Any]:
-        """Serialize resolved field values, expanding nested records and excluding bookkeeping."""
+        """Serialize resolved configuration without exposing credentials."""
+        from sglang.srt.utils.config_dump import redact_config_secrets
 
-        return {
-            field.name: _plain(resolution_result(self, field.name))
-            for field in record_fields(type(self))
-        }
+        return redact_config_secrets(
+            {
+                field.name: _plain(resolution_result(self, field.name))
+                for field in record_fields(type(self))
+            },
+            redact_strings=False,
+        )
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "DeepseekV4ForCausalLM",
@@ -623,7 +632,9 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    from sglang.srt.utils.config_dump import redact_cli_secrets
+
+    server_args._launch_command = " ".join(redact_cli_secrets(argv, parser))
     return server_args
 
 

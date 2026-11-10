@@ -187,6 +187,9 @@ class DecodeKVCacheOffloadManager:
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
 
+        if req.skip_radix_cache_insert:
+            return False
+
         if self.cache_controller is None or self.decode_host_mem_pool is None:
             return False
 

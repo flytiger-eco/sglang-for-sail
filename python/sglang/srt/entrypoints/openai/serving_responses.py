@@ -38,6 +38,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
 )
 from openai_harmony import Message as OpenAIMessage
 
+from sglang.srt.disaggregation.expanded_input import original_pair_key
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -556,6 +557,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         bootstrap_host=request.bootstrap_host,
                         bootstrap_port=request.bootstrap_port,
                         bootstrap_room=request.bootstrap_room,
+                        bootstrap_pair_key=original_pair_key(request, raw_request),
                         routed_dp_rank=effective_routed_dp_rank,
                         disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         # background+stream streams on this connection, so don't detach.

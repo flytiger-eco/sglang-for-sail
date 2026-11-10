@@ -2827,9 +2827,17 @@ class ServingChatTestCase(CustomTestCase):
             OpenAIServingChat(tm, TemplateManager())
 
     def test_streaming_abort_yields_error(self):
+        """Wire integer aborts must produce error SSE events and terminate."""
+        import msgspec
+
+        for code in (HTTPStatus.INTERNAL_SERVER_ERROR, 502, 504, 590):
+            with self.subTest(code=code):
+                wire_code = msgspec.msgpack.decode(msgspec.msgpack.encode(code))
+                self._assert_streaming_abort_error(wire_code)
+
+    def _assert_streaming_abort_error(self, err_code):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort():
             yield {
@@ -2896,7 +2904,7 @@ class ServingChatTestCase(CustomTestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["code"], int(err_code))
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"

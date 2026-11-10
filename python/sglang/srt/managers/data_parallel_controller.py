@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    ExpandedInputLenReleaseReq,
+    ExpandedInputLenReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -356,6 +358,8 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
+                (ExpandedInputLenReq, self.send_to_all_workers),
+                (ExpandedInputLenReleaseReq, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (

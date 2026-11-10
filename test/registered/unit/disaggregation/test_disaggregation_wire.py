@@ -70,6 +70,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -156,7 +157,7 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
-        req = SimpleNamespace(
+        req = ReqDouble(
             kv=ReqKvInfo(req_pool_idx=0),
             prefix_indices=[0, 1],
             extend_range=SimpleNamespace(length=3),
@@ -370,7 +371,7 @@ class TestQwen4StateWire(unittest.TestCase):
         return pool
 
     def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+        req = ReqDouble(kv=ReqKvInfo(req_pool_idx=7))
 
         np.testing.assert_array_equal(
             get_qsa_pending_state_indices(req),
@@ -878,7 +879,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
                 queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
                 queue.metadata_buffers = buffers
-                req = SimpleNamespace(
+                req = ReqDouble(
                     rid="r0",
                     bootstrap_host="127.0.0.1",
                     bootstrap_room=9,
@@ -940,7 +941,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             sampling_mask_rows.append(
                 np.array([6, 2], np.int32), np.array([-0.25, -1.75], np.float32)
             )
-            req = SimpleNamespace(
+            req = ReqDouble(
                 rid="r0",
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,

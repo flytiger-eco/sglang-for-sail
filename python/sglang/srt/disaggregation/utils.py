@@ -1828,6 +1828,11 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
+    # An internal request-local abort can finish through a transfer queue later.
+    reason = getattr(req, "_requested_abort_reason", None)
+    if reason is not None:
+        error_message = reason["message"]
+        status_code = reason.get("status_code")
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 

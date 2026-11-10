@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -63,7 +63,7 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingCompletionTestCase(unittest.TestCase):
+class ServingCompletionTestCase(CustomTestCase):
     """Bundle all prompt/echo tests in one TestCase."""
 
     # ---------- shared test fixtures ----------
@@ -253,9 +253,17 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
 
     def test_streaming_abort_yields_error(self):
+        """Wire integer aborts must produce error SSE events and terminate."""
+        import msgspec
+
+        for code in (HTTPStatus.INTERNAL_SERVER_ERROR, 502, 504, 590):
+            with self.subTest(code=code):
+                wire_code = msgspec.msgpack.decode(msgspec.msgpack.encode(code))
+                self._assert_streaming_abort_error(wire_code)
+
+    def _assert_streaming_abort_error(self, err_code):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
         async def _mock_generate_abort(*args, **kwargs):
             yield {
@@ -310,7 +318,7 @@ class ServingCompletionTestCase(unittest.TestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["code"], int(err_code))
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"

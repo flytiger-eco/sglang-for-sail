@@ -72,6 +72,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_vision_policy, server_args)
     run_hook(handle_offload_compatibility, server_args)
+    from sglang.srt.arg_groups.image_pruning_hook import handle_image_pruning
+
+    run_hook(handle_image_pruning, server_args)
+
     from sglang.srt.arg_groups.validation_hook import (
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,

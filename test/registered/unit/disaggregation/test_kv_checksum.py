@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.req_double import ReqDouble
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -213,7 +214,7 @@ class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
 
 
 def _make_req(expected_chksum, num_input_tokens, rid="r0"):
-    return SimpleNamespace(
+    return ReqDouble(
         rid=rid,
         bootstrap_room=12345,
         kv=SimpleNamespace(req_pool_idx=0),

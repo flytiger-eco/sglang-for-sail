@@ -461,6 +461,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        bootstrap_pair_key: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -494,6 +495,9 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            bootstrap_pair_key=bootstrap_pair_key
+            if bootstrap_pair_key is not None
+            else rid,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             kv_hints=kv_hints,
@@ -576,6 +580,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        bootstrap_pair_key: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -609,6 +614,9 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            bootstrap_pair_key=bootstrap_pair_key
+            if bootstrap_pair_key is not None
+            else rid,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
             kv_hints=kv_hints,
@@ -1371,6 +1379,7 @@ class Engine(EngineScoreMixin, EngineBase):
         device."""
         if self._attached:
             if isinstance(self.tokenizer_manager, TokenizerManager):
+                self.tokenizer_manager.close_decode_control_sync()
                 mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
                 if mm_processor is not None:
                     mm_processor.shutdown()
@@ -1406,6 +1415,7 @@ class Engine(EngineScoreMixin, EngineBase):
             kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
             if isinstance(self.tokenizer_manager, TokenizerManager):
+                self.tokenizer_manager.close_decode_control_sync()
                 mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
                 if mm_processor is not None:
                     mm_processor.shutdown()

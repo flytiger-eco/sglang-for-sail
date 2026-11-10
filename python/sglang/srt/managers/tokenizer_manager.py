@@ -45,6 +45,7 @@ from typing import (
     Tuple,
     Union,
 )
+from uuid import uuid4
 
 import fastapi
 import numpy as np
@@ -62,6 +63,7 @@ from sglang.srt.beam_search.output import (
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.expanded_input import EXPANDED_INPUT_MAX_INFLIGHT
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -83,6 +85,8 @@ from sglang.srt.managers.io_struct import (
     ElasticScaleUpdateReq,
     EmbeddingReqInput,
     EncoderDispatchErrorReq,
+    ExpandedInputLenReleaseReq,
+    ExpandedInputLenReq,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -232,6 +236,31 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 @dataclasses.dataclass
+class _LoRAUsageGroup:
+    """Hold admitted adapter references while parallel GPU users are alive.
+
+    The producer owns the initial user until dispatch finishes (or unwinds).
+    This also pins adapters during prefix warm-up and a concurrent unload,
+    without looking up an already-unregistered adapter for each sample.
+    """
+
+    registry: LoRARegistry
+    acquired_ids: List[str]
+    users: int = 1
+
+    def add_user(self):
+        assert self.users > 0, "Cannot add a user to a retired LoRA group"
+        self.users += 1
+
+    async def release_user(self):
+        # All bookkeeping runs on the tokenizer event loop, before any await.
+        assert self.users > 0, "LoRA group user retired more than once"
+        self.users -= 1
+        if self.users == 0:
+            await self.registry.release(self.acquired_ids)
+
+
+@dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
 
@@ -242,11 +271,17 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    expanded_input_error: Optional[str] = None
+    expanded_input_status: Optional[int] = None
+    expanded_input_pair: Optional[Tuple[str, str]] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
     dispatched: bool = False
     abort_sent: bool = False
+    lora_release_task: Optional[asyncio.Task] = None
+    lora_acquired_id: Optional[str] = None
+    lora_usage_group: Optional[_LoRAUsageGroup] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -755,6 +790,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
+        self._decode_control_session = None
+        self._expanded_input_tasks = {}
+        self._expanded_input_owners = {}
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None
@@ -884,8 +922,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self._init_req_state(obj, request)
         request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        request_states = {rid: self.rid_to_state[rid] for rid in request_rids}
         try:
-            if get_disagg().language_only:
+            if get_disagg().language_only or (
+                get_disagg().disaggregation_mode in ("prefill", "decode")
+                and (envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get())
+            ):
                 self._handle_epd_disaggregation_encode_request(obj)
 
             # Log the request
@@ -919,7 +961,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
-            self._release_req_states_on_failure(request_rids)
+            self._release_req_states_on_failure(request_rids, request_states)
             raise
 
     def _detect_input_format(
@@ -1055,6 +1097,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_text = obj.text
         token_type_ids = None
         contains_mm_input = obj.contains_mm_input()
+        if (
+            isinstance(obj, GenerateReqInput)
+            and contains_mm_input
+            and (obj.session_id or obj.session_params)
+            and self.disaggregation_mode
+            in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE)
+            and (envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get())
+        ):
+            raise ValueError("Expanded-input PD does not support multimodal sessions")
+        deferred_mm_decode = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and getattr(obj, "_needs_expanded_input_len", False)
+        )
+        if deferred_mm_decode and getattr(obj, "return_prompt_token_ids", False):
+            raise ValueError(
+                "Expanded-input Decode cannot return actual Prefill prompt token IDs"
+            )
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -1082,6 +1141,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 self.mm_processor
                 and contains_mm_input
+                and not deferred_mm_decode
                 and getattr(
                     self.mm_processor,
                     "generates_input_ids_from_raw_prompt",
@@ -1108,8 +1168,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures
         )
-        should_run_mm_processor = self.mm_processor is not None and (
-            contains_mm_input or is_mossvl
+        # Decode keeps placeholder IDs until Prefill publishes its final
+        # pruned length and MRoPE delta. Local expansion would use the full
+        # image grid and reject the shorter authoritative pruned length.
+        should_run_mm_processor = (
+            not deferred_mm_decode
+            and self.mm_processor is not None
+            and (contains_mm_input or is_mossvl)
         )
 
         if should_run_mm_processor:
@@ -1211,6 +1276,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 "this item will fall back to hash_feature().",
                                 hex_hash,
                             )
+            if mm_inputs and mm_inputs.mm_items:
+                import hashlib
+
+                for item in mm_inputs.mm_items:
+                    identity = item.model_specific_data.get("epd_pruning_identity")
+                    if identity is not None:
+                        # Namespace caller-provided hashes by retained spatial positions.
+                        item.set_pad_value()
+                        digest = hashlib.sha256(
+                            f"{item.hash}:{identity}".encode("utf-8")
+                        ).digest()
+                        item.set_hash(int.from_bytes(digest, "big"))
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1221,9 +1298,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+        # Notify only after multimodal expansion and validation, so Decode
+        # never allocates a request that Prefill will reject.
+        if (
+            mm_inputs
+            and mm_inputs.input_ids is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and (envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get())
+            and getattr(obj, "bootstrap_room", None) is not None
+        ):
+            self._track_expanded_len_task(
+                self._notify_decode_expanded_len(
+                    str(obj.bootstrap_room),
+                    len(input_ids),
+                    str(obj.rid),
+                    (
+                        int(mm_inputs.mrope_position_delta.item())
+                        if mm_inputs.mrope_position_delta is not None
+                        else 0
+                    ),
+                    obj.bootstrap_pair_key,
+                ),
+                str(obj.rid),
+            )
+        return tokenized_obj
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
@@ -1511,6 +1612,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                bootstrap_pair_key=obj.bootstrap_pair_key,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
@@ -1524,6 +1626,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+                needs_expanded_input_len=getattr(
+                    obj, "_needs_expanded_input_len", False
+                ),
+                expanded_input_generation=getattr(
+                    obj, "_expanded_input_generation", None
+                ),
                 priority=obj.priority,
                 kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,
@@ -1691,6 +1799,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
+            self._register_expanded_input_owner(tokenized_obj)
             self._dispatch_to_scheduler(tokenized_obj)
             self._mark_state_dispatched(tokenized_obj.rid)
             dispatched = True
@@ -1712,6 +1821,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state.get(rid)
         if state is not None:
             state.dispatched = True
+            if getattr(state, "expanded_input_error", None) is not None:
+                self._abort_expanded_input_failure(rid, state)
+
+    def _abort_expanded_input_failure(self, rid, state):
+        # Never expose downstream control credentials or URLs in client errors.
+        error = state.expanded_input_error
+        status = getattr(state, "expanded_input_status", None) or HTTPStatus.BAD_GATEWAY
+        self.abort_request(
+            rid,
+            exact=True,
+            finished_reason={"type": "abort", "message": error, "status_code": status},
+        )
 
     async def _send_batch_request(
         self,
@@ -1739,6 +1860,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
 
+            for tokenized_obj in tokenized_objs:
+                self._register_expanded_input_owner(tokenized_obj)
             self._dispatch_to_scheduler(batch_req)
             for tokenized_obj in tokenized_objs:
                 self._mark_state_dispatched(tokenized_obj.rid)
@@ -1787,6 +1910,31 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             out["meta_info"] = meta_info
         return out
 
+    def _schedule_lora_release(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        tasks = getattr(self, "asyncio_tasks", None)
+        if tasks is not None:
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        return task
+
+    def _retire_lora_usage(self, state: ReqState):
+        """Own one release task per request, shared by every completion path."""
+        group = getattr(state, "lora_usage_group", None)
+        acquired_id = getattr(state, "lora_acquired_id", None)
+        if group is None and acquired_id is None:
+            return None  # Client-supplied lora_id does not establish ownership.
+        task = getattr(state, "lora_release_task", None)
+        if task is None:
+            coroutine = (
+                group.release_user()
+                if group is not None
+                else self.lora_registry.release(acquired_id)
+            )
+            task = self._schedule_lora_release(coroutine)
+            state.lora_release_task = task
+        return task
+
     async def _handle_abort_finish_reason(
         self,
         out: dict,
@@ -1796,6 +1944,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Returns the output dict to yield (stream abort), None for normal flow;
         raises ValueError/HTTPException for non-stream aborts."""
         finish_reason = out["meta_info"]["finish_reason"]
+        if finish_reason.get("type") == "abort":
+            task = self._retire_lora_usage(state)
+            if task is not None:
+                # Cancelling a response consumer must not cancel retirement.
+                await asyncio.shield(task)
 
         if (
             finish_reason.get("type") == "abort"
@@ -1807,18 +1960,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if finish_reason.get("type") == "abort" and finish_reason.get(
             "status_code"
-        ) in (
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
-        ):
+        ) in range(500, 600):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.
-            if state.obj.rid in self.rid_to_state:
+            if self.rid_to_state.get(state.obj.rid) is state:
+                self._cancel_expanded_input_tasks(state.obj.rid)
                 del self.rid_to_state[state.obj.rid]
 
-            # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2008,34 +2156,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "many threads to send them one by one with parallel sampling (n > 1)."
                 )
 
-            # Tokenize all requests
-            objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+            source_states = {}
+            for i, rid in enumerate(obj.rid):
+                state = self.rid_to_state.get(rid)
+                if state is None or state.obj is not obj[i]:
+                    raise ValueError(
+                        "Parallel sampling input request is no longer active"
+                    )
+                source_states[rid] = state
+            acquired_ids = [
+                state.lora_acquired_id
+                for state in source_states.values()
+                if state.lora_acquired_id is not None
+            ]
+            lora_group = (
+                _LoRAUsageGroup(self.lora_registry, acquired_ids)
+                if acquired_ids
+                else None
             )
+            if lora_group is not None:
+                for state in source_states.values():
+                    state.lora_acquired_id = None  # Ownership moved to the group.
+            try:
+                # Tokenize all requests
+                objs = [obj[i] for i in range(batch_size)]
+                tokenized_objs = await asyncio.gather(
+                    *(self._tokenize_one_request(obj) for obj in objs)
+                )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                # Ensure independent mm_items so wrap_shm_features won't mutate the original
-                if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
-                    tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
-                    tokenized_obj.mm_inputs.mm_items = [
-                        copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
-                    ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
-                request_rids.add(tmp_obj.rid)
-                await self._send_one_request(tokenized_obj)
-                await self._wait_one_response(tmp_obj, request).__anext__()
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                # Cache the common prefix for parallel sampling
+                for i in range(batch_size):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -2045,18 +2195,60 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    tokenized_obj.sampling_params = copy.copy(
+                        tokenized_obj.sampling_params
+                    )
+                    tokenized_obj.sampling_params.max_new_tokens = 0
+                    tokenized_obj.stream = False
                     self._init_req_state(tmp_obj)
                     request_rids.add(tmp_obj.rid)
-                    state = self.rid_to_state[tmp_obj.rid]
-                    tokenized_obj.time_stats = state.time_stats
-                    if tmp_obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                    if lora_group is not None:
+                        self.rid_to_state[tmp_obj.rid].lora_usage_group = lora_group
+                        lora_group.add_user()
                     await self._send_one_request(tokenized_obj)
-                    generators.append(self._wait_one_response(tmp_obj, request))
-                    rids.append(tmp_obj.rid)
+                    await self._wait_one_response(tmp_obj, request).__anext__()
 
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+                # Expand requests, assign new rids for them, and send them
+                for i in range(batch_size):
+                    for _ in range(obj.parallel_sample_num):
+                        tmp_obj = copy.copy(objs[i])
+                        tokenized_obj = copy.copy(tokenized_objs[i])
+                        # Ensure independent mm_items so wrap_shm_features won't mutate the original
+                        if (
+                            hasattr(tokenized_obj, "mm_inputs")
+                            and tokenized_obj.mm_inputs
+                        ):
+                            tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                            tokenized_obj.mm_inputs.mm_items = [
+                                copy.copy(item)
+                                for item in tokenized_obj.mm_inputs.mm_items
+                            ]
+                        tokenized_obj.rid = tmp_obj.regenerate_rid()
+                        self._init_req_state(tmp_obj)
+                        request_rids.add(tmp_obj.rid)
+                        if lora_group is not None:
+                            self.rid_to_state[tmp_obj.rid].lora_usage_group = lora_group
+                            lora_group.add_user()
+                        state = self.rid_to_state[tmp_obj.rid]
+                        tokenized_obj.time_stats = state.time_stats
+                        if tmp_obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_objs[i].input_ids)
+                        await self._send_one_request(tokenized_obj)
+                        generators.append(self._wait_one_response(tmp_obj, request))
+                        rids.append(tmp_obj.rid)
+
+                # These normalized placeholders never reached the scheduler.
+                # Remove all of them, including the n-expanded extra input states.
+                for rid, state in source_states.items():
+                    if self.rid_to_state.get(rid) is state:
+                        state.time_stats.set_finished_time()
+                        self._cancel_expanded_input_tasks(rid)
+                        del self.rid_to_state[rid]
+            finally:
+                if lora_group is not None:
+                    # Do not await this task: cancellation must not prevent the
+                    # producer's retirement, and GPU users keep the group pinned.
+                    self._schedule_lora_release(lora_group.release_user())
 
         # Wait for all requests
         is_stream = hasattr(obj, "stream") and obj.stream
@@ -2111,7 +2303,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        *,
+        exact: bool = False,
+        finished_reason=None,
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -2124,7 +2323,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid, abort_all=abort_all, exact=exact, finished_reason=finished_reason
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2625,11 +2826,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                     )
 
+                self._cancel_expanded_input_tasks(rid)
                 del self.rid_to_state[rid]
 
-                # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._retire_lora_usage(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3153,14 +3353,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             self.crash_dump_request_list.popleft()
 
+    def _dump_configuration(self):
+        from sglang.srt.utils.config_dump import redact_config_for_dump
+
+        updates = get_context().overrides_log()
+        try:
+            startup_config = self.server_args.resolved_dict()
+        except Exception as error:
+            logger.error("Failed to snapshot startup config for the dump: %r", error)
+            startup_config = None
+        return redact_config_for_dump(
+            {
+                "server_args": startup_config,
+                "config_updates": updates,
+                "resolved_config": self._dump_config_snapshot(),
+                "launch_command": self.server_args.launch_command,
+            },
+            self.server_args,
+            updates,
+        )
+
     def _dump_data_to_file(
         self, data_list: List[Tuple], filename: str, log_message: str
     ):
         logger.info(log_message)
         to_dump_with_server_args = {
-            "server_args": self.server_args,
-            "config_updates": get_context().overrides_log(),
-            "resolved_config": self._dump_config_snapshot(),
+            **self._dump_configuration(),
             "requests": data_list.copy(),
         }
 
@@ -3243,11 +3461,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Write the data to the file
                 data_to_dump_with_server_args = {
-                    "server_args": self.server_args,
-                    "config_updates": get_context().overrides_log(),
-                    "resolved_config": self._dump_config_snapshot(),
+                    **self._dump_configuration(),
                     "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
                 }
                 with open(filename, "wb") as f:
                     try:
@@ -3385,6 +3600,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         state.finished = True
         state.time_stats.set_finished_time()
+        self._retire_lora_usage(state)
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -3427,6 +3643,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
+        self._cancel_expanded_input_tasks(recv_obj.rid)
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
@@ -3577,6 +3794,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+        # Acquire succeeded. Record the owned reference before another await;
+        # input lora_id and later input mutation must never decide retirement.
+        children = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+        for i, child in enumerate(children):
+            acquired_id = (
+                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+            )
+            state = self.rid_to_state.get(child.rid)
+            if state is not None and state.obj is child:
+                state.lora_acquired_id = acquired_id
         # Propagate lora_id to any sub-objects already cached by __getitem__.
         for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
             sub_obj.lora_id = (
@@ -3628,7 +3855,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
 
-    def _release_req_states_on_failure(self, rids: Iterable[str]):
+    def _release_req_states_on_failure(self, rids: Iterable[str], expected_states=None):
         """Release rid_to_state entries created for a failed handler.
 
         Undelivered states are removed locally. Dispatched requests are aborted
@@ -3636,6 +3863,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """
         for rid in rids:
             state = self.rid_to_state.get(rid)
+            if (
+                state is not None
+                and expected_states is not None
+                and rid in expected_states
+                and state is not expected_states[rid]
+            ):
+                # A completed handler may unwind after the caller reused its
+                # RID. Its cleanup must not retire the replacement owner.
+                continue
+            self._cancel_expanded_input_tasks(rid)
             if state is not None:
                 if state.dispatched:
                     try:
@@ -3645,6 +3882,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Failed to abort request %s during cleanup", rid
                         )
                 else:
+                    self._retire_lora_usage(state)
                     del self.rid_to_state[rid]
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:
@@ -3688,6 +3926,56 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
     ):
         """Handle EPD-disaggregation mode encoding request."""
+        feature_enabled = envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+        if (
+            feature_enabled
+            and isinstance(obj, GenerateReqInput)
+            and get_disagg().disaggregation_mode in ("prefill", "decode")
+        ):
+            children = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+            for child in children:
+                if (
+                    get_disagg().disaggregation_mode in ("prefill", "decode")
+                    and child.contains_mm_input()
+                    and (child.session_id or child.session_params)
+                ):
+                    raise ValueError(
+                        "Expanded-input PD does not support multimodal sessions"
+                    )
+            if any(child.contains_mm_input() for child in children):
+                if getattr(obj, "parallel_sample_num", 1) > 1:
+                    raise ValueError(
+                        "Expanded-input PD does not support multimodal parallel sampling"
+                    )
+                for child in children:
+                    if not child.contains_mm_input():
+                        continue
+                    if child.return_routed_experts:
+                        raise ValueError(
+                            "Expanded-input PD does not support return_routed_experts"
+                        )
+                    key = child.bootstrap_pair_key
+                    if not isinstance(key, str) or not 1 <= len(key) <= 128:
+                        raise ValueError(
+                            "Expanded-input PD requires an immutable bootstrap_pair_key "
+                            "shared by the original Prefill/Decode pair"
+                        )
+            if get_disagg().disaggregation_mode == "decode":
+                for child in children:
+                    child._needs_expanded_input_len = child.contains_mm_input()
+                    if child._needs_expanded_input_len:
+                        child._expanded_input_generation = uuid4().hex
+                return
+            if not get_disagg().language_only:
+                return
+            if not obj.is_single:
+                # Dispatch each Prefill item too: a parent-only wait flag is
+                # lost by cached children and can trigger local vision work.
+                for child in children:
+                    child.is_single = True
+                    child.batch_size = 1
+                    self._handle_epd_disaggregation_encode_request(child)
+                return
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
             # dispatch to encoder by default
             should_dispatch = True
@@ -3717,6 +4005,311 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.encoder_dispatch_ready[obj.rid] = dispatch_ready
             else:
                 obj.need_wait_for_mm_inputs = False
+            for child in obj.__dict__.get("_sub_obj_cache", {}).values():
+                child.need_wait_for_mm_inputs = bool(
+                    obj.need_wait_for_mm_inputs and child.contains_mm_input()
+                )
+
+    def notify_expanded_input_len(
+        self,
+        rid: str,
+        expanded_input_len: int,
+        mrope_position_delta: int,
+        request_generation: str,
+        metadata_version: int = 2,
+    ):
+        """Forward an exact expanded length from Decode HTTP to Scheduler."""
+        self._dispatch_to_scheduler(
+            ExpandedInputLenReq(
+                rid=rid,
+                expanded_input_len=expanded_input_len,
+                mrope_position_delta=mrope_position_delta,
+                metadata_version=metadata_version,
+                request_generation=request_generation,
+            )
+        )
+
+    def _register_expanded_input_owner(self, tokenized_obj):
+        if (
+            not isinstance(tokenized_obj, TokenizedGenerateReqInput)
+            or not tokenized_obj.needs_expanded_input_len
+        ):
+            return
+        state = self.rid_to_state[tokenized_obj.rid]
+        key = (str(tokenized_obj.bootstrap_room), tokenized_obj.bootstrap_pair_key)
+        existing = self._expanded_input_owners.get(key)
+        if existing is state:
+            return
+        if existing is not None:
+            raise ValueError(
+                "Concurrent reuse of a bootstrap room and pair identity is unsupported"
+            )
+        if len(self._expanded_input_owners) >= EXPANDED_INPUT_MAX_INFLIGHT:
+            raise fastapi.HTTPException(
+                status_code=503,
+                detail="Expanded-input Decode admission is full; retry the request",
+            )
+        state.expanded_input_pair = key
+        self._expanded_input_owners[key] = state
+
+    def get_expanded_input_generation(self, room: str, pair_key: str):
+        if get_disagg().disaggregation_mode != "decode":
+            return None
+        state = self._expanded_input_owners.get((str(room), pair_key))
+        if state is None or state.finished:
+            return None
+        return getattr(state.obj, "_expanded_input_generation", None)
+
+    def _cancel_expanded_input_tasks(self, rid):
+        state = self.rid_to_state.get(rid)
+        pair = getattr(state, "expanded_input_pair", None)
+        if pair is not None and self._expanded_input_owners.get(pair) is state:
+            # Same FIFO as metadata notifications: release the old reservation
+            # on every DP worker before admitting a replacement owner.
+            self._dispatch_to_scheduler(
+                ExpandedInputLenReleaseReq(
+                    rid=pair[0], request_generation=state.obj._expanded_input_generation
+                )
+            )
+            self._expanded_input_owners.pop(pair)
+            state.expanded_input_pair = None
+        for task in self._expanded_input_tasks.pop(rid, ()):
+            task.cancel()
+
+    def _track_expanded_len_task(self, coroutine, request_rid: str) -> None:
+        owner = self.rid_to_state.get(request_rid)
+        task = asyncio.create_task(coroutine)
+        self.asyncio_tasks.add(task)
+        pending = self._expanded_input_tasks
+        pending.setdefault(request_rid, set()).add(task)
+
+        def _done(completed_task):
+            self.asyncio_tasks.discard(completed_task)
+            current = pending.get(request_rid)
+            if current is not None:
+                current.discard(completed_task)
+                if not current:
+                    pending.pop(request_rid, None)
+            try:
+                completed_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:
+                logger.exception("Expanded input length notification failed")
+                state = self.rid_to_state.get(request_rid)
+                if state is owner and state is not None and not state.finished:
+                    if isinstance(error, PermissionError):
+                        detail = "Decode control authentication failed"
+                    elif isinstance(error, ValueError):
+                        detail = "Decode rejected expanded-input control metadata"
+                    elif isinstance(error, (TimeoutError, RuntimeError)):
+                        detail = "Decode expanded-input metadata delivery timed out"
+                    else:
+                        detail = "Decode expanded-input metadata delivery failed"
+                    state.expanded_input_error = detail
+                    state.expanded_input_status = (
+                        HTTPStatus.GATEWAY_TIMEOUT
+                        if isinstance(error, (TimeoutError, RuntimeError))
+                        else HTTPStatus.BAD_GATEWAY
+                    )
+                    if state.dispatched:
+                        self._abort_expanded_input_failure(request_rid, state)
+
+        task.add_done_callback(_done)
+
+    async def close_decode_control(self):
+        tasks = {
+            task
+            for pending in getattr(self, "_expanded_input_tasks", {}).values()
+            for task in pending
+        }
+        session = getattr(self, "_decode_control_session", None)
+        try:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # Lifespan/Engine shutdown can itself be cancelled during draining.
+            if session is not None:
+                await session.close()
+                if self._decode_control_session is session:
+                    self._decode_control_session = None
+
+    def close_decode_control_sync(self):
+        session = getattr(self, "_decode_control_session", None)
+        tasks = [
+            task
+            for pending in getattr(self, "_expanded_input_tasks", {}).values()
+            for task in pending
+        ]
+        if session is None and not tasks:
+            return
+        loop = session._loop if session is not None else tasks[0].get_loop()
+        if loop.is_closed():
+            # No notification can advance on the closed owner loop. Finalize
+            # the connector on an available loop and await aiohttp's close.
+            if session is not None:
+                try:
+                    running = asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(session.close())
+                else:
+                    self._decode_control_close_task = running.create_task(
+                        session.close()
+                    )
+            self._decode_control_session = None
+        elif loop.is_running():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is loop:
+                # A synchronous Engine.shutdown cannot block its own event loop.
+                # Retain the task so async callers can await completion.
+                self._decode_control_close_task = loop.create_task(
+                    self.close_decode_control()
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    self.close_decode_control(), loop
+                ).result()
+        else:
+            loop.run_until_complete(self.close_decode_control())
+
+    async def _get_decode_control_session(self):
+        import aiohttp
+
+        session = self._decode_control_session
+        if session is None or session.closed:
+            key = (
+                get_disagg().disagg_decode_control_key
+                or get_serving().admin_api_key
+                or get_serving().api_key
+            )
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            session = aiohttp.ClientSession(headers=headers)
+            self._decode_control_session = session
+        return session
+
+    async def _notify_decode_expanded_len(
+        self,
+        rid: str,
+        expanded_len: int,
+        request_rid: str,
+        mrope_position_delta: int,
+        pair_key: str,
+    ) -> None:
+        import aiohttp
+
+        urls = list(
+            dict.fromkeys(
+                url.rstrip("/") + "/v1/expanded_input_len"
+                for url in get_disagg().disagg_decode_urls or ()
+            )
+        )
+        if not urls:
+            raise RuntimeError("Expanded-input Prefill requires --disagg-decode-urls")
+        session = await self._get_decode_control_session()
+        deadline = time.monotonic() + envs.SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT.get()
+
+        async def query(url):
+            async with session.post(
+                url,
+                json={
+                    "rid": rid,
+                    "query_generation": True,
+                    "bootstrap_pair_key": pair_key,
+                },
+                timeout=aiohttp.ClientTimeout(
+                    total=max(0.001, min(5, deadline - time.monotonic()))
+                ),
+            ) as response:
+                if response.status == 202:
+                    return url, None
+                if response.status in (401, 403):
+                    raise PermissionError(
+                        f"Decode control authentication failed: HTTP {response.status} at {url}"
+                    )
+                if 400 <= response.status < 500 and response.status != 429:
+                    raise ValueError(
+                        f"Decode owner query rejected: HTTP {response.status} at {url}"
+                    )
+                if response.status != 200:
+                    raise ConnectionError(
+                        f"Decode owner temporarily unavailable: HTTP {response.status} at {url}"
+                    )
+                data = await response.json()
+                generation = data.get("request_generation")
+                if not isinstance(generation, str) or not 1 <= len(generation) <= 128:
+                    raise ValueError("Invalid Decode owner generation")
+                return url, generation
+
+        async def notify(url, generation):
+            payload = {
+                "rid": rid,
+                "expanded_input_len": expanded_len,
+                "mrope_position_delta": mrope_position_delta,
+                "metadata_version": 2,
+                "request_generation": generation,
+                "bootstrap_pair_key": pair_key,
+            }
+            attempt = 0
+            while time.monotonic() < deadline:
+                try:
+                    async with session.post(
+                        url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=max(0.001, min(5, deadline - time.monotonic()))
+                        ),
+                    ) as response:
+                        if response.status == 200:
+                            return
+                        if 400 <= response.status < 500 and response.status != 429:
+                            raise ValueError(
+                                f"Decode rejected metadata: HTTP {response.status} at {url}"
+                            )
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+                attempt += 1
+                await asyncio.sleep(
+                    min(0.1 * attempt, 1, max(0, deadline - time.monotonic()))
+                )
+            raise RuntimeError(f"Decode metadata delivery timed out at {url}")
+
+        async def poll_owner(url):
+            while time.monotonic() < deadline:
+                try:
+                    result = await query(url)
+                    if result[1] is not None:
+                        return result
+                except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+                    pass
+                await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            raise TimeoutError("Decode owner registration timed out")
+
+        tasks = [asyncio.create_task(poll_owner(url)) for url in urls]
+        errors = []
+        try:
+            for completed in asyncio.as_completed(tasks):
+                try:
+                    url, generation = await completed
+                except (PermissionError, ValueError, TimeoutError) as error:
+                    errors.append(error)
+                    continue
+                await notify(url, generation)
+                return
+            if errors and all(
+                isinstance(e, (PermissionError, ValueError)) for e in errors
+            ):
+                raise errors[0]
+            raise RuntimeError(f"No live Decode owner for room={rid} rid={request_rid}")
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def convert_to_span_attrs(
         self,

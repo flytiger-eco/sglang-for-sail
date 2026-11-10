@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_ppu,
     is_xpu,
     print_info_once,
 )
@@ -579,7 +580,13 @@ class VisionFlash3Attention(nn.Module):
         )
         if s_aux is not None:
             fa_kwargs["sinks"] = s_aux
-        output = flash_attn_func(q, k, v, **fa_kwargs)
+        if is_ppu():
+            from sglang.srt.hardware_backend.ppu.attention.flash_attention import (
+                flash_attn_varlen_func as ppu_flash_attn,
+            )
+            output = ppu_flash_attn(q, k, v, **fa_kwargs)
+        else:
+            output = flash_attn_func(q, k, v, **fa_kwargs)
 
         return output
 
@@ -1383,6 +1390,7 @@ class VisionAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
         full_attn: bool = True,
+        return_attention_score: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -1532,22 +1540,35 @@ class VisionAttention(nn.Module):
             q_head_end = (self.tp_rank + 1) * self.num_attention_heads_per_partition
             s_aux = self.sinks[q_head_start:q_head_end]
 
-        output = self.qkv_backend.forward(
-            q=q,
-            k=k,
-            v=v,
-            bsz=bsz,
-            seq_len=s,
-            cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
-            forward_metadata=forward_metadata,
-            sequence_lengths=sequence_lengths,
-            max_seqlen=max_seqlen,
-            output_ws=attn_output_ws,
-            softmax_scale=self.softmax_scale,
-            window_size=effective_window_size,
-            s_aux=s_aux,
-        )
+        attention_score = None
+        if return_attention_score:
+            if not _is_cuda or attention_mask is not None or s_aux is not None or effective_window_size != (-1, -1):
+                raise ValueError("Image pruning score extraction requires CUDA full unmasked attention")
+            from sglang.srt.layers.attention.flash_attn_with_score import flash_attn_varlen_func_with_score
+
+            cu = forward_metadata.cu_seqlens if forward_metadata is not None else resolve_seqlens(cu_seqlens, bsz, s, device=q.device)
+            cu = cu.to(device=q.device, dtype=torch.int32)
+            max_len = forward_metadata.max_seqlen if forward_metadata is not None else int((cu[1:] - cu[:-1]).max().item())
+            output, attention_score = flash_attn_varlen_func_with_score(
+                q, k, v, cu, max_len, self.softmax_scale
+            )
+        else:
+            output = self.qkv_backend.forward(
+                q=q,
+                k=k,
+                v=v,
+                bsz=bsz,
+                seq_len=s,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+                forward_metadata=forward_metadata,
+                sequence_lengths=sequence_lengths,
+                max_seqlen=max_seqlen,
+                output_ws=attn_output_ws,
+                softmax_scale=self.softmax_scale,
+                window_size=effective_window_size,
+                s_aux=s_aux,
+            )
 
         assert output.dim() == 3, output.shape
 
@@ -1569,4 +1590,4 @@ class VisionAttention(nn.Module):
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
 
-        return output
+        return (output, attention_score) if return_attention_score else output

@@ -26,9 +26,10 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.req_double import ReqDouble
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
@@ -587,7 +588,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._add_request_to_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
 
-        req = SimpleNamespace(
+        req = ReqDouble(
             finished=lambda: False,
             output_ids=[10, 11, 12],
             time_stats=MagicMock(),
@@ -697,6 +698,28 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_pd_multimodal_retract_aborts_after_releasing_kv(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.output_streamer = MagicMock()
+        req = self._make_req("multimodal")
+        req.needs_expanded_input_len = True
+        req.expanded_input_len = 8
+        scheduler.running_batch.reqs = [req]
+        with (
+            get_parallel().override(tp_rank=0),
+            patch("sglang.srt.managers.scheduler.retract_all") as release,
+        ):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        release.assert_called_once()
+        self.assertTrue(req.finished())
+        reason = req.finished_reason.to_json()
+        self.assertEqual(reason["status_code"], 503)
+        self.assertEqual(reason["err_type"], "ServiceUnavailableError")
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 if __name__ == "__main__":

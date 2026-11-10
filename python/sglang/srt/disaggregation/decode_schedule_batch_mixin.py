@@ -54,7 +54,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_range.length] = chunk
             offset += req.extend_range.length
 
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
+            seq_len = req.effective_input_len + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
                 assert seq_len - pre_len == req.extend_range.length, (

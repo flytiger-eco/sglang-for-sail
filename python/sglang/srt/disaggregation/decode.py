@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -51,6 +51,10 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.expanded_input import (
+    EXPANDED_INPUT_MAX_INFLIGHT,
+    finalize_expanded_input_positions,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -75,6 +79,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    MultimodalInputs,
     NextBatchPlan,
     ScheduleBatch,
 )
@@ -426,6 +431,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        # Keys include the Prefill request generation, not just reusable rooms.
+        self._pending_expanded_lens = OrderedDict()
+        self._seen_expanded_metadata = OrderedDict()
+        self._expanded_len_cache_ttl = 600.0
+        self._expanded_len_cache_max = EXPANDED_INPUT_MAX_INFLIGHT
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -562,8 +572,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_retractable_len(self, req: Req) -> int:
         if not self._uses_swa_tail_prealloc():
-            return len(req.origin_input_ids) + len(req.output_ids)
-        return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
+            return req.effective_input_len + len(req.output_ids)
+        return self._swa_tail_len(req.effective_input_len) + len(req.output_ids)
 
     def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
         allocated_kv_len = self._pre_alloc_fill_len(req)
@@ -760,7 +770,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             is_retracted = False
             is_rebootstrap = True
 
-        if self._check_if_req_exceed_kv_capacity(req):
+        if not req.needs_expanded_input_len:
+            req.expanded_input_len = len(req.origin_input_ids)
+        else:
+            req._expanded_input_len_wait_start = time.monotonic()
+        if req.expanded_input_len is not None and self._check_if_req_exceed_kv_capacity(
+            req
+        ):
             return
 
         if is_retracted:
@@ -784,6 +800,210 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def _apply_expanded_input_len(self, req: Req, metadata) -> None:
+        if metadata is None:
+            prepare_abort(
+                req,
+                "Conflicting Prefill multimodal metadata",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        expanded_input_len, delta, version = metadata
+        previous = getattr(req, "_expanded_input_metadata", None)
+        if previous is not None and previous != metadata:
+            prepare_abort(
+                req,
+                "Conflicting Prefill multimodal metadata",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        # Install RoPE before publishing the length that releases preallocation.
+        if req.multimodal_inputs is None:
+            req.multimodal_inputs = MultimodalInputs(mm_items=[])
+        req.multimodal_inputs.mrope_position_delta = torch.tensor(
+            [[delta]], dtype=torch.long
+        )
+        req.multimodal_inputs.mrope_position_delta_repeated_cache = None
+        req._expanded_input_metadata = metadata
+        # Placeholder IDs never identify image content, even at equal lengths.
+        req.skip_radix_cache_insert = True
+        req.expanded_input_len = expanded_input_len
+
+    def _cleanup_pending_expanded_lens(self, now: float) -> None:
+        # Only consumed tombstones expire. Pending deliveries were acknowledged
+        # to Prefill and remain pinned until consumption or owner retirement.
+        while self._seen_expanded_metadata:
+            key = next(iter(self._seen_expanded_metadata))
+            if (
+                now - self._seen_expanded_metadata[key][1]
+                <= self._expanded_len_cache_ttl
+            ):
+                break
+            self._seen_expanded_metadata.pop(key)
+
+    def release_expanded_input_len(self, room: str, generation: str) -> None:
+        key = (str(room), generation)
+        self._pending_expanded_lens.pop(key, None)
+        self._seen_expanded_metadata.pop(key, None)
+
+    def set_expanded_input_len(
+        self,
+        rid: str,
+        expanded_input_len: int,
+        mrope_position_delta: int,
+        request_generation: str,
+        metadata_version: int = 2,
+    ) -> bool:
+        """Retain acknowledged deliveries until consumption or owner release.
+
+        The single Decode HTTP worker admits at most this many live owners.
+        Its retire broadcasts precede new deliveries on the same FIFO control
+        channel. Thus a valid delivery always has a reserved cache slot on
+        every DP worker, even when that worker does not own the request.
+        """
+        if (
+            not isinstance(request_generation, str)
+            or not 1 <= len(request_generation) <= 128
+        ):
+            raise ValueError("Invalid expanded-input request generation")
+        key = (str(rid), request_generation)
+        now = time.monotonic()
+        metadata = (expanded_input_len, mrope_position_delta, metadata_version)
+        valid = (
+            type(expanded_input_len) is int
+            and 0 < expanded_input_len < 2**63
+            and type(mrope_position_delta) is int
+            and -(2**63) <= mrope_position_delta < 2**63
+            and 0 < expanded_input_len + mrope_position_delta < 2**63
+            and type(metadata_version) is int
+            and metadata_version == 2
+        )
+        pending = self._pending_expanded_lens.get(key)
+        consumed = self._seen_expanded_metadata.get(key)
+        previous = pending if pending is not None else consumed
+        if not valid or (previous is not None and previous[0] != metadata):
+            metadata = None
+            logger.error(
+                "Invalid or conflicting Prefill metadata room=%s generation=%s", *key
+            )
+        elif previous is not None:
+            return True
+        if consumed is not None:
+            self._seen_expanded_metadata.pop(key)
+            self._seen_expanded_metadata[key] = (metadata, now)
+            return True
+        if (
+            pending is None
+            and len(self._pending_expanded_lens) >= self._expanded_len_cache_max
+        ):
+            # Frontend owner admission supplies backpressure before HTTP can
+            # acknowledge this case; never evict another live delivery.
+            logger.error("Expanded-input owner/cache capacity invariant violated")
+            return False
+        self._pending_expanded_lens[key] = (metadata, now)
+        return True
+
+    def _sync_expanded_input_metadata(self) -> None:
+        """One attention-TP leader decides readiness, expiry and timeouts."""
+        if not any(dr.req.needs_expanded_input_len for dr in self.queue):
+            return
+        distributed = (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(self.gloo_group) > 1
+        )
+        leader = not distributed or torch.distributed.get_rank(self.gloo_group) == 0
+        decisions = None
+        if leader:
+            now = time.monotonic()
+            self._cleanup_pending_expanded_lens(now)
+            decisions = []
+            timeout = envs.SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT.get()
+            for dr in self.queue:
+                req = dr.req
+                if not req.needs_expanded_input_len:
+                    continue
+                generation = getattr(req, "_expanded_input_generation", None)
+                room = str(req.bootstrap_room)
+                key = (room, generation)
+                record = self._seen_expanded_metadata.get(key)
+                if generation is not None and record is not None and record[0] is None:
+                    decisions.append(
+                        (
+                            req.rid,
+                            generation,
+                            None,
+                            "Conflicting Prefill multimodal metadata",
+                        )
+                    )
+                    continue
+                if req.expanded_input_len is not None:
+                    continue
+                if generation is not None:
+                    candidates = [key] if key in self._pending_expanded_lens else []
+                else:
+                    candidates = [
+                        candidate
+                        for candidate in self._pending_expanded_lens
+                        if candidate[0] == room
+                    ]
+                if candidates:
+                    key = min(
+                        candidates, key=lambda k: self._pending_expanded_lens[k][1]
+                    )
+                    metadata, _ = self._pending_expanded_lens[key]
+                    decisions.append(
+                        (
+                            req.rid,
+                            key[1],
+                            metadata,
+                            None
+                            if metadata
+                            else "Conflicting Prefill multimodal metadata",
+                        )
+                    )
+                elif now - req._expanded_input_len_wait_start > timeout:
+                    decisions.append(
+                        (
+                            req.rid,
+                            None,
+                            None,
+                            "Timed out waiting for Prefill expanded input length",
+                        )
+                    )
+        if distributed:
+            objects = [decisions]
+            torch.distributed.broadcast_object_list(
+                objects,
+                src=torch.distributed.get_global_rank(self.gloo_group, 0),
+                group=self.gloo_group,
+            )
+            decisions = objects[0]
+        requests = {dr.req.rid: dr.req for dr in self.queue}
+        for rid, generation, metadata, error in decisions:
+            req = requests[rid]
+            if generation is not None:
+                key = (str(req.bootstrap_room), generation)
+                self._pending_expanded_lens.pop(key, None)
+                self._seen_expanded_metadata.pop(key, None)
+                self._seen_expanded_metadata[key] = (metadata, time.monotonic())
+                while len(self._seen_expanded_metadata) > self._expanded_len_cache_max:
+                    self._seen_expanded_metadata.pop(
+                        next(iter(self._seen_expanded_metadata))
+                    )
+            if error is not None:
+                prepare_abort(
+                    req,
+                    error,
+                    status_code=(
+                        HTTPStatus.GATEWAY_TIMEOUT
+                        if generation is None
+                        else HTTPStatus.INTERNAL_SERVER_ERROR
+                    ),
+                )
+            else:
+                req._expanded_input_generation = generation
+                self._apply_expanded_input_len(req, metadata)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
@@ -839,6 +1059,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             bootstrap_room=req.bootstrap_room,
         )
 
+        if req.needs_expanded_input_len:
+            kv_receiver.prealloc_abort_pair_key = req._expanded_input_pair_key
         decode_req = DecodeRequest(
             req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
         )
@@ -869,8 +1091,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @staticmethod
     def _rebootstrap_prefill_len(req: Req) -> int:
         if getattr(req, "pd_rebootstrap_in_progress", False):
-            return len(req.origin_input_ids) + len(req.output_ids)
-        return len(req.origin_input_ids)
+            return req.effective_input_len + len(req.output_ids)
+        return req.effective_input_len
 
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
@@ -885,10 +1107,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # This is the same token count as offloading-based retraction, where
             # offload_kv_cache saves seqlen-1 tokens; the boundary token's KV is
             # (re)computed on the decode side once generation resumes.
-            return len(req.origin_input_ids) + len(req.output_ids)
-        return len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            return req.effective_input_len + len(req.output_ids)
+        return req.effective_input_len + max(len(req.output_ids) - 1, 0)
 
-    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+    def _check_if_req_exceed_kv_capacity(
+        self, req: Req, *, emit_output: bool = True
+    ) -> bool:
         message = None
         allocator = self.token_to_kv_pool_allocator
         full_required, swa_required = self._prealloc_required_tokens(req)
@@ -921,7 +1145,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if message is not None:
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+            if emit_output:
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 
@@ -1054,6 +1279,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
             elif poll == KVPoll.Failed:
+                if getattr(
+                    decode_req.kv_receiver, "_prealloc_local_abort", False
+                ) and self._needs_prealloc_abort_ack(decode_req):
+                    # A local cancel is terminal to polling, but its peer may
+                    # not have registered yet. Do not let failure_exception()
+                    # clear the retry/ACK owner before the common abort scan.
+                    if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    continue
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
                 try:
@@ -1066,11 +1300,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     logger.debug(error_message)
                 else:
                     logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
@@ -1228,6 +1463,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    @staticmethod
+    def _needs_prealloc_abort_ack(decode_req: DecodeRequest) -> bool:
+        receiver = decode_req.kv_receiver
+        return (
+            decode_req.req.needs_expanded_input_len
+            and isinstance(receiver, CommonKVReceiver)
+            and hasattr(receiver, "finish_prealloc_abort")
+            and (
+                receiver.conclude_state != KVPoll.Failed
+                or getattr(receiver, "_prealloc_local_abort", False)
+            )
+        )
+
+    def _sync_prealloc_abort_ready(self, ready: List[bool]) -> List[bool]:
+        """Agree on retirement before changing queue lengths or ACK trackers."""
+        if ready and torch.distributed.is_initialized():
+            group = self.gloo_group
+            if torch.distributed.get_world_size(group) > 1:
+                bits = torch.tensor(ready, dtype=torch.uint8, device="cpu")
+                torch.distributed.all_reduce(
+                    bits, op=torch.distributed.ReduceOp.MIN, group=group
+                )
+                return bits.tolist()
+        return ready
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1242,6 +1502,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError("rids_to_check cannot be used in PP mode")
 
         self._resolve_pending_reqs()
+        self._sync_expanded_input_metadata()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
@@ -1254,7 +1515,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
+            r.effective_input_len + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
 
@@ -1286,11 +1547,75 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
-        # First, remove all failed requests from the queue
+        # Revalidate the authoritative prompt, not the shorter placeholders.
+        for decode_req in self.queue:
+            req = decode_req.req
+            if not req.needs_expanded_input_len or req.expanded_input_len is None:
+                continue
+            if getattr(req, "_expanded_input_len_capacity_checked", False):
+                continue
+            req._expanded_input_len_capacity_checked = True
+            if req.expanded_input_len < len(req.origin_input_ids):
+                prepare_abort(
+                    req,
+                    "Prefill expanded input length is smaller than Decode input length",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            elif (
+                req.expanded_input_len >= self.scheduler.max_req_input_len
+                or req.expanded_input_len >= self.scheduler.max_req_len
+            ):
+                prepare_abort(
+                    req,
+                    "Expanded multimodal prompt exceeds the model context limit",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            else:
+                self.scheduler.init_req_max_new_tokens(req)
+                if isinstance(getattr(req, "to_finish", None), FINISH_ABORT):
+                    req.finished_reason = req.to_finish
+                    continue
+                try:
+                    finalize_expanded_input_positions(req)
+                except ValueError as error:
+                    prepare_abort(req, str(error), status_code=HTTPStatus.BAD_REQUEST)
+                    continue
+                self._check_if_req_exceed_kv_capacity(req, emit_output=False)
+
+        # Every TP rank must retire the same request indices. ACK arrival and
+        # bootstrap resolution are rank-local; compute readiness first, without
+        # clearing any receiver/ACK state, then agree before emitting output.
+        abort_ready = [False] * len(self.queue)
+        has_aborted_request = False
+        pending_ids = None
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+            if not isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                continue
+            has_aborted_request = True
+            receiver = decode_req.kv_receiver
+            if self._needs_prealloc_abort_ack(decode_req):
+                abort_ready[i] = receiver.finish_prealloc_abort()
+                continue
+            receiver.ensure_abort_notified()
+            if (
+                isinstance(receiver, CommonKVReceiver)
+                and not receiver.abort_notified
+                and receiver.conclude_state != KVPoll.Failed
+            ):
+                if pending_ids is None:
+                    pending_ids = {id(item) for item in self.pending_reqs}
+                if id(decode_req) in pending_ids:
+                    continue
+            abort_ready[i] = True
+        # FINISH_ABORT is a replicated scheduler decision; ACK readiness is
+        # rank-local. Gate on the former, never on any(abort_ready), so healthy
+        # queues avoid an extra collective without splitting TP participation.
+        if has_aborted_request:
+            abort_ready = self._sync_prealloc_abort_ready(abort_ready)
+        for i, decode_req in enumerate(self.queue):
+            if abort_ready[i]:
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1345,7 +1670,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if i in indices_to_remove:
                 continue
 
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                continue  # Still waiting to notify P; never allocate this room.
             if not decode_req.waiting_for_input:
+                continue
+            if (
+                decode_req.req.needs_expanded_input_len
+                and decode_req.req.expanded_input_len is None
+            ):
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
@@ -1398,6 +1730,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
+                and not decode_req.req.skip_radix_cache_insert
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
@@ -1508,9 +1841,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         reclaim_error,
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                     )
+                    if self._needs_prealloc_abort_ack(decode_req):
+                        # No destinations were published. Keep the owner until
+                        # next tick's ACK-gated, TP-consistent abort scan.
+                        continue
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
                     )
+                    decode_req.kv_receiver.ensure_abort_notified()
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     failed_reqs.append(decode_req)
@@ -1755,7 +2093,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         num_tokens = ceil_align(
-            len(decode_req.req.origin_input_ids), self.host_pool.page_size
+            decode_req.req.effective_input_len, self.host_pool.page_size
         )
         required_tokens = num_tokens + self.host_reserved_tokens
         if (
@@ -1803,14 +2141,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return False
         req = decode_req.req
         retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
+            r.effective_input_len + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
         required_tokens = self._required_admission_tokens(
             req,
-            self._required_alloc_tokens(
-                fill_len=len(req.origin_input_ids), prefix_len=0
-            ),
+            self._required_alloc_tokens(fill_len=req.effective_input_len, prefix_len=0),
             0,
             retractable_tokens,
         )
@@ -1854,7 +2190,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max(
                 [
                     min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                    + len(x.origin_input_ids)
+                    + x.effective_input_len
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
                 ]
@@ -1976,7 +2312,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and len(self.scheduler.running_batch.reqs) > 0
         ):
             need_swa_space_for_single_req = max(
-                self._swa_tail_len(len(x.origin_input_ids))
+                self._swa_tail_len(x.effective_input_len)
                 + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                 - retractable_swa_tokens
                 for x in self.scheduler.running_batch.reqs
@@ -3050,7 +3386,7 @@ class SchedulerDisaggregationDecodeMixin:
             if expected == 0:
                 verified.append(i)
                 continue
-            seq_len = len(req.origin_input_ids)
+            seq_len = req.effective_input_len
             page_indices_gpu = page_indices_for_request(self, req, seq_len)
             state_indices = state_indices_for_request(self, req, seq_len)
             actual = computer.compute(page_indices_gpu, state_indices)

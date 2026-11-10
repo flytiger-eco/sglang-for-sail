@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.separate_buffer_allocator_double import (
     separate_buffer_allocator_double,
 )
@@ -123,7 +124,7 @@ def _make_prealloc_queue(
 
 
 def _make_req(rid: str, prompt_len: int):
-    return SimpleNamespace(
+    return ReqDouble(
         rid=rid,
         origin_input_ids=[0] * prompt_len,
         output_ids=[],
@@ -192,7 +193,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
             max_token_pool_size=100,
             max_total_num_tokens=100,
         )
-        req = SimpleNamespace(
+        req = ReqDouble(
             rid="rebootstrap",
             origin_input_ids=[0] * 60,
             output_ids=[0] * 60,  # 60 + 60 = 120 > 100

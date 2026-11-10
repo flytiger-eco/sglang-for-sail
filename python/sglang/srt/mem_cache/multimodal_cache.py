@@ -71,6 +71,7 @@ def _get_tensor_size(embedding: torch.Tensor):
 @dataclass(kw_only=True)
 class EmbeddingResult:
     embedding: torch.Tensor
+    image_pruning_indices: Optional[List[List[int]]] = None
 
 
 class MultiModalStaticCache(MultimodalCache):

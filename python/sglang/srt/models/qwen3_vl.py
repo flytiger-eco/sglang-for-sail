@@ -28,6 +28,7 @@ from einops import rearrange
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -282,6 +283,7 @@ class Qwen3_VisionBlock(nn.Module):
         forward_metadata: Optional[VisionAttentionMetadata] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        return_attention_score: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -294,13 +296,17 @@ class Qwen3_VisionBlock(nn.Module):
             forward_metadata=forward_metadata,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            return_attention_score=return_attention_score,
         )
+        score = None
+        if return_attention_score:
+            attn, score = attn
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
         norm2 = self.norm2(x)
         mlp = self.mlp(norm2)
         x += mlp
-        return x
+        return (x, score) if return_attention_score else x
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
@@ -382,6 +388,15 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
+        from sglang.srt.layers.attention.visual_token_pruning import should_extract_image_pruning_score
+
+        self.extract_image_pruning_score = should_extract_image_pruning_score(
+            get_mm().image_pruning_rate,
+            get_disagg().language_only,
+            use_data_parallel,
+            get_parallel().tp_size,
+            envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get(),
+        )
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -1033,15 +1048,20 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
+        attention_score = None
 
         for layer_num, blk in enumerate(self.blocks):
+            need_score = self.extract_image_pruning_score and layer_num == len(self.blocks) - 1
             x = blk(
                 x,
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 forward_metadata=forward_metadata,
+                return_attention_score=need_score,
             )
+            if need_score:
+                x, attention_score = x
 
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
@@ -1053,6 +1073,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+        if attention_score is not None:
+            return hidden_states, attention_score.reshape(-1, self.spatial_merge_unit).mean(dim=1)
         return hidden_states
 
     def forward_with_npu_graph(
@@ -1477,13 +1499,27 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
+        if get_disagg().language_only:
+            raise RuntimeError("EPD language-only workers must consume precomputed image embeddings")
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        return self._get_visual_feature(items, image_grid_thw)
+        output = self._get_visual_feature(items, image_grid_thw)
+        rate = get_mm().image_pruning_rate
+        if rate <= 0:
+            return output
+        if self.use_data_parallel or not isinstance(output, tuple):
+            raise RuntimeError("Image pruning requires attention scores from eager non-DP vision")
+        from sglang.srt.layers.attention.visual_token_pruning import prune_image_items
+
+        embeddings, scores = output
+        return prune_image_items(
+            embeddings, scores, items, self.visual.spatial_merge_size, rate
+        )
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        return self._get_visual_feature(items, video_grid_thw)
+        output = self._get_visual_feature(items, video_grid_thw)
+        return output[0] if isinstance(output, tuple) else output
 
     def _get_visual_feature(
         self, items: List[MultimodalDataItem], grid_thw: torch.Tensor

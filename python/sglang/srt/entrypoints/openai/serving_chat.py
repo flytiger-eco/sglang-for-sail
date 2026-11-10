@@ -12,7 +12,8 @@ from enum import Enum
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from sglang.srt.runtime_context import get_model, get_serving
+from sglang.srt.disaggregation.expanded_input import original_pair_key
+from sglang.srt.runtime_context import get_disagg, get_model, get_serving
 
 
 class ThinkingMode(str, Enum):
@@ -1102,7 +1103,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return None
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
-        if self.tokenizer_manager.model_config.is_multimodal:
+        is_expanded_len_decode = get_disagg().disaggregation_mode == "decode" and (
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+        )
+        if self.tokenizer_manager.model_config.is_multimodal or is_expanded_len_decode:
             return None
 
         media_type = next(
@@ -1260,6 +1264,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            bootstrap_pair_key=original_pair_key(request, raw_request),
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
@@ -2028,14 +2033,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    status_code = (finish_reason or {}).get("status_code")
+                    if (
+                        finish_reason_type == "abort"
+                        and isinstance(status_code, int)
+                        and not isinstance(status_code, bool)
                     ):
-                        code = finish_reason["status_code"]
+                        try:
+                            error_type = HTTPStatus(status_code).name
+                        except ValueError:
+                            error_type = "ServerError"
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
+                            error_type,
+                            int(status_code),
                         )
                         yield f"data: {error}\n\n"
                         error_aborted = True

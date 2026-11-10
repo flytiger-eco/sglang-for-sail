@@ -329,6 +329,37 @@ async def preprocess_video(
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
+def _select_epd_image_tokens(input_ids, offsets, modalities, positions, delta, indices):
+    """Select original spatial positions; sequence length and RoPE extent differ."""
+    if len(indices) != sum(m == Modality.IMAGE for m in modalities):
+        raise ValueError("image_pruning_indices must contain one entry per image")
+    keep = list(range(len(input_ids)))
+    removed = set()
+    image_idx = 0
+    new_offsets = []
+    removed_before = 0
+    for modality, (start, end) in zip(modalities, offsets):
+        count = end - start + 1
+        if modality == Modality.IMAGE:
+            selected = indices[image_idx]
+            image_idx += 1
+            if (not isinstance(selected, (list, tuple)) or not selected
+                or any(type(i) is not int or i < 0 or i >= count for i in selected)
+                or list(selected) != sorted(set(selected))):
+                raise ValueError("image_pruning_indices must be sorted unique in-range integers")
+            selected_set = set(selected)
+            removed.update(start + i for i in range(count) if i not in selected_set)
+            kept_count = len(selected)
+        else:
+            kept_count = count
+        new_start = start - removed_before
+        new_offsets.append((new_start, new_start + kept_count - 1))
+        removed_before += count - kept_count
+    keep = [i for i in keep if i not in removed]
+    return ([input_ids[i] for i in keep], new_offsets, positions[:, keep],
+            delta + len(removed))
+
+
 class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
@@ -349,6 +380,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        self.image_pruning_rate = getattr(server_args, 'image_pruning_rate', 0.0)
         self.model_type = hf_config.model_type
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
@@ -748,6 +780,16 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             tokens_per_second=self._tokens_per_second,
         )
         mrope_positions = mrope_positions.squeeze(1)
+        pruning_indices = kwargs.get("image_pruning_indices")
+        if (self.image_pruning_rate > 0 and Modality.IMAGE in modality_list
+                and pruning_indices is None):
+            raise ValueError("Encoder omitted image_pruning_indices with pruning enabled")
+        if pruning_indices is not None:
+            input_ids, offsets, mrope_positions, mrope_position_delta = (
+                _select_epd_image_tokens(input_ids, offsets, modality_list,
+                                         mrope_positions, mrope_position_delta,
+                                         pruning_indices)
+            )
 
         mm_items = []
         consumed_per_modality = {}
@@ -758,6 +800,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             embedding_slice = embeddings[modality][
                 embedding_start : embedding_start + num_tokens
             ]
+            if embedding_slice.shape[0] != num_tokens:
+                raise ValueError("Encoder embedding rows disagree with image token metadata")
             consumed_per_modality[modality] = embedding_start + num_tokens
             mm_items.append(
                 MultimodalDataItem(
@@ -766,6 +810,19 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                     precomputed_embeddings=embedding_slice,
                 )
             )
+
+        if pruning_indices is not None:
+            for item, (start, end) in zip(mm_items, offsets):
+                if item.modality == Modality.IMAGE:
+                    # Identical feature rows can occupy different spatial positions.
+                    item.model_specific_data["epd_pruning_identity"] = repr((
+                        self.image_pruning_rate,
+                        mrope_positions[:, start:end + 1].tolist(),
+                    ))
+
+        for modality, consumed in consumed_per_modality.items():
+            if embeddings[modality].shape[0] != consumed:
+                raise ValueError("Encoder supplied extra embedding rows")
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,

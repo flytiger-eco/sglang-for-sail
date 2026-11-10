@@ -1149,7 +1149,9 @@ class RuntimeContext:
         d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
-        return d
+        from sglang.srt.utils.config_dump import redact_config_secrets
+
+        return redact_config_secrets(d, redact_strings=False)
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:
         """Publish a temporary dummy config for tests and restore the previous context.

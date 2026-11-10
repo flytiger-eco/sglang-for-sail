@@ -281,6 +281,9 @@ def handle_encoder_disaggregation(server_args: Any):
                 model_arch,
                 cfg.tp_size,
             )
+    from sglang.srt.disaggregation.expanded_input import validate_expanded_input_config
+
+    validate_expanded_input_config(cfg, model_arch)
     if (cfg.encoder_only or cfg.language_only) and model_arch not in [
         "Qwen2VLForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",

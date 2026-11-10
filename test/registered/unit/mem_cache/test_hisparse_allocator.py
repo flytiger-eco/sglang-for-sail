@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -180,7 +181,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         kv_loc = torch.arange(512, 512 + fill_len, dtype=torch.int64)
         host_indices = torch.arange(1000, 1128, dtype=torch.int64)
 
-        req = SimpleNamespace(
+        req = ReqDouble(
             rid="req-0",
             origin_input_ids=list(range(fill_len)),
             output_ids=[],

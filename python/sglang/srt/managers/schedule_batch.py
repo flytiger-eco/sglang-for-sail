@@ -1357,6 +1357,8 @@ class Req(ReqDllmMixin):
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        self.needs_expanded_input_len = False
+        self.expanded_input_len: Optional[int] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1416,9 +1418,16 @@ class Req(ReqDllmMixin):
         )
 
     @property
+    def effective_input_len(self) -> int:
+        """Prompt length used for Decode KV accounting."""
+        if self.expanded_input_len is not None:
+            return self.expanded_input_len
+        return len(self.origin_input_ids)
+
+    @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
-        return len(self.origin_input_ids) + len(self.output_ids)
+        return self.effective_input_len + len(self.output_ids)
 
     @property
     def is_beam_leader(self) -> bool:
@@ -1474,7 +1483,7 @@ class Req(ReqDllmMixin):
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+            return min(self.kv.kv_committed_len, self.effective_input_len)
         return self.kv.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
@@ -2073,6 +2082,8 @@ class Req(ReqDllmMixin):
         # carries token ``input_ids`` and drops any image/audio/video inputs, so
         # the rebootstrap recompute would not reproduce the original prefix KV
         # for multi-modal requests. Add multi-modal support before enabling it.
+        if self.needs_expanded_input_len:
+            raise ValueError("Expanded-input multimodal rebootstrap is unsupported")
         sp = self.sampling_params
         return {
             "input_ids": [int(x) for x in self.origin_input_ids]

@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.expanded_input import EXPANDED_INPUT_MAX_INFLIGHT
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
@@ -213,6 +214,13 @@ class KVArgsRegisterInfo:
         )
 
 
+@dataclasses.dataclass
+class _PreallocAbortReplay:
+    expires_at: float
+    drained: bool = False
+    targets: Set[Tuple[str, int]] = dataclasses.field(default_factory=set)
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
@@ -237,6 +245,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._mamba_state_cp_sharded = getattr(
             args, "mamba_state_shard_on_attn_cp", False
         )
+        self._init_prealloc_abort_state()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -324,6 +333,115 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def _init_prealloc_abort_state(self) -> None:
+        self._prealloc_abort_lock = threading.RLock()
+        self._prealloc_abort_attempts = {}
+        self._prealloc_abort_replays = OrderedDict()
+        self._prealloc_abort_ack_tracker = {}
+
+    def _send_prealloc_abort_ack(self, ip, port, room, pair_key) -> None:
+        try:
+            address = NetworkAddress(ip, port)
+            self._send_multipart_locked(
+                address.to_tcp(),
+                [
+                    b"PREALLOC_ABORT_ACK",
+                    str(room).encode("ascii"),
+                    pair_key.encode("utf-8"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                ],
+                is_ipv6=address.is_ipv6,
+            )
+        except Exception as error:
+            logger.debug("Preallocation abort ACK delivery failed: %s", error)
+
+    def _get_prealloc_abort_replay(self, key, *, create=False):
+        now = time.monotonic()
+        while self._prealloc_abort_replays:
+            first = next(iter(self._prealloc_abort_replays))
+            if self._prealloc_abort_replays[first].expires_at > now:
+                break
+            self._prealloc_abort_replays.popitem(last=False)
+            room, pair_key = first
+            if (
+                room not in self.request_status
+                and self._prealloc_abort_attempts.get(room) == pair_key
+            ):
+                # A disconnected D may stop retrying before a pending chunk
+                # drains. Retire its index together with the bounded replay.
+                self._prealloc_abort_attempts.pop(room)
+        record = self._prealloc_abort_replays.get(key)
+        if record is None and create:
+            # Do not evict a live replay: other Decode/P TP ranks can still retry.
+            if len(self._prealloc_abort_replays) >= EXPANDED_INPUT_MAX_INFLIGHT:
+                return None
+            record = _PreallocAbortReplay(
+                now + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            )
+            self._prealloc_abort_replays[key] = record
+        return record
+
+    def _handle_prealloc_abort(self, frames) -> None:
+        # WAIT_FOR_ROOM is opt-in and never falls back to a room-only ABORT.
+        if len(frames) != 6:
+            return
+        room = int(frames[1].decode("ascii"))
+        pair_key = frames[5].decode("utf-8")
+        ip, port = frames[2].decode("ascii"), int(frames[3].decode("ascii"))
+        key = (room, pair_key)
+        with self._prealloc_abort_lock:
+            record = self._get_prealloc_abort_replay(key)
+            if record is None:
+                if (
+                    self._prealloc_abort_attempts.get(room) != pair_key
+                    or room not in self.request_status
+                ):
+                    return
+                record = self._get_prealloc_abort_replay(key, create=True)
+                if record is None:
+                    return
+                if self.check_status(room) != KVPoll.Success:
+                    self.update_status(room, KVPoll.Failed)
+            if record.drained:
+                # A cleared or reused room cannot turn an old retry into a
+                # failure of the new owner. Only replay this attempt's ACK.
+                self._send_prealloc_abort_ack(ip, port, room, pair_key)
+                return
+            record.targets.add((ip, port))
+            self._ack_prealloc_abort_if_drained(room, pair_key, record)
+
+    def _ack_prealloc_abort_if_drained(self, room, pair_key, record) -> None:
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        record.drained = True
+        if (
+            room not in self.request_status
+            and self._prealloc_abort_attempts.get(room) == pair_key
+        ):
+            self._prealloc_abort_attempts.pop(room)
+        targets, record.targets = record.targets, set()
+        for ip, port in targets:
+            self._send_prealloc_abort_ack(ip, port, room, pair_key)
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        super()._maybe_ack_drained_abort(room)
+        if room not in getattr(self, "_prealloc_abort_attempts", {}):
+            return
+        with self._prealloc_abort_lock:
+            pair_key = self._prealloc_abort_attempts.get(room)
+            record = self._prealloc_abort_replays.get((room, pair_key))
+            if record is not None and not record.drained:
+                self._ack_prealloc_abort_if_drained(room, pair_key, record)
+
+    def _handle_prealloc_abort_ack(self, frames) -> None:
+        if len(frames) != 4:
+            return
+        key = (int(frames[1].decode("ascii")), frames[2].decode("utf-8"))
+        with self._prealloc_abort_lock:
+            acks = self._prealloc_abort_ack_tracker.get(key)
+            if acks is not None:
+                acks.add(int(frames[3].decode("ascii")))
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -2480,6 +2598,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 # Decode-side abort notification: mark room as failed and ACK
                 if room == "ABORT":
+                    if (
+                        len(waiting_req_bytes) > 4
+                        and waiting_req_bytes[4] == b"WAIT_FOR_ROOM"
+                    ):
+                        self._handle_prealloc_abort(waiting_req_bytes)
+                        continue
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
@@ -2648,12 +2772,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if msg[0] == b"ABORT_ACK":
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
-                    # Deferred release: the 3-frame ack carries the prefill rank
-                    # and means its transfer drained; aggregate for is_abort_release_safe.
                     if self.enable_deferred_decode_kv_release and len(msg) >= 3:
                         self.note_abort_ack(
                             ack_aborted_room, int(msg[2].decode("ascii"))
                         )
+                    continue
+
+                if msg[0] == b"PREALLOC_ABORT_ACK":
+                    self._handle_prealloc_abort_ack(msg)
                     continue
 
                 parsed = self.parse_kv_status_message(msg)
@@ -2815,6 +2941,33 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.init_time = time.time()
         self._init_trace_ctx()
 
+    def set_prealloc_abort_pair_key(self, pair_key: str) -> None:
+        self.prealloc_abort_pair_key = pair_key
+        with self.kv_mgr._prealloc_abort_lock:
+            self.kv_mgr._prealloc_abort_attempts[self.bootstrap_room] = pair_key
+
+    def clear(self) -> None:
+        pair_key = getattr(self, "prealloc_abort_pair_key", None)
+        if pair_key is None:
+            super().clear()
+            return
+        with self.kv_mgr._prealloc_abort_lock:
+            # A peer P rank can fail the TP group before this rank receives
+            # WAIT_FOR_ROOM. Retain this exact attempt before clearing it too.
+            self.kv_mgr._get_prealloc_abort_replay(
+                (self.bootstrap_room, pair_key),
+                create=self.conclude_state == KVPoll.Failed,
+            )
+            super().clear()
+            # Only the replay survives retirement. Leaving an active binding
+            # here could match an old retry while a reused room's constructor
+            # has published its status but has not bound the new pair yet.
+            if (
+                self.kv_mgr._prealloc_abort_attempts.get(self.bootstrap_room)
+                == pair_key
+            ):
+                self.kv_mgr._prealloc_abort_attempts.pop(self.bootstrap_room)
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
@@ -2903,6 +3056,92 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         self.session_id = mgr.get_session_id()
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+
+    def abort(self):
+        if self.init_time is None and getattr(self, "prealloc_abort_pair_key", None):
+            self._prealloc_local_abort = True
+            self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return
+        super().abort()
+
+    def _send_abort_notification(self, *, force_arm: bool = False):
+        if (
+            not force_arm
+            and self.init_time is None
+            and getattr(self, "prealloc_abort_pair_key", None)
+        ):
+            # A failed receiver can reach ensure_abort_notified() after its
+            # local state was cleared. Pairing, not conclude_state, selects
+            # the preallocation wire protocol; a terminal peer need not wait.
+            self._send_prealloc_abort_notification()
+            return
+        # Published or partially published destinations still require the
+        # existing drain protocol, including force_arm on partial publication.
+        super()._send_abort_notification(force_arm=force_arm)
+
+    def _send_prealloc_abort_notification(self):
+        for info in self.bootstrap_infos:
+            try:
+                sock, lock = self._connect_to_bootstrap_server(info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            b"ABORT",
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            b"WAIT_FOR_ROOM",
+                            self.prealloc_abort_pair_key.encode("utf-8"),
+                        ]
+                    )
+                self.abort_notified = True
+            except Exception as error:
+                logger.debug("Preallocation abort delivery failed: %s", error)
+
+    def finish_prealloc_abort(self) -> bool:
+        """Wait until every P sender has observed a local preallocation reject.
+
+        P can publish expanded lengths before its scheduler registers the room.
+        An ordinary abort of an unknown room is intentionally ignored. Retry a
+        paired abort until registered senders acknowledge it. The immutable
+        dispatcher pair key fences retries and ACKs across room reuse.
+        """
+        assert self.init_time is None, "Published KV destinations require drain ACKs"
+        now = time.monotonic()
+        started = getattr(self, "_prealloc_abort_started", None)
+        if started is None:
+            self._prealloc_abort_started = started = now
+        # Bootstrap queries can keep returning no route after P rejected its
+        # request. Bound that phase too, even before there is an ACK tracker.
+        if now - started >= self.kv_mgr.waiting_timeout:
+            return True
+        if not getattr(self, "bootstrap_infos", None):
+            return False
+        key = (self.bootstrap_room, self.prealloc_abort_pair_key)
+        with self.kv_mgr._prealloc_abort_lock:
+            acks = self.kv_mgr._prealloc_abort_ack_tracker.setdefault(key, set())
+            ready = len(acks) >= len(self.bootstrap_infos)
+        if ready:
+            # Keep the ACKs until Decode's TP group agrees to retire the room.
+            # clear() owns the teardown; a local True must remain True later.
+            return True
+        if now - getattr(self, "_prealloc_abort_last_sent", float("-inf")) >= 0.1:
+            self._prealloc_abort_last_sent = now
+            self._send_prealloc_abort_notification()
+        return False
+
+    def clear(self) -> None:
+        if hasattr(self, "_prealloc_abort_started"):
+            with self.kv_mgr._prealloc_abort_lock:
+                self.kv_mgr._prealloc_abort_ack_tracker.pop(
+                    (self.bootstrap_room, self.prealloc_abort_pair_key), None
+                )
+        if getattr(self, "_prealloc_local_abort", False):
+            with self.kv_mgr.failure_lock:
+                self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        super().clear()
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:

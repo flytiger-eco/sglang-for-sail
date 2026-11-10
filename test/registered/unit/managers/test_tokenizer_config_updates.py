@@ -29,6 +29,7 @@ def _manager(case, **fields):
     publish(server_args, role="tokenizer")
     case.addCleanup(reset_context)
     manager = TokenizerManager.__new__(TokenizerManager)
+    manager._expanded_input_tasks = {}
     manager.server_args = server_args
     return manager
 

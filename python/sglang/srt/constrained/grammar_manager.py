@@ -112,11 +112,15 @@ class GrammarManager:
 
     def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
+                reason = recv_req.finished_reason or {}
+                req.set_finish_with_abort(
+                    reason.get("message", "Aborted by AbortReq."),
+                    status_code=reason.get("status_code") or 400,
+                )
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
         custom_params = req.sampling_params.custom_params
