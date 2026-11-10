@@ -232,10 +232,15 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertNotIn("pillow", install)
 
     def test_deep_gemm_uses_authenticated_index_without_prompts(self):
-        env = RUNNER._pip_install_env(["deep_gemm==1.1.0+v0.1.0.ppu2.2.0"])
+        with patch.dict(
+            os.environ,
+            {"PPU_ARTIFACTORY_USER": "user@example", "PPU_ARTIFACTORY_PASSWORD": "p@ss"},
+        ):
+            env = RUNNER._pip_install_env(["deep_gemm==1.1.0+v0.1.0.ppu2.2.0"])
         self.assertEqual(
             env["PIP_INDEX_URL"],
-            "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple",
+            "https://user%40example:p%40ss@pkg.flytiger-eco.com/"
+            "artifactory/api/pypi/pypi_index/simple",
         )
         self.assertEqual(env["PIP_NO_INPUT"], "1")
 

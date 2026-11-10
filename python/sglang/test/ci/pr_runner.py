@@ -13,6 +13,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote
 
 
 def sanitize(text):
@@ -201,8 +202,13 @@ def _ensure_rust_toolchain(root):
 def _pip_install_env(packages):
     env = os.environ.copy()
     if any(package.startswith("deep_gemm==") for package in packages):
+        credentials = ""
+        user = env.get("PPU_ARTIFACTORY_USER")
+        password = env.get("PPU_ARTIFACTORY_PASSWORD")
+        if user and password:
+            credentials = f"{quote(user, safe='')}:{quote(password, safe='')}@"
         env["PIP_INDEX_URL"] = (
-            "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+            f"https://{credentials}pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
         )
         env["PIP_NO_INPUT"] = "1"
     return env
