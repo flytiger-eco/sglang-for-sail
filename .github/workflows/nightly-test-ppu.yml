@@ -9,6 +9,10 @@ on:
         description: 'Optional comma-separated test IDs for a focused rerun'
         required: false
         default: ''
+      skip_tests:
+        description: 'Optional comma-separated test IDs to skip'
+        required: false
+        default: ''
 
 concurrency:
   group: ppu-real-resource-validation
@@ -52,6 +56,7 @@ jobs:
         id: manifest
         env:
           ONLY_TESTS: ${{ inputs.only_tests }}
+          SKIP_TESTS: ${{ inputs.skip_tests }}
         run: |
           mkdir -p .ppu-resource/compat
           cat > .ppu-resource/build_manifest.py <<'PY'
@@ -185,6 +190,9 @@ jobs:
           if selected:
               TESTS = [item for item in TESTS if item['id'] in selected]
               assert {item['id'] for item in TESTS} == selected
+          excluded = set(filter(None, os.environ.get('SKIP_TESTS', '').split(',')))
+          assert excluded <= {item['id'] for item in TESTS}
+          TESTS = [item for item in TESTS if item['id'] not in excluded]
           (ROOT / '.ppu-resource/manifest.json').write_text(json.dumps({'tests': TESTS}, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write('matrix=' + json.dumps({'include': TESTS}, separators=(',', ':')) + '\n')
@@ -625,7 +633,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: real-${{ matrix.id }}
           command: bash /workspace/source/.ppu-resource/worker.sh
-          host_volumes: /wl_nas/pr-ci/real-resource/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}:/ppu-evidence,/wl_nas/pr-ci/real-resource-cache/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}:/ppu-resource-cache
+          host_volumes: /wl_nas/pr-ci/real-resource/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.id }}:/ppu-evidence,/wl_nas/pr-ci/real-resource-cache/${{ github.run_id }}/${{ github.run_attempt }}:/ppu-resource-cache
           extra_env: "TEST_ID=${{ matrix.id }},TEST_TARGET=${{ matrix.target }},TEST_SECONDS=${{ matrix.seconds }},TEST_IN_CI=${{ matrix.in_ci }},ONLY_RUN=${{ matrix.only_run }},FORCE_UNSKIP=${{ matrix.force_unskip }},PPU_EVIDENCE_DIR=/ppu-evidence,PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_SUPPORTS_FP8=0,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PIP_INDEX_URL=https://pypi.org/simple"
           container_options: |
             privileged: true
