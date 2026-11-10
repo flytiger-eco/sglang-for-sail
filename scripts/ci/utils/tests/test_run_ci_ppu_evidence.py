@@ -133,11 +133,11 @@ class StrictRunnerTest(unittest.TestCase):
         for row in rows:
             action = (row["action"], row["packages"])
             self.assertEqual(actions.setdefault(row["file"], action), action)
-        deep_gemm = [row["packages"] for row in rows if "deep_gemm@" in row["packages"]]
+        deep_gemm = [row["packages"] for row in rows if "deep_gemm" in row["packages"]]
         self.assertEqual(len(deep_gemm), 4)
         for spec in deep_gemm:
             self.assertIn("--no-build-isolation", spec)
-            self.assertIn("deep_gemm-1.1.0%2Bv0.1.0.ppu2.2.0.tar.gz", spec)
+            self.assertIn("deep_gemm==1.1.0+v0.1.0.ppu2.2.0", spec)
 
     def test_manifest_selects_exact_source_registrations(self):
         manifest = self.root / "selection.tsv"
@@ -230,6 +230,14 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertEqual(install[-1], "imageio-ffmpeg==0.5.1")
         self.assertNotIn("imageio==2.36.0", install)
         self.assertNotIn("pillow", install)
+
+    def test_deep_gemm_uses_authenticated_index_without_prompts(self):
+        env = RUNNER._pip_install_env(["deep_gemm==1.1.0+v0.1.0.ppu2.2.0"])
+        self.assertEqual(
+            env["PIP_INDEX_URL"],
+            "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple",
+        )
+        self.assertEqual(env["PIP_NO_INPUT"], "1")
 
     def test_dependency_failure_is_recorded_and_continues(self):
         first = self.root / "first.py"

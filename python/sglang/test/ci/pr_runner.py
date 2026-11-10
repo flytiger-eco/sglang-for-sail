@@ -198,6 +198,16 @@ def _ensure_rust_toolchain(root):
     _COMPLETED_BUILDS.add(key)
 
 
+def _pip_install_env(packages):
+    env = os.environ.copy()
+    if any(package.startswith("deep_gemm==") for package in packages):
+        env["PIP_INDEX_URL"] = (
+            "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+        )
+        env["PIP_NO_INPUT"] = "1"
+    return env
+
+
 def ensure_test_dependencies(filename):
     root = Path(os.environ.get("GITHUB_WORKSPACE", Path(__file__).resolve().parents[4]))
     record = _dependency_action(root, filename)
@@ -243,6 +253,7 @@ def ensure_test_dependencies(filename):
                 *missing,
             ],
             check=True,
+            env=_pip_install_env(packages),
         )
     return {}
 
