@@ -211,6 +211,12 @@ def _pip_install_command(packages):
     if any("DeepGEMM-for-sail.git" in package for package in packages):
         setup = (
             "source /usr/local/PPU_SDK/envsetup.sh && "
+            "export CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/CUDA_SDK/include"
+            "${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}} && "
+            "export CFLAGS=\"-D__CUDA_FP16_H__ -D__CUDA_BF16_H__ "
+            "-D__CUDA_FP8_H__ ${CFLAGS:-}\" && "
+            "export CXXFLAGS=\"-D__CUDA_FP16_H__ -D__CUDA_BF16_H__ "
+            "-D__CUDA_FP8_H__ ${CXXFLAGS:-}\" && "
             "export MAX_JOBS=20 PYTORCH_SAIL_ARCH='ppu_10;ppu_15' && "
         )
         return ["bash", "-c", setup + shlex.join(command)]

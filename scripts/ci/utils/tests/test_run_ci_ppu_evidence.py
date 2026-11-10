@@ -237,6 +237,10 @@ class StrictRunnerTest(unittest.TestCase):
         )
         self.assertEqual(command[:2], ["bash", "-c"])
         self.assertIn("source /usr/local/PPU_SDK/envsetup.sh", command[2])
+        self.assertIn("CUDA_SDK/include", command[2])
+        self.assertIn("-D__CUDA_FP16_H__", command[2])
+        self.assertIn("-D__CUDA_BF16_H__", command[2])
+        self.assertIn("-D__CUDA_FP8_H__", command[2])
         self.assertIn("MAX_JOBS=20", command[2])
         self.assertIn("PYTORCH_SAIL_ARCH='ppu_10;ppu_15'", command[2])
         self.assertIn(
