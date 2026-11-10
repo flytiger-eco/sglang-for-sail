@@ -13,7 +13,6 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote
 
 
 def sanitize(text):
@@ -199,19 +198,23 @@ def _ensure_rust_toolchain(root):
     _COMPLETED_BUILDS.add(key)
 
 
-def _pip_install_env(packages):
-    env = os.environ.copy()
-    if any(package.startswith("deep_gemm==") for package in packages):
-        credentials = ""
-        user = env.get("PPU_ARTIFACTORY_USER")
-        password = env.get("PPU_ARTIFACTORY_PASSWORD")
-        if user and password:
-            credentials = f"{quote(user, safe='')}:{quote(password, safe='')}@"
-        env["PIP_INDEX_URL"] = (
-            f"https://{credentials}pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"
+def _pip_install_command(packages):
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "--no-deps",
+        *packages,
+    ]
+    if any("DeepGEMM-for-sail.git" in package for package in packages):
+        setup = (
+            "source /usr/local/PPU_SDK/envsetup.sh && "
+            "export MAX_JOBS=20 PYTORCH_SAIL_ARCH='ppu_10;ppu_15' && "
         )
-        env["PIP_NO_INPUT"] = "1"
-    return env
+        return ["bash", "-c", setup + shlex.join(command)]
+    return command
 
 
 def ensure_test_dependencies(filename):
@@ -248,19 +251,7 @@ def ensure_test_dependencies(filename):
     packages = shlex.split(record["packages"])
     missing = [package for package in packages if not _package_installed(package)]
     if missing:
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--no-cache-dir",
-                "--no-deps",
-                *missing,
-            ],
-            check=True,
-            env=_pip_install_env(packages),
-        )
+        subprocess.run(_pip_install_command(missing), check=True)
     return {}
 
 
