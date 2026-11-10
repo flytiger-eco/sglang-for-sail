@@ -1606,6 +1606,7 @@ class Envs:
     # CPU preparation can lead ordered ViT execution by one batch.
     SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE = EnvBool(False)
     SGLANG_ENABLE_REDKV_MGET = EnvBool(False)
+    SGLANG_ENABLE_TTFT_PARALLEL = EnvBool(False)
     SGLANG_ENABLE_BATCH_JPEG_DECODE = EnvBool(False)
     SGLANG_ENABLE_JPEG_GPU_DECODE = EnvBool(True)
     SGLANG_JPEG_CPU_DECODE_WORKERS = EnvInt(1)

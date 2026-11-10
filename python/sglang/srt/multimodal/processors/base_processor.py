@@ -1167,12 +1167,16 @@ class BaseMultimodalProcessor(ABC):
         image_scaling_factor: float = 1.0,
         max_image_frames: int = 30,
         audio_sample_rate: Optional[int] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> Tuple[List, List]:
         """
         load multimodal data parallelly using iterators.
         """
         futures = []
         task_info = []
+        preloaded_images_iter = (
+            iter(_preloaded_images) if _preloaded_images is not None else None
+        )
 
         for text_part in text_parts:
             modality = multimodal_tokens.get_modality_of_token(text_part)
@@ -1204,8 +1208,14 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                futures.append(
-                    self.io_executor.submit(
+                if modality == Modality.IMAGE and preloaded_images_iter is not None:
+                    future = concurrent.futures.Future()
+                    try:
+                        future.set_result(next(preloaded_images_iter))
+                    except StopIteration as exc:
+                        raise ValueError("Too few preloaded images") from exc
+                else:
+                    future = self.io_executor.submit(
                         self.__class__._load_single_item,
                         data,
                         modality,
@@ -1213,7 +1223,7 @@ class BaseMultimodalProcessor(ABC):
                         audio_sample_rate,
                         discard_alpha_channel,
                     )
-                )
+                futures.append(future)
                 task_info.append((modality, data, frame_count_limit))
 
         for modality, iterator in data_iterators.items():
@@ -1303,8 +1313,13 @@ class BaseMultimodalProcessor(ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> BaseMultiModalProcessorOutput:
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+        if _preloaded_images is not None and len(_preloaded_images) != len(
+            image_data or []
+        ):
+            raise ValueError("Preloaded image count must match image_data")
 
         input_ids = prompt if isinstance(prompt, list) else None
         if input_ids is not None and self._all_mm_data_is_preprocessed(
@@ -1340,6 +1355,17 @@ class BaseMultimodalProcessor(ABC):
         n_video = len(video_data) if video_data else 0
         n_audio = len(audio_data) if audio_data else 0
 
+        if (
+            _preloaded_images is None
+            and image_data
+            and cnt[Modality.IMAGE] == n_image
+            and not any(getattr(item, "content_hash", None) for item in image_data)
+            and self._aim_image_batch_enabled()
+        ):
+            _preloaded_images = await self.load_images_only_async(
+                image_data, discard_alpha_channel=discard_alpha_channel
+            )
+
         # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
         if (
             self.skip_tokenizer_init
@@ -1358,6 +1384,7 @@ class BaseMultimodalProcessor(ABC):
                 discard_alpha_channel=discard_alpha_channel,
                 audio_sample_rate=audio_sample_rate,
                 input_ids=input_ids,
+                _preloaded_images=_preloaded_images,
             )
         # For models other than MiniCPMO and MiniCPMV,
         # totally align multimodal_tokens, fast path
@@ -1371,6 +1398,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
             input_ids=input_ids,
+            _preloaded_images=_preloaded_images,
         )
 
     async def fast_load_mm_data(
@@ -1384,6 +1412,7 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
         input_ids: Optional[Union[List[int], torch.Tensor]] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         A fast version of `load_mm_data` that loads multimodal data directly.
@@ -1405,8 +1434,8 @@ class BaseMultimodalProcessor(ABC):
 
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
-        batched_images = None
-        if image_data and self._aim_image_batch_enabled():
+        batched_images = _preloaded_images
+        if batched_images is None and image_data and self._aim_image_batch_enabled():
             batched_images = await self.load_images_only_async(image_data, discard_alpha_channel)
         modalities_data = [
             ([] if batched_images is not None else image_data, Modality.IMAGE),
@@ -1484,6 +1513,7 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
         input_ids: Optional[Union[List[int], torch.Tensor]] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -1522,6 +1552,7 @@ class BaseMultimodalProcessor(ABC):
             data_iterators=data_iterators,
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
+            _preloaded_images=_preloaded_images,
         )
         task_info_iter = iter(task_info)
         futures_iter = iter(futures)
