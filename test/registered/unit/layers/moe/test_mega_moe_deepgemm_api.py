@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
 )
+from sglang.srt.utils import is_sail
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -189,6 +190,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertEqual(deep_gemm.set_num_sms.call_args_list, [call(130), call(132)])
         self.assertEqual(mega_moe._MEGA_MOE_SYMM_BUFFER, {})
 
+    @unittest.skipIf(
+        is_sail(),
+        "the PPU MegaMoE path takes per-layer MMA types and its own DeepGEMM APIs",
+    )
     def test_mxf4_weight_transform_uses_matching_mma_type(self):
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
@@ -231,6 +236,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.transform_weights_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
 
+    @unittest.skipIf(
+        is_sail(),
+        "the PPU MegaMoE path takes per-layer MMA types and its own DeepGEMM APIs",
+    )
     def test_mxf4_pre_dispatch_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")
         deep_gemm.mega_moe_pre_dispatch = MagicMock()
@@ -811,6 +820,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         torch.testing.assert_close(actual, expected)
 
+    @unittest.skipIf(
+        is_sail(),
+        "the PPU MegaMoE path takes per-layer MMA types and its own DeepGEMM APIs",
+    )
     def test_draft_layers_keep_their_own_w4a4_choice(self):
         """Draft MegaMoE layers must not follow the target's MMA type once built.
 
@@ -844,6 +857,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     )
                     self.assertEqual(mega_moe._mega_moe_mma_type(draft), expected_draft)
 
+    @unittest.skipIf(
+        is_sail(),
+        "the PPU MegaMoE path takes per-layer MMA types and its own DeepGEMM APIs",
+    )
     def test_draft_build_scope_restores_w4a4_on_exception(self):
         """A failed draft build must not leave the target on the draft's MMA type."""
         with get_context().override_server_args(
