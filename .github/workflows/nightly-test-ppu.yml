@@ -26,6 +26,10 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
+      mmmu_repair_only:
+        description: 'TEMPORARY: Back up stale MMMU metadata, validate loading, and skip tests'
+        type: boolean
+        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -971,12 +975,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'mmmu_repair_only'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertNotIn('if', jobs['sweep-execute'])
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      self.assertEqual(jobs['sweep-execute']['if'], 'inputs.mmmu_repair_only != true')
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always() && inputs.mmmu_repair_only != true')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1269,6 +1273,91 @@ jobs:
           bash scripts/ci/ppu/ppu_install_dependency.sh
           python3 -m pip install pytest==8.3.5 tabulate
           SH
+          cat > .ppu-sweep/mmmu_repair.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from datasets import load_dataset
+
+          ROOT = Path('/nas_aisw/datasets/datasets/LLM/Comprehensive_Examination/v1/MMMU')
+          DESTINATION = Path('/ppu-models')
+          RUN_ID = os.environ.get('GITHUB_RUN_ID', 'local')
+
+          def emit(name, value):
+              print(name + '=' + json.dumps(value, ensure_ascii=False), flush=True)
+
+          def validate(source, config, split, streaming):
+              dataset = load_dataset(source, config, split=split, streaming=streaming)
+              row = next(iter(dataset)) if streaming else dataset[0]
+              if 'question' not in row or 'image_1' not in row:
+                  raise RuntimeError(f'Missing required MMMU columns: {source} {config} {split}')
+              if row['image_1'] is None:
+                  raise RuntimeError(f'Missing MMMU image: {source} {config} {split}')
+              result = {
+                  'source': str(source), 'config': config, 'split': split,
+                  'streaming': streaming, 'columns': sorted(row),
+              }
+              if not streaming:
+                  result['rows'] = len(dataset)
+              return result
+
+          if not ROOT.is_dir():
+              raise FileNotFoundError(f'MMMU directory not found: {ROOT}')
+          metadata_files = sorted(ROOT.rglob('dataset_infos.json'))
+          renamed = []
+          checks = []
+          try:
+              for original in metadata_files:
+                  backup = original.with_name(original.name + '.bak')
+                  if backup.exists():
+                      backup = original.with_name(original.name + '.bak.' + RUN_ID)
+                  if backup.exists():
+                      raise FileExistsError(f'Backup already exists: {backup}')
+                  original.rename(backup)
+                  renamed.append((original, backup))
+                  emit('PPU_MMMU_METADATA_BACKUP', {
+                      'original': str(original), 'backup': str(backup),
+                  })
+              for config, split in [('Math', 'test'), ('Accounting', 'validation')]:
+                  for streaming in (True, False):
+                      checks.append(validate(str(ROOT), config, split, streaming))
+              for repo_id in ('MMMU/MMMU', 'lmms-lab/MMMU'):
+                  checks.append(validate(repo_id, 'Accounting', 'validation', True))
+          except Exception as error:
+              rollback_errors = []
+              for original, backup in reversed(renamed):
+                  try:
+                      if not original.exists():
+                          backup.rename(original)
+                  except OSError as rollback_error:
+                      rollback_errors.append(str(rollback_error))
+              emit('PPU_MMMU_REPAIR_FAILED', {
+                  'error': str(error), 'rollback_errors': rollback_errors,
+              })
+              raise
+          report = {
+              'root': str(ROOT),
+              'backups': [
+                  {'original': str(original), 'backup': str(backup)}
+                  for original, backup in renamed
+              ],
+              'checks': checks,
+          }
+          DESTINATION.mkdir(parents=True, exist_ok=True)
+          (DESTINATION / 'mmmu_repair.json').write_text(json.dumps(report, indent=2))
+          with (DESTINATION / 'summary.log').open('a') as stream:
+              stream.write('## MMMU repair\n\n')
+              stream.write(f'- Metadata files backed up: {len(renamed)}\n')
+              stream.write(f'- Loading checks passed: {len(checks)}\n')
+              for original, backup in renamed:
+                  stream.write(f'- `{original}` -> `{backup}`\n')
+          emit('PPU_MMMU_REPAIR_SUMMARY', {
+              'metadata_backup_count': len(renamed),
+              'checks_passed': len(checks),
+              'ok': True,
+          })
+          PY
           cat > .ppu-sweep/models.sh <<'SH'
           set -euo pipefail
           umask 022
@@ -1278,6 +1367,8 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          export PYTHONPATH="$PWD/.ppu-sweep/compat:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+          HF_DATASETS_CACHE=/tmp/ppu-mmmu-datasets-cache timeout --signal=TERM --kill-after=30s 300s python3 .ppu-sweep/mmmu_repair.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1408,6 +1499,7 @@ jobs:
           printf 'image=%s\ndigest=%s\n' "$PPU_BASE_IMAGE_REF" "$PPU_BASE_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
 
   sweep-execute:
+    if: inputs.mmmu_repair_only != true
     needs: [sweep-prepare, sweep-models, sweep-image]
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -1498,7 +1590,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always()
+    if: always() && inputs.mmmu_repair_only != true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
