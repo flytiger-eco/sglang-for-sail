@@ -14,6 +14,7 @@ from sglang.kernels.ops.attention.deep_select import (
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
@@ -71,7 +72,12 @@ class FullTopKIndexer:
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        dense_prefill_topk(
+            data,
+            kv,
+            out=inputs.out_raw_indices[: data.num_rows],
+            two_level=envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get(),
+        )
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:

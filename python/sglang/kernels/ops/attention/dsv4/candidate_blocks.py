@@ -145,6 +145,42 @@ def amax_topk_blocks(
     return blocks
 
 
+def candidate_block_ids(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    topk_blocks: int,
+    *,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Per row the ``topk_blocks`` blocks of ``block_size`` columns with the
+    largest block maximum among its first ``seq_lens[i]`` columns, the newest
+    block always kept, as column ids: block ``b`` covers columns ``b *
+    block_size .. b * block_size + block_size - 1``. Ids are unordered and
+    ``-1`` past ``min(topk_blocks, nblocks[i])``. ``nblocks`` is
+    ``ceil(seq_lens / block_size)`` as int32.
+
+    Together with :func:`topk_transform_candidates` this is how a prefill layer
+    replaces its full-width top-k: the block maxima cost one read of the scores,
+    and the second level reads only the selected blocks.
+    """
+    from .topk import topk_transform_ragged_v2
+
+    rows, width = logits.shape
+    # keys past a row's block count stay unset; the top-k reads a row up to its
+    # block count only (v2 wants the stride a multiple of 4)
+    width_blocks = (width + block_size - 1) // block_size
+    keys = logits.new_empty(rows, (width_blocks + 3) // 4 * 4, dtype=torch.float32)
+    amax8_varlen(logits, seq_lens, out=keys)
+    if out is None:
+        out = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
+    topk_transform_ragged_v2(
+        keys, nblocks, out_offsets=torch.zeros_like(nblocks), out_indices=out
+    )
+    return out
+
+
 def candidate_block_mask(
     blocks: torch.Tensor, width: int, block_size: int
 ) -> torch.Tensor:
