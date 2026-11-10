@@ -89,18 +89,39 @@ def int8_index_logits(q, weights, kv, lens):
 
 
 def int8_paged_index_logits(
-    q, weights, cache, lens, page_table, plan, width, page_size
+    q, weights, cache, lens, page_table, plan, width, page_size, rows_per_request=1
 ):
+    """Paged INT8 logits of ``rows_per_request`` query rows per request.
+
+    The kernel reads one context length, one block-table row and ``next_n`` query
+    rows per request, so a multi-row call needs the batch-shaped views below. The
+    rows of one request must have non-decreasing lengths (the schedule sizes the
+    K walk from the group's last row); callers mask each row past its own length.
+    """
     from deep_gemm import int8_paged_mqa_logits
 
     assert q.shape[-1] == 128 and cache.shape[1] == page_size * 132
     q_int8, w = quantize_query(q, weights)
+    group = rows_per_request
+    if group > 1:
+        batch, heads, head_dim = (
+            q_int8.shape[0] // group,
+            q_int8.shape[1],
+            q_int8.shape[2],
+        )
+        q_kernel = q_int8.view(batch, group, heads, head_dim)
+        lens_kernel = lens.to(torch.int32).view(batch, group)
+        table_kernel = page_table[::group].contiguous()
+    else:
+        q_kernel = q_int8.unsqueeze(1)
+        lens_kernel = lens.to(torch.int32).reshape(-1, 1)
+        table_kernel = page_table
     return int8_paged_mqa_logits(
-        q_int8.unsqueeze(1),
+        q_kernel,
         cache.view(cache.shape[0], page_size, 1, 132),
         w.contiguous(),
-        lens.to(torch.int32).reshape(-1, 1),
-        page_table,
+        lens_kernel,
+        table_kernel,
         plan,
         width,
         clean_logits=False,
