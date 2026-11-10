@@ -7,6 +7,7 @@ from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     quantize_fp4_indexer_tensor,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
+from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -375,6 +376,61 @@ class TestDensePrefillIndexer(CustomTestCase):
                     torch.cuda.synchronize()
                     self.assertEqual(torch.cuda.memory_allocated(), baseline)
                 del inputs, candidates
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and (torch.cuda.get_device_capability()[0] == 10 or is_sail()),
+    "requires SM100, or the PPU dense-indexer path",
+)
+class TestDensePrefillTopkTwoLevel(CustomTestCase):
+    """The plain-layer top-k selects the same positions through the two-level
+    candidate structure. Both contexts below exceed the block window
+    (``ceil(ctx / 8) > k``), so the second level really reads a subset.
+
+    Separate from ``TestDensePrefillIndexer`` because that class is SM100-only,
+    while this path also runs (and is what the PPU prefill uses) on PPU.
+    """
+
+    def test_two_level_matches_dense(self):
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                inputs = make_inputs([(8, 8192), (4, 40000)], ratio=ratio)
+                data = scoring.DeepGEMMPrefillData(
+                    k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
+                    request_starts=inputs["starts"],
+                    lens_per_request=[n for _, n in inputs["request_lengths"]],
+                    rows_per_request=[q for q, _ in inputs["request_lengths"]],
+                    compress_lens=inputs["lengths"],
+                    q_fp4=inputs["q"][0],
+                    q_sf=inputs["q"][1],
+                    weights=inputs["weights"],
+                )
+                self.assertGreater(
+                    int(data.compress_lens.max()) // 8,
+                    inputs["topk"],
+                    "the context must exceed the block window",
+                )
+                rows, k = data.compress_lens.shape[0], inputs["topk"]
+                dense = torch.full((rows, k), -1, dtype=torch.int32, device="cuda")
+                scoring.dense_prefill_topk(
+                    data, inputs["kv"], out=dense, two_level=False
+                )
+                two_level = torch.full_like(dense, -1)
+                scoring.dense_prefill_topk(
+                    data, inputs["kv"], out=two_level, two_level=True
+                )
+                # Selection is exact, so with untied fp32 scores the two sides
+                # agree on the position set; only the emit order is unspecified.
+                for row in range(rows):
+                    self.assertEqual(
+                        int((dense[row] >= 0).sum()), int((two_level[row] >= 0).sum())
+                    )
+                    torch.testing.assert_close(
+                        dense[row][dense[row] >= 0].sort().values,
+                        two_level[row][two_level[row] >= 0].sort().values,
+                    )
+                del inputs, data
 
 
 if __name__ == "__main__":

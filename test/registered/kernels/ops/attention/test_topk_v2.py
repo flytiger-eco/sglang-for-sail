@@ -34,8 +34,10 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_block_ids
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
+    topk_transform_candidates,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -814,6 +816,118 @@ def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> N
             assert (out_cpu == seq - 1).any(dim=1).all()
         for row in range(batch):
             _assert_topk_values(scores_cpu[row], out_cpu[row], k)
+
+
+# A block-max pass keeps the `topk_blocks` whole 8-column blocks with the largest
+# maximum, and selecting inside them is exact for any k <= topk_blocks: the k best
+# positions occupy at most k blocks, each of which outranks every block left out.
+# So the candidate kernel must agree with the full-width one value for value.
+CANDIDATE_CONFIGS = [
+    # rows at or below k (trivial path), at the block-count edges, and well past
+    # the block window, where only the kept blocks are read
+    ("short", [1, 512]),
+    ("at_window", [8192, 16384, 16383]),
+    ("over_window", [32768, 65536, 131072]),
+    ("ragged", [517, 2048, 8193, 40000, 131071]),
+]
+
+
+def _candidate_scores(lengths: list[int]) -> torch.Tensor:
+    """Ragged rows pasted into one fp32 matrix. Untied on purpose: with repeated
+    values the fp16 coarse histogram cannot separate elements sitting on a bin
+    boundary, so the two kernels may legitimately disagree on those (which is
+    what `MAX_PERMIT_ERROR` covers elsewhere in this file)."""
+    width = (max(lengths) + 7) & ~7  # amax8 reads each block as one 32 B load
+    scores = torch.full(
+        (len(lengths), width), OUTSIDE_SCORE, dtype=torch.float32, device="cuda"
+    )
+    for row, length in enumerate(lengths):
+        scores[row, :length] = torch.randn(length, device="cuda")
+    return scores
+
+
+@pytest.mark.parametrize("k,topk_blocks", [(512, 1024), (1024, 2048), (1024, 1024)])
+@pytest.mark.parametrize("name,lengths", CANDIDATE_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_candidates(
+    name: str, lengths: list[int], k: int, topk_blocks: int
+) -> None:
+    """The two-level selection equals the full-width top-k when k <= topk_blocks."""
+    torch.manual_seed(len(lengths) * 104729 + k + topk_blocks)
+    device = "cuda"
+    scores = _candidate_scores(lengths)
+    lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    # non-zero per-row bias: the emitted position is `column + out_offsets[row]`
+    offsets = torch.arange(len(lengths), dtype=torch.int32, device=device) * 7919
+
+    blocks = candidate_block_ids(scores, lens, (lens + 7) // 8, topk_blocks)
+    our = torch.empty((len(lengths), k), dtype=torch.int32, device=device)
+    topk_transform_candidates(
+        scores, lens, blocks, out_offsets=offsets, out_indices=our
+    )
+    dense = torch.empty_like(our)
+    topk_transform_ragged_v2(scores, lens, out_offsets=offsets, out_indices=dense)
+
+    bias = offsets.cpu().tolist()
+    for row, length in enumerate(lengths):
+        window = scores[row, :length]
+        picks = {}
+        for label, out in (("candidate", our), ("dense", dense)):
+            local = [v - bias[row] for v in out[row].cpu().tolist() if v != -1]
+            if length > k:
+                assert len(local) == k, f"{name} row {row} {label}: {len(local)}"
+            assert len(set(local)) == len(local), (
+                f"{name} row {row} {label}: duplicates"
+            )
+            assert all(0 <= i < length for i in local), (
+                f"{name} row {row} {label}: out of window"
+            )
+            picks[label] = (
+                window[torch.tensor(local, dtype=torch.long, device=device)]
+                .sort()
+                .values
+            )
+        # Untied fp32 scores: the two levels must pick the exact same columns.
+        assert torch.equal(picks["candidate"], picks["dense"]), (
+            f"{name} row {row} k={k} topk_blocks={topk_blocks}"
+        )
+
+
+@pytest.mark.parametrize("topk_blocks", [64, 512, 2048])
+@pytest.mark.parametrize("name,lengths", CANDIDATE_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_candidate_block_ids(
+    name: str, lengths: list[int], topk_blocks: int
+) -> None:
+    """Level one keeps the blocks with the largest 8-column maximum plus the newest
+    one, and -1 pads past ``min(topk_blocks, ceil(len / 8))``."""
+    torch.manual_seed(len(lengths) * 7919 + topk_blocks)
+    device = "cuda"
+    scores = _candidate_scores(lengths)
+    lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    nblocks = (lens + 7) // 8
+    blocks = candidate_block_ids(scores, lens, nblocks, topk_blocks)
+
+    for row, length in enumerate(lengths):
+        nb = int(nblocks[row])
+        kept = min(topk_blocks, nb)
+        ids = [v for v in blocks[row].cpu().tolist() if v != -1]
+        assert len(ids) == kept, f"{name} row {row}: {len(ids)} != {kept}"
+        assert len(set(ids)) == kept, f"{name} row {row}: duplicate block ids"
+        assert all(0 <= i < nb for i in ids), f"{name} row {row}: block id out of range"
+        assert nb - 1 in ids, f"{name} row {row}: the newest block must be kept"
+        # amax8_varlen's keys: the 8-column maximum, the newest one +inf
+        maxima = scores[row, : nb * 8].reshape(nb, 8).max(dim=1).values.clone()
+        maxima[nb - 1] = float("inf")
+        want = maxima.topk(kept).values.sort().values
+        got = maxima[torch.tensor(ids, dtype=torch.long, device=device)].sort().values
+        assert torch.equal(got, want), f"{name} row {row} topk_blocks={topk_blocks}"
+
+    # `out=` reuses the caller's persistent buffer (the prefill graph path)
+    buf = torch.empty(len(lengths), topk_blocks, dtype=torch.int32, device=device)
+    again = candidate_block_ids(scores, lens, nblocks, topk_blocks, out=buf)
+    assert again is buf
+    assert torch.equal(again.sort(dim=1).values, blocks.sort(dim=1).values)
 
 
 if __name__ == "__main__":

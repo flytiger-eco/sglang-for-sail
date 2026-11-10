@@ -53,6 +53,7 @@ def _jit_topk_v2_module():
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_candidates", f"{kernel}::transform_candidates"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
@@ -248,6 +249,37 @@ def topk_transform_ragged_v2(
         return
     module = _jit_topk_v2_module()
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+def topk_transform_candidates(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    blocks: torch.Tensor,
+    *,
+    out_offsets: torch.Tensor,
+    out_indices: torch.Tensor,
+) -> None:
+    """Ragged top-k restricted to each row's candidate blocks.
+
+    Row ``i`` selects the top-k of the columns ``blocks[i]`` name -- block ``b``
+    covering columns ``8 b .. 8 b + 7`` of ``scores[i]``, read only where they are
+    below ``seq_lens[i]`` -- and writes ``column + out_offsets[i]`` into
+    ``out_indices[i]``, ``-1`` padded. ``blocks`` is int32 ``[rows, num_blocks]``,
+    ``-1`` past each row's block count; at most 2048 blocks.
+
+    This is the second level of the two-level indexer. Restricted to the blocks
+    of a block-max top-k over the same scores, its result equals the full
+    ``topk_transform_ragged_v2`` of those scores whenever
+    ``k = out_indices.shape[1]`` is at most the block count: the k best positions
+    occupy at most k blocks, and every one of them outranks the blocks left out.
+
+    NOTE: unlike ``topk_transform_ragged_v2`` this does not write ``scores``.
+    """
+    if is_xpu():
+        raise NotImplementedError("candidate top-k requires the CUDA/PPU JIT path")
+    _jit_topk_v2_module().topk_transform_candidates(
+        scores, seq_lens, blocks, out_offsets, out_indices
+    )
 
 
 def topk_transform_paged_v2(

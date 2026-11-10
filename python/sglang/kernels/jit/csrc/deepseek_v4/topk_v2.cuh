@@ -40,8 +40,9 @@ enum class TopKMode {
   KPOOL,
 };
 
-using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
-using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
+using Register2 = impl::TopKRegister<2>;   // <= 8192, register-resident, 1 read
+using Register4 = impl::TopKRegister<4>;   // <= 16384, register-resident, 1 read
+using Candidate = impl::TopKCandidate<4>;  // <= 2048 blocks of 8, 1 gathered read
 using Streaming = impl::TopKStreaming;
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
@@ -167,6 +168,19 @@ struct TopKRaggedParams {
   const int32_t* __restrict__ out_offsets;
   int32_t* __restrict__ topk_indices;
   int64_t score_stride;
+  uint32_t topk;
+};
+
+/// The second level of the two-level indexer: the top-k of a row restricted to
+/// the `blocks_stride` candidate blocks a block-max pass already selected.
+struct TopKCandidateParams {
+  const float* __restrict__ scores;
+  const int32_t* __restrict__ seq_lens;
+  const int32_t* __restrict__ blocks;  // [rows, blocks_stride] columns, -1 padded
+  const int32_t* __restrict__ out_offsets;
+  int32_t* __restrict__ topk_indices;
+  int64_t score_stride;
+  uint32_t blocks_stride;
   uint32_t topk;
 };
 
@@ -423,6 +437,53 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
       params.get_transform(bx),
       s_topk_indices,
       &smem);
+}
+
+/**
+ * \brief Candidate (prefill) top-k: select inside a row's selected blocks.
+ *
+ * Row `b` selects the top-k of the columns its `blocks[b]` name -- block `i`
+ * covering columns `8 i .. 8 i + 7` of `scores[b]` -- and writes
+ * `column + out_offsets[b]`, `-1` padded. Only `min(blocks_stride, ceil(
+ * seq_lens[b] / 8))` blocks are valid; the rest are `-1` and never read.
+ *
+ * This is the second level of the two-level indexer: a block-max pass keeps the
+ * `topk_blocks` blocks whose 8-column maximum is largest, and selecting among
+ * only those is exact for any `k <= topk_blocks` -- the global top-k positions
+ * lie in at most `k` blocks, each of which outranks every block left out. It
+ * reads 1/8 of the row the dense score pass would, plus the blocks themselves.
+ *
+ * Unlike `topk_ragged_kernel` this writes nothing to `scores`: the gathered
+ * window is already exactly the columns the row may select, so no head mask is
+ * needed and the buffer stays readable.
+ */
+template <bool kPDL>
+TOPK_KERNEL void topk_candidate_kernel(const __grid_constant__ TopKCandidateParams params) {
+  device::enable_smem_spilling();
+  const auto bx = blockIdx.x;
+  const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
+  const auto topk = params.topk;
+  const auto out = params.topk_indices + bx * static_cast<int64_t>(topk);
+  const auto bias = params.out_offsets[bx];
+
+  if (seq_len <= topk) {
+    device::PDLWaitPrimary<kPDL>();
+    for_each_item(topk, [&](uint32_t tx, uint32_t) { out[tx] = tx < seq_len ? static_cast<int32_t>(tx) + bias : -1; });
+    return;
+  }
+
+  constexpr uint32_t kBlockPositions = Candidate::kBlockPositions;
+  const auto num_blocks = (seq_len + kBlockPositions - 1) / kBlockPositions;
+  const auto kept = min(num_blocks, params.blocks_stride);
+  const auto problem = TopKProblem{
+      .in = params.scores + bx * params.score_stride,
+      .out = out,
+      .topk = topk,
+      .seq_len = seq_len,
+      .bias = bias,
+  };
+  __shared__ impl::MaxSmem<Candidate::Smem> smem;
+  Candidate::forward<kPDL>(problem, params.blocks + bx * params.blocks_stride, kept, &smem);
 }
 
 #ifdef USE_ROCM
@@ -1597,6 +1658,73 @@ struct TopKKernel {
     LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
         .config({.use_pdl = kUsePDL})
         .launch(topk_ragged_kpool_kernel<kUsePDL>, params);
+  }
+
+  /**
+   * \brief Candidate (prefill) variant of `transform_ragged`: the row's window
+   * is the union of the `blocks[b]` it names instead of one contiguous range.
+   *
+   * `scores` is only read, so unlike `transform_ragged` the buffer stays valid
+   * for the caller after the call. `blocks` is `[rows, num_blocks]` int32 column
+   * ids, `-1` past each row's block count; `num_blocks <= kMaxBlocks` (2048).
+   */
+  static void transform_candidates(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView blocks,
+      const tvm::ffi::TensorView out_offsets,
+      const tvm::ffi::TensorView topk_indices) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto C = SymbolicSize{"num_blocks"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B})  // seq_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({B, C})  // blocks
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(blocks);
+    TensorMatcher({B})  // out_offsets
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out_offsets);
+    TensorMatcher({B, K})  // topk_indices
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(topk_indices);
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(
+        static_cast<uint64_t>(C.unwrap()) <= Candidate::kMaxBlocks,
+        "num_blocks exceeds the candidate kernel's block window");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+
+    const auto params = TopKCandidateParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .blocks = static_cast<const int32_t*>(blocks.data_ptr()),
+        .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+        .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+        .score_stride = S.unwrap(),
+        .blocks_stride = static_cast<uint32_t>(C.unwrap()),
+        .topk = topk,
+    };
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+        .config({.use_pdl = kUsePDL})
+        .launch(topk_candidate_kernel<kUsePDL>, params);
   }
 
 #ifdef USE_ROCM  // see the packed kernel above
