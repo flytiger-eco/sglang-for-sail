@@ -1940,10 +1940,17 @@ def _load_image(
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
-    from sglang.srt.multimodal.aim_image import is_fatal_cuda_error, open_image_bytes
+    from sglang.srt.multimodal.aim_metrics import image_stage
 
     if image_file != "":
         image_bytes = get_image_bytes(image_file)
+    with image_stage("image_decode_single"):
+        return _decode_image_bytes(image_bytes, gpu_image_decode)
+
+
+def _decode_image_bytes(image_bytes, gpu_image_decode):
+    from sglang.srt.multimodal.aim_image import is_fatal_cuda_error, open_image_bytes
+
     if not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get():
         gpu_image_decode = False
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
@@ -1963,9 +1970,9 @@ def _load_image(
             )
             return image_tensor
         except Exception as e:
-            if isinstance(e, (MemoryError, torch.OutOfMemoryError)) or is_fatal_cuda_error(
-                e
-            ):
+            if isinstance(
+                e, (MemoryError, torch.OutOfMemoryError)
+            ) or is_fatal_cuda_error(e):
                 raise
             if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
@@ -1995,11 +2002,14 @@ def load_image(
     ImageData, PIL Image, bytes, URL, file path, or base64 string.
     """
     from sglang.srt.multimodal.aim_image import load_image_with_fallback
+    from sglang.srt.multimodal.aim_metrics import image_stage, record_image_event
 
-    return load_image_with_fallback(
-        lambda: _load_image_input(image_file, gpu_image_decode),
-        enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
-    )
+    with image_stage("image_load_single"):
+        return load_image_with_fallback(
+            lambda: _load_image_input(image_file, gpu_image_decode),
+            enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
+            record=record_image_event,
+        )
 
 
 def _load_image_input(
@@ -2041,14 +2051,20 @@ def _load_image_input(
 def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     from sglang.srt.multimodal.aim_image import image_bytes_from_source
+    from sglang.srt.multimodal.aim_metrics import image_stage, record_image_event
 
     def http_fetch(url):
-        return download_remote_media(url, timeout=int(os.getenv("REQUEST_TIMEOUT", "3")))
+        with image_stage("image_http"):
+            return download_remote_media(
+                url, timeout=int(os.getenv("REQUEST_TIMEOUT", "3"))
+            )
 
     if isinstance(image_file, str) and image_file.startswith("imagetransfer_http"):
         from sglang.srt.connector.redkv import resolve_image_bytes
 
-        return resolve_image_bytes(image_file, http_fetch=http_fetch)
+        return resolve_image_bytes(
+            image_file, http_fetch=http_fetch, record=record_image_event
+        )
     return image_bytes_from_source(
         image_file, http_fetch=http_fetch, base64_decode=pybase64.b64decode
     )

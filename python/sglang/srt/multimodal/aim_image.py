@@ -85,11 +85,7 @@ def image_bytes_from_source(
 
 def is_heif_bytes(data: bytes) -> bool:
     """Detect HEIF from its ftyp brand, even if the CDN URL advertises JPEG."""
-    return (
-        len(data) >= 12
-        and data[4:8] == b"ftyp"
-        and data[8:12] in _HEIF_BRANDS
-    )
+    return len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _HEIF_BRANDS
 
 
 def is_fatal_cuda_error(error: BaseException) -> bool:
@@ -133,7 +129,7 @@ def open_image_bytes(data: bytes) -> Image.Image:
         raise ValueError(f"Could not decode image: {exc}") from exc
 
 
-def image_load_error_fallback(error: Exception, *, enabled: bool):
+def image_load_error_fallback(error: Exception, *, enabled: bool, record=None):
     """Handle a failed fetch/decode without fetching the same image again."""
     if (
         not enabled
@@ -148,10 +144,12 @@ def image_load_error_fallback(error: Exception, *, enabled: bool):
         "image because SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE is enabled",
         type(error).__name__,
     )
+    if record is not None:
+        record("image_fallback", "fallback", 0.0, 1)
     return Image.new("RGB", (1, 1)), (1, 1)
 
 
-def load_image_with_fallback(loader: Callable, *, enabled: bool):
+def load_image_with_fallback(loader: Callable, *, enabled: bool, record=None):
     """AIM's explicit 1px policy, limited to input/transport/decode failures.
 
     RuntimeError (including CUDA faults), MemoryError and programming errors
@@ -160,4 +158,4 @@ def load_image_with_fallback(loader: Callable, *, enabled: bool):
     try:
         return loader()
     except (ValueError, OSError, requests.exceptions.RequestException) as exc:
-        return image_load_error_fallback(exc, enabled=enabled)
+        return image_load_error_fallback(exc, enabled=enabled, record=record)

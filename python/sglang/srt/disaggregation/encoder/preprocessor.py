@@ -21,6 +21,7 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.aim_metrics import record_image_event
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
@@ -128,6 +129,7 @@ class EncoderPreprocessor:
         model_preprocessor: Optional[Callable] = None,
     ):
         self.server_args = server_args
+        self.aim_image_metrics = record_image_event
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
         self.encoder_media_processor_config = encoder_media_processor_config
@@ -468,6 +470,7 @@ class EncoderPreprocessor:
             on_error=lambda _source, error: image_load_error_fallback(
                 error,
                 enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
+                record=self.aim_image_metrics,
             )[0],
         )
         try:

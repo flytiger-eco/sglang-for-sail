@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.aim_metrics import record_image_event
 from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
@@ -654,7 +655,7 @@ class MMEncoder:
         )
         if envs.SGLANG_AIM_ENCODER_PIPELINE.get() and not self.aim_encoder_pipeline_enabled:
             logger.warning("AIM encoder pipeline requires CPU preprocessing without a model-specific encoder hook; using normal path")
-        self._aim_preparation = CPUPreparationQueue() if self.aim_encoder_pipeline_enabled else None
+        self._aim_preparation = CPUPreparationQueue(record=record_image_event) if self.aim_encoder_pipeline_enabled else None
         logger.info("AIM encoder CPU preparation pipeline enabled=%s", self.aim_encoder_pipeline_enabled)
 
         self.context = zmq.asyncio.Context(2)

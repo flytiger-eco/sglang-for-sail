@@ -9,15 +9,22 @@ import asyncio
 import concurrent.futures
 import contextvars
 import threading
+from time import perf_counter
 
 
 class _Preparation:
-    def __init__(self):
+    def __init__(self, record=None):
         self.future = None
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
         self.loop = None
         self.task = None
+        self.record = record
+        self.queued_at = perf_counter()
+
+    def observe(self, stage, result, seconds):
+        if self.record is not None:
+            self.record(stage, result, seconds, 1)
 
     def run(self, prepare):
         async def run_async():
@@ -32,12 +39,28 @@ class _Preparation:
                 with self.lock:
                     self.loop = self.task = None
 
-        return asyncio.run(run_async())
+        start = perf_counter()
+        self.observe("encoder_prepare_queue", "success", start - self.queued_at)
+        result = "success"
+        try:
+            return asyncio.run(run_async())
+        except asyncio.CancelledError:
+            result = "cancel"
+            raise
+        except BaseException:
+            result = "error"
+            raise
+        finally:
+            self.observe("encoder_prepare", result, perf_counter() - start)
 
     def cancel(self):
+        already_cancelled = self.cancelled.is_set()
         self.cancelled.set()
         if self.future is not None:
-            self.future.cancel()
+            if self.future.cancel() and not already_cancelled:
+                self.observe(
+                    "encoder_prepare_queue", "cancel", perf_counter() - self.queued_at
+                )
         with self.lock:
             if self.loop is not None and self.task is not None:
                 self.loop.call_soon_threadsafe(self.task.cancel)
@@ -46,17 +69,18 @@ class _Preparation:
 class CPUPreparationQueue:
     """At most current + next batch, with one CPU coordinator at a time.
 
-All public methods are called by the encoder event-loop thread. Cancellation
-stops the coordinator's await; already-running I/O/CPU pool calls finish under
-their own timeouts, and do not hold up the dispatcher shutdown.
-"""
+    All public methods are called by the encoder event-loop thread. Cancellation
+    stops the coordinator's await; already-running I/O/CPU pool calls finish under
+    their own timeouts, and do not hold up the dispatcher shutdown.
+    """
 
-    def __init__(self):
+    def __init__(self, record=None):
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="aim-encoder-prepare"
         )
         self._jobs = {}
         self._closed = False
+        self._record = record
 
     def submit(self, batch_id, prepare):
         if self._closed:
@@ -65,7 +89,7 @@ their own timeouts, and do not hold up the dispatcher shutdown.
             raise RuntimeError(f"Duplicate encoder preparation: {batch_id}")
         if len(self._jobs) >= 2:
             raise RuntimeError("Encoder preparation queue is full")
-        job = _Preparation()
+        job = _Preparation(record=self._record)
         job.future = self._executor.submit(
             contextvars.copy_context().run, job.run, prepare
         )

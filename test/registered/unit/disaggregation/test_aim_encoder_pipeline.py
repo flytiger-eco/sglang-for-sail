@@ -141,6 +141,62 @@ class FakeEncoder:
 
 
 class TestCPUPreparationQueue(unittest.IsolatedAsyncioTestCase):
+    async def test_metrics_distinguish_running_and_queued_cancellation(self):
+        events = []
+        queue = CPUPreparationQueue(record=lambda *event: events.append(event))
+        started = threading.Event()
+
+        async def blocked():
+            started.set()
+            await asyncio.sleep(60)
+
+        queue.submit("running", blocked)
+        queue.submit("queued", blocked)
+        await eventually(started.is_set)
+        queue.close()
+        await eventually(
+            lambda: any(event[:2] == ("encoder_prepare", "cancel") for event in events)
+        )
+        self.assertEqual(
+            sorted((stage, outcome) for stage, outcome, _, _ in events),
+            [
+                ("encoder_prepare", "cancel"),
+                ("encoder_prepare_queue", "cancel"),
+                ("encoder_prepare_queue", "success"),
+            ],
+        )
+
+    async def test_metrics_distinguish_queue_and_execution_outcomes(self):
+        events = []
+        queue = CPUPreparationQueue(record=lambda *event: events.append(event))
+
+        async def success():
+            return "pixels"
+
+        async def failure():
+            raise ValueError("invalid image")
+
+        try:
+            queue.submit("good", success)
+            self.assertEqual(await queue.take("good"), "pixels")
+            queue.submit("bad", failure)
+            with self.assertRaisesRegex(ValueError, "invalid image"):
+                await queue.take("bad")
+            self.assertEqual(
+                [(stage, outcome) for stage, outcome, _, _ in events],
+                [
+                    ("encoder_prepare_queue", "success"),
+                    ("encoder_prepare", "success"),
+                    ("encoder_prepare_queue", "success"),
+                    ("encoder_prepare", "error"),
+                ],
+            )
+            self.assertTrue(
+                all(seconds >= 0 and count == 1 for _, _, seconds, count in events)
+            )
+        finally:
+            queue.close()
+
     async def test_bounded_jobs_and_runtime_context(self):
         queue = CPUPreparationQueue()
         release = threading.Event()

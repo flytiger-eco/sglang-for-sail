@@ -2,23 +2,24 @@
 
 import ast
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import functools
 import importlib.util
 import os
-from pathlib import Path
 import sys
 import threading
-from types import ModuleType, SimpleNamespace
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
-
 ROOT = Path(__file__).resolve().parents[4]
-SOURCE = Path(os.environ.get(
-    "AIM_ENCODER_TEST_SOURCE",
-    str(ROOT / "python/sglang/srt/disaggregation/encoder/preprocessor.py"),
-))
+SOURCE = Path(
+    os.environ.get(
+        "AIM_ENCODER_TEST_SOURCE",
+        str(ROOT / "python/sglang/srt/disaggregation/encoder/preprocessor.py"),
+    )
+)
 spec = importlib.util.spec_from_file_location(
     "aim_image_loader", ROOT / "python/sglang/srt/multimodal/aim_image_loader.py"
 )
@@ -26,7 +27,9 @@ loader = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(loader)
 tree = ast.parse(SOURCE.read_text())
 encoder = next(n for n in tree.body if getattr(n, "name", None) == "EncoderPreprocessor")
-method = next(n for n in encoder.body if getattr(n, "name", None) == "_flatten_and_load_images")
+method = next(
+    n for n in encoder.body if getattr(n, "name", None) == "_flatten_and_load_images"
+)
 flags = {
     "SGLANG_ENABLE_REDKV_MGET": True,
     "SGLANG_ENABLE_BATCH_JPEG_DECODE": False,
@@ -34,11 +37,13 @@ flags = {
     "SGLANG_JPEG_CPU_DECODE_WORKERS": 1,
     "SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE": False,
 }
-envs = SimpleNamespace(**{
-    name: SimpleNamespace(get=lambda name=name: flags[name]) for name in flags
-})
+envs = SimpleNamespace(
+    **{name: SimpleNamespace(get=lambda name=name: flags[name]) for name in flags}
+)
 namespace = dict(globals(), Modality=SimpleNamespace(IMAGE="image"))
-exec(compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec"), namespace)
+exec(
+    compile(ast.Module(body=[method], type_ignores=[]), str(SOURCE), "exec"), namespace
+)
 load_encoder_images = namespace["_flatten_and_load_images"]
 
 
@@ -58,12 +63,17 @@ class TestEncoderBatchImageLoading(unittest.IsolatedAsyncioTestCase):
         redkv.fallback_url = lambda value: value.removeprefix("imagetransfer_")
         redkv.mget_bytes_from_redis_cache_with_status = mget
         image_policy = ModuleType("sglang.srt.multimodal.aim_image")
-        image_policy.image_load_error_fallback = lambda error, **_: (_ for _ in ()).throw(error)
-        self.modules = patch.dict(sys.modules, {
-            "sglang.srt.multimodal.aim_image_loader": loader,
-            "sglang.srt.connector.redkv": redkv,
-            "sglang.srt.multimodal.aim_image": image_policy,
-        })
+        image_policy.image_load_error_fallback = lambda error, **_: (
+            _ for _ in ()
+        ).throw(error)
+        self.modules = patch.dict(
+            sys.modules,
+            {
+                "sglang.srt.multimodal.aim_image_loader": loader,
+                "sglang.srt.connector.redkv": redkv,
+                "sglang.srt.multimodal.aim_image": image_policy,
+            },
+        )
         self.modules.start()
 
         def load_one(value, **_):

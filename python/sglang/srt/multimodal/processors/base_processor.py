@@ -557,7 +557,9 @@ class BaseMultimodalProcessor(ABC):
         Supports image, video, and audio tokens.
         """
         if not isinstance(prompt, list):
-            prompt = self._tokenizer.encode(prompt)
+            from sglang.srt.multimodal.aim_metrics import image_stage
+            with image_stage("image_tokenization", enabled=img_grid_thw is not None and len(img_grid_thw) > 0):
+                prompt = self._tokenizer.encode(prompt)
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
@@ -966,6 +968,7 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        gpu_image_decode=None,
     ):
         """
         Load a single multimodal data.
@@ -978,7 +981,7 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(data, cls.gpu_image_decode if gpu_image_decode is None else gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1048,6 +1051,70 @@ class BaseMultimodalProcessor(ABC):
                 if not cls._is_preprocessed_input(item):
                     return False
         return has_mm_data
+
+    @staticmethod
+    def _aim_image_batch_enabled():
+        return envs.SGLANG_ENABLE_REDKV_MGET.get() or (
+            envs.SGLANG_ENABLE_BATCH_JPEG_DECODE.get()
+            and not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get()
+        )
+
+    async def load_images_only_async(
+        self, image_data, discard_alpha_channel=True, record=None
+    ):
+        """Prefetch images while retaining the normal per-image return contract.
+
+        The blocking batch coordinator runs on asyncio's executor, separately
+        from our existing I/O workers. A request cancellation stops submission
+        and cancels queued work; running downloads retain their own timeouts.
+        """
+        if not image_data:
+            return []
+        if record is None:
+            from sglang.srt.multimodal.aim_metrics import record_image_event
+
+            record = record_image_event
+        cancel_event = threading.Event()
+        cpu_decode = (
+            envs.SGLANG_ENABLE_BATCH_JPEG_DECODE.get()
+            and not envs.SGLANG_ENABLE_JPEG_GPU_DECODE.get()
+        )
+
+        def load_one(data):
+            if isinstance(data, torch.Tensor):
+                return data
+            return self.__class__._load_single_item(
+                data,
+                Modality.IMAGE,
+                discard_alpha_channel=discard_alpha_channel,
+                gpu_image_decode=False if cpu_decode else None,
+            )
+
+        def on_error(source, error):
+            image, _ = image_load_error_fallback(
+                error,
+                enabled=envs.SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE.get(),
+                record=record,
+            )
+            return load_one(image)
+
+        try:
+            return await asyncio.to_thread(
+                load_images_batch,
+                image_data,
+                executor=self.io_executor,
+                max_in_flight=max(1, self.mm_io_worker_num),
+                load_one=load_one,
+                enable_mget=envs.SGLANG_ENABLE_REDKV_MGET.get(),
+                cancel_event=cancel_event,
+                record=record,
+                cpu_jpeg_decode=cpu_decode,
+                decode_max_in_flight=max(1, envs.SGLANG_JPEG_CPU_DECODE_WORKERS.get()),
+                on_error=on_error,
+            )
+        except BaseException:
+            cancel_event.set()
+            raise
 
     def _submit_mm_data_loading_tasks_simple(
         self,
@@ -1338,8 +1405,11 @@ class BaseMultimodalProcessor(ABC):
 
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
+        batched_images = None
+        if image_data and self._aim_image_batch_enabled():
+            batched_images = await self.load_images_only_async(image_data, discard_alpha_channel)
         modalities_data = [
-            (image_data, Modality.IMAGE),
+            ([] if batched_images is not None else image_data, Modality.IMAGE),
             (video_data, Modality.VIDEO),
             (audio_data, Modality.AUDIO),
         ]
@@ -1353,7 +1423,7 @@ class BaseMultimodalProcessor(ABC):
 
         logger.debug("[load_mm_data(simple)] total futures submitted: %d", len(futures))
 
-        images: List[Any] = [None] * len(image_data) if image_data else []
+        images: List[Any] = batched_images if batched_images is not None else ([None] * len(image_data) if image_data else [])
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
 

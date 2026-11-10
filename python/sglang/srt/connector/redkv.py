@@ -81,9 +81,7 @@ def _create_redis_client():
     parameters = inspect.signature(Connection.__init__).parameters
     if "protocol" in parameters:
         kwargs["protocol"] = 2
-    pool = EdsBlockingConnectionPool(
-        cluster_name=os.environ["CACHE_SERVICE"], **kwargs
-    )
+    pool = EdsBlockingConnectionPool(cluster_name=os.environ["CACHE_SERVICE"], **kwargs)
     try:
         return Redis(connection_pool=pool, decode_responses=False)
     except Exception:
@@ -101,14 +99,19 @@ def get_redis_client():
         if time.monotonic() < _retry_after:
             return None
         if not os.environ.get("CACHE_SERVICE") or not os.environ.get("EDS_HTTP_HOST"):
-            logger.warning("RedKV requires CACHE_SERVICE and EDS_HTTP_HOST; using HTTP fallback")
+            logger.warning(
+                "RedKV requires CACHE_SERVICE and EDS_HTTP_HOST; using HTTP fallback"
+            )
             _retry_after = time.monotonic() + _RETRY_COOLDOWN
             return None
         try:
             _redis_client = _create_redis_client()
         except Exception as exc:
             # Do not expose image/cache keys, URLs, or connection credentials.
-            logger.warning("RedKV initialization failed (%s); using HTTP fallback", type(exc).__name__)
+            logger.warning(
+                "RedKV initialization failed (%s); using HTTP fallback",
+                type(exc).__name__,
+            )
             _retry_after = time.monotonic() + _RETRY_COOLDOWN
             return None
         return _redis_client
@@ -146,7 +149,11 @@ def _error_status(exc):
         from redis.exceptions import ResponseError
         from redis.exceptions import TimeoutError as RedisTimeoutError
     except ImportError:
-        RedisConnectionError, RedisTimeoutError, ResponseError = ConnectionError, TimeoutError, ()
+        RedisConnectionError, RedisTimeoutError, ResponseError = (
+            ConnectionError,
+            TimeoutError,
+            (),
+        )
     if isinstance(exc, (TimeoutError, RedisTimeoutError)):
         return "timeout"
     if isinstance(exc, (ConnectionError, RedisConnectionError)):
@@ -189,7 +196,10 @@ def mget_bytes_from_redis_cache_with_status(keys):
         values = client.mget(keys)
         if not isinstance(values, (tuple, list)) or len(values) != len(keys):
             return RedKVMgetResult(missing, "invalid_response")
-        if any(value is not None and (not isinstance(value, bytes) or not value) for value in values):
+        if any(
+            value is not None and (not isinstance(value, bytes) or not value)
+            for value in values
+        ):
             return RedKVMgetResult(missing, "invalid_value")
         return RedKVMgetResult(dict(zip(keys, values)))
     except Exception as exc:
@@ -209,6 +219,7 @@ def resolve_image_bytes(source, http_fetch, record=None):
     outcome = "error" if result.error else "hit" if result.value is not None else "miss"
     if record is not None:
         record("redkv_get", outcome, time.perf_counter() - started, 1)
+        record("redkv_cache", outcome, 0.0, 1)
     if result.value is not None:
         return result.value
     started = time.perf_counter()
