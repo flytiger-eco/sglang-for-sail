@@ -15,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase
 
 class TestFp8MoeRunnerFallback(CustomTestCase):
     def _runner_backend_for(self, global_backend):
-        method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
+        method = fp8.Fp8MoEMethod(fp8.Fp8Config())
         with patch.object(fp8, "get_moe_runner_backend", return_value=global_backend):
             method.create_moe_runner(layer=None, moe_runner_config=MoeRunnerConfig())
         return method.runner.runner_backend

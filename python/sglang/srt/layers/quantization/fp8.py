@@ -1178,6 +1178,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config, *, use_ppu_w4a8: bool = False):
         self.quant_config = quant_config
         self.use_ppu_w4a8 = use_ppu_w4a8
+        self.ppu_w4a8_per_token_quant = (
+            use_ppu_w4a8 and not envs.SGLANG_PPU_W4A8_A_PER_GROUP_QUANT.get()
+        )
         if use_ppu_w4a8:
             from sglang.srt.layers.moe.utils import is_sbo_enabled, is_tbo_enabled
             from sglang.srt.runtime_context import get_exec
@@ -2215,6 +2218,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.use_ppu_w4a8:
             import deep_gemm
 
+            group_size = 0 if self.ppu_w4a8_per_token_quant else 128
+            supported = getattr(
+                deep_gemm, "get_w4a8_activation_group_sizes", lambda: (0,)
+            )()
+            if group_size not in supported:
+                raise RuntimeError(
+                    f"PPU MiMo W4A8 activation group size {group_size} is not "
+                    "supported by the installed DeepGEMM; install a matching build."
+                )
+
             for name in ("w13", "w2"):
                 weight = getattr(layer, f"{name}_weight")
                 scale = getattr(layer, f"{name}_weight_scale_inv")
@@ -2229,7 +2242,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 setattr(layer, f"{name}_w4a8_inv_scale", inv_scale)
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
-                    {"dispatcher_output_dtype": "fp8", "is_channel_quant": True}
+                    {
+                        "dispatcher_output_dtype": "fp8",
+                        "is_channel_quant": self.ppu_w4a8_per_token_quant,
+                    }
                 )
             return
 
@@ -2893,8 +2909,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
-                block_shape=None if self.use_ppu_w4a8 else block_shape,
-                per_channel_quant=self.use_ppu_w4a8,
+                block_shape=None if self.ppu_w4a8_per_token_quant else block_shape,
+                per_channel_quant=self.ppu_w4a8_per_token_quant,
                 use_mxfp4_w4a8=self.use_ppu_w4a8,
                 w13_w4a8_inv_scale=getattr(layer, "w13_w4a8_inv_scale", 1.0),
                 w2_w4a8_inv_scale=getattr(layer, "w2_w4a8_inv_scale", 1.0),

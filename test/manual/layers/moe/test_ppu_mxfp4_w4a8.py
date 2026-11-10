@@ -4,7 +4,9 @@ Uses real weight preprocessing, activation quantization and both GEMMs.
 This does not replace checkpoint accuracy or multi-node DeepEP validation.
 """
 
+import os
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -67,14 +69,15 @@ def decode_weights(packed, scales):
     return lookup[codes] * torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
 
 
-def quantize_activation_reference(x):
-    groups = x.float().reshape(*x.shape[:-1], 1, x.shape[-1])
+def quantize_activation_reference(x, per_token):
+    group_size = x.shape[-1] if per_token else 128
+    groups = x.float().reshape(*x.shape[:-1], -1, group_size)
     scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-10) / 448
     q = (groups / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
     return (q.float() * scale).reshape(x.shape)
 
 
-def make_layer(intermediate=256):
+def make_layer(intermediate=256, *, per_token=False):
     e, h, topk = 4, 512, 2
     config = Fp8Config(
         is_checkpoint_fp8_serialized=True,
@@ -91,7 +94,11 @@ def make_layer(intermediate=256):
         params_dtype=torch.bfloat16,
         inplace=False,
     )
-    method = Fp8MoEMethod(config, use_ppu_w4a8=True)
+    with patch.dict(
+        os.environ,
+        SGLANG_PPU_W4A8_A_PER_GROUP_QUANT="0" if per_token else "1",
+    ):
+        method = Fp8MoEMethod(config, use_ppu_w4a8=True)
     layer = torch.nn.Module()
     layer.moe_runner_config = runner_config
     with torch.device("cuda"):
@@ -114,9 +121,9 @@ def make_layer(intermediate=256):
     return layer, method, reference_weights
 
 
-def reference_moe(x, ids, route_weights, weights):
+def reference_moe(x, ids, route_weights, weights, per_token):
     gate_up, down = weights
-    h = quantize_activation_reference(x)
+    h = quantize_activation_reference(x, per_token)
     result = torch.zeros(x.shape, device=x.device, dtype=torch.float32)
     for expert in range(gate_up.shape[0]):
         tokens, slots = torch.where(ids == expert)
@@ -125,16 +132,17 @@ def reference_moe(x, ids, route_weights, weights):
         gu = (h[tokens] @ gate_up[expert].T).bfloat16()
         gate, up = gu.float().chunk(2, dim=-1)
         activated = (F.silu(gate) * up).bfloat16()
-        quantized = quantize_activation_reference(activated)
+        quantized = quantize_activation_reference(activated, per_token)
         out = (quantized @ down[expert].T).bfloat16()
         result.index_add_(0, tokens, out.float() * route_weights[tokens, slots, None])
     return result.bfloat16()
 
 
+@pytest.mark.parametrize("per_token", [False, True])
 @torch.inference_mode()
-def test_contiguous_moe():
+def test_contiguous_moe(per_token):
     torch.manual_seed(20261104)
-    layer, method, weights = make_layer()
+    layer, method, weights = make_layer(per_token=per_token)
     counts = [0, 1, 17, 65]
     rows = torch.tensor(counts, device="cuda", dtype=torch.int32)
     indices = torch.repeat_interleave(
@@ -142,11 +150,15 @@ def test_contiguous_moe():
     )
     x = torch.randn(sum(counts), 512, device="cuda", dtype=torch.bfloat16)
     expected = reference_moe(
-        x, indices[:, None], torch.ones(sum(counts), 1, device="cuda"), weights
+        x,
+        indices[:, None],
+        torch.ones(sum(counts), 1, device="cuda"),
+        weights,
+        per_token,
     )
     q, scales = sglang_per_token_group_quant_fp8(
         x,
-        x.shape[-1],
+        x.shape[-1] if per_token else 128,
         column_major_scales=False,
         scale_tma_aligned=False,
         scale_ue8m0=False,
@@ -159,10 +171,10 @@ def test_contiguous_moe():
         w13_w4a8_inv_scale=layer.w13_w4a8_inv_scale,
         w2_w4a8_inv_scale=layer.w2_w4a8_inv_scale,
         use_fp8=True,
-        per_channel_quant=True,
+        per_channel_quant=per_token,
         is_fp4_experts=True,
         use_mxfp4_w4a8=True,
-        block_shape=None,
+        block_shape=None if per_token else [128, 128],
     )
     actual = method.runner.runner_core.run(
         DeepGemmRunnerInput(q, scales, use_masked_gemm=False, m_indices=indices),
@@ -185,10 +197,11 @@ def test_contiguous_moe():
 
 
 @pytest.mark.parametrize("intermediate", [1536, 2048])
+@pytest.mark.parametrize("per_token", [False, True])
 @torch.inference_mode()
-def test_masked_moe_graph_replay(intermediate):
+def test_masked_moe_graph_replay(intermediate, per_token):
     torch.manual_seed(20261104)
-    layer, method, weights = make_layer(intermediate)
+    layer, method, weights = make_layer(intermediate, per_token=per_token)
     x = torch.randn(4, 128, 512, device="cuda", dtype=torch.bfloat16)
     counts = torch.tensor([0, 1, 17, 65], device="cuda", dtype=torch.int32)
     quant = DeepGemmMoeQuantInfo(
@@ -199,18 +212,18 @@ def test_masked_moe_graph_replay(intermediate):
         w13_w4a8_inv_scale=layer.w13_w4a8_inv_scale,
         w2_w4a8_inv_scale=layer.w2_w4a8_inv_scale,
         use_fp8=True,
-        per_channel_quant=True,
+        per_channel_quant=per_token,
         is_fp4_experts=True,
         use_mxfp4_w4a8=True,
-        block_shape=None,
+        block_shape=None if per_token else [128, 128],
     )
 
     def forward():
         q, scales = sglang_per_token_group_quant_fp8(
-            x.view(-1, x.shape[-1]), x.shape[-1]
+            x.view(-1, x.shape[-1]), x.shape[-1] if per_token else 128
         )
         q = q.view(x.shape)
-        scales = scales.view(*x.shape[:-1], 1)
+        scales = scales.view(*x.shape[:-1], -1)
         return method.runner.runner_core.run(
             DeepGemmRunnerInput(
                 q, scales, use_masked_gemm=True, masked_m=counts, expected_m=32
@@ -225,7 +238,11 @@ def test_masked_moe_graph_replay(intermediate):
                 continue
             ids = torch.full((count, 1), expert, device="cuda", dtype=torch.int32)
             expected = reference_moe(
-                x[expert, :count], ids, torch.ones(count, 1, device="cuda"), weights
+                x[expert, :count],
+                ids,
+                torch.ones(count, 1, device="cuda"),
+                weights,
+                per_token,
             )
             observed = actual[expert, :count]
             assert torch.isfinite(observed).all()
@@ -237,13 +254,18 @@ def test_masked_moe_graph_replay(intermediate):
     previous_dispose = capture_flags.disable_dispose_tensor
     capture_flags.disable_dispose_tensor = True
     try:
-        for _ in range(3):
-            eager = forward()
-        torch.cuda.synchronize()
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        # Warm the execution plan on the same stream used for capture.
+        with torch.cuda.stream(capture_stream):
+            for _ in range(3):
+                eager = forward()
+        capture_stream.synchronize()
         check_reference(eager)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=capture_stream):
             captured = forward()
+        torch.cuda.current_stream().wait_stream(capture_stream)
         for factor, occupancy in [(0.25, [65, 0, 1, 17]), (2.0, [17, 65, 0, 1])]:
             x.copy_(torch.randn_like(x) * factor)
             counts.copy_(torch.tensor(occupancy, device="cuda", dtype=torch.int32))
