@@ -18,10 +18,10 @@ def _check_cancelled(cancel_event):
 def bounded_map(function, items, *, executor, max_in_flight, cancel_event=None):
     """Return ordered results with at most ``max_in_flight`` submitted tasks.
 
-On error/cancellation, queued tasks are cancelled; already-running I/O must
-finish under its own timeout. The caller retains ownership of the executor.
-Do not call from one of its workers: even a one-worker pool must remain usable.
-"""
+    On error/cancellation, queued tasks are cancelled; already-running I/O must
+    finish under its own timeout. The caller retains ownership of the executor.
+    Do not call from one of its workers: even a one-worker pool must remain usable.
+    """
     if max_in_flight < 1:
         raise ValueError("max_in_flight must be positive")
     # ThreadPoolExecutor has no public worker-membership API. This guard catches
@@ -62,6 +62,12 @@ def _record(record, stage, result, seconds, count):
         record(stage, result, seconds, count)
 
 
+def _record_failure(record, stage, error, started, count):
+    # Match image_stage for both asyncio and concurrent.futures cancellation.
+    outcome = "cancel" if type(error).__name__ == "CancelledError" else "error"
+    _record(record, stage, outcome, perf_counter() - started, count)
+
+
 def _resolve_redkv_batch(image_files, *, mget, record):
     from sglang.srt.connector.redkv import fallback_url, is_redkv_url
 
@@ -76,9 +82,7 @@ def _resolve_redkv_batch(image_files, *, mget, record):
     if not indices:
         return image_files
     if mget is None:
-        from sglang.srt.connector.redkv import (
-            mget_bytes_from_redis_cache_with_status,
-        )
+        from sglang.srt.connector.redkv import mget_bytes_from_redis_cache_with_status
 
         mget = mget_bytes_from_redis_cache_with_status
 
@@ -166,6 +170,8 @@ def _load_images_cpu(
             return unwrapped
         try:
             return get_bytes(unwrapped)
+        except CancelledError:
+            raise
         except Exception as error:
             if on_error is None:
                 raise
@@ -183,8 +189,8 @@ def _load_images_cpu(
             max_in_flight=max_in_flight,
             cancel_event=cancel_event,
         )
-    except BaseException:
-        _record(record, "image_fetch", "error", perf_counter() - start, fetch_count)
+    except BaseException as error:
+        _record_failure(record, "image_fetch", error, start, fetch_count)
         raise
     if fetch_count:
         outcome = (
@@ -201,7 +207,7 @@ def _load_images_cpu(
             start = perf_counter()
             try:
                 image = decoder(source)
-            except MemoryError:
+            except (CancelledError, MemoryError):
                 raise
             except Exception as error:
                 if type(error).__name__ == "OutOfMemoryError":
@@ -223,8 +229,8 @@ def _load_images_cpu(
             max_in_flight=decode_max_in_flight,
             cancel_event=cancel_event,
         )
-    except BaseException:
-        _record(record, "image_decode", "error", perf_counter() - start, len(sources))
+    except BaseException as error:
+        _record_failure(record, "image_decode", error, start, len(sources))
         raise
     _record(record, "image_decode", "success", perf_counter() - start, len(sources))
     # Aggregate per-JPEG work separately from batch wall time. Stats callbacks
@@ -267,7 +273,6 @@ def load_images_batch(
     use its per-image CPU/PIL fallback. ``on_error(source, error)`` applies the
     same failure policy to a fetch error without retrying the failed request.
     """
-    _check_cancelled(cancel_event)
     if max_in_flight < 1:
         raise ValueError("max_in_flight must be positive")
     if decode_max_in_flight is None:
@@ -275,15 +280,18 @@ def load_images_batch(
     if decode_max_in_flight < 1:
         raise ValueError("decode_max_in_flight must be positive")
     if not image_files:
+        _check_cancelled(cancel_event)
         return []
-    sources = (
-        _resolve_redkv_batch(image_files, mget=mget, record=record)
-        if enable_mget
-        else image_files
-    )
-    _check_cancelled(cancel_event)
+    # image_load covers the entire batch, including MGET and HTTP fallbacks.
     start = perf_counter()
     try:
+        _check_cancelled(cancel_event)
+        sources = (
+            _resolve_redkv_batch(image_files, mget=mget, record=record)
+            if enable_mget
+            else image_files
+        )
+        _check_cancelled(cancel_event)
         if cpu_jpeg_decode:
             results = _load_images_cpu(
                 sources,
@@ -305,8 +313,8 @@ def load_images_batch(
                 max_in_flight=max_in_flight,
                 cancel_event=cancel_event,
             )
-    except BaseException:
-        _record(record, "image_load", "error", perf_counter() - start, len(sources))
+    except BaseException as error:
+        _record_failure(record, "image_load", error, start, len(image_files))
         raise
     _record(record, "image_load", "success", perf_counter() - start, len(sources))
     return results

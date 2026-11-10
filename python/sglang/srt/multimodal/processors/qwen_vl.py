@@ -448,7 +448,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         Build input_ids with timestamps for qwen3_vl models.
         """
         if not isinstance(prompt, list):
-            prompt = self._processor.tokenizer.encode(prompt)
+            from sglang.srt.multimodal.aim_metrics import image_stage
+            with image_stage("image_tokenization", enabled=img_grid_thw is not None and len(img_grid_thw) > 0):
+                prompt = self._processor.tokenizer.encode(prompt)
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)

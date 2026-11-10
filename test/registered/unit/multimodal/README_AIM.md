@@ -99,3 +99,23 @@ backpressure, cancellation, current/next overlap under blocking forward,
 main-thread TP preparation consensus, shutdown, bounded I/O, cache hit/miss/error
 and image fallback. Real EPD tests use PNG and JPEG ordered/repeated multi-image
 requests, plus separate 64K and 16K performance measurements.
+
+## Image and Encoder stage metrics
+
+Adapted from bd12da416a. Existing TokenizerMetricsCollector and
+EncoderMetricsCollector own AIM mm_items_total / mm_stage_seconds families.
+No Prometheus objects are created on import or per request. Bounded stage/result
+labels distinguish cache errors, misses, cancellation and explicit 1px fallback,
+without using image URLs as labels. Stages are nested and must not be summed as
+TTFT. JPEG worker time is distinct from batch decode wall time.
+
+The split EncoderPreprocessor records through the same process recorder as
+ordinary image loading, HTTP/cache fallback, tokenizer text tokenization and
+CPU preparation. Target legacy prompt semantics are preserved; the source
+parent's optional tokenizer-prefetch API is not introduced solely for metrics.
+The bounded image fast path requires batch JPEG or MGET to be enabled.
+
+Validation: 76 CPU/runtime tests passed; one optional real HEIF round-trip was
+skipped because the image lacks pillow-heif. Real PPU PNG/JPEG workloads and
+serving /metrics snapshots are tested per frozen deployment revision. External
+EDS/RedKV live service is not assumed; cache outcomes use controlled fixtures.

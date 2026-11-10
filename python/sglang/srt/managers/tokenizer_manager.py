@@ -1155,9 +1155,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
-                )
+                from sglang.srt.multimodal.aim_metrics import image_stage
+                with image_stage("image_tokenization", enabled=contains_mm_input):
+                    input_ids, token_type_ids = await self._tokenize_texts(
+                        input_text, is_cross_encoder_request
+                    )
 
         if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(

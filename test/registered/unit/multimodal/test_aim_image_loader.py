@@ -23,10 +23,22 @@ def jpeg_bytes(mode="L"):
 
 
 class TestAIMImageLoader(unittest.TestCase):
+    def test_gpu_disable_flag_is_shared_by_ordinary_and_encoder_callers(self):
+        with (
+            patch.dict(os.environ, {"SGLANG_ENABLE_JPEG_GPU_DECODE": "false"}),
+            patch.object(common, "is_cuda", return_value=True),
+            patch("torchvision.io.decode_jpeg") as decode,
+        ):
+            image, _ = common.load_image(jpeg_bytes(), gpu_image_decode=True)
+        self.assertIsInstance(image, Image.Image)
+        decode.assert_not_called()
+
     def test_http_uses_existing_download_policy(self):
         url = "https://images.example/image.jpg"
         with (
-            patch.object(common, "download_remote_media", return_value=b"image") as fetch,
+            patch.object(
+                common, "download_remote_media", return_value=b"image"
+            ) as fetch,
             patch.dict(os.environ, {"REQUEST_TIMEOUT": "7"}),
         ):
             self.assertEqual(common.get_image_bytes(url), b"image")
@@ -35,13 +47,15 @@ class TestAIMImageLoader(unittest.TestCase):
     def test_redkv_fallback_uses_existing_download_policy(self):
         key = "imagetransfer_https://images.example/image.jpg"
 
-        def resolve(source, *, http_fetch):
+        def resolve(source, *, http_fetch, record=None):
             self.assertEqual(source, key)
             return http_fetch(source.removeprefix("imagetransfer_"))
 
         with (
             patch.object(redkv, "resolve_image_bytes", side_effect=resolve),
-            patch.object(common, "download_remote_media", return_value=b"image") as fetch,
+            patch.object(
+                common, "download_remote_media", return_value=b"image"
+            ) as fetch,
             patch.dict(os.environ, {"REQUEST_TIMEOUT": "7"}),
         ):
             self.assertEqual(common.get_image_bytes(key), b"image")

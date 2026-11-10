@@ -1537,6 +1537,11 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels or {}
 
+        from sglang.srt.multimodal.aim_metrics import ImageIOMetrics, install_image_metrics
+        self.aim_image_metrics = ImageIOMetrics(self.labels, "tokenizer", Counter, Histogram)
+        install_image_metrics(self.aim_image_metrics.record)
+
+
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
             documentation="Engine startup duration by phase in seconds.",
@@ -2336,6 +2341,11 @@ class EncoderMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+
+        from sglang.srt.multimodal.aim_metrics import ImageIOMetrics, install_image_metrics
+        self.aim_image_metrics = ImageIOMetrics(self.labels, "encoder", Counter, Histogram)
+        install_image_metrics(self.aim_image_metrics.record)
+
 
         self.cache_evictions_total = Counter(
             name="sglang:encoder_cache_evictions_total",
