@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import ctypes
 import hashlib
+import functools
 import logging
 import os
 import pickle
@@ -22,6 +23,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.aim_encoder_pipeline import CPUPreparationQueue
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
@@ -641,6 +643,19 @@ class MMEncoder:
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
             encoder_media_processor_config=encoder_media_processor_config,
         )
+
+        pre = self.preprocessor
+        self.aim_encoder_pipeline_enabled = (
+            envs.SGLANG_AIM_ENCODER_PIPELINE.get()
+            and not pre.use_image_processor_gpu
+            and str(pre.vision_config.get("image", {}).get("device", "cpu")) in ("cpu", "None")
+            and pre.image_processor is not None
+            and pre._model_preprocessor is None
+        )
+        if envs.SGLANG_AIM_ENCODER_PIPELINE.get() and not self.aim_encoder_pipeline_enabled:
+            logger.warning("AIM encoder pipeline requires CPU preprocessing without a model-specific encoder hook; using normal path")
+        self._aim_preparation = CPUPreparationQueue() if self.aim_encoder_pipeline_enabled else None
+        logger.info("AIM encoder CPU preparation pipeline enabled=%s", self.aim_encoder_pipeline_enabled)
 
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
@@ -1262,18 +1277,23 @@ class MMEncoder:
         *,
         use_global_cache: bool,
         is_health_check: bool = False,
+        prepared_batch_id: Optional[str] = None,
     ) -> EncodeContext:
         """Prepare one context consistently before TP ranks enter model forward."""
         ctx = None
         local_error = None
         error_phase = 0
         try:
-            ctx = await self._prepare_encode_context(
-                requests,
-                modality,
-                use_global_cache=use_global_cache,
-                is_health_check=is_health_check,
-            )
+            if prepared_batch_id is None:
+                ctx = await self._prepare_encode_context(
+                    requests, modality,
+                    use_global_cache=use_global_cache,
+                    is_health_check=is_health_check,
+                )
+            else:
+                # Only this await consumes a prepared CPU context. The status
+                # synchronization and all model/transport work stay on this thread.
+                ctx = await self._aim_preparation.take(prepared_batch_id)
         except Exception as e:
             local_error = e
             error_phase = 1
@@ -2289,8 +2309,22 @@ class MMEncoder:
                 )
         return [(0, 0, 0, msg, code)] * len(requests)
 
+    def prepare_batch(self, batch_id: str, requests: List[dict], modality: Modality):
+        if self._aim_preparation is None or modality != Modality.IMAGE:
+            raise RuntimeError("Unsupported encoder preparation request")
+        is_health_check = all(is_health_check_request(req["req_id"]) for req in requests)
+        self._aim_preparation.submit(
+            batch_id,
+            functools.partial(
+                self._prepare_encode_context, requests, modality,
+                use_global_cache=self.mm_global_cache is not None and not is_health_check,
+                is_health_check=is_health_check,
+            ),
+        )
+
     async def batch_encode(
-        self, requests: List[dict], modality: Modality
+        self, requests: List[dict], modality: Modality,
+        prepared_batch_id: Optional[str] = None,
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Encode requests through one fused pipeline; encode() is the N=1 case.
 
@@ -2312,6 +2346,7 @@ class MMEncoder:
                 modality,
                 use_global_cache=use_global_cache,
                 is_health_check=is_health_check,
+                prepared_batch_id=prepared_batch_id,
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
             if self.image_pruning_rate > 0 and modality == Modality.IMAGE:
@@ -2547,9 +2582,13 @@ async def run_encoder(
     server_args: ServerArgs, schedule_path, dist_init_method, rank: int
 ):
     encoder = MMEncoder(server_args, schedule_path, dist_init_method, rank)
-    while True:
-        request = await async_sock_recv(encoder.schedule_socket)
-        await _handle_encoder_worker_request(encoder, request)
+    try:
+        while True:
+            request = await async_sock_recv(encoder.schedule_socket)
+            await _handle_encoder_worker_request(encoder, request)
+    finally:
+        if encoder._aim_preparation is not None:
+            encoder._aim_preparation.close()
 
 
 async def _handle_encoder_worker_request(encoder: MMEncoder, request):
@@ -2560,10 +2599,16 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()
+    elif isinstance(request, dict) and request.get("type") == "prepare_batch":
+        encoder.prepare_batch(request["batch_id"], request["requests"], Modality.from_str(request["modality"]))
+    elif isinstance(request, dict) and request.get("type") == "close_preparation":
+        if encoder._aim_preparation is not None:
+            encoder._aim_preparation.close()
     elif isinstance(request, dict) and request.get("type") == "batch_encode":
         await encoder.batch_encode(
             request["requests"],
             Modality.from_str(request["modality"]),
+            prepared_batch_id=request.get("prepared_batch_id"),
         )
     else:
         # Health-check rids need no special routing: batch_encode derives

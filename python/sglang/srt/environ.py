@@ -1603,11 +1603,14 @@ class Envs:
     # ===================================================================
     # Encoder pipeline and disaggregation
     # ===================================================================
+    # CPU preparation can lead ordered ViT execution by one batch.
     SGLANG_MM_RETURN_1PX_IMAGE_ON_LOAD_FAILURE = EnvBool(False)
     SGLANG_ENABLE_REDKV_MGET = EnvBool(False)
     SGLANG_ENABLE_BATCH_JPEG_DECODE = EnvBool(False)
     SGLANG_ENABLE_JPEG_GPU_DECODE = EnvBool(True)
     SGLANG_JPEG_CPU_DECODE_WORKERS = EnvInt(1)
+    SGLANG_AIM_ENCODER_PIPELINE = EnvBool(False)
+    SGLANG_AIM_ENCODER_MAX_PENDING = EnvInt(32)
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")

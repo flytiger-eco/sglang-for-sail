@@ -78,3 +78,24 @@ configure `--disagg-decode-urls`, and send a fresh `X-Request-ID` per paired
 request when using an older gateway. Unsupported configurations fail at startup.
 Image pruning still preserves retained spatial indices through the encoder cache
 and transport, including caller-supplied hashes and DeepStack channels.
+## Bounded Encoder CPU preparation
+
+Adapted from 92048b9e8b to the split encoder/server.py, runtime.py and
+preprocessor.py architecture. Enable SGLANG_AIM_ENCODER_PIPELINE=1 for CPU
+image processing without model-specific preprocessing hooks. Current and next
+preparation are bounded to two tickets; SGLANG_AIM_ENCODER_MAX_PENDING (default
+32) bounds queued requests. GPU dispatch and TP status/metadata collectives
+remain on the main event-loop thread and retain submission order.
+
+Includes the source commit's necessary AIM image/RedKV loading prerequisites.
+SGLANG_ENABLE_BATCH_JPEG_DECODE=1 with SGLANG_ENABLE_JPEG_GPU_DECODE=0 enables
+bounded torchvision CPU JPEG decoding. SGLANG_JPEG_CPU_DECODE_WORKERS defaults
+to 1. Dictionaries carrying content hashes/metadata keep the existing verified
+loading contract. Remote HTTP continues through download_remote_media security
+and timeout policy. RedKV MGET and 1px fallback are separately opt-in.
+
+Twenty-nine CPU/runtime image-loader and scheduler tests cover ordering,
+backpressure, cancellation, current/next overlap under blocking forward,
+main-thread TP preparation consensus, shutdown, bounded I/O, cache hit/miss/error
+and image fallback. Real EPD tests use PNG and JPEG ordered/repeated multi-image
+requests, plus separate 64K and 16K performance measurements.
