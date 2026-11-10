@@ -27,8 +27,7 @@ Registered hooks
 5. ``FlashMLABackend._apply_decode_target_verify_metadata`` (REPLACE) —
    Replaces the method body on PPU with the PPU-specific logic:
    ``scheduler_metadata, _ = get_mla_metadata(...)``, the
-   ``if is_ppu(): raise`` guard, and the ``.tile_scheduler_metadata`` /
-   ``.num_splits`` attribute pattern.  Handles DRAFT_EXTEND_V2 with the
+   lazy ``FlashMLASchedMeta`` object for both BF16 and FP8.  Handles DRAFT_EXTEND_V2 with the
    correct seq_lens (no double-add) and cuda_graph_draft_extend_seq_lens_k.
 
 6. ``FlashMLABackend.init_forward_metadata_in_graph`` (REPLACE) —
@@ -119,14 +118,11 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
     Key differences from the community version:
     * Uses ``scheduler_metadata, _ = get_mla_metadata(...)`` (discards
       second return value) instead of ``mla_metadata, num_splits = ...``.
-    * Contains ``if is_ppu(): raise`` guard inside the fp8 kvcache path.
-    * Sets ``.tile_scheduler_metadata`` and ``.num_splits`` attributes on
-      the scheduler_metadata object for CUDA graph buffer views.
+    * Uses lazy metadata for both BF16 and FP8; the library owns the
+      scheduler tensors rather than copying community tensor metadata.
     * Creates ``FlashMLADecodeMetadata`` with sched-meta as flashmla_metadata
       and None as num_splits (no separate num_splits).
     """
-    import logging
-
     import triton
 
     from sglang.kernels.ops.attention.utils import (
@@ -138,106 +134,63 @@ def _ppu_flashmla_apply_decode_target_verify_metadata(
         PAGE_SIZE,
         FlashMLADecodeMetadata,
     )
-    from sglang.srt.utils import is_ppu
 
-    _logger = logging.getLogger(__name__)
+    seq_lens = seq_lens[:bs]
+    seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
 
-    if True:
-        seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+    if forward_mode.is_target_verify():
+        seq_lens = seq_lens + self.num_draft_tokens
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu + self.num_draft_tokens
 
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.num_draft_tokens
-            if seq_lens_cpu is not None:
-                seq_lens_cpu = seq_lens_cpu + self.num_draft_tokens
+    # CUDA graph batches may omit the CPU mirror. Use the preallocated width
+    # rather than synchronizing seq_lens.max().item() during capture/replay.
+    max_seqlen_pad = (
+        triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
+        if seq_lens_cpu is not None
+        else self.cuda_graph_kv_indices.shape[1]
+    )
 
-        seq_max = (
-            seq_lens_cpu.max().item()
-            if seq_lens_cpu is not None
-            else seq_lens.max().item()
+    create_flashmla_kv_indices_triton[
+        (
+            bs,
+            get_num_kv_index_blocks_flashmla(
+                self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
+            ),
         )
-        max_seqlen_pad = triton.cdiv(seq_max, PAGE_SIZE)
+    ](
+        self.req_to_token,
+        req_pool_indices[:bs],
+        seq_lens,
+        None,
+        self.cuda_graph_kv_indices,
+        self.req_to_token.stride(0),
+        self.cuda_graph_kv_indices.stride(0),
+    )
 
-        create_flashmla_kv_indices_triton[
-            (
-                bs,
-                get_num_kv_index_blocks_flashmla(
-                    self.cuda_graph_kv_indices.stride(0), PAGE_SIZE
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            self.cuda_graph_kv_indices,
-            self.req_to_token.stride(0),
-            self.cuda_graph_kv_indices.stride(0),
-        )
+    q_head_mult = (
+        self.num_draft_tokens
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        else 1
+    )
+    scheduler_metadata, _ = get_mla_metadata(
+        seq_lens.to(torch.int32),
+        q_head_mult * self.num_q_heads,
+        1,
+        is_fp8_kvcache=self.is_fp8_kvcache,
+    )
+    seq_lens_k = None
+    if forward_mode.is_draft_extend_v2():
+        # The graph kernel binds this static buffer; refresh per replay.
+        self.cuda_graph_draft_extend_seq_lens_k[:bs].copy_(seq_lens)
+        seq_lens_k = self.cuda_graph_draft_extend_seq_lens_k[:bs]
 
-        q_head_mult = (
-            self.num_draft_tokens
-            if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
-            else 1
-        )
-        scheduler_metadata, _ = get_mla_metadata(
-            seq_lens.to(torch.int32),
-            q_head_mult * self.num_q_heads,
-            1,
-            is_fp8_kvcache=self.is_fp8_kvcache,
-        )
-        if self.is_fp8_kvcache:
-            if is_ppu():
-                raise
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                q_head_mult * self.num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
-
-            actual_num_sm_parts = mla_metadata.shape[0]
-            assert actual_num_sm_parts <= self.cuda_graph_mla_metadata.shape[0], (
-                f"num_sm_parts {actual_num_sm_parts} exceeds preallocated max "
-                f"{self.cuda_graph_mla_metadata.shape[0]}"
-            )
-
-            if (
-                self.cuda_graph_mla_metadata_view is None
-                or actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]
-            ):
-                if self.cuda_graph_mla_metadata_view is not None:
-                    _logger.warning(
-                        f"num_sm_parts mismatch in CUDA Graph replay: "
-                        f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
-                        f"replay={actual_num_sm_parts}. "
-                        f"This may indicate batch size changed between capture and replay."
-                    )
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-            # num_splits has shape (bs+1,) -- always update for the current bs.
-            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
-
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            scheduler_metadata.tile_scheduler_metadata = (
-                self.cuda_graph_mla_metadata_view
-            )
-            scheduler_metadata.num_splits = self.cuda_graph_num_splits_view
-
-        seq_lens_k = None
-        if forward_mode.is_draft_extend_v2():
-            # The graph kernel binds this static buffer; refresh per replay.
-            self.cuda_graph_draft_extend_seq_lens_k[:bs].copy_(seq_lens)
-            seq_lens_k = self.cuda_graph_draft_extend_seq_lens_k[:bs]
-
-        self.forward_metadata = FlashMLADecodeMetadata(
-            scheduler_metadata,
-            None,
-            self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-            seq_lens_k if seq_lens_k is not None else seq_lens.to(torch.int32),
-        )
+    self.forward_metadata = FlashMLADecodeMetadata(
+        scheduler_metadata,
+        None,
+        self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+        seq_lens_k if seq_lens_k is not None else seq_lens.to(torch.int32),
+    )
 
 
 # ---------------------------------------------------------------------------

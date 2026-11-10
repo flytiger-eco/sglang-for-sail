@@ -570,6 +570,7 @@ class CpuShortlistContractTest(unittest.TestCase):
                 for r in cpu
             },
             {
+                "test_flashmla_fp8_kv_unit.py",
                 "test_ppu_constraints.py",
                 "test_ppu_environment_fingerprint_unit.py",
                 "accuracy_eval/test_ppu_accuracy_eval_unit.py",
@@ -577,7 +578,7 @@ class CpuShortlistContractTest(unittest.TestCase):
                 "pr/test_cpu_eval.py",
             },
         )
-        self.assertEqual(len(cpu), 5)
+        self.assertEqual(len(cpu), 6)
         for registration in cpu:
             self.assertEqual(registration.backend, registry.HWBackend.CPU)
             self.assertIsNone(registration.disabled)
