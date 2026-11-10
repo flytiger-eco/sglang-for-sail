@@ -2025,6 +2025,16 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
+    if isinstance(image_file, str) and image_file.startswith(
+        ("imagetransfer_http://", "imagetransfer_https://")
+    ):
+        from sglang.srt.connector.redkv import resolve_image_bytes
+
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        return resolve_image_bytes(
+            image_file,
+            http_fetch=lambda url: download_remote_media(url, timeout=timeout),
+        )
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         return download_remote_media(image_file, timeout=timeout)
