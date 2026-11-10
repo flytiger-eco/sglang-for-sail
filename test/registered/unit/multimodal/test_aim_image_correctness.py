@@ -59,6 +59,13 @@ class TestImageInputContracts(unittest.TestCase):
                 self.assertEqual(self.read(source), self.payload)
         self.fetch.assert_not_called()
 
+    def test_bare_jpeg_base64_starting_with_slash_is_content(self):
+        payload = make_image_bytes(image_format="JPEG")
+        encoded = base64.b64encode(payload).decode()
+        self.assertTrue(encoded.startswith("/9j"))
+        self.assertEqual(self.read(encoded), payload)
+        self.fetch.assert_not_called()
+
     def test_url_delegates_to_existing_fetch_policy(self):
         source = "https://image.example/test.png?signature=private"
         self.assertEqual(self.read(source), self.payload)
