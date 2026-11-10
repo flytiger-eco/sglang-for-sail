@@ -5166,6 +5166,12 @@ class DeepseekV4ForCausalLM(nn.Module):
     def prepare_cp_inputs(self, forward_batch, **kwargs):
         """Pass full-sequence language inputs to the runner's CP boundary."""
         input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None:
+            # A vocab-parallel embedding all-reduces row-wise across TP ranks, which
+            # is only valid when every rank embeds the same ids. CP shards the rows
+            # instead, so embed the full sequence here (identical on all ranks) and
+            # let the runner shard the embeddings, never the ids.
+            input_embeds = self.get_input_embeddings()(forward_batch.input_ids)
         return input_embeds, forward_batch.positions, kwargs
 
     def get_input_embeddings(self) -> nn.Module:

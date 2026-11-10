@@ -295,5 +295,54 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
         runner.prefill_cp_bcg_input.select_replay_bucket_for_batch.assert_not_called()
 
 
+class TestDeepseekV41CPPrepareInputs(CustomTestCase):
+    """CP prefill must embed the FULL ids, never the per-rank row shards.
+
+    A vocab-parallel embedding finishes with a row-wise all-reduce across the TP
+    group, which is only valid when every rank embeds the same ids. CP shards the
+    rows instead, so ``prepare_cp_inputs`` has to hand the runner full-sequence
+    embeddings and let it shard the embeddings (not the ids).
+    """
+
+    class _FakeModel:
+        def __init__(self):
+            self.seen = []
+
+        def get_input_embeddings(self):
+            def embed(ids):
+                self.seen.append(ids)
+                return ids.unsqueeze(-1).float()
+
+            return embed
+
+    def _call(self, model, forward_batch, **kwargs):
+        return DeepseekV4ForCausalLM.prepare_cp_inputs(model, forward_batch, **kwargs)
+
+    def test_prefill_embeds_the_full_sequence(self):
+        model = self._FakeModel()
+        full_ids = torch.tensor([11, 22, 33, 44])
+        batch = NS(input_ids=full_ids, positions=torch.arange(4))
+
+        embeds, positions, kwargs = self._call(model, batch)
+
+        self.assertEqual(len(model.seen), 1)
+        self.assertEqual(model.seen[0].data_ptr(), full_ids.data_ptr())
+        self.assertTrue(torch.equal(embeds, full_ids.unsqueeze(-1).float()))
+        self.assertTrue(torch.equal(positions, batch.positions))
+        self.assertEqual(kwargs, {})
+
+    def test_supplied_embeddings_are_not_recomputed(self):
+        model = self._FakeModel()
+        batch = NS(input_ids=torch.tensor([1, 2]), positions=torch.arange(2))
+        given = torch.zeros(2, 3)
+
+        embeds, positions, kwargs = self._call(model, batch, input_embeds=given)
+
+        self.assertIs(embeds, given)
+        self.assertEqual(model.seen, [])
+        self.assertTrue(torch.equal(positions, batch.positions))
+        self.assertNotIn("input_embeds", kwargs)
+
+
 if __name__ == "__main__":
     unittest.main()
