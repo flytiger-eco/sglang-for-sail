@@ -255,6 +255,8 @@ class DsparkFoldedSampling(IntEnum):
 
 
 class Envs:
+    # Explicit opt-in; encoder-only mode keeps the BF16 visual default.
+    SGLANG_QUANTIZE_VIT = EnvBool(False)
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
     #   section; add a new one only when no current section is a clear fit.

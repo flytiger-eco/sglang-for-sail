@@ -70,6 +70,10 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
 )
+from sglang.srt.multimodal.aim_vision_policy import (
+    remap_vision_exclusions,
+    resolve_vision_quantization,
+)
 from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
@@ -85,6 +89,7 @@ from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
+    get_device_capability,
     is_cpu,
     is_npu,
     round_up,
@@ -101,6 +106,21 @@ if _is_npu:
     graph_runners_dict["npu"] = ViTNpuGraphRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _create_online_vision_quantization(name):
+    from sglang.srt.layers.quantization import get_quantization_config
+
+    quant_config = get_quantization_config(name)()
+    major, minor = get_device_capability()
+    if major is None or major * 10 + minor < quant_config.get_min_capability():
+        raise ValueError("Online FP8 vision quantization requires a supported CUDA GPU")
+    if torch.get_default_dtype() not in quant_config.get_supported_act_dtypes():
+        raise ValueError(
+            "Online FP8 vision quantization requires a supported activation dtype"
+        )
+    return quant_config
+
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -1284,6 +1304,7 @@ class Qwen3LLMModel(Qwen3Model):
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    supports_aim_vision_policy = True
 
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1314,14 +1335,40 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
+        mm_config = get_mm()
+        inherit_vision_quant = envs.SGLANG_QUANTIZE_VIT.get()
+        vision_policy_requested = (
+            mm_config.vision_quantization is not None
+            or mm_config.vision_model_path is not None
+            or inherit_vision_quant
+        )
+        if self.language_model_only and vision_policy_requested:
+            raise ValueError(
+                "AIM vision options require a checkpoint with a visual tower"
+            )
         if self.language_model_only:
             self.visual = None
         else:
+            vision_quant_config = resolve_vision_quantization(
+                mm_config.vision_quantization,
+                quant_config,
+                separate_weights=mm_config.vision_model_path is not None,
+                inherit_model=inherit_vision_quant,
+                create_online=_create_online_vision_quantization,
+            )
+            if vision_quant_config is not None:
+                if vision_quant_config.get_name() != "fp8":
+                    raise ValueError(
+                        "AIM vision quantization currently supports only FP8"
+                    )
+                vision_quant_config = remap_vision_exclusions(
+                    vision_quant_config, self.hf_to_sglang_mapper
+                )
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
-                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-                quant_config=None,
+                # Preserve the existing BF16 vision default. Both online FP8
+                # and checkpoint quantization inheritance are explicit opt-ins.
+                quant_config=vision_quant_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
