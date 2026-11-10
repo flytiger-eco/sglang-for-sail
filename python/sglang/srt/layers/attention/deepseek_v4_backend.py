@@ -71,6 +71,9 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer_quant import (
+    use_dsv41_int8_indexer,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -1583,6 +1586,12 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        query_head_dim = self.index_head_dim
+        if not use_dsv41_int8_indexer() and (
+            compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer
+        ):
+            # The PPU planner takes the stored Q width: two FP4 values per byte.
+            query_head_dim //= 2
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
@@ -1604,7 +1613,7 @@ class DeepseekV4AttnBackend(
                     c_seq_lens.shape[0] // rows_per_request,
                     rows_per_request,
                     self.index_n_heads,
-                    self.index_head_dim,
+                    query_head_dim,
                 )
             ),
         )
