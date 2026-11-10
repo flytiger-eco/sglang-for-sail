@@ -9,8 +9,8 @@ from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
 register_cuda_ci(est_time=600, stage="nightly", runner_config="4-gpu-gb300")
 
-MODEL_PATH = "deepseek-ai/DeepSeek-V4-Pro"
-SERVER_LAUNCH_TIMEOUT = 3600
+MODEL_PATH = "/nas_aisw/datasets/checkpoints/LLM/deepseek/v4/DeepSeek-V4-Pro-MXFP4-FP8"
+SERVER_LAUNCH_TIMEOUT = 5400
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 BALANCED_ARGS = [
