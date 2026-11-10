@@ -1107,6 +1107,13 @@ class Envs:
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    # PPU: produce the wq_b input quant inside the q_a RMSNorm launch instead
+    # of running a separate per-token quant kernel on its bf16 output. The
+    # fused launch saves one pass over the activation, but its variance
+    # reduction does not match flashinfer's kernel bit for bit (~1e-6 of the
+    # bf16 rows differ by one ulp), which the DSA indexer's top-k can amplify
+    # into different tokens. Off by default; turn on to accept that trade.
+    SGLANG_OPT_FUSED_Q_A_RMSNORM_QUANT = EnvBool(False)
     # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
