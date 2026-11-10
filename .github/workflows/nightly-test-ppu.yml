@@ -1440,6 +1440,7 @@ jobs:
               for model in MODELS:
                   by_name.setdefault(normalized(model.split('/')[-1]), []).append(model)
               matches = {model: [] for model in MODELS}
+              near_matches = {model: [] for model in MODELS}
               errors, visited = [], 0
               completed = True
               deadline = time.monotonic() + 900
@@ -1464,12 +1465,29 @@ jobs:
                           matches[model].append(str(current))
                       if (current / 'config.json').is_file() or (current / 'adapter_config.json').is_file():
                           subdirectories[:] = []
+                  current_name = normalized(current.name)
+                  for model in MODELS:
+                      target_name = normalized(model.split('/')[-1])
+                      if current_name == target_name or min(len(current_name), len(target_name)) < 6:
+                          continue
+                      if current_name not in target_name and target_name not in current_name:
+                          continue
+                      declared_repo = None
+                      try:
+                          declared_repo = json.loads((current / 'config.json').read_text()).get('_name_or_path')
+                      except (OSError, ValueError, AttributeError):
+                          pass
+                      if declared_repo == model:
+                          matches[model].append(str(current))
+                      elif len(near_matches[model]) < 20:
+                          near_matches[model].append(str(current))
               emit('PPU_CHECKPOINT_SCAN', {
                   'root': str(CHECKPOINTS), 'completed': completed,
                   'visited_directories': visited, 'errors': errors,
                   'matches': {model: len(paths) for model, paths in matches.items()},
+                  'near_matches': {model: paths for model, paths in near_matches.items() if paths},
               })
-              return matches, completed
+              return matches, near_matches, completed
 
           def offline_validate(model):
               result = {'core_ok': False, 'config_ok': False, 'tokenizer_ok': None, 'load_ok': False}
@@ -1506,6 +1524,15 @@ jobs:
                   result['config_ok'] = True
               except Exception as error:
                   result['config_error'] = type(error).__name__ + ': ' + str(error)
+                  if result['core_ok'] and metadata == 'config.json':
+                      try:
+                          from sglang.srt.configs.model_config import ModelConfig
+                          config = ModelConfig(model)
+                          result['sglang_config_ok'] = True
+                          result['sglang_config_class'] = type(config.hf_config).__name__
+                      except Exception as sglang_error:
+                          result['sglang_config_ok'] = False
+                          result['sglang_config_error'] = type(sglang_error).__name__ + ': ' + str(sglang_error)
               snapshot = Path(result['snapshot'])
               if metadata != 'adapter_config.json' and any((snapshot / name).is_file() for name in ('tokenizer_config.json', 'tokenizer.json', 'tokenizer.model')):
                   try:
@@ -1515,7 +1542,11 @@ jobs:
                   except Exception as error:
                       result['tokenizer_ok'] = False
                       result['tokenizer_error'] = type(error).__name__ + ': ' + str(error)
-              result['load_ok'] = result['core_ok'] and result['config_ok'] and result['tokenizer_ok'] is not False
+              result['load_ok'] = (
+                  result['core_ok']
+                  and (result['config_ok'] or result.get('sglang_config_ok', False))
+                  and result['tokenizer_ok'] is not False
+              )
               return result
 
           def write_revision(main, revision):
@@ -1571,7 +1602,7 @@ jobs:
 
           verify_layout_contract()
           emit('PPU_SYMLINK_LAYOUT_SELFTEST', {'ok': True})
-          checkpoint_matches, search_completed = find_checkpoints()
+          checkpoint_matches, near_matches, search_completed = find_checkpoints()
           rows = []
           for model in MODELS:
               print('PROCESSING_MODEL', model, flush=True)
@@ -1598,6 +1629,7 @@ jobs:
               row = {
                   'model': model, 'action': action, 'before': before,
                   'checkpoint_candidates': candidates,
+                  'near_checkpoint_candidates': near_matches[model],
                   'selected_checkpoint': selected[0]['path'] if selected else None,
                   'repair': repair, 'final': final,
               }
@@ -1627,7 +1659,7 @@ jobs:
                   stream.write('| %s | %s | %s | %s | %s |\n' % (
                       row['model'], row['action'],
                       row['selected_checkpoint'] or 'none',
-                      final.get('core_ok', False), final.get('config_ok', False),
+                      final.get('core_ok', False), final.get('load_ok', False),
                   ))
           PY
           cat > .ppu-sweep/models.sh <<'SH'
@@ -1639,6 +1671,7 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
           timeout --signal=TERM --kill-after=30s 1800s python3 .ppu-sweep/repair_models.py
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
