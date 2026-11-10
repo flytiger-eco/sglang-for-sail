@@ -4,6 +4,11 @@ run-name: PPU real test resource validation | ${{ github.run_id }}
 # Temporary diagnostic workflow. Restore the CUDA sweep after the run.
 on:
   workflow_dispatch:
+    inputs:
+      only_tests:
+        description: 'Optional comma-separated test IDs for a focused rerun'
+        required: false
+        default: ''
 
 concurrency:
   group: ppu-real-resource-validation
@@ -45,6 +50,8 @@ jobs:
           python-version: '3.12'
       - name: Build real-test validation bundle
         id: manifest
+        env:
+          ONLY_TESTS: ${{ inputs.only_tests }}
         run: |
           mkdir -p .ppu-resource/compat
           cat > .ppu-resource/build_manifest.py <<'PY'
@@ -174,6 +181,10 @@ jobs:
               resources.extend(item['resources'])
           assert len(TESTS) == 26
           assert len(resources) == 27 and len(set(resources)) == 27
+          selected = set(filter(None, os.environ.get('ONLY_TESTS', '').split(',')))
+          if selected:
+              TESTS = [item for item in TESTS if item['id'] in selected]
+              assert {item['id'] for item in TESTS} == selected
           (ROOT / '.ppu-resource/manifest.json').write_text(json.dumps({'tests': TESTS}, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write('matrix=' + json.dumps({'include': TESTS}, separators=(',', ':')) + '\n')
@@ -310,10 +321,15 @@ jobs:
                   mark for mark in item.own_markers
                   if mark.name not in ('skip', 'skipif')
               ]
-              for obj in (getattr(item, 'cls', None), getattr(item, 'obj', None)):
-                  if obj is not None:
+              method = getattr(item, 'obj', None)
+              for obj in (getattr(item, 'cls', None), getattr(method, '__func__', method)):
+                  if obj is None:
+                      continue
+                  try:
                       obj.__unittest_skip__ = False
                       obj.__unittest_skip_why__ = ''
+                  except (AttributeError, TypeError):
+                      pass
 
 
           def pytest_configure(config):
