@@ -31,20 +31,6 @@ _IMPORT_ERROR = ImportError(
 )
 
 
-def _require_legacy_kernels(op: str, use_legacy: bool) -> None:
-    """The PPU ``flash_mla`` wheel only builds FlashMLA's legacy kernel set.
-
-    ``use_legacy=False`` selects the V4.1 token-interleaved caches
-    (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``), which that wheel does not ship, so
-    reject it instead of running the legacy kernel against those layouts.
-    """
-    if not use_legacy:
-        raise NotImplementedError(
-            f"PPU FlashMLA does not support {op}(use_legacy=False): the PPU wheel "
-            "only carries the legacy kernels, not the V4.1 token-interleaved ones."
-        )
-
-
 # Add for nvtx profiling
 SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
 SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
@@ -136,8 +122,6 @@ def flash_mla_with_kvcache(
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
 
-    _require_legacy_kernels("flash_mla_with_kvcache", use_legacy)
-
     if kv_format not in (None, "V32"):
         raise NotImplementedError(
             f"PPU FlashMLA does not support explicit KV layout {kv_format!r}."
@@ -215,8 +199,6 @@ def flash_mla_sparse_fwd(
     """
     if _import_error is not None:
         raise _IMPORT_ERROR from _import_error
-
-    _require_legacy_kernels("flash_mla_sparse_fwd", use_legacy)
 
     return _flashmla.flash_mla_sparse_fwd(
         q,

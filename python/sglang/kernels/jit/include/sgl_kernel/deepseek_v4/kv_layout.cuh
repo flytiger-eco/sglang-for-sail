@@ -110,8 +110,15 @@ constexpr int64_t kv_page_bytes(int64_t page_size) {
   return (page_size * Traits::kBytesPerToken + Traits::kPageAlign - 1) / Traits::kPageAlign * Traits::kPageAlign;
 }
 
-/// Addressing of a paged cache of `1 << kPageBits` tokens per page, padded to kPageAlign:
-/// slot `i`'s data at `i * kDataStride`, its scales at `kScaleBase + i * kScaleStride`.
+/// Addressing of a paged cache: slot `i`'s data at `i * kDataStride`, its scales
+/// at `kScaleBase + i * kScaleStride`. The block-split layouts place all data
+/// rows first and then all scale rows; V41_NEW / V41_FP4_NEW interleave them so
+/// each token's scales are the tail of its own row, which is what the FlashMLA
+/// kernels on PPU read (`slot * bytes_per_token + data_bytes`; see
+/// FlashMLA-for-sail `csrc/ppu/decode/sparse/sparse_decode_wg.cuh`). Picking the
+/// wrong arrangement makes the reader treat neighbour data bytes as ue8m0
+/// exponents (scale = 2**(b-127), up to inf), overflow the logits and zero the
+/// attention output.
 template <KVLayout kLayout, uint32_t kPageBits>
 struct PagedKV {
   using Traits = KVLayoutTraits<kLayout>;
