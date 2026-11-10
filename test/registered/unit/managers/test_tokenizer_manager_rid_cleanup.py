@@ -115,6 +115,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     override.install()
     case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
+    tm._expanded_input_tasks = {}
     tm.server_args = MagicMock()
     tm._config_updates = []
     tm.server_args.enable_trace = False
@@ -405,6 +406,411 @@ class TestAbortOutputPayload(CustomTestCase):
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
+
+    def _parallel_lora_manager(self, texts, n, stream=False):
+        from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+
+        tm = _make_tokenizer_manager(self)
+        tm.enable_lora = True
+        tm.asyncio_tasks = set()
+        tm.lora_registry = LoRARegistry(
+            [
+                LoRARef(
+                    lora_id="adapter",
+                    lora_name="adapter-path",
+                    lora_path="/dummy/adapter",
+                )
+            ]
+        )
+        obj = GenerateReqInput(
+            text=texts,
+            sampling_params={"n": n, "max_new_tokens": 4},
+            lora_path="adapter-path",
+            stream=stream,
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        return tm, obj
+
+    def test_parallel_lora_samples_pin_adapter_through_warmup_and_unload(self):
+        """n-expanded owners must release once after all fresh-RID users finish."""
+        from types import SimpleNamespace
+
+        async def run(texts, n, stream):
+            tm, obj = self._parallel_lora_manager(texts, n, stream)
+            await tm.lora_registry.acquire("adapter-path")  # another live request
+            await tm._validate_and_resolve_lora(obj)
+            counter = tm.lora_registry._counters["adapter"]
+            await tm.lora_registry.unregister("adapter-path")
+            unload = asyncio.create_task(tm.lora_registry.wait_for_unload("adapter"))
+            users = []
+
+            async def tokenize(child):
+                return SimpleNamespace(
+                    rid=child.rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=4),
+                    stream=child.stream,
+                )
+
+            async def send(child):
+                tm._mark_state_dispatched(child.rid)
+                users.append(child.rid)
+                self.assertFalse(unload.done())
+                self.assertGreater(counter.value(), 1)
+
+            async def wait(child, request):
+                state = tm.rid_to_state[child.rid]
+                self.assertFalse(unload.done())
+                await tm._handle_batch_output(_make_batch_str_output(child.rid))
+                yield state.out_list[-1]
+
+            tm._tokenize_one_request = tokenize
+            tm._send_one_request = send
+            tm._wait_one_response = wait
+            try:
+                responses = [value async for value in tm._handle_batch_request(obj)]
+                if tm.asyncio_tasks:
+                    await asyncio.gather(*list(tm.asyncio_tasks))
+                self.assertEqual(len(users), obj.batch_size * (n + 1))
+                self.assertEqual(
+                    sum(len(v) if isinstance(v, list) else 1 for v in responses),
+                    obj.batch_size * n,
+                )
+                self.assertEqual(tm.rid_to_state, {})
+                self.assertEqual(counter.value(), 1)
+                self.assertFalse(unload.done())
+                await tm.lora_registry.release("adapter")
+                await asyncio.wait_for(unload, 1)
+                self.assertEqual(counter.value(), 0)
+            finally:
+                if not unload.done():
+                    unload.cancel()
+                await asyncio.gather(unload, return_exceptions=True)
+
+        for texts, n, stream in [
+            ("single", 2, False),
+            ("single", 2, True),
+            (["one", "two"], 3, False),
+        ]:
+            with self.subTest(texts=texts, n=n, stream=stream):
+                asyncio.run(run(texts, n, stream))
+
+    def test_parallel_lora_failure_keeps_dispatched_users_pinned(self):
+        """Construction failure/cancellation must wait for each GPU abort echo."""
+        from types import SimpleNamespace
+
+        async def run(mode):
+            tm, obj = self._parallel_lora_manager("single", 2)
+            await tm._validate_and_resolve_lora(obj)
+            counter = tm.lora_registry._counters["adapter"]
+            expected = dict(tm.rid_to_state)
+            request_rids = set(obj.rid)
+            inflight = []
+            sample_sends = 0
+
+            async def tokenize(child):
+                if mode == "tokenize_error":
+                    raise ValueError("tokenization failed")
+                return SimpleNamespace(
+                    rid=child.rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=4),
+                    stream=False,
+                )
+
+            async def send(child):
+                nonlocal sample_sends
+                if child.sampling_params.max_new_tokens:
+                    sample_sends += 1
+                    if sample_sends == 2:
+                        if mode == "send_cancel":
+                            raise asyncio.CancelledError()
+                        raise RuntimeError("dispatch failed")
+                    inflight.append(child.rid)
+                tm._mark_state_dispatched(child.rid)
+
+            async def wait(child, request):
+                state = tm.rid_to_state[child.rid]
+                await tm._handle_batch_output(_make_batch_str_output(child.rid))
+                yield state.out_list[-1]
+
+            tm._tokenize_one_request = tokenize
+            tm._send_one_request = send
+            tm._wait_one_response = wait
+            aborted = []
+            tm.abort_request = lambda rid: aborted.append(rid)
+            try:
+                async for _ in tm._handle_batch_request(obj, request_rids=request_rids):
+                    pass
+                self.fail("expected injected failure")
+            except (ValueError, RuntimeError, asyncio.CancelledError):
+                tm._release_req_states_on_failure(request_rids, expected)
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            if inflight:
+                self.assertEqual(counter.value(), 2)
+                self.assertEqual(set(aborted), set(inflight))
+                for rid in inflight:
+                    tm._handle_abort_req(_make_abort_req(rid))
+                if tm.asyncio_tasks:
+                    await asyncio.gather(*list(tm.asyncio_tasks))
+            self.assertEqual(counter.value(), 0)
+            self.assertEqual(tm.rid_to_state, {})
+
+        for mode in ("tokenize_error", "send_error", "send_cancel"):
+            with self.subTest(mode=mode):
+                asyncio.run(run(mode))
+
+    def test_parallel_lora_cannot_take_reused_input_rid(self):
+        """A late parallel handler must not pool a replacement owner's lease."""
+        from types import SimpleNamespace
+
+        async def run():
+            tm, obj = self._parallel_lora_manager("old", 2)
+            await tm._validate_and_resolve_lora(obj)
+            expected = dict(tm.rid_to_state)
+            reused = obj.rid[0]
+            tm._handle_abort_req(_make_abort_req(reused))
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            replacement = GenerateReqInput(
+                text="new", rid=reused, lora_path="adapter-path"
+            )
+            replacement.normalize_batch_and_arguments()
+            tm._init_req_state(replacement)
+            await tm._validate_and_resolve_lora(replacement)
+            new_state = tm.rid_to_state[reused]
+
+            async def tokenize(child):
+                return SimpleNamespace(
+                    rid=child.rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=4),
+                    stream=False,
+                )
+
+            async def send(child):
+                tm._mark_state_dispatched(child.rid)
+
+            async def wait(child, request):
+                state = tm.rid_to_state[child.rid]
+                await tm._handle_batch_output(_make_batch_str_output(child.rid))
+                yield state.out_list[-1]
+
+            tm._tokenize_one_request = tokenize
+            tm._send_one_request = send
+            tm._wait_one_response = wait
+            with self.assertRaisesRegex(ValueError, "no longer active"):
+                async for _ in tm._handle_batch_request(obj):
+                    pass
+            tm._release_req_states_on_failure(set(obj.rid), expected)
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            self.assertIs(tm.rid_to_state[reused], new_state)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+            tm._release_req_states_on_failure({reused})
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+
+        asyncio.run(run())
+
+    def test_parallel_lora_stream_cancel_waits_for_scheduler_completion(self):
+        """Closing a stream cannot release adapters still used by the GPU."""
+        from types import SimpleNamespace
+
+        async def run():
+            tm, obj = self._parallel_lora_manager("single", 2, True)
+            await tm._validate_and_resolve_lora(obj)
+            counter = tm.lora_registry._counters["adapter"]
+            expected = dict(tm.rid_to_state)
+            request_rids = set(obj.rid)
+            samples = []
+            waiting = asyncio.Event()
+
+            async def tokenize(child):
+                return SimpleNamespace(
+                    rid=child.rid,
+                    sampling_params=SimpleNamespace(max_new_tokens=4),
+                    stream=child.stream,
+                )
+
+            async def send(child):
+                tm._mark_state_dispatched(child.rid)
+                if child.sampling_params.max_new_tokens:
+                    samples.append(child.rid)
+
+            async def wait(child, request):
+                if child.rid in samples:
+                    waiting.set()
+                    await asyncio.Event().wait()
+                state = tm.rid_to_state[child.rid]
+                await tm._handle_batch_output(_make_batch_str_output(child.rid))
+                yield state.out_list[-1]
+
+            tm._tokenize_one_request = tokenize
+            tm._send_one_request = send
+            tm._wait_one_response = wait
+            aborted = []
+            tm.abort_request = lambda rid: aborted.append(rid)
+
+            async def consume():
+                try:
+                    async for _ in tm._handle_batch_request(
+                        obj, request_rids=request_rids
+                    ):
+                        pass
+                except BaseException:
+                    tm._release_req_states_on_failure(request_rids, expected)
+                    raise
+
+            task = asyncio.create_task(consume())
+            await asyncio.wait_for(waiting.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            self.assertEqual(counter.value(), 2)
+            self.assertEqual(set(aborted), set(samples))
+            for rid in samples:
+                tm._handle_abort_req(_make_abort_req(rid))
+            if tm.asyncio_tasks:
+                await asyncio.gather(*list(tm.asyncio_tasks))
+            self.assertEqual(counter.value(), 0)
+            self.assertEqual(tm.rid_to_state, {})
+
+        asyncio.run(run())
+
+    def test_client_lora_id_cannot_release_an_unacquired_reference(self):
+        """Pre-admission validation must not decrement another owner's adapter."""
+
+        async def run():
+            from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+
+            tm = _make_tokenizer_manager(self)
+            tm.enable_lora = True
+            tm.lora_registry = LoRARegistry(
+                [
+                    LoRARef(
+                        lora_id="adapter",
+                        lora_name="adapter-path",
+                        lora_path="/dummy/adapter",
+                    )
+                ]
+            )
+            await tm.lora_registry.acquire("adapter-path")  # another live request
+            obj = GenerateReqInput(
+                text="invalid",
+                rid="rejected",
+                lora_path="adapter-path",
+                lora_id="adapter",
+            )
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            tm._release_req_states_on_failure({"rejected"})
+            await asyncio.sleep(0)
+            self.assertNotIn("rejected", tm.rid_to_state)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+            await tm.lora_registry.release("adapter")
+
+        asyncio.run(run())
+
+    def test_successful_lora_acquire_records_each_batch_owner(self):
+        """Batch cleanup must release the acquired IDs despite input mutation."""
+
+        async def run():
+            from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+
+            tm = _make_tokenizer_manager(self)
+            tm.enable_lora = True
+            tm.lora_registry = LoRARegistry(
+                [
+                    LoRARef(
+                        lora_id="adapter",
+                        lora_name="adapter-path",
+                        lora_path="/dummy/adapter",
+                    )
+                ]
+            )
+            await tm.lora_registry.acquire("adapter-path")  # another live request
+            obj = GenerateReqInput(
+                text=["a", "b"],
+                rid=["first", "second"],
+                lora_path=["adapter-path", "adapter-path"],
+            )
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+            await tm._validate_and_resolve_lora(obj)
+            for state in tm.rid_to_state.values():
+                state.obj.lora_id = "caller-mutated-id"
+            tm._release_req_states_on_failure({"first", "second"})
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertEqual(tm.lora_registry._counters["adapter"].value(), 1)
+            self.assertEqual(tm.rid_to_state, {})
+            await tm.lora_registry.release("adapter")
+
+        asyncio.run(run())
+
+    def test_lora_usage_retires_once_across_batch_abort_and_consumer(self):
+        """One completed owner must not decrement another owner's adapter usage."""
+
+        async def run():
+            for completion in ("batch", "abort_echo"):
+                for status in (400, 502, 504):
+                    with self.subTest(completion=completion, status=status):
+                        tm = _make_tokenizer_manager(self)
+                        tm.enable_lora = True
+                        from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+
+                        tm.lora_registry = LoRARegistry(
+                            [
+                                LoRARef(
+                                    lora_id="adapter",
+                                    lora_name="adapter-path",
+                                    lora_path="/dummy/adapter",
+                                )
+                            ]
+                        )
+                        await tm.lora_registry.acquire("adapter-path")
+                        await tm.lora_registry.acquire("adapter-path")
+                        state = _make_req_state("lora")
+                        state.obj.lora_path = "adapter-path"
+                        state.obj.lora_id = "adapter"
+                        state.lora_acquired_id = "adapter"
+                        state.obj.stream = True
+                        tm.rid_to_state["lora"] = state
+                        reason = {
+                            "type": "abort",
+                            "message": "request failed",
+                            "status_code": status,
+                        }
+                        if completion == "batch":
+                            await tm._handle_batch_output(
+                                _make_batch_str_output("lora", finished_reason=reason)
+                            )
+                        else:
+                            tm._handle_abort_req(
+                                AbortReq(rid="lora", finished_reason=reason)
+                            )
+                        out = state.out_list[-1]
+                        # The response consumer can run before the scheduled release.
+                        await tm._handle_abort_finish_reason(out, state, True)
+                        await tm._handle_abort_finish_reason(out, state, True)
+                        await asyncio.sleep(0)
+                        self.assertNotIn("lora", tm.rid_to_state)
+                        self.assertEqual(
+                            tm.lora_registry._counters["adapter"].value(), 1
+                        )
+                        await tm.lora_registry.unregister("adapter-path")
+                        unload = asyncio.create_task(
+                            tm.lora_registry.wait_for_unload("adapter")
+                        )
+                        await asyncio.sleep(0)
+                        self.assertFalse(unload.done())
+                        await tm.lora_registry.release("adapter")
+                        await unload
+
+        asyncio.run(run())
 
     def test_batch_output_removes_rid_on_finish(self):
         """When a request finishes in _handle_batch_output, rid should be removed."""

@@ -529,6 +529,8 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
         aux["original_image_sizes"] = _normalize_aux_value(
             mm_inputs.get("original_image_sizes")
         )
+    if mm_inputs.get("image_pruning_indices") is not None:
+        aux["image_pruning_indices"] = mm_inputs["image_pruning_indices"]
     return aux
 
 
@@ -548,6 +550,12 @@ class MMEncoder:
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
+        self.image_pruning_rate = getattr(server_args, "image_pruning_rate", 0.0)
+        if self.image_pruning_rate > 0:
+            if server_args.encoder_transfer_backend != "zmq_to_tokenizer":
+                raise ValueError("Image pruning currently requires zmq_to_tokenizer")
+            if server_args.enable_mm_global_cache:
+                raise ValueError("Image pruning requires metadata-aware local cache; global cache is unsupported")
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -1125,6 +1133,29 @@ class MMEncoder:
                     mm_item.set(key, value)
         return mm_items
 
+    def _collect_image_pruning_indices(self, items, grids, embedding):
+        """Validate the model's authoritative retained rows, never infer them from rate."""
+        indices = []
+        for item in items:
+            kept = getattr(item, "image_pruning_indices", None)
+            if kept is None:
+                raise ValueError("Pruned image embedding is missing retained indices")
+            indices.extend(kept)
+        self._validate_image_pruning_indices(indices, grids, embedding)
+        return [list(row) for row in indices]
+
+    def _validate_image_pruning_indices(self, indices, grids, embedding):
+        if indices is None or len(indices) != len(grids):
+            raise ValueError("Image pruning metadata/grid count mismatch")
+        for row, grid in zip(indices, grids):
+            original_count = self.preprocessor.get_num_tokens(grid, Modality.IMAGE)
+            expected = max(1, int(original_count * (1.0 - self.image_pruning_rate)))
+            if (len(row) != expected or any(type(i) is not int for i in row)
+                    or row != sorted(set(row)) or row[0] < 0 or row[-1] >= original_count):
+                raise ValueError("Invalid retained image indices")
+        if sum(map(len, indices)) != embedding.shape[0]:
+            raise ValueError("Pruned embedding rows do not match retained image indices")
+
     async def _prepare_encode_context(
         self,
         requests: List[dict],
@@ -1250,7 +1281,8 @@ class MMEncoder:
         if local_error is None:
             try:
                 assert ctx is not None
-                await self._publish_preprocess_metadata(ctx, requests)
+                if not (self.image_pruning_rate > 0 and modality == Modality.IMAGE):
+                    await self._publish_preprocess_metadata(ctx, requests)
             except Exception as e:
                 local_error = e
                 error_phase = 2
@@ -1738,6 +1770,7 @@ class MMEncoder:
             )
 
             cache_hit = False
+            pruning_indices = None
             # The prefix cache hashes the whole request; a fused multi-request
             # batch has no per-request key, so only N=1 contexts use it.
             use_mm_cache = (
@@ -1750,11 +1783,14 @@ class MMEncoder:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
                 mm_hashes = [mm_item.hash for mm_item in mm_items]
+                if self.image_pruning_rate > 0 and modality == Modality.IMAGE:
+                    mm_hashes.append(hash(("qwen38-image-pruning-v1", "attention_score", self.image_pruning_rate)))
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
                     mm_cache = self.mm_cache.get(mm_hashes)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
+                        pruning_indices = mm_cache.image_pruning_indices
                         cache_hit = True
 
             if mm_embedding is None:
@@ -1769,6 +1805,17 @@ class MMEncoder:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
                     )
+
+            if self.image_pruning_rate > 0 and modality == Modality.IMAGE:
+                if cache_hit:
+                    self._validate_image_pruning_indices(
+                        pruning_indices, ctx.preprocess_result.grid_thw, mm_embedding
+                    )
+                else:
+                    pruning_indices = self._collect_image_pruning_indices(
+                        mm_items, ctx.preprocess_result.grid_thw, mm_embedding
+                    )
+                self._apply_pruning_metadata(ctx, pruning_indices, mm_embedding)
 
             try:
                 self._validate_embedding_token_count(ctx, mm_embedding)
@@ -1799,7 +1846,10 @@ class MMEncoder:
                     entries_before = len(self.mm_cache)
                     already_present = self.mm_cache.has(mm_hash)
                     inserted = self.mm_cache.set(
-                        mm_hash, EmbeddingResult(embedding=mm_embedding)
+                        mm_hash, EmbeddingResult(
+                            embedding=mm_embedding,
+                            image_pruning_indices=pruning_indices,
+                        )
                     )
                     entries_after = len(self.mm_cache)
                     if encoder_metrics_collector is not None:
@@ -1847,6 +1897,15 @@ class MMEncoder:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
+
+    def _apply_pruning_metadata(self, ctx, indices, embedding):
+        self._validate_image_pruning_indices(
+            indices, ctx.preprocess_result.grid_thw, embedding
+        )
+        indices = [list(row) for row in indices]
+        ctx.preprocess_result.token_counts = [len(row) for row in indices]
+        ctx.preprocess_result.mm_inputs["image_pruning_indices"] = indices
+        ctx.aux_data["image_pruning_indices"] = indices
 
     async def _compute_embedding(
         self,
@@ -2162,6 +2221,10 @@ class MMEncoder:
                     # A view would pin the whole batch tensor until the last transfer.
                     embedding = embedding.clone()
                 req_aux_data = dict(ctx.aux_data)
+                if ctx.aux_data.get("image_pruning_indices") is not None:
+                    req_aux_data["image_pruning_indices"] = ctx.aux_data[
+                        "image_pruning_indices"
+                    ][item_offset:item_end]
                 if ctx.aux_data.get("original_image_sizes") is not None:
                     req_aux_data["original_image_sizes"] = ctx.aux_data[
                         "original_image_sizes"
@@ -2251,6 +2314,8 @@ class MMEncoder:
                 is_health_check=is_health_check,
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
+            if self.image_pruning_rate > 0 and modality == Modality.IMAGE:
+                await self._publish_preprocess_metadata(ctx, requests)
 
             if self.profiler is not None:
                 for _ in requests:

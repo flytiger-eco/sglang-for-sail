@@ -30,12 +30,13 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.test_utils import enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _FakeReq:
+class _FakeReq(ReqDouble):
     def __init__(
         self,
         rid,

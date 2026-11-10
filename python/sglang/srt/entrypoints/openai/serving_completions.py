@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.disaggregation.expanded_input import original_pair_key
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -125,6 +126,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            bootstrap_pair_key=original_pair_key(request, raw_request),
             routed_dp_rank=effective_routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
@@ -357,14 +359,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # /abort_request or session lifecycle cleanup) falls through
                 # to the normal chunk path, matching the non-stream behavior
                 # in tokenizer_manager._handle_abort_finish_reason.
-                if finish_reason_type == "abort" and isinstance(
-                    finish_reason.get("status_code"), HTTPStatus
+                status_code = (finish_reason or {}).get("status_code")
+                if (
+                    finish_reason_type == "abort"
+                    and isinstance(status_code, int)
+                    and not isinstance(status_code, bool)
                 ):
-                    code = finish_reason["status_code"]
+                    try:
+                        error_type = HTTPStatus(status_code).name
+                    except ValueError:
+                        error_type = "ServerError"
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
-                        code.name,
-                        code.value,
+                        error_type,
+                        int(status_code),
                     )
                     yield f"data: {error}\n\n"
                     break

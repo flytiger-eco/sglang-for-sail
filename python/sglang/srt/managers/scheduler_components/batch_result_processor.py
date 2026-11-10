@@ -151,7 +151,7 @@ class SchedulerBatchResultProcessor:
         if capturer is None:
             return
         start_len = req.routed_experts_start_len
-        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        seqlen = req.effective_input_len + len(req.output_ids_through_stop)
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,
@@ -181,7 +181,7 @@ class SchedulerBatchResultProcessor:
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
-        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+        seqlen = req.effective_input_len + len(req.output_ids_through_stop)
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.kv.req_pool_idx,
             seqlen=seqlen,
@@ -1493,7 +1493,7 @@ class SchedulerBatchResultProcessor:
             "mamba track boundary reached before a decode token was appended "
             f"(req {req.rid}); output_ids is empty"
         )
-        token_seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        token_seq_len = req.effective_input_len + len(req.output_ids) - 1
         assert (req.kv.kv_committed_len - token_seq_len) in (0, 1), (
             f"mamba track boundary: kv_committed_len={req.kv.kv_committed_len} "
             f"leads seq_len={token_seq_len} by more than one (req {req.rid}); "

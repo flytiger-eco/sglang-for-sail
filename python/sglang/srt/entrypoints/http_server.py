@@ -67,6 +67,7 @@ from fastapi.routing import APIRoute
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.expanded_input import original_pair_key
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -437,6 +438,9 @@ async def lifespan(fast_api_app: FastAPI):
         # Start the HTTP server
         yield
     finally:
+        manager = getattr(_global_state, "tokenizer_manager", None)
+        if isinstance(manager, TokenizerManager):
+            await manager.close_decode_control()
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -916,6 +920,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    obj.bootstrap_pair_key = original_pair_key(obj, request)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -924,6 +929,18 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     obj, request
                 ):
                     yield b"data: " + dumps_json(out) + b"\n\n"
+            except HTTPException as e:
+                out = {
+                    "error": {
+                        "message": str(e.detail),
+                        "type": "server_error"
+                        if e.status_code >= 500
+                        else "invalid_request_error",
+                        "code": e.status_code,
+                        "retryable": e.status_code == 429 or e.status_code >= 500,
+                    }
+                }
+                yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1659,13 +1676,85 @@ async def configure_logging(
     return Response(status_code=200)
 
 
+@app.post("/v1/expanded_input_len")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def expanded_input_len(raw_request: Request):
+    """Receive Prefill's exact multimodal-expanded prompt length."""
+    try:
+        body = await raw_request.json()
+    except (ValueError, UnicodeDecodeError):
+        return ORJSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return ORJSONResponse({"error": "JSON body must be an object"}, status_code=400)
+    rid = body.get("rid")
+    if type(rid) not in (str, int) or not 1 <= len(str(rid)) <= 128:
+        return ORJSONResponse({"error": "invalid bootstrap room"}, status_code=400)
+    pair_key = body.get("bootstrap_pair_key")
+    if not isinstance(pair_key, str) or not 1 <= len(pair_key) <= 128:
+        return ORJSONResponse({"error": "invalid bootstrap_pair_key"}, status_code=400)
+    if body.get("query_generation") is True:
+        manager = _global_state.tokenizer_manager
+        try:
+            current_generation = manager.get_expanded_input_generation(
+                str(rid), pair_key
+            )
+        except ValueError as error:
+            return ORJSONResponse({"error": str(error)}, status_code=409)
+        if current_generation is None:
+            return ORJSONResponse(
+                {"status": "waiting_for_decode_request"}, status_code=202
+            )
+        return ORJSONResponse({"request_generation": current_generation})
+    generation = body.get("request_generation")
+    if not isinstance(generation, str) or not 1 <= len(generation) <= 128:
+        return ORJSONResponse({"error": "invalid request_generation"}, status_code=400)
+    expanded_len = body.get("expanded_input_len")
+    if (
+        not isinstance(expanded_len, int)
+        or isinstance(expanded_len, bool)
+        or expanded_len <= 0
+    ):
+        return ORJSONResponse(
+            {"error": "expanded_input_len must be a positive integer"},
+            status_code=400,
+        )
+    delta = body.get("mrope_position_delta")
+    version = body.get("metadata_version")
+    if type(delta) is not int or type(version) is not int or version != 2:
+        return ORJSONResponse(
+            {"error": "integer mrope_position_delta and metadata_version=2 required"},
+            status_code=400,
+        )
+    if not (
+        0 < expanded_len < 2**63
+        and -(2**63) <= delta < 2**63
+        and 0 < expanded_len + delta < 2**63
+    ):
+        return ORJSONResponse(
+            {"error": "invalid MRoPE continuation position"}, status_code=400
+        )
+    manager = _global_state.tokenizer_manager
+    try:
+        current_generation = manager.get_expanded_input_generation(str(rid), pair_key)
+    except ValueError as error:
+        return ORJSONResponse({"error": str(error)}, status_code=409)
+    if generation != current_generation:
+        return ORJSONResponse(
+            {"error": "stale generation or unknown Decode room"}, status_code=409
+        )
+    manager.notify_expanded_input_len(
+        str(rid), expanded_len, delta, generation, version
+    )
+    return ORJSONResponse({"status": "ok"})
+
+
 @app.post("/abort_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid, abort_all=obj.abort_all, exact=obj.exact
         )
         return Response(status_code=200)
     except Exception as e:

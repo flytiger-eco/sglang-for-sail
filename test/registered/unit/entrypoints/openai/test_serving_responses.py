@@ -1193,6 +1193,7 @@ class EnginePassthroughTestCase(CustomTestCase):
                 bootstrap_host="10.0.0.1",
                 bootstrap_port=8998,
                 bootstrap_room=42,
+                bootstrap_pair_key="original-pair",
                 routed_dp_rank=1,
                 disagg_prefill_dp_rank=0,
                 store=False,
@@ -1204,6 +1205,7 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertEqual(adapted_request.bootstrap_host, "10.0.0.1")
         self.assertEqual(adapted_request.bootstrap_port, 8998)
         self.assertEqual(adapted_request.bootstrap_room, 42)
+        self.assertEqual(adapted_request.bootstrap_pair_key, "original-pair")
         self.assertEqual(adapted_request.routed_dp_rank, 2)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 

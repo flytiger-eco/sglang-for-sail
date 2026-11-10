@@ -45,3 +45,36 @@ SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 python3 -m pytest -q \
 End-to-end feature activation, performance and multimodal comparisons are recorded
 separately for each tested source revision and container image. Unit-test success
 alone does not establish end-to-end correctness.
+
+## Position-aware image pruning
+
+Adapted from 6fb0d26d6e, including the required expanded-length handoff from
+15bed020e9. Set --image-pruning-rate (default 0, valid range [0,1)) and
+--image-pruning-strategy attention_score consistently on E/P/D. The supported
+encoder path is eager TP1, without DP vision, using
+SGLANG_VIT_ENABLE_CUDA_GRAPH=0 and zmq_to_tokenizer transport. Global multimodal
+cache is rejected; the local embedding cache preserves retained indices.
+
+Prefill uses --language-only and --disagg-decode-urls pointing to Decode.
+Decode uses --language-only. Pruning enables the expanded-length handoff;
+SGLANG_DISAGG_EXPANDED_INPUT_LEN=1 also enables it independently. Prefill sends
+the final prompt length and MRoPE continuation delta in one versioned message
+before Decode allocates KV. Early messages, duplicates, conflicts, and missing
+metadata have bounded handling.
+
+Attention importance selects rows after the visual merger. Selected indices
+remain in original raster order and select all DeepStack columns together.
+The original grid supplies MRoPE coordinates; image placeholders, embedding row
+counts, and request lengths use the retained indices.
+
+Run test/manual/epd_pruning with RUN_VISION_GPU_SMOKE=1 for the real two-layer
+PPU model and dense attention-score numerical reference, in addition to CPU
+cache/transport/metadata tests.
+
+
+The pruning port uses the generation-aware expanded-input handoff from
+`daee1ae624`. Set `SGLANG_DISAGG_EXPANDED_INPUT_LEN=1` on Prefill and Decode,
+configure `--disagg-decode-urls`, and send a fresh `X-Request-ID` per paired
+request when using an older gateway. Unsupported configurations fail at startup.
+Image pruning still preserves retained spatial indices through the encoder cache
+and transport, including caller-supplied hashes and DeepStack channels.

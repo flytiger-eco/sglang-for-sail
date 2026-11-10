@@ -950,6 +950,7 @@ class GenerateReqInput:
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
             image_data=self.image_data[i],
+            need_wait_for_mm_inputs=False,
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
@@ -1033,6 +1034,12 @@ class GenerateReqInput:
                 if self.token_indices_to_pool is not None
                 else None
             ),
+        )
+        sub._needs_expanded_input_len = getattr(
+            self, "_needs_expanded_input_len", False
+        )
+        sub.need_wait_for_mm_inputs = bool(
+            self.need_wait_for_mm_inputs and sub.contains_mm_input()
         )
         cache[i] = sub
         return sub
@@ -1151,6 +1158,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+
+    # Exact multimodal-expanded prompt length is supplied asynchronously by Prefill.
+    needs_expanded_input_len: bool = False
+    expanded_input_generation: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2187,6 +2198,14 @@ class AbortReq(BaseReq, kw_only=True):
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
 
+    # Append fields to preserve older positional IPC senders.
+    exact: bool = False
+
+    def matches(self, rid: str) -> bool:
+        return self.abort_all or (
+            rid == self.rid if self.exact else rid.startswith(self.rid)
+        )
+
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
@@ -2198,6 +2217,19 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
     error_msg: str
     error_code: int
+
+
+class ExpandedInputLenReq(BaseReq, kw_only=True):
+    request_generation: str
+    expanded_input_len: int
+    mrope_position_delta: int
+    metadata_version: int = 2
+
+
+class ExpandedInputLenReleaseReq(BaseReq, kw_only=True):
+    """Retire one HTTP owner's metadata on all Decode DP workers."""
+
+    request_generation: str
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):

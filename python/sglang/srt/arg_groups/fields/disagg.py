@@ -56,6 +56,15 @@ class Disagg(msgspec.Struct):
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
+    disagg_decode_urls: A[
+        List[str],
+        "Direct Decode URLs used for expanded multimodal metadata.",
+    ] = msgspec.field(default_factory=list)
+    disagg_decode_control_key: A[
+        Optional[str],
+        "Outbound Decode control API credential. Defaults to this server's "
+        "admin/API key; set it explicitly when P and D use different keys.",
+    ] = None
     disaggregation_transfer_backend: A[
         str,
         Arg(

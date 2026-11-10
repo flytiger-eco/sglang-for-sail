@@ -49,6 +49,12 @@ class Mm(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs
     # -------------------------------------------------------------------------
+    image_pruning_rate: A[
+        float, "Fraction of post-merger image tokens to remove (0 <= rate < 1).",
+    ] = 0.0
+    image_pruning_strategy: A[
+        Literal["attention_score"], "Image token importance strategy.",
+    ] = "attention_score"
     enable_broadcast_mm_inputs_process: A[
         bool,
         "Enable broadcast mm-inputs process in scheduler.",

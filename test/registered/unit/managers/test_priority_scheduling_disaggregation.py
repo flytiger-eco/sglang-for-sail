@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: 
 from sglang.srt.runtime_context import get_context, publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.separate_buffer_allocator_double import (
     bind_separate_buffer_capacity,
 )
@@ -417,7 +418,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
     def _new_decode_req(self, rid: str, priority: int, *, failed: bool = False):
-        req = SimpleNamespace(
+        req = ReqDouble(
             rid=rid,
             priority=priority,
             origin_input_ids=[1, 2, 3],
@@ -633,7 +634,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         )
 
     def _new_req(self):
-        return SimpleNamespace(
+        return ReqDouble(
             rid="rid-0",
             origin_input_ids=np.array([1, 2], dtype=np.int32),
             output_ids=[np.int32(3), np.int32(4)],

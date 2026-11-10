@@ -455,8 +455,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue.pp_size = 1
 
         req = MagicMock()
+        req.needs_expanded_input_len = False
+        req.expanded_input_len = None
+        req.skip_radix_cache_insert = False
         req.rid = "req-1"
         req.origin_input_ids = list(range(8))
+        req.effective_input_len = len(req.origin_input_ids)
         req.output_ids = [99]
         req.last_node = object()
         req.finished_reason = None
@@ -568,6 +572,9 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         q.tree_cache = MagicMock()
 
         req = MagicMock()
+        req.needs_expanded_input_len = False
+        req.expanded_input_len = None
+        req.skip_radix_cache_insert = False
         req.req_pool_idx = 0
         req.lock_receipt = DecLockRefParams(
             component_lock_uuids={ComponentType.SWA: 123}

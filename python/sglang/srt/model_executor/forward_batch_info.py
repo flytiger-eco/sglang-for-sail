@@ -1523,6 +1523,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     .unsqueeze(0)
                     .repeat(3, 1)
                 )
+            elif mm_input.mrope_positions is None:
+                mrope_positions = self._expand_mrope_from_input(
+                    mm_input, extend_prefix_len + 1
+                ) + torch.arange(extend_seq_len)
             else:
                 mrope_positions = mm_input.mrope_positions[
                     :,

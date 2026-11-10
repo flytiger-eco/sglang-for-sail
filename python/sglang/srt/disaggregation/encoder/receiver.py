@@ -520,7 +520,7 @@ _GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
 )
-_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes",)
+_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes", "image_pruning_indices")
 # MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",
@@ -2038,13 +2038,17 @@ class MMReceiverBase(ABC):
         existing FAIL channel. AbortReq is broadcast, so every TP rank does
         this and the status all-reduce stays consistent."""
         for waiting_req in self.waiting_list:
-            if not (recv_req.abort_all or waiting_req.rid.startswith(recv_req.rid)):
+            if not (recv_req.matches(waiting_req.rid)):
                 continue
             if waiting_req.status in (
                 WaitingMMRequestStatus.PENDING,
                 WaitingMMRequestStatus.SUCCESS,
             ):
-                waiting_req._fail_and_release("Aborted by user", error_code=400)
+                reason = recv_req.finished_reason or {}
+                waiting_req._fail_and_release(
+                    reason.get("message", "Aborted by user"),
+                    error_code=reason.get("status_code") or 400,
+                )
                 waiting_req.release_resources()
                 logger.info(f"Abort waiting mm request. rid={waiting_req.rid}")
 

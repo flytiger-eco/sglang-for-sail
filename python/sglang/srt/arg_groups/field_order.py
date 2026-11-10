@@ -523,5 +523,8 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_decode_host_receive_threshold",
     "vision_quantization",
     "vision_model_path",
+    "image_pruning_rate",
+    "image_pruning_strategy",
+    "disagg_decode_urls",
 )
 # fmt: on

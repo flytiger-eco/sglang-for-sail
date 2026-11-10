@@ -383,6 +383,13 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        pair_key = getattr(req, "_expanded_input_pair_key", None)
+        if (
+            backend == TransferBackend.MOONCAKE
+            and envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+            and pair_key is not None
+        ):
+            req.disagg_kv_sender.set_prealloc_abort_pair_key(pair_key)
         self._process_req(req)
         req.pending_bootstrap = True
         return True

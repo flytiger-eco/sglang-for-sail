@@ -257,7 +257,7 @@ class SchedulerOutputStreamer:
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
                 embeddings.append(req.embedding)
-                prompt_tokens.append(len(req.origin_input_ids))
+                prompt_tokens.append(req.effective_input_len)
                 cached_tokens.append(req.cached_tokens)
 
                 # Collect detailed cache breakdown if available
@@ -458,7 +458,7 @@ class _GenerationStreamAccumulator:
         output_ids_ = req.output_ids_through_stop
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.prompt_tokens.append(len(req.origin_input_ids))
+        self.prompt_tokens.append(req.effective_input_len)
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (

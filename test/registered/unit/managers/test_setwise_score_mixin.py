@@ -21,6 +21,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -615,7 +616,7 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         reqs = []
         for idx, phs in enumerate(phs_per_req):
             reqs.append(
-                SimpleNamespace(
+                ReqDouble(
                     finished=lambda: True,
                     rid=f"rid-{idx}",
                     http_worker_ipc=None,

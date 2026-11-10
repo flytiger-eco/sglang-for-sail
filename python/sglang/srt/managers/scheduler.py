@@ -139,6 +139,8 @@ from sglang.srt.managers.io_struct import (
     DumperControlReqInput,
     DumperControlReqOutput,
     EndWeightUpdateReqInput,
+    ExpandedInputLenReleaseReq,
+    ExpandedInputLenReq,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -1797,6 +1799,8 @@ class Scheduler(
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (ShutdownReq, self.handle_shutdown),
+                (ExpandedInputLenReq, self.handle_expanded_input_len),
+                (ExpandedInputLenReleaseReq, self.handle_expanded_input_release),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
@@ -1823,6 +1827,27 @@ class Scheduler(
                 ),
             ]
         )
+
+    def handle_expanded_input_len(self, notification: ExpandedInputLenReq) -> None:
+        if self.disagg_decode_prealloc_queue is None:
+            logger.warning(
+                "Ignoring expanded input length outside Decode mode: rid=%s",
+                notification.rid,
+            )
+            return
+        self.disagg_decode_prealloc_queue.set_expanded_input_len(
+            str(notification.rid),
+            notification.expanded_input_len,
+            notification.mrope_position_delta,
+            notification.request_generation,
+            notification.metadata_version,
+        )
+
+    def handle_expanded_input_release(self, notification: ExpandedInputLenReleaseReq):
+        if self.disagg_decode_prealloc_queue is not None:
+            self.disagg_decode_prealloc_queue.release_expanded_input_len(
+                str(notification.rid), notification.request_generation
+            )
 
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
@@ -2513,7 +2538,7 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
-        input_len = len(req.origin_input_ids)
+        input_len = req.effective_input_len
         max_new_tokens = (
             req.sampling_params.max_new_tokens
             if req.sampling_params.max_new_tokens is not None
@@ -2819,6 +2844,13 @@ class Scheduler(
                 token_indices_to_pool=recv_req.token_indices_to_pool,
             )
             req.tokenizer = self.tokenizer
+            req.needs_expanded_input_len = getattr(
+                recv_req, "needs_expanded_input_len", False
+            )
+            req._expanded_input_generation = getattr(
+                recv_req, "expanded_input_generation", None
+            )
+            req._expanded_input_pair_key = recv_req.bootstrap_pair_key
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3040,70 +3072,80 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
-            # When return_logprob is False, logprob_start_len should be ignored
-            recv_req.logprob_start_len = -1
-
-        if recv_req.logprob_start_len == -1:
-            if recv_req.return_logprob and recv_req.token_ids_logprob is None:
-                # If logprob is required but neither token_ids_logprob nor logprob_start_len is
-                # set, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids)
-            elif req.is_prefill_only:
-                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
-                # beyond input sequence to skip input logprob computation entirely
-                req.logprob_start_len = len(req.origin_input_ids)
-            else:
-                # If return_logprob is False, only the last token requires logprob computation
-                req.logprob_start_len = -1
-        else:
-            req.logprob_start_len = recv_req.logprob_start_len
-
-        if req.logprob_start_len > len(req.origin_input_ids):
-            error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
-            req.logprob_start_len = -1
-            req.set_finish_with_abort(error_msg)
-            self._add_request_to_queue(req)
-            return
-
-        if (
-            get_device().mlx_enable_sampling
-            and req.return_logprob
-            and 0 <= req.logprob_start_len < len(req.origin_input_ids)
-        ):
-            # The MLX sampling path computes output logprobs only; the
-            # prefill result carries no input_token_logprobs, so letting
-            # this through would crash output processing.
-            error_msg = (
-                "Prompt input logprobs (logprob_start_len) are not supported "
-                "on the MLX sampling path; omit logprob_start_len to get "
-                "output logprobs."
+        if req.needs_expanded_input_len:
+            req._deferred_position_options = (
+                recv_req.return_logprob,
+                recv_req.logprob_start_len,
+                recv_req.token_ids_logprob,
+                recv_req.return_routed_experts,
+                recv_req.routed_experts_start_len,
             )
             req.logprob_start_len = -1
-            req.set_finish_with_abort(error_msg)
-            self._add_request_to_queue(req)
-            return
+        else:
+            if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
+                # When return_logprob is False, logprob_start_len should be ignored
+                recv_req.logprob_start_len = -1
 
-        if recv_req.return_routed_experts:
-            error_msg = None
-            if recv_req.routed_experts_start_len < 0:
-                error_msg = (
-                    f"{recv_req.routed_experts_start_len=} is lower than 0. "
-                    "Please use a non-negative routed_experts_start_len."
-                )
+            if recv_req.logprob_start_len == -1:
+                if recv_req.return_logprob and recv_req.token_ids_logprob is None:
+                    # If logprob is required but neither token_ids_logprob nor logprob_start_len is
+                    # set, return the logprobs for output tokens by default
+                    req.logprob_start_len = len(req.origin_input_ids)
+                elif req.is_prefill_only:
+                    # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
+                    # beyond input sequence to skip input logprob computation entirely
+                    req.logprob_start_len = len(req.origin_input_ids)
+                else:
+                    # If return_logprob is False, only the last token requires logprob computation
+                    req.logprob_start_len = -1
+            else:
+                req.logprob_start_len = recv_req.logprob_start_len
 
-            if recv_req.routed_experts_start_len > len(req.origin_input_ids):
-                error_msg = (
-                    f"{recv_req.routed_experts_start_len=} is higher than the "
-                    f"number of input tokens {len(req.origin_input_ids)=}. Please "
-                    f"use a smaller routed_experts_start_len."
-                )
-
-            if error_msg is not None:
-                req.routed_experts_start_len = 0
+            if req.logprob_start_len > len(req.origin_input_ids):
+                error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+                req.logprob_start_len = -1
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
+
+            if (
+                get_device().mlx_enable_sampling
+                and req.return_logprob
+                and 0 <= req.logprob_start_len < len(req.origin_input_ids)
+            ):
+                # The MLX sampling path computes output logprobs only; the
+                # prefill result carries no input_token_logprobs, so letting
+                # this through would crash output processing.
+                error_msg = (
+                    "Prompt input logprobs (logprob_start_len) are not supported "
+                    "on the MLX sampling path; omit logprob_start_len to get "
+                    "output logprobs."
+                )
+                req.logprob_start_len = -1
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
+
+            if recv_req.return_routed_experts:
+                error_msg = None
+                if recv_req.routed_experts_start_len < 0:
+                    error_msg = (
+                        f"{recv_req.routed_experts_start_len=} is lower than 0. "
+                        "Please use a non-negative routed_experts_start_len."
+                    )
+
+                if recv_req.routed_experts_start_len > len(req.origin_input_ids):
+                    error_msg = (
+                        f"{recv_req.routed_experts_start_len=} is higher than the "
+                        f"number of input tokens {len(req.origin_input_ids)=}. Please "
+                        f"use a smaller routed_experts_start_len."
+                    )
+
+                if error_msg is not None:
+                    req.routed_experts_start_len = 0
+                    req.set_finish_with_abort(error_msg)
+                    self._add_request_to_queue(req)
+                    return
 
         if get_parallel().pp_rank == 0 and getattr(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
@@ -3560,7 +3602,13 @@ class Scheduler(
             # The request moved to another scheduler queue after abort_request
             # deferred it, so retry against its current location.
             self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
+            self.abort_request(
+                AbortReq(
+                    rid=req.rid,
+                    exact=True,
+                    finished_reason=getattr(req, "_requested_abort_reason", None),
+                )
+            )
             return
 
         prepare_abort(req, "Aborted")
@@ -5446,7 +5494,9 @@ class Scheduler(
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
+                if recv_req.finished_reason is not None:
+                    chunked_req._requested_abort_reason = recv_req.finished_reason
                 self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
@@ -5457,7 +5507,9 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+            if recv_req.matches(req.rid):
+                if recv_req.finished_reason is not None:
+                    req._requested_abort_reason = recv_req.finished_reason
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -5491,8 +5543,10 @@ class Scheduler(
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
+                recv_req.abort_all, recv_req.rid, exact=recv_req.exact
             ):
+                if recv_req.finished_reason is not None:
+                    req._requested_abort_reason = recv_req.finished_reason
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
@@ -5511,7 +5565,9 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # Abort requests that have not yet been bootstrapped
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
+                    if recv_req.finished_reason is not None:
+                        req._requested_abort_reason = recv_req.finished_reason
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     self._release_aborted_request(req)
 
@@ -5522,7 +5578,9 @@ class Scheduler(
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                if recv_req.matches(req.rid):
+                    if recv_req.finished_reason is not None:
+                        req._requested_abort_reason = recv_req.finished_reason
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
@@ -5530,7 +5588,11 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
+                    if recv_req.finished_reason is not None:
+                        decode_req.req._requested_abort_reason = (
+                            recv_req.finished_reason
+                        )
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
                     if get_parallel().pp_size > 1:
@@ -5538,7 +5600,11 @@ class Scheduler(
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                if recv_req.matches(decode_req.req.rid):
+                    if recv_req.finished_reason is not None:
+                        decode_req.req._requested_abort_reason = (
+                            recv_req.finished_reason
+                        )
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if decode_req.host_staged:
                         # Keep the host destination alive until prefill stops writing.
@@ -5553,7 +5619,11 @@ class Scheduler(
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                    if recv_req.matches(decode_req.rid):
+                        if recv_req.finished_reason is not None:
+                            decode_req._requested_abort_reason = (
+                                recv_req.finished_reason
+                            )
                         discard_kv_cache_backup(
                             decode_req,
                             self.tree_cache,
@@ -5568,14 +5638,18 @@ class Scheduler(
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if not req.finished() and (recv_req.matches(req.rid)):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                if recv_req.abort_message:
+                if recv_req.finished_reason is not None:
+                    req._requested_abort_reason = recv_req.finished_reason
+                    req.to_finish = FINISH_ABORT(
+                        recv_req.finished_reason["message"],
+                        recv_req.finished_reason.get("status_code"),
+                    )
+                elif recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
                     req.to_finish = FINISH_ABORT(
                         recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
@@ -5647,6 +5721,18 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and req.needs_expanded_input_len
+            ):
+                req.set_finish_with_abort(
+                    "Expanded-input multimodal rebootstrap is unsupported",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    err_type="ServiceUnavailableError",
+                )
+                req.finished_reason = req.to_finish
+                self.output_streamer.stream_output([req], req.return_logprob)
+                continue
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
@@ -6119,7 +6205,8 @@ def _make_abort_req(
 ) -> AbortReq:
     return AbortReq(
         rid=req.rid,
-        finished_reason=finished_reason,
+        finished_reason=finished_reason
+        or getattr(req, "_requested_abort_reason", None),
         weight_versions=compute_weight_version_spans(
             req.weight_version_events,
             current_version=get_serving().weight_version,

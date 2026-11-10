@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.req_double import ReqDouble
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -74,7 +75,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         return scheduler
 
     def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
-        return SimpleNamespace(
+        return ReqDouble(
             rid="test-req",
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(

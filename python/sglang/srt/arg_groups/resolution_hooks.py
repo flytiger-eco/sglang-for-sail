@@ -27,6 +27,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_model_source_paths",
         "handle_multimodal",
         "handle_vision_policy",
+        "handle_image_pruning",
         "handle_ssl_validation",
         "handle_asr_validation",
         "handle_deprecated_args",
