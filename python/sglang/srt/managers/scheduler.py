@@ -87,6 +87,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
+from sglang.srt.disaggregation.expanded_input import expanded_input_pair_key
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -2850,7 +2851,9 @@ class Scheduler(
             req._expanded_input_generation = getattr(
                 recv_req, "expanded_input_generation", None
             )
-            req._expanded_input_pair_key = recv_req.bootstrap_pair_key
+            req._expanded_input_pair_key = expanded_input_pair_key(
+                recv_req, self.disaggregation_mode
+            )
 
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(

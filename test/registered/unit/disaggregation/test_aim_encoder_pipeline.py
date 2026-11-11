@@ -7,22 +7,27 @@ are substituted; the preparation queue and scheduler methods are unchanged.
 
 import ast
 import asyncio
-import concurrent.futures
-import contextlib
+
+# These imports also populate the namespace for AST-loaded runtime methods.
+import concurrent.futures  # noqa: F401
+import contextlib  # noqa: F401
 import contextvars
 import enum
 import importlib.util
 import logging
-from pathlib import Path
 import threading
-import time
-from collections import defaultdict
-from http import HTTPStatus
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+import time  # noqa: F401
 import unittest
-import uuid
+import uuid  # noqa: F401
+from collections import defaultdict  # noqa: F401
+from http import HTTPStatus
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple  # noqa: F401
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = ROOT / "python/sglang/srt/disaggregation/encoder/runtime.py"
@@ -48,36 +53,69 @@ class Modality(enum.Enum):
 
 def load_scheduler():
     names = {
-        "MMError", "BadRequestError", "InternalError", "PendingRequest",
-        "EncoderScheduler", "_handle_encoder_worker_request",
+        "MMError",
+        "BadRequestError",
+        "InternalError",
+        "PendingRequest",
+        "EncoderScheduler",
+        "_handle_encoder_worker_request",
     }
     server_tree = ast.parse(SERVER.read_text())
     tree = ast.parse(SOURCE.read_text())
-    nodes = [n for n in server_tree.body if getattr(n, "name", None) in
-             {"MMError", "BadRequestError", "InternalError", "_handle_encoder_worker_request"}]
-    nodes += [n for n in tree.body if getattr(n, "name", None) in
-              {"PendingRequest", "EncoderScheduler", "validate_encode_request"}]
+    nodes = [
+        n
+        for n in server_tree.body
+        if getattr(n, "name", None)
+        in {
+            "MMError",
+            "BadRequestError",
+            "InternalError",
+            "_handle_encoder_worker_request",
+        }
+    ]
+    nodes += [
+        n
+        for n in tree.body
+        if getattr(n, "name", None)
+        in {"PendingRequest", "EncoderScheduler", "validate_encode_request"}
+    ]
     namespace = dict(globals())
     namespace.update(
         logger=logging.getLogger("aim-encoder-test"),
         cuda_failure_detected=lambda: False,
         _BATCHABLE_MODALITIES={Modality.IMAGE, Modality.AUDIO},
-        zmq=SimpleNamespace(Socket=object), MMEncoder=object,
+        zmq=SimpleNamespace(Socket=object),
+        MMEncoder=object,
         ProfileReq=type("ProfileReq", (), {}),
-        envs=SimpleNamespace(SGLANG_AIM_ENCODER_MAX_PENDING=SimpleNamespace(get=lambda: 2)),
+        envs=SimpleNamespace(
+            SGLANG_AIM_ENCODER_MAX_PENDING=SimpleNamespace(get=lambda: 2)
+        ),
         sock_send=lambda socket, message: socket.append(message),
         wrap_as_pickle=lambda message: message,
-        server_module=SimpleNamespace(ENCODER_REQ_TIMEOUT=5, encoder_metrics_collector=None),
+        server_module=SimpleNamespace(
+            ENCODER_REQ_TIMEOUT=5, encoder_metrics_collector=None
+        ),
     )
     # Error classes precede EncoderScheduler's default arguments.
-    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), namespace
+    )
     for name in ["MMError", "BadRequestError", "InternalError"]:
         setattr(namespace["server_module"], name, namespace[name])
-    encoder = next(n for n in server_tree.body if getattr(n, "name", None) == "MMEncoder")
-    prepare = next(n for n in encoder.body if getattr(n, "name", None) == "_prepare_encode_context_on_all_ranks")
+    encoder = next(
+        n for n in server_tree.body if getattr(n, "name", None) == "MMEncoder"
+    )
+    prepare = next(
+        n
+        for n in encoder.body
+        if getattr(n, "name", None) == "_prepare_encode_context_on_all_ranks"
+    )
     namespace["EncodeContext"] = object
     namespace["_preprocess_layout_digest"] = lambda ctx: (1, 2)
-    exec(compile(ast.Module(body=[prepare], type_ignores=[]), str(SERVER), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[prepare], type_ignores=[]), str(SERVER), "exec"),
+        namespace,
+    )
     return namespace
 
 
@@ -87,8 +125,11 @@ EncoderScheduler = NS["EncoderScheduler"]
 
 def request(index, modality="image"):
     return {
-        "req_id": str(index), "modality": modality, "mm_items": [index],
-        "num_parts": 1, "part_idx": 0,
+        "req_id": str(index),
+        "modality": modality,
+        "mm_items": [index],
+        "num_parts": 1,
+        "part_idx": 0,
     }
 
 
@@ -96,6 +137,7 @@ async def eventually(predicate):
     async def wait():
         while not predicate():
             await asyncio.sleep(0.001)
+
     await asyncio.wait_for(wait(), 2)
 
 
@@ -281,8 +323,10 @@ class TestEncoderPipeline(unittest.IsolatedAsyncioTestCase):
                 scheduler.start()
                 try:
                     results = await asyncio.gather(
-                        *(scheduler.submit(request(i, modality))
-                          for i, modality in enumerate(modalities)),
+                        *(
+                            scheduler.submit(request(i, modality))
+                            for i, modality in enumerate(modalities)
+                        ),
                         return_exceptions=True,
                     )
                     for modality, result in zip(modalities, results):
@@ -385,7 +429,9 @@ class TestEncoderPipeline(unittest.IsolatedAsyncioTestCase):
         finally:
             await scheduler.stop()
 
-    async def test_canceled_prepared_request_finishes_tp_order_and_releases_result(self):
+    async def test_canceled_prepared_request_finishes_tp_order_and_releases_result(
+        self,
+    ):
         release = threading.Event()
 
         async def prepare(_):
@@ -404,6 +450,8 @@ class TestEncoderPipeline(unittest.IsolatedAsyncioTestCase):
             await tasks[0]
             await eventually(lambda: len(encoder.forwarded) == 2)
             self.assertEqual(encoder.forwarded, [["0"], ["1"]])
+            # Forwarding is observed before the scheduler's awaited cleanup.
+            await eventually(lambda: "1" not in encoder.embedding_to_send)
             self.assertNotIn("1", encoder.embedding_to_send)
         finally:
             await scheduler.stop()
@@ -413,20 +461,28 @@ class TestEncoderPipeline(unittest.IsolatedAsyncioTestCase):
         queue = CPUPreparationQueue()
         main_thread = threading.get_ident()
         sync_threads = []
+
         async def prepare():
             return SimpleNamespace()
+
         def sync(error, **kwargs):
             self.assertIsNone(error)
             sync_threads.append(threading.get_ident())
             raise NS["BadRequestError"]("Image preprocessing failed on another TP rank")
+
         queue.submit("batch", prepare)
-        encoder = SimpleNamespace(_aim_preparation=queue, image_pruning_rate=.5,
-                                  _sync_tp_prepare_status=sync)
+        encoder = SimpleNamespace(
+            _aim_preparation=queue, image_pruning_rate=0.5, _sync_tp_prepare_status=sync
+        )
         try:
             with self.assertRaisesRegex(NS["BadRequestError"], "another TP rank"):
                 await NS["_prepare_encode_context_on_all_ranks"](
-                    encoder, [request(0)], Modality.IMAGE,
-                    use_global_cache=False, prepared_batch_id="batch")
+                    encoder,
+                    [request(0)],
+                    Modality.IMAGE,
+                    use_global_cache=False,
+                    prepared_batch_id="batch",
+                )
             self.assertEqual(sync_threads, [main_thread])
         finally:
             queue.close()
@@ -450,14 +506,24 @@ class TestEncoderPipeline(unittest.IsolatedAsyncioTestCase):
         handler = NS["_handle_encoder_worker_request"]
         requests = [request(0)]
         try:
-            await handler(encoder, {
-                "type": "prepare_batch", "batch_id": "batch0",
-                "requests": requests, "modality": "IMAGE",
-            })
-            await handler(encoder, {
-                "type": "batch_encode", "prepared_batch_id": "batch0",
-                "requests": requests, "modality": "IMAGE",
-            })
+            await handler(
+                encoder,
+                {
+                    "type": "prepare_batch",
+                    "batch_id": "batch0",
+                    "requests": requests,
+                    "modality": "IMAGE",
+                },
+            )
+            await handler(
+                encoder,
+                {
+                    "type": "batch_encode",
+                    "prepared_batch_id": "batch0",
+                    "requests": requests,
+                    "modality": "IMAGE",
+                },
+            )
             self.assertEqual(encoder.prepared, [["0"]])
             self.assertEqual(encoder.forwarded, [["0"]])
             await handler(encoder, {"type": "close_preparation"})

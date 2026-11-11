@@ -434,14 +434,19 @@ class TestExpandedInputReview(CustomTestCase):
         """TLS credentials must follow API/control-key readback protections."""
         import pickle
 
-        from sglang.srt.utils.config_dump import redact_config_for_dump
+        from sglang.srt.utils.config_dump import (
+            capture_engine_command,
+            redact_config_for_dump,
+        )
 
         password = "tls-sentinel-password"
         args = ServerArgs(model_path="dummy", ssl_keyfile_password=password)
         import msgspec
 
         msgspec.Struct.__setattr__(
-            args, "_launch_command", "sglang --ssl-keyfile-password " + password
+            args,
+            "_launch_command",
+            capture_engine_command({"ssl_keyfile_password": password}),
         )
         publish(args, role="tokenizer")
         self.assertEqual(args.resolved_dict()["ssl_keyfile_password"], "<redacted>")
@@ -468,16 +473,14 @@ class TestExpandedInputReview(CustomTestCase):
 
         import msgspec
 
-        from sglang.srt.utils.config_dump import SECRET_FIELDS
+        from sglang.srt.utils.config_dump import SECRET_FIELDS, capture_engine_command
 
         values = {name: name + "-sentinel\nquoted'\\tail" for name in SECRET_FIELDS}
         args = ServerArgs(model_path="dummy", **values)
         msgspec.Struct.__setattr__(
             args,
             "_launch_command",
-            "Engine("
-            + ", ".join(f"{name}={key!r}" for name, key in values.items())
-            + ")",
+            capture_engine_command(values),
         )
         publish(args, role="tokenizer")
         for name, key in values.items():

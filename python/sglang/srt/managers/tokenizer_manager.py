@@ -1160,6 +1160,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids = []
             else:
                 from sglang.srt.multimodal.aim_metrics import image_stage
+
                 image_sources = (
                     obj.image_data
                     if isinstance(obj.image_data, list)
@@ -1288,7 +1289,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         input_text=mm_processor_input,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
-                        **({"_preloaded_images": preloaded_images} if preloaded_images is not None else {}),
+                        **(
+                            {"_preloaded_images": preloaded_images}
+                            if preloaded_images is not None
+                            else {}
+                        ),
                     )
             elif (
                 get_disagg().language_only
@@ -4162,7 +4167,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             except asyncio.CancelledError:
                 pass
             except Exception as error:
-                logger.exception("Expanded input length notification failed")
+                from sglang.srt.utils.config_dump import redact_url_userinfo
+
+                # Client exceptions may retain an unsanitized request URL in
+                # their traceback or chained exception. Log only safe text.
+                logger.error(
+                    "Expanded input length notification failed: %s",
+                    redact_url_userinfo(str(error)),
+                )
                 state = self.rid_to_state.get(request_rid)
                 if state is owner and state is not None and not state.finished:
                     if isinstance(error, PermissionError):
@@ -4269,6 +4281,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         import aiohttp
 
+        from sglang.srt.utils.config_dump import redact_url_userinfo
+
         urls = list(
             dict.fromkeys(
                 url.rstrip("/") + "/v1/expanded_input_len"
@@ -4281,6 +4295,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         deadline = time.monotonic() + envs.SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT.get()
 
         async def query(url):
+            safe_url = redact_url_userinfo(url)
             async with session.post(
                 url,
                 json={
@@ -4296,15 +4311,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     return url, None
                 if response.status in (401, 403):
                     raise PermissionError(
-                        f"Decode control authentication failed: HTTP {response.status} at {url}"
+                        f"Decode control authentication failed: HTTP {response.status} at {safe_url}"
                     )
                 if 400 <= response.status < 500 and response.status != 429:
                     raise ValueError(
-                        f"Decode owner query rejected: HTTP {response.status} at {url}"
+                        f"Decode owner query rejected: HTTP {response.status} at {safe_url}"
                     )
                 if response.status != 200:
                     raise ConnectionError(
-                        f"Decode owner temporarily unavailable: HTTP {response.status} at {url}"
+                        f"Decode owner temporarily unavailable: HTTP {response.status} at {safe_url}"
                     )
                 data = await response.json()
                 generation = data.get("request_generation")
@@ -4313,6 +4328,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return url, generation
 
         async def notify(url, generation):
+            safe_url = redact_url_userinfo(url)
             payload = {
                 "rid": rid,
                 "expanded_input_len": expanded_len,
@@ -4335,7 +4351,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             return
                         if 400 <= response.status < 500 and response.status != 429:
                             raise ValueError(
-                                f"Decode rejected metadata: HTTP {response.status} at {url}"
+                                f"Decode rejected metadata: HTTP {response.status} at {safe_url}"
                             )
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     pass
@@ -4343,7 +4359,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await asyncio.sleep(
                     min(0.1 * attempt, 1, max(0, deadline - time.monotonic()))
                 )
-            raise RuntimeError(f"Decode metadata delivery timed out at {url}")
+            raise RuntimeError(f"Decode metadata delivery timed out at {safe_url}")
 
         async def poll_owner(url):
             while time.monotonic() < deadline:

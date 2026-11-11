@@ -24,6 +24,7 @@ import logging
 from array import array
 from collections import deque
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -193,6 +194,7 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.bootstrap_overlap = envs.SGLANG_DISAGG_BOOTSTRAP_OVERLAP.get()
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -362,7 +364,7 @@ class PrefillBootstrapQueue:
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
         """Create a KV sender for the request without enqueuing it.
-        Returns False if the request exceeds KV capacity."""
+        Returns False if KV or cancellation replay admission rejects the request."""
         if self._check_if_req_exceed_kv_capacity(req):
             return False
 
@@ -371,25 +373,60 @@ class PrefillBootstrapQueue:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
             else self.transfer_backend
         )
-        kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
-
-        dest_tp_ranks = [self.tp_rank]
-
-        req.disagg_kv_sender = kv_sender_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
-            bootstrap_room=req.bootstrap_room,
-            dest_tp_ranks=dest_tp_ranks,
-            pp_rank=self.pp_rank,
-            req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
-        )
         pair_key = getattr(req, "_expanded_input_pair_key", None)
-        if (
+        paired_abort = (
             backend == TransferBackend.MOONCAKE
             and envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
             and pair_key is not None
-        ):
-            req.disagg_kv_sender.set_prealloc_abort_pair_key(pair_key)
+        )
+        if paired_abort:
+            reserved = self.kv_manager.reserve_prealloc_abort(
+                req.bootstrap_room, pair_key
+            )
+            # Admission must agree across P ranks before any creates a sender:
+            # otherwise their bootstrap queues and later collectives diverge.
+            admitted = (
+                poll_and_all_reduce_attn_cp_tp_group(
+                    [
+                        SimpleNamespace(
+                            poll=lambda: KVPoll.Success if reserved else KVPoll.Failed
+                        )
+                    ],
+                    self.scheduler.attn_cp_cpu_group,
+                    self.scheduler.attn_tp_cpu_group,
+                )[0]
+                == KVPoll.Success
+            )
+            if not admitted:
+                self.kv_manager.release_prealloc_abort_reservation(
+                    req.bootstrap_room, pair_key
+                )
+                prepare_abort(
+                    req,
+                    "Preallocation cancellation replay capacity exhausted; retry later",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.scheduler.retire_unadmitted_request(req)
+                return False
+
+        kv_sender_class = get_kv_class(backend, KVClassType.SENDER)
+        try:
+            req.disagg_kv_sender = kv_sender_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                dest_tp_ranks=[self.tp_rank],
+                pp_rank=self.pp_rank,
+                req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            )
+            if paired_abort:
+                req.disagg_kv_sender.set_prealloc_abort_pair_key(pair_key)
+        except Exception:
+            if paired_abort:
+                self.kv_manager.release_prealloc_abort_reservation(
+                    req.bootstrap_room, pair_key
+                )
+            raise
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -518,7 +555,11 @@ class PrefillBootstrapQueue:
                 failed_reqs.append(req)
             elif poll == KVPoll.Bootstrapping:
                 if (
-                    req.prefill_attempt_count < get_disagg().optimistic_prefill_attempts
+                    (
+                        self.bootstrap_overlap
+                        or req.prefill_attempt_count
+                        < get_disagg().optimistic_prefill_attempts
+                    )
                     and not req.is_retracted  # engine paused
                     and not (
                         _uses_write_through_cache(self.scheduler.tree_cache)
@@ -528,7 +569,8 @@ class PrefillBootstrapQueue:
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
-                    req.prefill_attempt_count += 1
+                    if not self.bootstrap_overlap:
+                        req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
@@ -1266,7 +1308,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
-                elif self.has_bootstrapped_waiting_req():
+                elif (
+                    self.has_bootstrapped_waiting_req()
+                    and not self.disagg_prefill_bootstrap_queue.bootstrap_overlap
+                ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
                     if not self.enable_overlap:
