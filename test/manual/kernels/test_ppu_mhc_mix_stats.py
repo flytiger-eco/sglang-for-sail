@@ -1,6 +1,7 @@
 """PPU row-tiled mHC reduction: numerical, batch and Graph regressions.
 
-Run with python test/registered/kernels/ops/layernorm/test_ppu_mhc_mix_stats.py.
+Run with python test/manual/kernels/test_ppu_mhc_mix_stats.py.
+Kept manual until the PPU runner has a registered kernel-test suite.
 """
 
 import unittest
@@ -9,10 +10,7 @@ from unittest.mock import patch
 import torch
 import triton
 
-from sglang.test.ci.ci_register import register_ppu_ci
 from sglang.test.test_utils import CustomTestCase
-
-register_ppu_ci(est_time=120, suite="stage-b-test-1-gpu-ppu")
 
 
 class TestMhcMixStatsPPU(CustomTestCase):
@@ -35,14 +33,49 @@ class TestMhcMixStatsPPU(CustomTestCase):
             def __getitem__(self, grid):
                 def launch(*args, **kwargs):
                     kwargs["BLOCK_M"] = block_m
-                    return kernel[(triton.cdiv(x.shape[0], block_m),)](
-                        *args, **kwargs
-                    )
+                    return kernel[(triton.cdiv(x.shape[0], block_m),)](*args, **kwargs)
 
                 return launch
 
         with patch.object(self.mhc, "_hc_mix_stats_reduce_kernel", OriginalReduce()):
             return self.mhc.hc_mix_stats(x, fn, 1e-6)
+
+    def test_reduce_launch_tiles(self):
+        kernel = self.mhc._hc_mix_stats_reduce_kernel
+        calls = []
+
+        class RecordingReduce:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    calls.append((grid, kwargs["BLOCK_M"]))
+                    return kernel[grid](*args, **kwargs)
+
+                return launch
+
+        cases = (
+            (8, 20480, 24, True),
+            (9, 20480, 24, True),
+            (2048, 20480, 24, True),
+            (2049, 20480, 24, True),
+            (32, 16384, 24, True),
+            (32, 20480, 16, True),
+            (32, 20480, 24, False),
+        )
+        for rows, k, mix, sail in cases:
+            with self.subTest(rows=rows, k=k, mix=mix, sail=sail):
+                x = torch.zeros(rows, k, device="cuda", dtype=torch.bfloat16)
+                fn = torch.zeros(mix, k, device="cuda", dtype=torch.float32)
+                calls.clear()
+                with patch.object(self.mhc, "_is_sail", sail), patch.object(
+                    self.mhc, "_hc_mix_stats_reduce_kernel", RecordingReduce()
+                ):
+                    self.mhc.hc_mix_stats(x, fn, 1e-6)
+                expected = (
+                    8
+                    if sail and 8 < rows <= 2048 and k == 20480 and mix == 24
+                    else self.mhc._block_m_for(rows)
+                )
+                self.assertEqual(calls, [((triton.cdiv(rows, expected),), expected)])
 
     def test_reference_batch_invariance_and_boundaries(self):
         shapes = (1, 2, 4, 8, 9, 16, 32, 64, 128, 256, 512, 1024, 2048, 2049)
