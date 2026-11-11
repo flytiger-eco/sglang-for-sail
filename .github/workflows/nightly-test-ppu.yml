@@ -277,7 +277,13 @@ jobs:
                       raise FileNotFoundError(_SHAREGPT_PATH)
                   resource_event('dataset_file', 'success', repo_id=repo_id, filename=filename, actual=_SHAREGPT_PATH)
                   return _SHAREGPT_PATH
-              fields = {'repo_id': repo_id, 'filename': filename, 'repo_type': kwargs.get('repo_type', 'model')}
+              fields = {
+                  'repo_id': repo_id,
+                  'filename': filename,
+                  'repo_type': kwargs.get('repo_type', 'model'),
+                  'revision': kwargs.get('revision'),
+                  'subfolder': kwargs.get('subfolder'),
+              }
               resource_event('hub_file', 'start', **fields)
               try:
                   result = _original_hf_hub_download(repo_id, filename, *args, **kwargs)
@@ -330,7 +336,11 @@ jobs:
                   if mark.name not in ('skip', 'skipif')
               ]
               method = getattr(item, 'obj', None)
-              for obj in (getattr(item, 'cls', None), getattr(method, '__func__', method)):
+              for obj in (
+                  getattr(item, 'cls', None),
+                  getattr(item, 'instance', None),
+                  getattr(method, '__func__', method),
+              ):
                   if obj is None:
                       continue
                   try:
