@@ -366,11 +366,16 @@ jobs:
               method_name = target.rsplit('::', 1)[-1]
               method = getattr(cls, method_name, None)
               if getattr(method, '__unittest_skip__', False):
+                  original = getattr(method, '__wrapped__', None)
+                  if original is not None:
+                      setattr(cls, method_name, original)
+                      method = original
                   method.__unittest_skip__ = False
                   method.__unittest_skip_why__ = ''
                   resource_event(
                       'plugin', 'method_unskip',
                       class_name=cls.__name__, method_name=method_name,
+                      restored_wrapper=original is not None,
                   )
 
 
