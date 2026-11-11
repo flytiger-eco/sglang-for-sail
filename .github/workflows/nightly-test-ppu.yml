@@ -350,6 +350,21 @@ jobs:
                       pass
 
 
+          def pytest_collectstart(collector):
+              if os.environ.get('FORCE_UNSKIP') != '1':
+                  return
+              cls = getattr(collector, 'obj', None)
+              if not isinstance(cls, type):
+                  return
+              target = os.environ.get('TEST_TARGET', '')
+              if f'::{cls.__name__}::' not in target:
+                  return
+              if getattr(cls, '__unittest_skip__', False):
+                  cls.__unittest_skip__ = False
+                  cls.__unittest_skip_why__ = ''
+                  resource_event('plugin', 'class_unskip', class_name=cls.__name__)
+
+
           def pytest_configure(config):
               resource_event(
                   'plugin', 'configure',
