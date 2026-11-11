@@ -619,10 +619,31 @@ class CommonKVManager(BaseKVManager):
             if targets is None:
                 targets = self._room_notify_targets(bootstrap_room)
             status = self._update_status_locked(bootstrap_room, status)
-            pending = _PendingKVStatus(status, failure_reason)
-            self._pending_status_notifications.setdefault(bootstrap_room, []).append(
-                pending
+            pending = self._track_status_notification_locked(
+                bootstrap_room, status, failure_reason
             )
+        return self._send_tracked_status_notification(
+            bootstrap_room=bootstrap_room, targets=targets, pending=pending
+        )
+
+    def _track_status_notification_locked(
+        self, bootstrap_room: int, status: KVPoll, failure_reason: Optional[str]
+    ) -> _PendingKVStatus:
+        """Retain a committed notification while holding failure_lock."""
+        pending = _PendingKVStatus(status, failure_reason)
+        self._pending_status_notifications.setdefault(bootstrap_room, []).append(
+            pending
+        )
+        return pending
+
+    def _send_tracked_status_notification(
+        self,
+        *,
+        bootstrap_room: int,
+        targets: List[Tuple[str, int]],
+        pending: _PendingKVStatus,
+    ) -> KVPoll:
+        """Send outside failure_lock and retire exactly this notification."""
         try:
             # The scheduler may observe the terminal status and clear the room
             # now. The latch preserves this committed notification, including
@@ -630,8 +651,8 @@ class CommonKVManager(BaseKVManager):
             self.send_kv_status_message(
                 targets=targets,
                 bootstrap_room=bootstrap_room,
-                status=status,
-                failure_reason=failure_reason,
+                status=pending.status,
+                failure_reason=pending.failure_reason,
                 _pending_status=pending,
             )
         finally:

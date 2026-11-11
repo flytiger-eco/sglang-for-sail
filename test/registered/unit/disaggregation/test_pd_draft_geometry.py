@@ -198,6 +198,8 @@ class TestPDDraftGeometry(CustomTestCase):
                     mgr.custom_mem_pool_type = ""
                     mgr.max_transfer_batch_indices = 0
                     mgr.attn_tp_size = 16
+                    mgr.dcp_size = 1
+                    mgr.dcp_rank = 0
                     mgr.is_mla_backend = True
                     mgr.is_hybrid_mla_backend = False
                     mgr._validate_envelope_kv_layout = lambda *args: None
@@ -218,6 +220,7 @@ class TestPDDraftGeometry(CustomTestCase):
                         dst_kv_item_len=page_bytes,
                         dst_kv_layer_ids=[0, 1],
                         dst_draft_entry_count=1,
+                        dst_draft_metadata_present=True,
                         dst_draft_token_major=True,
                         dst_draft_head_num=2,
                         dst_draft_total_head_num=16,
@@ -279,7 +282,9 @@ class TestPDDraftGeometry(CustomTestCase):
                     expected_draft[1024] = 31
                     torch.testing.assert_close(draft_dest, expected_draft)
                     info.dst_kv_item_lens[0] += 576
-                    with self.assertRaisesRegex(ValueError, "Target KV"):
+                    with self.assertRaisesRegex(
+                        ValueError, "^Source/destination KV page geometry differs$"
+                    ):
                         mgr.prepare_dcp_entry_geometry(info)
                     info.dst_kv_item_lens[0] -= 576
                     info.dst_dcp_size = 8
@@ -324,6 +329,8 @@ class TestPDDraftGeometry(CustomTestCase):
                 mgr.custom_mem_pool_type = ""
                 mgr.max_transfer_batch_indices = 0
                 mgr.attn_tp_size = src_tp
+                mgr.dcp_size = 1
+                mgr.dcp_rank = 0
                 mgr.is_mla_backend = True
                 mgr.is_hybrid_mla_backend = False
                 mgr._validate_envelope_kv_layout = Mock()
@@ -346,6 +353,7 @@ class TestPDDraftGeometry(CustomTestCase):
                     dst_kv_item_len=target_widths[0],
                     dst_kv_layer_ids=list(range(4)),
                     dst_draft_entry_count=1,
+                    dst_draft_metadata_present=True,
                     dst_draft_token_major=True,
                     dst_draft_head_num=2,
                     dst_draft_total_head_num=16,
@@ -644,6 +652,8 @@ class TestPDDraftGeometry(CustomTestCase):
     def test_registration_rejects_invalid_mixed_geometry(self):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.attn_tp_size = 16
+        mgr.dcp_size = 1
+        mgr.dcp_rank = 0
         mgr.kv_args = SimpleNamespace(
             page_size=4,
             kv_data_ptrs=[10, 20],
@@ -660,6 +670,7 @@ class TestPDDraftGeometry(CustomTestCase):
             dst_kv_item_lens=[24, 192],
             dst_draft_token_major=True,
             dst_draft_entry_count=1,
+            dst_draft_metadata_present=True,
             dst_page_size=4,
             dst_kv_layer_ids=[],
             dst_dcp_size=8,
@@ -705,10 +716,19 @@ class TestPDDraftGeometry(CustomTestCase):
     def test_source_dcp_mixed_layout_is_rejected(self):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.dcp_size = 8
+        mgr.dcp_rank = 0
+        mgr.attn_tp_size = 16
         mgr.kv_args = SimpleNamespace(kv_item_lens=[24, 12], draft_kv_entry_count=1)
         with self.assertRaisesRegex(ValueError, "Prefill DCP1"):
             mgr.kv_args.draft_kv_token_major = True
-            mgr.prepare_dcp_entry_geometry(SimpleNamespace(dst_draft_token_major=True))
+            mgr.prepare_dcp_entry_geometry(
+                SimpleNamespace(
+                    dst_draft_token_major=True,
+                    dst_attn_tp_size=8,
+                    dst_dcp_size=1,
+                    dst_dcp_rank=0,
+                )
+            )
 
     def test_failure_status_reaches_transfer_caller(self):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
@@ -785,6 +805,8 @@ class TestPDDraftGeometry(CustomTestCase):
             KVArgsRegisterInfo.from_zmq(msg + [b"bad"])
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.attn_tp_size = 16
+        mgr.dcp_size = 1
+        mgr.dcp_rank = 0
         mgr.kv_args = SimpleNamespace(
             page_size=4,
             kv_data_ptrs=[10],
@@ -880,6 +902,8 @@ class TestPDDraftGeometry(CustomTestCase):
                     mgr.max_transfer_batch_indices = 0
                     mgr.attn_tp_size = 16
                     mgr.attn_cp_size = 1
+                    mgr.dcp_size = 1
+                    mgr.dcp_rank = 0
                     mgr.is_mla_backend = False
                     mgr.is_hybrid_mla_backend = True
                     # The memory envelope gate requires a published server bag;

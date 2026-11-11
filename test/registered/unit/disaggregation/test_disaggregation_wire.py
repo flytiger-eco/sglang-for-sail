@@ -78,6 +78,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class TestDisaggregationWire(unittest.TestCase):
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.failure_lock = threading.Lock()
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         for outstanding in (0, 1):

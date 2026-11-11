@@ -1023,9 +1023,22 @@ def build_kv_layer_ids(
         # Keep the legacy positional registration for non-hybrid NPU pools.
         # Their layer IDs do not necessarily match the exported buffer groups.
         if not is_npu() and is_mla_backend(token_to_kv_pool):
-            return get_transfer_kv_layer_ids(
+            layer_ids = get_transfer_kv_layer_ids(
                 token_to_kv_pool, draft_token_to_kv_pool, num_hidden_layers
             )
+            # An ordinary contiguous MLA target needs no new wire metadata.
+            # Preserve rolling upgrades in both directions, including P PP2
+            # -> D PP1; CP layer shards and multi-group layouts keep exact IDs.
+            start = getattr(token_to_kv_pool, "start_layer", None)
+            layers = getattr(token_to_kv_pool, "layer_num", 0)
+            if (
+                not num_draft_entries
+                and not getattr(token_to_kv_pool, "layer_shard_enabled", False)
+                and start is not None
+                and layer_ids == list(range(start, start + layers))
+            ):
+                return []
+            return layer_ids
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:

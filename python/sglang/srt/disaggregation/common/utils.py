@@ -288,6 +288,29 @@ def _draft_head_transfer_geometry(
     )
 
 
+def is_draft_head_transfer_sliced(
+    *,
+    src_token_bytes: int,
+    dst_token_bytes: int,
+    total_heads: int,
+    src_tp_size: int,
+    src_tp_rank: int,
+    dst_tp_size: int,
+    dst_tp_rank: int,
+) -> bool:
+    """Whether this sender needs a separate descriptor for each draft token."""
+    _, _, width = _draft_head_transfer_geometry(
+        src_token_bytes,
+        dst_token_bytes,
+        total_heads,
+        src_tp_size,
+        src_tp_rank,
+        dst_tp_size,
+        dst_tp_rank,
+    )
+    return width > 0 and not (width == src_token_bytes == dst_token_bytes)
+
+
 def build_draft_head_transfer_blocks(
     plan,
     *,

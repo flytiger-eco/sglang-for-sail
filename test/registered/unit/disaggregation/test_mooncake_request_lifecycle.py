@@ -4,13 +4,14 @@ import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
+    TransferInfo,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,6 +40,8 @@ def make_manager():
     manager.prefill_response_tracker = defaultdict(set)
     manager.addr_to_rooms_tracker = defaultdict(set)
     manager.enable_staging = False
+    manager.is_mla_backend = False
+    manager.is_dummy_cp_rank = False
     manager.messages = []
     manager._connect = Mock(
         return_value=SimpleNamespace(send_multipart=manager.messages.append)
@@ -53,9 +56,17 @@ def make_sender(manager, room=1):
     return sender
 
 
-def rejection(room=1):
-    return SimpleNamespace(
-        room=room, is_dummy=False, endpoint="127.0.0.1", dst_port=1234
+def rejection(room=1, *, session="peer", port=1234, dummy=False, required=1):
+    return TransferInfo(
+        room=room,
+        endpoint="127.0.0.1",
+        dst_port=port,
+        mooncake_session_id=session,
+        dst_kv_indices=None,
+        dst_aux_index=None,
+        dst_state_indices=[],
+        required_dst_info_num=required,
+        is_dummy=dummy,
     )
 
 
@@ -117,6 +128,8 @@ class TestMooncakeRequestLifecycle(CustomTestCase):
 
     def _assert_rejection_before_notification(self, *, clear):
         manager = make_manager()
+        req = rejection()
+        manager.transfer_infos[1] = {req.mooncake_session_id: req}
         connecting, release = threading.Event(), threading.Event()
         errors = []
         socket = manager._connect.return_value
@@ -146,7 +159,7 @@ class TestMooncakeRequestLifecycle(CustomTestCase):
         success.start()
         try:
             self.assertTrue(connecting.wait(5), errors)
-            manager._fail_bootstrap_request(rejection(), "invalid registration")
+            manager._fail_bootstrap_request(req, "invalid registration")
             self.assertEqual([int(msg[1]) for msg in manager.messages], [KVPoll.Failed])
             if clear:
                 make_sender(manager).clear()
@@ -270,7 +283,7 @@ class TestMooncakeRequestLifecycle(CustomTestCase):
         manager = make_manager()
         manager.request_status.clear()
         manager.is_dummy_cp_rank = False
-        manager._fail_bootstrap_request(rejection(), "invalid registration")
+        manager._reject_bootstrap_request(rejection(), "invalid registration")
         self.assertEqual(manager.request_status, {})
         self.assertEqual(manager.failure_records, {1: "invalid registration"})
         self.assertEqual([int(msg[1]) for msg in manager.messages], [KVPoll.Failed])
@@ -278,6 +291,129 @@ class TestMooncakeRequestLifecycle(CustomTestCase):
             with patch.object(MooncakeKVSender, "_init_trace_ctx"):
                 sender = MooncakeKVSender(manager, "127.0.0.1:8000", 1, [0], 0)
         self.assertEqual(manager.check_status(sender.bootstrap_room), KVPoll.Failed)
+
+    def test_cleared_request_ignores_late_registration_failure(self):
+        manager = make_manager()
+        req = rejection()
+        manager.transfer_infos[1] = {req.mooncake_session_id: req}
+        manager._fail_bootstrap_request(req, "invalid registration")
+        make_sender(manager).clear()
+        with manager.failure_lock:
+            manager.failure_records.pop(1)
+        manager.messages.clear()
+
+        # The worker retained req before failure_exception consumed this room.
+        manager._fail_bootstrap_request(req, "late registration failure")
+        self.assertEqual(manager.failure_records, {})
+        self.assertEqual(manager.request_status, {})
+        self.assertEqual(manager.messages, [])
+        self.assertEqual(manager._pending_status_notifications, {})
+        with get_context().override_server_args(dp_size=1):
+            with patch.object(MooncakeKVSender, "_init_trace_ctx"):
+                MooncakeKVSender(manager, "127.0.0.1:8000", 1, [0], 0)
+        self.assertEqual(manager.check_status(1), KVPoll.Bootstrapping)
+
+    def test_replaced_request_ignores_old_snapshot_with_same_identifiers(self):
+        manager = make_manager()
+        old_req = rejection()
+        replacement = rejection()
+        self.assertIsNot(old_req, replacement)
+        manager.transfer_infos[1] = {replacement.mooncake_session_id: replacement}
+        manager._fail_bootstrap_request(old_req, "obsolete request failed")
+        self.assertEqual(manager.failure_records, {})
+        self.assertEqual(manager.check_status(1), KVPoll.Transferring)
+        self.assertEqual(manager.messages, [])
+        self.assertIs(manager.transfer_infos[1]["peer"], replacement)
+
+    def test_registered_failure_notifies_all_real_peers_after_clear(self):
+        manager = make_manager()
+        reqs = [
+            rejection(session="rejected", port=1234),
+            rejection(session="sibling", port=1235),
+            rejection(session="same-endpoint", port=1235),
+            rejection(session="dummy", port=1236, dummy=True),
+        ]
+        manager.transfer_infos[1] = {req.mooncake_session_id: req for req in reqs}
+        delivered = []
+
+        def connect(endpoint, *, is_ipv6):
+            self.assertFalse(is_ipv6)
+            # The scheduler may clear as soon as Failed becomes observable.
+            make_sender(manager).clear()
+            with manager.failure_lock:
+                manager.failure_records.pop(1, None)
+            return SimpleNamespace(
+                send_multipart=lambda msg: delivered.append((endpoint, msg))
+            )
+
+        manager._connect.side_effect = connect
+        manager._fail_bootstrap_request(reqs[0], "registration rejected")
+        self.assertEqual(
+            [endpoint for endpoint, _ in delivered],
+            ["tcp://127.0.0.1:1234", "tcp://127.0.0.1:1235"],
+        )
+        self.assertTrue(all(int(msg[1]) == KVPoll.Failed for _, msg in delivered))
+        self.assertTrue(all(msg[3] == b"registration rejected" for _, msg in delivered))
+        self.assertEqual(manager.request_status, {})
+        self.assertEqual(manager.failure_records, {})
+        self.assertEqual(manager._pending_status_notifications, {})
+
+    def test_dummy_failure_still_notifies_real_siblings(self):
+        manager = make_manager()
+        dummy = rejection(session="dummy", port=1236, dummy=True)
+        sibling = rejection(session="real", port=1235)
+        manager.transfer_infos[1] = {"dummy": dummy, "real": sibling}
+        manager._fail_bootstrap_request(dummy, "dummy registration rejected")
+        manager._connect.assert_called_once_with("tcp://127.0.0.1:1235", is_ipv6=False)
+        self.assertEqual([int(msg[1]) for msg in manager.messages], [KVPoll.Failed])
+        self.assertEqual(manager.check_status(1), KVPoll.Failed)
+        self.assertEqual(manager._pending_status_notifications, {})
+
+    def test_incoming_rejection_notifies_registered_and_unregistered_peers(self):
+        manager = make_manager()
+        sibling = rejection(session="sibling", port=1235)
+        manager.transfer_infos[1] = {"sibling": sibling}
+        manager._reject_bootstrap_request(rejection(), "incoming peer rejected")
+        self.assertEqual(
+            manager._connect.call_args_list,
+            [
+                call("tcp://127.0.0.1:1235", is_ipv6=False),
+                call("tcp://127.0.0.1:1234", is_ipv6=False),
+            ],
+        )
+        self.assertEqual(
+            [int(msg[1]) for msg in manager.messages], [KVPoll.Failed, KVPoll.Failed]
+        )
+        self.assertEqual(manager._pending_status_notifications, {})
+
+    def test_presender_rejection_also_rejects_later_peer(self):
+        manager = make_manager()
+        manager.request_status.clear()
+        manager._reject_bootstrap_request(rejection(), "first peer rejected")
+        manager._connect.reset_mock()
+        manager.messages.clear()
+        manager._register_bootstrap_request(rejection(session="late-peer", port=1235))
+        manager._connect.assert_called_once_with("tcp://127.0.0.1:1235", is_ipv6=False)
+        self.assertEqual([int(msg[1]) for msg in manager.messages], [KVPoll.Failed])
+        self.assertEqual(manager.messages[0][3], b"first peer rejected")
+        self.assertEqual(manager.request_status, {})
+        self.assertEqual(manager.transfer_infos, {})
+        self.assertEqual(manager.failure_records, {1: "first peer rejected"})
+        self.assertEqual(manager._pending_status_notifications, {})
+
+    def test_bootstrap_registration_preserves_completion_and_prefix(self):
+        manager = make_manager()
+        manager.request_status[1] = KVPoll.Bootstrapping
+        first = rejection(session="first", required=2)
+        second = rejection(session="second", port=1235, required=2)
+        second.decode_prefix_len = 64
+        manager._register_bootstrap_request(first)
+        self.assertEqual(manager.check_status(1), KVPoll.Bootstrapping)
+        manager._register_bootstrap_request(second)
+        self.assertEqual(manager.check_status(1), KVPoll.WaitingForInput)
+        self.assertEqual(manager.req_to_decode_prefix_len[1], 64)
+        self.assertEqual(manager.failure_records, {})
+        self.assertEqual(manager.messages, [])
 
     def test_receiver_failure_is_terminal_and_clear_drops_late_status(self):
         manager = make_manager()

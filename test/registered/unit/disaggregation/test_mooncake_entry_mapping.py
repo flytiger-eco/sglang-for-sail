@@ -2,12 +2,14 @@
 
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 from test_mooncake_mixed_transfer import manager, registration
 
 from sglang.srt.disaggregation.mooncake.conn import KVArgsRegisterInfo
+from sglang.srt.disaggregation.utils import build_kv_layer_ids
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -157,6 +159,70 @@ class TestMooncakeEntryMapping(CustomTestCase):
                     self.assertTrue(records)
                     self.assertTrue(all(dst >= dst_bases[6] for _, dst, _ in records))
 
+    def test_compressed_pp_whole_pages_keep_draft_suffix_outside_target_groups(self):
+        m = manager(tp=16)
+        m.pp_size = 2
+        m.pp_rank = 1
+        a = m.kv_args
+        a.engine_rank = 16
+        a.page_size = 256
+        a.prefill_start_layer = 2
+        a.prefill_end_layer = 4
+        a.mla_compression_ratios = [4, 128, 4, 128]
+        a.kv_layer_ids = []
+        a.kv_item_lens = [37440, 9216, 1728, 4096, 4096]
+        a.kv_data_ptrs = [(i + 1) * 1000000 for i in range(5)]
+        info = KVArgsRegisterInfo.from_zmq(registration())
+        info.dst_attn_tp_size = 16
+        info.dst_draft_head_num = 1
+        info.dst_page_size = 256
+        info.dst_kv_layer_ids = []
+        info.dst_kv_item_lens = [37440, 37440, 9216, 9216, 1728, 1728, 4096, 4096]
+        info.dst_kv_item_len = 37440
+        info.dst_kv_ptrs = [(i + 1) * 10000000 for i in range(8)]
+        expected_mapping = [1, 3, 5, 6, 7]
+        m.prepare_dcp_entry_geometry(info)
+        self.assertEqual(info.dcp_dst_entry_indices, expected_mapping)
+        self.assertFalse(m._uses_mixed_kv_transfer(info))
+        sources = {
+            base: (np.arange(4 * width, dtype=np.uint32) + i * 13).astype(np.uint8)
+            for i, (base, width) in enumerate(zip(a.kv_data_ptrs, a.kv_item_lens))
+        }
+        destinations = {
+            base: np.full(6 * width, 205, dtype=np.uint8)
+            for base, width in zip(info.dst_kv_ptrs, info.dst_kv_item_lens)
+        }
+        expected = {base: data.copy() for base, data in destinations.items()}
+        records = []
+        m._transfer_data = self._copy_transport(sources, destinations, records)
+        # Exercise the real main-KV sender, including its envelope configuration
+        # check. Only transport is replaced; mapping is never mocked.
+        with get_context().override_server_args(enable_unified_memory=False):
+            result = m.send_kvcache(
+                "session",
+                np.array([1, 3], dtype=np.int32),
+                info.dst_kv_ptrs,
+                np.array([2, 5], dtype=np.int32),
+                None,
+                dst_layer_ids=[],
+                dst_kv_item_len=info.dst_kv_item_len,
+                dst_attn_tp_size=16,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(len(records), 10)
+        for i, j in enumerate(expected_mapping):
+            width = a.kv_item_lens[i]
+            for src_page, dst_page in ((1, 2), (3, 5)):
+                expected[info.dst_kv_ptrs[j]][
+                    dst_page * width : (dst_page + 1) * width
+                ] = sources[a.kv_data_ptrs[i]][
+                    src_page * width : (src_page + 1) * width
+                ]
+        # Full arrays include target-page padding, both complete draft pages,
+        # untouched P-stage-0 buffers, and untouched destination pages.
+        for base in info.dst_kv_ptrs:
+            np.testing.assert_array_equal(destinations[base], expected[base])
+
     def test_plain_mla_one_sided_ids_preserve_dcp_bytes(self):
         for src_ids, dst_ids in (([0, 1], []), ([], [0, 1])):
             for dcp_rank in (0, 1):
@@ -217,7 +283,7 @@ class TestMooncakeEntryMapping(CustomTestCase):
 
     def test_one_sided_ids_reject_ambiguous_layouts(self):
         cases = (
-            ("pp", {"pp_size": 2}, {}, 0),
+            ("pp_bad_span", {"pp_size": 2}, {"prefill_start_layer": 1}, 0),
             ("cp_layer_split", {"attn_cp_size": 2}, {}, 0),
             ("hybrid", {"is_hybrid_mla_backend": True}, {}, 0),
             ("not_mla", {"is_mla_backend": False}, {}, 0),
@@ -264,6 +330,95 @@ class TestMooncakeEntryMapping(CustomTestCase):
         m = self._plain_manager([0, 1])
         with self.assertRaisesRegex(RuntimeError, "missing a transfer entry"):
             m._resolve_kv_entry_indices([0], 1)
+
+    def test_plain_mla_pp_one_sided_ids_copy_the_correct_stage(self):
+        # The old wire has no IDs. The upgraded peer must use the existing PP
+        # slice, not positional zip(), for both upgrade directions.
+        for stage in (0, 1):
+            for old_peer in ("prefill", "decode"):
+                with self.subTest(stage=stage, old_peer=old_peer):
+                    start = stage * 2
+                    src_ids = [] if old_peer == "prefill" else [start, start + 1]
+                    dst_ids = [] if old_peer == "decode" else [0, 1, 2, 3]
+                    m = self._plain_manager(src_ids)
+                    m.pp_size = 2
+                    m.pp_rank = stage
+                    m.kv_args.prefill_start_layer = start
+                    m.kv_args.prefill_end_layer = start + 2
+                    dst_ptrs = [10000000, 20000000, 30000000, 40000000]
+                    sources = {
+                        base: (np.arange(width * 3, dtype=np.uint32) + 19).astype(
+                            np.uint8
+                        )
+                        for base, width in zip(m.kv_args.kv_data_ptrs, [12, 20])
+                    }
+                    destinations = {
+                        base: np.full(width * 4, 205, dtype=np.uint8)
+                        for base, width in zip(dst_ptrs, [12, 20, 12, 20])
+                    }
+                    expected = {
+                        base: data.copy() for base, data in destinations.items()
+                    }
+                    records = []
+                    m._transfer_data = self._copy_transport(
+                        sources, destinations, records
+                    )
+                    result = m._send_kvcache_generic(
+                        "session",
+                        m.kv_args.kv_data_ptrs,
+                        dst_ptrs,
+                        m.kv_args.kv_item_lens,
+                        np.array([1], dtype=np.int32),
+                        np.array([2], dtype=np.int32),
+                        None,
+                        src_layer_ids=src_ids,
+                        dst_layer_ids=dst_ids,
+                    )
+                    self.assertEqual(result, 0)
+                    for i, width in enumerate((12, 20)):
+                        expected[dst_ptrs[start + i]][2 * width : 3 * width] = sources[
+                            m.kv_args.kv_data_ptrs[i]
+                        ][width : 2 * width]
+                    for base in dst_ptrs:
+                        np.testing.assert_array_equal(
+                            destinations[base], expected[base]
+                        )
+
+    def test_pp_legacy_mapping_rejects_wrong_known_layer_span(self):
+        for src_ids, dst_ids in (([0, 1], []), ([], [1, 2, 3, 4])):
+            with self.subTest(src_ids=src_ids, dst_ids=dst_ids):
+                m = self._plain_manager(src_ids)
+                m.pp_size = 2
+                m.kv_args.prefill_start_layer = 2
+                m.kv_args.prefill_end_layer = 4
+                with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+                    m._resolve_kv_entry_indices(dst_ids, 4)
+
+    def test_plain_mla_metadata_keeps_old_wire_but_preserves_layer_shards(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        for layer_shard, groups in ((False, 1), (True, 1), (False, 3)):
+            with self.subTest(layer_shard=layer_shard, groups=groups):
+                pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+                pool.start_layer = 2
+                pool.layer_num = 2
+                pool.layer_shard_enabled = layer_shard
+                count = 2 * groups
+                pool.get_contiguous_buf_infos = Mock(
+                    return_value=(list(range(count)), [1024] * count, [256] * count)
+                )
+                with patch(
+                    "sglang.srt.disaggregation.utils.is_npu", return_value=False
+                ):
+                    ids = build_kv_layer_ids(
+                        token_to_kv_pool=pool,
+                        draft_token_to_kv_pool=None,
+                        num_draft_entries=0,
+                        num_hidden_layers=4,
+                    )
+                self.assertEqual(
+                    ids, [2, 3] * groups if layer_shard or groups > 1 else []
+                )
 
     def test_complete_metadata_retains_strict_layer_mapping(self):
         m = self._plain_manager([1, 3])
