@@ -17,22 +17,22 @@ Registered hooks:
    to the Triton sparse path.
 
 2. ``MiniMaxSparseAttnBackend.init_forward_metadata_out_graph`` (AROUND) —
-   Resets the per-forward SAIL MSA state: the next decode rebuilds its plans
-   (CUDA-graph-safe refresh), the eager prefill chunk buffers are freed, and
-   the live ``ForwardBatch`` is stashed for hook 3. The metadata hooks run
-   before every forward (AttentionBackend contract), so the stash is always
-   current.
+   Resets the per-forward SAIL MSA state: the next decode (and target verify)
+   rebuilds its plans (CUDA-graph-safe refresh), the eager prefill chunk
+   buffers are freed, and the live ``ForwardBatch`` is stashed for hook 3.
+   The metadata hooks run before every forward (AttentionBackend contract),
+   so the stash is always current.
 
 3. ``minimax_sparse_prefill`` (AROUND, module-level kernel) — Intercepts the
    core sparse prefill kernel only; the community ``forward_extend`` keeps
    handling KV/index-cache writes, DP-padding trim and re-pad, and
-   ``cu_seqlens``/``prefix_lens`` construction. When the SAIL MSA gate holds
-   and the batch is eager (not under CUDA-graph capture), the Triton kernel
-   is replaced with ``msa_ppu_forward_extend`` (chunked indexer +
-   whole-batch attend). Every other case — gate off, capture, or a missing
-   forward-batch context — falls back to the original Triton kernel (warned
-   once per process under capture) after rejecting an fp8 index cache,
-   which only the SAIL MSA indexer can read.
+   ``cu_seqlens``/``prefix_lens`` construction. When the SAIL MSA gate holds,
+   a speculative TARGET_VERIFY batch goes to ``msa_ppu_forward_verify``
+   (uniform draft width, graph-safe, eager and captured) and a plain prefill
+   batch to ``msa_ppu_forward_extend`` (eager only). Every other case — gate
+   off, captured prefill, or missing context — falls back to the original
+   Triton kernel (warned once per process under capture) after rejecting an
+   fp8 index cache, which only the SAIL MSA indexer can read.
 
 4. ``MiniMaxSparseAttnBackend.forward_decode`` (AROUND) — Routes decodes
    through the SAIL MSA indexer + selection + attend (graph-safe) when the
@@ -110,6 +110,7 @@ def _init_ppu_msa(backend, runner) -> None:
     backend.use_msa_ppu = False
     backend._ppu_msa_attend = False
     backend._ppu_msa_dec = None
+    backend._ppu_msa_ver = None
     backend._ppu_msa_state = None
     backend._ppu_msa_shared = None
     backend._ppu_msa_current_batch = None
@@ -200,6 +201,10 @@ def _ppu_msa_init_forward_metadata_out_graph(
         # build kernels on replay). The prefill state is per-forward;
         # dropping it also frees the chunk buffers.
         dec_state.need_build = True
+    ver_state = getattr(self, "_ppu_msa_ver", None)
+    if ver_state is not None:
+        # TARGET_VERIFY runs the same captured-rebuild contract as decode.
+        ver_state.need_build = True
     self._ppu_msa_state = None
     # Stash the live ForwardBatch for the minimax_sparse_prefill hook: the
     # SAIL MSA prefill planner needs req_pool_indices plus a stable
@@ -314,21 +319,6 @@ def _ppu_msa_sparse_prefill(
     if backend is None or not getattr(backend, "use_msa_ppu", False):
         return _triton_prefill()
 
-    # Under capture (defensive; prefill graphs should be gated off) fall
-    # back to the Triton path, which is capture-safe, and warn once.
-    if torch.cuda.is_current_stream_capturing():
-        # Intentionally once per worker process: avoiding cross-process IPC
-        # on this exceptional path keeps capture fallback independent by
-        # rank.
-        global _ppu_prefill_capture_warned
-        if not _ppu_prefill_capture_warned:
-            logger.warning(
-                "[MiniMaxSparse][SAIL MSA] sparse prefill under CUDA-graph "
-                "capture; routing this batch to the Triton path."
-            )
-            _ppu_prefill_capture_warned = True
-        return _triton_prefill()
-
     # The SAIL planner neither produces nor consumes the cross-layer top-k
     # index cache, and does not implement the hisparse loc remapping; a batch
     # needing either stays on the community Triton path.
@@ -345,7 +335,50 @@ def _ppu_msa_sparse_prefill(
 
     from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
         msa_ppu_forward_extend,
+        msa_ppu_forward_verify,
     )
+
+    if forward_batch.forward_mode.is_target_verify():
+        # Speculative verify is graph-safe (the decode state's rebuild
+        # contract). It needs the uniform draft width the backend captured
+        # its verify state with; anything else (e.g. a compact-ragged or
+        # adaptive width, which the gate rejects) stays on Triton.
+        ver = getattr(backend, "_ppu_msa_ver", None)
+        if ver is not None and q.shape[0] == seq_lens.shape[0] * ver.qo_len:
+            # ``seq_lens`` is the POST-WRITE KV length (prefix + draft
+            # width); when captured it is the graph-owned tensor refreshed
+            # on every replay, so the plans verify against live lengths.
+            _, o = msa_ppu_forward_verify(
+                backend,
+                q,
+                idx_q,
+                idx_k_cache,
+                k_cache,
+                v_cache,
+                forward_batch,
+                seq_lens=seq_lens,
+                req_pool_indices=slot_ids,
+                cu_seqlens=cu_seqlens,
+                prefix_lens=prefix_lens,
+                max_seqlen_q=max_seqlen_q,
+            )
+            return None, o
+        return _triton_prefill()
+
+    # Under capture (defensive; prefill graphs should be gated off) fall
+    # back to the Triton path, which is capture-safe, and warn once.
+    if torch.cuda.is_current_stream_capturing():
+        # Intentionally once per worker process: avoiding cross-process IPC
+        # on this exceptional path keeps capture fallback independent by
+        # rank.
+        global _ppu_prefill_capture_warned
+        if not _ppu_prefill_capture_warned:
+            logger.warning(
+                "[MiniMaxSparse][SAIL MSA] sparse prefill under CUDA-graph "
+                "capture; routing this batch to the Triton path."
+            )
+            _ppu_prefill_capture_warned = True
+        return _triton_prefill()
 
     # cu_seqlens == [0] + cumsum(extend_seq_lens): recover the per-request
     # extend lens the MSA planner consumes.

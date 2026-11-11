@@ -22,7 +22,7 @@ try:
         _LockedJITEntry,
         _pack_len_meta_into,
         _paged_nhd_view,
-        _PpuMsaDecodeState,
+        _PpuMsaForwardState,
         _prefill_chunk_token_cap,
         compute_msa_ppu_gate,
         msa_ppu_forward_extend,
@@ -323,8 +323,8 @@ class TestPpuMsaIndexerFp8Allocation(_MsaGateFixture):
             ({"page_size": 1}, "page_size!=128"),
             ({"msa_enabled": False}, "SGLANG_SAIL_MINIMAX_M3_MSA=0"),
             ({"sm": 79}, "SM<80"),
-            ({"api_available": False}, "fmha_sm100 unavailable or API drifted"),
-            ({"speculative": "EAGLE"}, "speculative decoding enabled"),
+            ({"api_available": False}, "msa_for_sail unavailable or API drifted"),
+            ({"speculative": "DSPARK"}, None),
             ({"head_dim": 64}, "main head_dim!=128"),
             ({"kv_heads": 128}, "num_kv_heads==128 is layout-ambiguous"),
             ({"kv_heads": 2}, "num_idx_heads!=num_kv_heads"),
@@ -373,6 +373,17 @@ class TestPpuMsaIndexerFp8Allocation(_MsaGateFixture):
         self.assertFalse(fp8)
         self.assertEqual(dtype, torch.bfloat16)
         self.assertTrue(ok, reasons)
+
+    def test_compact_ragged_verify_blocks_fp8_indexer(self):
+        # Compact ragged verify mixes per-request draft widths; the MSA verify
+        # plan needs one static width, so the gate fails and the index-K cache
+        # stays bf16. Uniform-width verify (the case above) is unaffected.
+        with mock.patch.dict(os.environ, {"SGLANG_RAGGED_VERIFY_MODE": "compact"}):
+            fp8, dtype, _, (ok, _, reasons) = self._evaluate(speculative="DSPARK")
+        self.assertFalse(fp8)
+        self.assertFalse(ok)
+        self.assertEqual(dtype, torch.bfloat16)
+        self.assertIn("compact ragged verify", " ".join(reasons))
 
     def test_other_fp8_mode_cannot_bypass_sail_gate(self):
         fp8, dtype, _, (ok, _, _) = self._evaluate(
@@ -689,7 +700,7 @@ class TestDecodeFp8AttendStaging(CustomTestCase):
             _ppu_msa_idx_scale=HEAD_DIM**-0.5,
             _ppu_msa_scale=HEAD_DIM**-0.5,
         )
-        state = _PpuMsaDecodeState(backend, device, torch.bfloat16)
+        state = _PpuMsaForwardState(backend, device, torch.bfloat16)
         state.indexer_plan = object()
         state.attend_plan = object()
         state.max_score_active = torch.full(
