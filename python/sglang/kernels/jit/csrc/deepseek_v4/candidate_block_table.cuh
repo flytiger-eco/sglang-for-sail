@@ -37,7 +37,17 @@ struct CandidateBlockTableConfig {
   static constexpr uint32_t kWordsPerThread = kMaxSeqLen / 32 / kBlockSize;
   static_assert((kWords == 4 || kWords == 8) && kNumWarps == device::kWarpThreads);
   static constexpr int32_t kPad = std::numeric_limits<int32_t>::max();
-  using word_vec_t = device::AlignedVector<uint32_t, kWordsPerThread>;
+  // A thread's words move in this many words per vector load. PPU (sm89) caps a
+  // vector at 16 B, so its build splits them into 4-word chunks; every other
+  // target keeps the single wide vector (up to 32 B on Blackwell).
+#if defined(SGL_SAIL) || defined(__HGGCCC__)
+  static constexpr uint32_t kVecWords = 4;
+#else
+  static constexpr uint32_t kVecWords = kWordsPerThread;
+#endif
+  static constexpr uint32_t kVecChunks = kWordsPerThread / kVecWords;
+  static_assert(kWordsPerThread % kVecWords == 0);
+  using word_vec_t = device::AlignedVector<uint32_t, kVecWords>;
   struct WriteItem {
     uint32_t start;  // rank of the word's first bit | word index << 16
     uint32_t bits;
@@ -106,9 +116,13 @@ __launch_bounds__(CandidateBlockTableConfig<kWords>::kBlockSize, CandidateBlockT
   }
 
   // 1. the selected blocks as a bitmap
-  typename C::word_vec_t words;
-  words.fill(0u);
-  words.store(smem.bitmap, tx);
+  auto* __restrict__ bitmap = smem.bitmap + tx * C::kWordsPerThread;
+#pragma unroll
+  for (uint32_t c = 0; c < C::kVecChunks; ++c) {
+    typename C::word_vec_t chunk;
+    chunk.fill(0u);
+    chunk.store(bitmap + c * C::kVecWords);
+  }
   if (tx == 0) smem.queue_size = 0;
   __syncthreads();
   for (uint32_t t = tx; t < params.topk; t += C::kBlockSize) {
@@ -118,7 +132,15 @@ __launch_bounds__(CandidateBlockTableConfig<kWords>::kBlockSize, CandidateBlockT
   __syncthreads();
 
   // 2. rank of every word's first bit: block-wide exclusive scan of the popcounts
-  words.load(smem.bitmap, tx);
+  uint32_t words[C::kWordsPerThread];
+#pragma unroll
+  for (uint32_t c = 0; c < C::kVecChunks; ++c) {
+    typename C::word_vec_t chunk;
+    chunk.load(bitmap + c * C::kVecWords);
+#pragma unroll
+    for (uint32_t w = 0; w < C::kVecWords; ++w)
+      words[c * C::kVecWords + w] = chunk[w];
+  }
   uint32_t count[C::kWordsPerThread];
   uint32_t local = 0;
 #pragma unroll
