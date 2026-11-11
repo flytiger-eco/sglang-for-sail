@@ -2,7 +2,7 @@
 
 import ast
 import asyncio
-import functools
+import functools  # noqa: F401 -- Used by the AST-loaded image batching method.
 import importlib.util
 import os
 import sys
@@ -12,6 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE = Path(
@@ -26,7 +30,9 @@ spec = importlib.util.spec_from_file_location(
 loader = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(loader)
 tree = ast.parse(SOURCE.read_text())
-encoder = next(n for n in tree.body if getattr(n, "name", None) == "EncoderPreprocessor")
+encoder = next(
+    n for n in tree.body if getattr(n, "name", None) == "EncoderPreprocessor"
+)
 method = next(
     n for n in encoder.body if getattr(n, "name", None) == "_flatten_and_load_images"
 )

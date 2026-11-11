@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for the actual RedKV module, without importing GPU serving APIs."""
+
 import concurrent.futures
 import importlib.util
 import os
@@ -8,6 +9,10 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 SOURCE = Path(__file__).resolve().parents[3] / "python/sglang/srt/connector/redkv.py"
 spec = importlib.util.spec_from_file_location("aim_redkv_under_test", SOURCE)

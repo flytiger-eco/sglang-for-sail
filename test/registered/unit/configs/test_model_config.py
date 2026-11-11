@@ -10,10 +10,12 @@ from transformers import LlamaConfig
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    ModelImpl,
     get_hybrid_layer_ids,
     is_embedding_gemma,
     is_multimodal_model,
     register_model_config_factory,
+    resolve_enable_multimodal_default,
     resolve_spec_hidden_size,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
@@ -22,6 +24,58 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestMultimodalDefaults(CustomTestCase):
+    def test_qwen4_multimodal_default_matches_qwen35(self):
+        for architecture in (
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ):
+            for model_impl in (ModelImpl.AUTO, ModelImpl.TRANSFORMERS):
+                with self.subTest(architecture=architecture, model_impl=model_impl):
+                    self.assertIsNone(
+                        resolve_enable_multimodal_default(
+                            architecture, None, model_impl
+                        )
+                    )
+                    self.assertTrue(is_multimodal_model([architecture]))
+
+    def test_qwen4_preserves_explicit_multimodal_choices(self):
+        for enabled in (False, True):
+            for model_impl in (ModelImpl.AUTO, ModelImpl.TRANSFORMERS):
+                with self.subTest(enabled=enabled, model_impl=model_impl):
+                    self.assertIs(
+                        resolve_enable_multimodal_default(
+                            "Qwen4ExpForConditionalGeneration", enabled, model_impl
+                        ),
+                        enabled,
+                    )
+
+    def test_other_architecture_defaults_are_preserved(self):
+        for architecture in [
+            "Gemma3ForConditionalGeneration",
+            "Llama4ForConditionalGeneration",
+            "Step3VLForConditionalGeneration",
+            "InklingForConditionalGeneration",
+        ]:
+            with self.subTest(architecture=architecture):
+                self.assertFalse(
+                    resolve_enable_multimodal_default(
+                        architecture, None, ModelImpl.AUTO
+                    )
+                )
+        self.assertIsNone(
+            resolve_enable_multimodal_default(
+                "Qwen3_5MoeForConditionalGeneration", None, ModelImpl.AUTO
+            )
+        )
+        self.assertFalse(
+            resolve_enable_multimodal_default(
+                "Qwen4ExpForConditionalGeneration", False, ModelImpl.AUTO
+            )
+        )
 
 
 class TestHybridLayerIds(CustomTestCase):

@@ -337,8 +337,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _init_prealloc_abort_state(self) -> None:
         self._prealloc_abort_lock = threading.RLock()
         self._prealloc_abort_attempts = {}
+        self._prealloc_abort_reservations = set()
         self._prealloc_abort_replays = OrderedDict()
         self._prealloc_abort_ack_tracker = {}
+
+    def reserve_prealloc_abort(self, room: int, pair_key: str) -> bool:
+        """Reserve cancellation replay capacity before publishing a sender."""
+        key = (room, pair_key)
+        with self._prealloc_abort_lock:
+            self._get_prealloc_abort_replay(key)  # Retire expired history first.
+            if (
+                room in self._prealloc_abort_attempts
+                or key in self._prealloc_abort_replays
+            ):
+                return False
+            if key in self._prealloc_abort_reservations:
+                return True  # An unbound admission may now publish its sender.
+            if (
+                len(self._prealloc_abort_reservations) >= EXPANDED_INPUT_MAX_INFLIGHT
+                or len(self._prealloc_abort_replays) >= EXPANDED_INPUT_MAX_INFLIGHT
+                or room in self._prealloc_abort_attempts
+            ):
+                return False
+            self._prealloc_abort_reservations.add(key)
+            return True
+
+    def release_prealloc_abort_reservation(self, room: int, pair_key: str) -> None:
+        """Undo an admission reservation without touching a published owner."""
+        with self._prealloc_abort_lock:
+            key = (room, pair_key)
+            if (
+                self._prealloc_abort_attempts.get(room) != pair_key
+                and key not in self._prealloc_abort_replays
+            ):
+                self._prealloc_abort_reservations.discard(key)
 
     def _send_prealloc_abort_ack(self, ip, port, room, pair_key) -> None:
         try:
@@ -371,11 +403,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # A disconnected D may stop retrying before a pending chunk
                 # drains. Retire its index together with the bounded replay.
                 self._prealloc_abort_attempts.pop(room)
+            if self._prealloc_abort_attempts.get(room) != pair_key:
+                self._prealloc_abort_reservations.discard(first)
         record = self._prealloc_abort_replays.get(key)
         if record is None and create:
             # Do not evict a live replay: other Decode/P TP ranks can still retry.
-            if len(self._prealloc_abort_replays) >= EXPANDED_INPUT_MAX_INFLIGHT:
-                return None
+            if key not in self._prealloc_abort_reservations:
+                if (
+                    len(self._prealloc_abort_reservations)
+                    >= EXPANDED_INPUT_MAX_INFLIGHT
+                    or len(self._prealloc_abort_replays) >= EXPANDED_INPUT_MAX_INFLIGHT
+                ):
+                    return None
+                self._prealloc_abort_reservations.add(key)
             record = _PreallocAbortReplay(
                 now + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             )
@@ -390,6 +430,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pair_key = frames[5].decode("utf-8")
         ip, port = frames[2].decode("ascii"), int(frames[3].decode("ascii"))
         key = (room, pair_key)
+        targets = ()
         with self._prealloc_abort_lock:
             record = self._get_prealloc_abort_replay(key)
             if record is None:
@@ -406,14 +447,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if record.drained:
                 # A cleared or reused room cannot turn an old retry into a
                 # failure of the new owner. Only replay this attempt's ACK.
-                self._send_prealloc_abort_ack(ip, port, room, pair_key)
-                return
-            record.targets.add((ip, port))
-            self._ack_prealloc_abort_if_drained(room, pair_key, record)
+                targets = ((ip, port),)
+            else:
+                record.targets.add((ip, port))
+                targets = self._collect_prealloc_abort_acks(room, pair_key, record)
+        for ip, port in targets:
+            self._send_prealloc_abort_ack(ip, port, room, pair_key)
 
-    def _ack_prealloc_abort_if_drained(self, room, pair_key, record) -> None:
+    def _collect_prealloc_abort_acks(self, room, pair_key, record):
+        """Update replay state under its lock; callers send after releasing it."""
         if self._staging_outstanding.get(room, 0) > 0:
-            return
+            return ()
         record.drained = True
         if (
             room not in self.request_status
@@ -421,18 +465,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             self._prealloc_abort_attempts.pop(room)
         targets, record.targets = record.targets, set()
-        for ip, port in targets:
-            self._send_prealloc_abort_ack(ip, port, room, pair_key)
+        return targets
 
     def _maybe_ack_drained_abort(self, room: int) -> None:
         super()._maybe_ack_drained_abort(room)
         if room not in getattr(self, "_prealloc_abort_attempts", {}):
             return
+        targets = ()
         with self._prealloc_abort_lock:
             pair_key = self._prealloc_abort_attempts.get(room)
             record = self._prealloc_abort_replays.get((room, pair_key))
             if record is not None and not record.drained:
-                self._ack_prealloc_abort_if_drained(room, pair_key, record)
+                targets = self._collect_prealloc_abort_acks(room, pair_key, record)
+        for ip, port in targets:
+            self._send_prealloc_abort_ack(ip, port, room, pair_key)
 
     def _handle_prealloc_abort_ack(self, frames) -> None:
         if len(frames) != 4:
@@ -1033,16 +1079,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            return self._await_transfer_futures(futures)
+            return self._submit_transfer_tasks(
+                executor,
+                ((process_layer, parameters) for parameters in layers_params),
+            )
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads. Preserve this legacy path unless
@@ -1151,23 +1191,54 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
     def _await_transfer_futures(self, futures) -> int:
-        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        """Drain every submitted write before reporting a status or exception."""
         ret = 0
-        for future in concurrent.futures.as_completed(futures):
+        error = None
+        # result() also handles already-cancelled futures that an executor has
+        # removed from its queue, unlike an as_completed()/wait() waiter.
+        for future in futures:
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
+                if ret == 0:
+                    ret = -1
                 continue
-            if status != 0 and ret == 0:
-                ret = status
-                for f in futures:
-                    f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+                for pending in futures:
+                    pending.cancel()
+            else:
+                if status != 0 and ret == 0:
+                    ret = status
+                    for pending in futures:
+                        pending.cancel()
+        if error is not None:
+            # An interrupted result() wait need not mean that future is done.
+            for future in futures:
+                if not future.done():
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
+            raise error
         return ret
+
+    def _submit_transfer_tasks(self, executor, tasks) -> int:
+        """Keep partial submissions alive until their running writes drain."""
+        futures = []
+        try:
+            for function, arguments in tasks:
+                futures.append(executor.submit(function, *arguments))
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            try:
+                self._await_transfer_futures(futures)
+            except BaseException:
+                pass  # Preserve the submission error after all writes drain.
+            raise
+        return self._await_transfer_futures(futures)
 
     def send_kvcache(
         self,
@@ -1438,19 +1509,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(process_layer, *layer_params)
-                for layer_params in layers_params
-            ]
-            futures.extend(
-                executor.submit(process_sliced_draft, [params])
-                for params in sliced_draft_params
+            tasks = [(process_layer, parameters) for parameters in layers_params]
+            tasks.extend(
+                (process_sliced_draft, ([parameters],))
+                for parameters in sliced_draft_params
             )
-            try:
-                return self._await_transfer_futures(futures)
-            finally:
-                if pack_buffer is not None:
-                    concurrent.futures.wait(futures)
+            # Includes packed-buffer readers, even if submission fails halfway.
+            return self._submit_transfer_tasks(executor, tasks)
 
         transfer_blocks = []
         for layer_params in layers_params:
@@ -1586,12 +1651,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
 
-        futures = [
-            executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
-            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs
-        ]
-
-        return self._await_transfer_futures(futures)
+        return self._submit_transfer_tasks(
+            executor,
+            ((process_layer_tp_aware, parameters) for parameters in layer_ptr_pairs),
+        )
 
     def send_aux(
         self,
@@ -2472,12 +2535,26 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
-                                state_rc = self.maybe_send_extra(
-                                    req,
-                                    kv_chunk.state_indices,
-                                    executor,
-                                    target_rank_registration_info,
-                                )
+                                try:
+                                    state_rc = self.maybe_send_extra(
+                                        req,
+                                        kv_chunk.state_indices,
+                                        executor,
+                                        target_rank_registration_info,
+                                    )
+                                except (RuntimeError, ValueError) as exc:
+                                    # A request-local layout mismatch must not
+                                    # strand subsequent work or blacklist a
+                                    # healthy transport session.
+                                    logger.exception(
+                                        "State transfer failed for room %s",
+                                        kv_chunk.room,
+                                    )
+                                    self.conclude_failure(
+                                        bootstrap_room=kv_chunk.room,
+                                        failure_reason=str(exc),
+                                    )
+                                    break
                                 if state_rc != 0:
                                     with self.session_lock:
                                         self.session_failures[
@@ -2942,8 +3019,13 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self._init_trace_ctx()
 
     def set_prealloc_abort_pair_key(self, pair_key: str) -> None:
-        self.prealloc_abort_pair_key = pair_key
         with self.kv_mgr._prealloc_abort_lock:
+            if not self.kv_mgr.reserve_prealloc_abort(self.bootstrap_room, pair_key):
+                raise KVTransferError(
+                    self.bootstrap_room,
+                    "Preallocation cancellation replay capacity exhausted",
+                )
+            self.prealloc_abort_pair_key = pair_key
             self.kv_mgr._prealloc_abort_attempts[self.bootstrap_room] = pair_key
 
     def clear(self) -> None:
@@ -2951,6 +3033,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         if pair_key is None:
             super().clear()
             return
+        targets = ()
         with self.kv_mgr._prealloc_abort_lock:
             # A peer P rank can fail the TP group before this rank receives
             # WAIT_FOR_ROOM. Retain this exact attempt before clearing it too.
@@ -2958,7 +3041,16 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 (self.bootstrap_room, pair_key),
                 create=self.conclude_state == KVPoll.Failed,
             )
-            super().clear()
+            # Common cleanup can notify peers too; defer that I/O until the
+            # generation binding and replay state are updated atomically.
+            super().clear(notify_drained=False)
+            record = self.kv_mgr._prealloc_abort_replays.get(
+                (self.bootstrap_room, pair_key)
+            )
+            if record is not None and not record.drained:
+                targets = self.kv_mgr._collect_prealloc_abort_acks(
+                    self.bootstrap_room, pair_key, record
+                )
             # Only the replay survives retirement. Leaving an active binding
             # here could match an old retry while a reused room's constructor
             # has published its status but has not bound the new pair yet.
@@ -2967,6 +3059,21 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 == pair_key
             ):
                 self.kv_mgr._prealloc_abort_attempts.pop(self.bootstrap_room)
+            if (
+                self.bootstrap_room,
+                pair_key,
+            ) not in self.kv_mgr._prealloc_abort_replays:
+                self.kv_mgr._prealloc_abort_reservations.discard(
+                    (self.bootstrap_room, pair_key)
+                )
+        if hasattr(self.kv_mgr, "_deferred_ack_targets") and hasattr(
+            self.kv_mgr, "_staging_outstanding"
+        ):
+            self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+        for ip, port in targets:
+            self.kv_mgr._send_prealloc_abort_ack(
+                ip, port, self.bootstrap_room, pair_key
+            )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(

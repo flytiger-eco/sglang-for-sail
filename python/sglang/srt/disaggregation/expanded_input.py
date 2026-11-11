@@ -24,6 +24,19 @@ DELTA_POSITION_ARCHS = frozenset(
 )
 
 
+def expanded_input_pair_key(request, mode):
+    """Only media requests participate in generation-scoped preallocation aborts."""
+    if getattr(request, "needs_expanded_input_len", False) or (
+        getattr(mode, "value", mode) == "prefill"
+        and (
+            getattr(request, "mm_inputs", None) is not None
+            or getattr(request, "need_wait_for_mm_inputs", False)
+        )
+    ):
+        return request.bootstrap_pair_key
+    return None
+
+
 def original_pair_key(request, raw_request=None):
     """Resolve only dispatcher-provided identity, before worker ID generation."""
     key = getattr(request, "bootstrap_pair_key", None)
@@ -78,6 +91,21 @@ def validate_expanded_input_config(cfg, architecture):
         )
     if cfg.disaggregation_mode == "prefill" and not cfg.disagg_decode_urls:
         raise ValueError("Expanded-input Prefill requires --disagg-decode-urls")
+
+
+def optimistic_prefill_supported(cfg):
+    return cfg.pp_size == 1 and (
+        not cfg.enable_hierarchical_cache
+        or (
+            cfg.hicache_storage_backend is None
+            and cfg.hicache_write_policy in ("write_back", "write_through")
+        )
+        or (
+            cfg.hicache_storage_backend is not None
+            and cfg.hicache_host_memory_mode == "buffer_only"
+            and cfg.hicache_write_policy == "write_through"
+        )
+    )
 
 
 def finalize_expanded_input_positions(req):

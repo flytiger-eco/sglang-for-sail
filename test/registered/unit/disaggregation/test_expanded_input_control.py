@@ -18,6 +18,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReq
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.config_dump import capture_engine_command
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -40,7 +41,9 @@ class TestExpandedInputControl(CustomTestCase):
     def test_control_key_is_redacted_without_changing_authentication(self):
         args = ServerArgs(model_path="dummy", disagg_decode_control_key="decode-secret")
         msgspec.Struct.__setattr__(
-            args, "_launch_command", "serve --disagg-decode-control-key=decode-secret"
+            args,
+            "_launch_command",
+            capture_engine_command({"disagg_decode_control_key": "decode-secret"}),
         )
         self.assertEqual(args.disagg_decode_control_key, "decode-secret")
         self.assertEqual(
@@ -60,7 +63,9 @@ class TestExpandedInputControl(CustomTestCase):
         key = "decode\nsecret\\tail"
         args = ServerArgs(model_path="dummy", disagg_decode_control_key=key)
         msgspec.Struct.__setattr__(
-            args, "_launch_command", f"Engine(disagg_decode_control_key={key!r})"
+            args,
+            "_launch_command",
+            capture_engine_command({"disagg_decode_control_key": key}),
         )
         self.assertIn("<redacted>", args.launch_command)
         self.assertNotIn(repr(key), args.launch_command)
