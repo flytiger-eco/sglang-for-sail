@@ -264,7 +264,7 @@ def install_msa_jit_cross_process_lock() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def ppu_msa_available() -> bool:
-    """True if the msa_for_sail package (ppu_dev) exposes the graph-safe API.
+    """True iff the msa_for_sail package (ppu_dev) exposes the graph-safe API.
 
     Probes the *internal* planner signature (the public ``fmha_sail_plan``
     only forwards ``**kwargs``) for the graph-safe arguments this module
@@ -545,14 +545,22 @@ def _paged_nhd_view(cache: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================================
-# Decode state: fixed-address buffers shared across CUDA-graph buckets
+# Decode/verify state: fixed-address buffers shared across CUDA-graph buckets
 # ============================================================================
 
 
-class _PpuMsaDecodeState:
-    """Persistent decode buffers and per-forward plans, sized once for max_bs."""
+class _PpuMsaForwardState:
+    """Persistent graph-safe forward buffers and per-forward plans.
 
-    def __init__(self, backend, device, output_dtype):
+    ``qo_len`` is the uniform number of query tokens each request carries in
+    one forward: 1 for decode, ``speculative_num_draft_tokens`` for a
+    TARGET_VERIFY batch (every request verifies the same draft width). Plans
+    use bottom-right causal alignment, so query ``j`` of a request sees the
+    first ``prefix + j + 1`` KV positions in both cases.
+    """
+
+    def __init__(self, backend, device, output_dtype, qo_len: int = 1):
+        self.qo_len = int(qo_len)
         self.max_bs = backend._ppu_msa_max_bs
         self.max_ctx = backend.max_context_len
         self.max_pages = (self.max_ctx + _PAGE_SIZE - 1) // _PAGE_SIZE
@@ -566,21 +574,38 @@ class _PpuMsaDecodeState:
         h_idx = backend._ppu_msa_num_idx_heads
         h_q = backend._ppu_msa_num_q_heads
         topk = backend.topk_blocks
-        mb, mp = self.max_bs, self.max_pages
+        mb, mp, ql = self.max_bs, self.max_pages, self.qo_len
+        t_cap = mb * ql
         self.h_idx = h_idx
-        self.qo_buf = torch.ones(mb, dtype=torch.int32, device=device)
+        self.qo_buf = torch.full((mb,), ql, dtype=torch.int32, device=device)
         self.kv_buf = torch.zeros(mb, dtype=torch.int32, device=device)
+        # Per-request valid page count (written by the pack kernel).
         self.tok_pages_buf = torch.zeros(mb, dtype=torch.int32, device=device)
         self.start_buf = torch.zeros(mb, dtype=torch.int32, device=device)
         self.token_req_buf = torch.arange(mb, dtype=torch.int32, device=device)
         self.kv_indices = torch.zeros(mb * mp, dtype=torch.int32, device=device)
-        self.topk_buf = torch.zeros(mb, h_idx, topk, dtype=torch.int32, device=device)
+        if ql == 1:
+            # One query per request: the per-request page counts ARE the
+            # per-token ones, so the score-window kernel can read them as-is.
+            self.tok_pages_tok = self.tok_pages_buf
+            self.qo_offsets_page = None
+            self.prefix_buf = None
+        else:
+            # Per-token valid page counts: ceil((prefix + j + 1) / 128).
+            self.tok_pages_tok = torch.zeros(t_cap, dtype=torch.int32, device=device)
+            self.qo_offsets_page = (
+                torch.arange(ql, dtype=torch.int32, device=device) + _PAGE_SIZE
+            )
+            self.prefix_buf = torch.zeros(mb, dtype=torch.int32, device=device)
+        self.topk_buf = torch.zeros(
+            t_cap, h_idx, topk, dtype=torch.int32, device=device
+        )
         # 128-aligned page-tile count for output_maxscore plans.
         kt = _aligned_max_k_tiles(self.max_ctx)
         self.k_tiles = kt
         if backend._ppu_msa_indexer_fp8:
             self.idx_q_fp8 = torch.zeros(
-                mb,
+                t_cap,
                 h_idx,
                 backend.idx_head_dim,
                 dtype=torch.float8_e4m3fn,
@@ -590,29 +615,41 @@ class _PpuMsaDecodeState:
             self.idx_q_fp8 = None
         if backend._ppu_msa_attend and backend._ppu_msa_use_fp8_kvcache:
             self.attend_q_fp8 = torch.zeros(
-                mb, h_q, 128, dtype=torch.float8_e4m3fn, device=device
+                t_cap, h_q, 128, dtype=torch.float8_e4m3fn, device=device
             )
         else:
             self.attend_q_fp8 = None
-        self.out_buf = torch.zeros(mb, h_q, 128, dtype=output_dtype, device=device)
+        self.out_buf = torch.zeros(t_cap, h_q, 128, dtype=output_dtype, device=device)
 
 
-def _decode_build(backend, st, forward_batch, bs) -> None:
-    """Refresh per-forward decode metadata + build both plans (graph-safe).
+def _forward_build(
+    backend, st, forward_batch, bs, seq_lens=None, req_pool_indices=None
+) -> None:
+    """Refresh per-forward metadata + build both plans (graph-safe).
 
     Runs entirely on-device (no host reads), so it is legal both eagerly and
     inside CUDA-graph capture; when captured, the replay re-executes every
     kernel and recomputes the metadata from the static ``seq_lens`` buffer.
-    Plan-kernel count per forward: exactly one indexer (OnlyScore) plan and
-    one attend (sparse) plan.
+
+    ``seq_lens`` must be the POST-WRITE KV lengths: committed prefix plus
+    ``st.qo_len`` (decode keeps its own single-token metadata on the
+    forward batch; a TARGET_VERIFY batch passes the lengths the community
+    path resolved, which are refreshed per replay when captured). Plan-kernel
+    count per forward: exactly one indexer (OnlyScore) plan and one attend
+    (sparse) plan.
     """
     from msa_for_sail import fmha_sail_plan
+
+    if seq_lens is None:
+        seq_lens = forward_batch.seq_lens
+    if req_pool_indices is None:
+        req_pool_indices = forward_batch.req_pool_indices
 
     device = st.kv_buf.device
     qo_lens = st.qo_buf[:bs]
     kv_lens = st.kv_buf[:bs]
 
-    # qo_buf is invariantly all-ones (never rewritten after init), so it needs
+    # qo_buf is invariantly qo_len (never rewritten after init), so it needs
     # no per-forward refresh. One fused kernel fills the length-metadata
     # triple and packs the page table, replacing the former metadata chain
     # plus the separate pack launch; it reads only seq_lens and writes the
@@ -620,8 +657,8 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
     _pack_len_meta_into(
         st.kv_indices,
         backend.req_to_token,
-        forward_batch.req_pool_indices,
-        forward_batch.seq_lens,
+        req_pool_indices,
+        seq_lens,
         st.kv_buf,
         st.tok_pages_buf,
         st.start_buf,
@@ -629,15 +666,30 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
         st.max_pages,
         st.n_phys_pages,
     )
+    n_q = bs * st.qo_len
+    if st.qo_len > 1:
+        # Verify (and any multi-token forward): the score window and the
+        # causal top-k select need per-token valid page counts. Query j of a
+        # request sees prefix + j + 1 positions, so its page count is
+        # ceil((prefix + j + 1) / page). Device-only ops keep this graph-safe;
+        # a captured build re-executes them on replay.
+        torch.sub(st.kv_buf[:bs], st.qo_len, out=st.prefix_buf[:bs])
+        pages = st.tok_pages_tok[:n_q].view(bs, st.qo_len)
+        torch.add(
+            st.prefix_buf[:bs].unsqueeze(1),
+            st.qo_offsets_page.unsqueeze(0),
+            out=pages,
+        )
+        pages.floor_divide_(_PAGE_SIZE)
     # One -inf base per step; layers overwrite visited tiles, padding stays -inf.
     st.max_score_active = torch.full(
-        (st.h_idx, st.k_tiles, bs),
+        (st.h_idx, st.k_tiles, n_q),
         -float("inf"),
         dtype=backend._ppu_msa_score_dtype,
         device=device,
     )
 
-    shared = backend._ppu_msa_shared
+    indexer_ws, attend_ws = backend._ppu_msa_shared.for_qo_len(st.qo_len)
     st.indexer_plan = fmha_sail_plan(
         qo_lens,
         kv_lens,
@@ -648,11 +700,11 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
         output_maxscore=True,
         causal=True,
         graph_safe=True,
-        max_qo_len_override=1,
+        max_qo_len_override=st.qo_len,
         qo_len_uniform_override=True,
-        max_total_q=st.max_bs,
+        max_total_q=st.max_bs * st.qo_len,
         max_kv_len_override=st.max_ctx,  # required by output_maxscore=True
-        given_workspace=shared.indexer_ws,
+        given_workspace=indexer_ws,
         device=device,
     )
     if backend._ppu_msa_attend:
@@ -667,10 +719,10 @@ def _decode_build(backend, st, forward_batch, bs) -> None:
             causal=True,
             use_fp8_kvcache=backend._ppu_msa_use_fp8_kvcache,
             graph_safe=True,
-            max_qo_len_override=1,
+            max_qo_len_override=st.qo_len,
             qo_len_uniform_override=True,
-            max_total_q=st.max_bs,
-            given_workspace=shared.attend_ws,
+            max_total_q=st.max_bs * st.qo_len,
+            given_workspace=attend_ws,
             device=device,
         )
     else:
@@ -700,16 +752,21 @@ def _decode_attend_triton(
 
 
 def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
-    """Run one sparse layer's indexer and optional direct NHD attend."""
+    """Run one sparse layer's indexer and optional direct NHD attend.
+
+    ``bs`` counts requests; token-shaped buffers are indexed by
+    ``bs * st.qo_len`` (one token for decode, the draft width for verify).
+    """
     from msa_for_sail import fmha_sail, sparse_topk_select
 
+    n_q = bs * st.qo_len
     kv_indices = st.kv_indices
     max_score = st.max_score_active
     idx_k_paged = _paged_nhd_view(idx_k_cache)
     if st.idx_q_fp8 is not None and idx_q.dtype != torch.float8_e4m3fn:
         # fp8 indexer: idx_k_cache is already an e4m3 pool; stage idx_q
         # through the fixed-address fp8 buffer (graph-safe cast).
-        idx_q = st.idx_q_fp8[:bs].copy_(idx_q)
+        idx_q = st.idx_q_fp8[:n_q].copy_(idx_q)
     fmha_sail(
         idx_q,
         idx_k_paged,
@@ -722,9 +779,12 @@ def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
         sm_scale=backend._ppu_msa_idx_scale,
     )
     _force_init_local_scores_into(
-        max_score, st.tok_pages_buf[:bs], backend.init_blocks, backend.local_blocks
+        max_score,
+        st.tok_pages_tok[:n_q],
+        backend.init_blocks,
+        backend.local_blocks,
     )
-    topk = st.topk_buf[:bs]
+    topk = st.topk_buf[:n_q]
     sparse_topk_select(
         max_score, backend.topk_blocks, num_valid_pages=max_score.shape[1], output=topk
     )
@@ -734,8 +794,8 @@ def _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache):
 
     attend_q = q
     if backend._ppu_msa_use_fp8_kvcache:
-        attend_q = st.attend_q_fp8[:bs].copy_(q)
-    out = st.out_buf[:bs].contiguous()
+        attend_q = st.attend_q_fp8[:n_q].copy_(q)
+    out = st.out_buf[:n_q].contiguous()
     fmha_sail(
         attend_q,
         _paged_nhd_view(k_cache),
@@ -771,7 +831,7 @@ def msa_ppu_forward_decode(
     # Rebuild on first sparse layer per forward; key guards stale reuse and
     # capture requires the plan kernels in the recorded graph.
     if st.need_build or st.key != key or (capturing and not st.capture_built):
-        _decode_build(backend, st, forward_batch, bs)
+        _forward_build(backend, st, forward_batch, bs)
         st.key = key
         st.capture_built = capturing
         st.need_build = False
@@ -782,6 +842,74 @@ def msa_ppu_forward_decode(
             backend, q, k_cache, v_cache, st.topk_buf[:bs], forward_batch
         )
     return None, out.reshape(bs, -1)
+
+
+def msa_ppu_forward_verify(
+    backend,
+    q: torch.Tensor,
+    idx_q: torch.Tensor,
+    idx_k_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    forward_batch,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
+):
+    """SAIL MSA TARGET_VERIFY entry (eager and CUDA-graph capture).
+
+    Every request verifies the same draft width ``qo_len`` (the static
+    speculation width), so the batch reuses the decode machinery with
+    per-request ``qo_len`` queries at bottom-right causal alignment.
+    ``seq_lens`` is the community path's POST-WRITE KV length (prefix plus
+    draft width); under capture it is the graph-owned tensor that
+    ``init_forward_metadata_in_graph`` refreshes on every replay.
+    Returns ``(None, out)``.
+    """
+    n_q = q.shape[0]
+    st = backend._ppu_msa_ver
+    if st is None:
+        raise RuntimeError("SAIL MSA verify forward has no verify state")
+    bs = seq_lens.shape[0]
+    if n_q != bs * st.qo_len:
+        raise RuntimeError(
+            f"SAIL MSA verify expects a uniform draft width of {st.qo_len} "
+            f"per request ({bs * st.qo_len} tokens), got {n_q} tokens for "
+            f"{bs} requests"
+        )
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    key = (id(forward_batch), seq_lens.data_ptr(), bs)
+    if st.need_build or st.key != key or (capturing and not st.capture_built):
+        _forward_build(
+            backend,
+            st,
+            forward_batch,
+            bs,
+            seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
+        )
+        st.key = key
+        st.capture_built = capturing
+        st.need_build = False
+
+    out = _decode_layer(backend, st, bs, q, idx_q, idx_k_cache, k_cache, v_cache)
+    if out is None:
+        out = _extend_layer_triton(
+            backend,
+            q,
+            k_cache,
+            v_cache,
+            st.topk_buf[:n_q],
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            max_seqlen_q,
+            forward_batch,
+        )
+    return None, out.reshape(n_q, -1)
 
 
 # ============================================================================
@@ -1164,6 +1292,23 @@ def _sail_msa_bool_with_arch_default(name: str, sm_default: bool) -> bool:
     return getattr(envs, name).get()
 
 
+def _ragged_verify_compact(speculative_algorithm) -> bool:
+    """Whether compact ragged verify graphs are active for this algorithm.
+
+    The spec bag carries the algorithm *name*; the registry object (which
+    knows ``supports_ragged_verify``) comes from ``from_string``, as in
+    ``ModelRunner``.
+    """
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        ragged_verify_compact_graphs_enabled,
+    )
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    return ragged_verify_compact_graphs_enabled(
+        SpeculativeAlgorithm.from_string(speculative_algorithm)
+    )
+
+
 def _msa_ppu_config_reason(
     *,
     page_size: int,
@@ -1224,8 +1369,12 @@ def _msa_ppu_config_reason(
         return "aligned max_k_tiles >= 12288 (context too long)"
     if max(init_blocks, local_blocks) > _MAX_FORCE_WINDOW_BLOCKS:
         return "max(init_blocks, local_blocks) > 1024"
-    if speculative_algorithm is not None:
-        return "speculative decoding enabled"
+    if speculative_algorithm is not None and _ragged_verify_compact(
+        speculative_algorithm
+    ):
+        # Compact ragged verify mixes per-request draft widths; the MSA verify
+        # plan needs one static width for every request.
+        return "compact ragged verify (SGLANG_RAGGED_VERIFY_MODE=compact)"
     return None
 
 
@@ -1329,11 +1478,28 @@ def compute_msa_ppu_gate(backend, runner) -> Tuple[bool, bool, List[str]]:
 
 
 class _PpuMsaSharedState:
-    """Backend-level buffers shared by decode (graph + eager) and prefill."""
+    """Backend-level fixed-address plan workspaces, keyed by per-request qo_len.
+
+    One entry per forward shape: qo_len 1 (decode) and the draft width
+    (TARGET_VERIFY). Everything is allocated eagerly, before capture, so a
+    captured plan build only writes into fixed addresses.
+    """
 
     def __init__(self, backend):
+        self._backend = backend
+        self._by_qo_len: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def for_qo_len(self, qo_len: int):
+        entry = self._by_qo_len.get(qo_len)
+        if entry is None:
+            entry = self._allocate(qo_len)
+            self._by_qo_len[qo_len] = entry
+        return entry
+
+    def _allocate(self, qo_len: int):
         from msa_for_sail import allocate_graph_workspace
 
+        backend = self._backend
         device = backend.kv_pool.main_pool.device
         max_bs = backend._ppu_msa_max_bs
         h_kv = backend.kv_pool.main_pool.head_num
@@ -1341,38 +1507,58 @@ class _PpuMsaSharedState:
         h_idx = backend._ppu_msa_num_idx_heads
         h_q = backend._ppu_msa_num_q_heads
 
-        # Fixed-address graph workspaces sized for max_bs decode plans.
-        self.indexer_ws = allocate_graph_workspace(
+        indexer_ws = allocate_graph_workspace(
             max_bs,
             h_idx,
             num_kv_heads=1,
-            max_qo_len=1,
+            max_qo_len=qo_len,
             page_size=_PAGE_SIZE,
             num_kv_splits=-1,
             device=device,
             output_maxscore=True,
         )
-        self.attend_ws = allocate_graph_workspace(
+        attend_ws = allocate_graph_workspace(
             max_bs,
             h_q,
             num_kv_heads=h_kv,
-            max_qo_len=1,
+            max_qo_len=qo_len,
             page_size=_PAGE_SIZE,
             kv_block_num=topk,
             num_kv_splits=-1,
             use_fp8_kvcache=backend._ppu_msa_use_fp8_kvcache,
             device=device,
         )
+        return indexer_ws, attend_ws
 
 
 def init_msa_ppu_state(backend, runner) -> None:
     """Allocate the backend-held SAIL MSA state (call once after the gate passes)."""
+    from sglang.srt.runtime_context import get_spec
+
     backend._ppu_msa_q_dtype = runner.dtype
     backend._ppu_msa_shared = _PpuMsaSharedState(backend)
-    backend._ppu_msa_dec = _PpuMsaDecodeState(
+    backend._ppu_msa_dec = _PpuMsaForwardState(
         backend,
         backend.kv_pool.main_pool.device,
         backend._ppu_msa_q_dtype,
+    )
+    # Speculative decoding verifies a fixed draft width per request under the
+    # decode graph; a dedicated state carries that width through the plan.
+    spec = get_spec()
+    verify_width = (
+        int(spec.speculative_num_draft_tokens or 0)
+        if spec.speculative_algorithm is not None
+        else 0
+    )
+    backend._ppu_msa_ver = (
+        _PpuMsaForwardState(
+            backend,
+            backend.kv_pool.main_pool.device,
+            backend._ppu_msa_q_dtype,
+            qo_len=verify_width,
+        )
+        if verify_width > 0
+        else None
     )
     backend._ppu_msa_state = None  # per-forward prefill state
     backend._ppu_msa_scale = 128**-0.5
@@ -1399,8 +1585,9 @@ def msa_ppu_warmup(backend) -> None:
     st = backend._ppu_msa_dec
 
     # Pre-grow the select transpose workspace to its serving-time maximum.
+    ver = backend._ppu_msa_ver
     t_max = max(
-        st.max_bs,
+        st.max_bs * (ver.qo_len if ver is not None else 1),
         _prefill_chunk_token_cap(
             h_idx, st.max_ctx, backend._ppu_msa_score_dtype.itemsize
         ),
@@ -1436,7 +1623,7 @@ def msa_ppu_warmup(backend) -> None:
     )
 
     st.need_build = True
-    _decode_build(backend, st, fake_fb, 1)
+    _forward_build(backend, st, fake_fb, 1)
     _decode_layer(
         backend,
         st,
@@ -1457,6 +1644,38 @@ def msa_ppu_warmup(backend) -> None:
             fake_fb,
         )
     st.need_build = True  # real forwards rebuild with live metadata
+
+    if ver is not None:
+        # Force-compile the TARGET_VERIFY variants (qo_len tokens per request)
+        # before the decode graphs capture them. Same fake batch: seq_lens is
+        # the post-write total, so the prefix leaves room for every draft.
+        n_q = ver.qo_len
+        ver.need_build = True
+        _forward_build(backend, ver, fake_fb, 1)
+        _decode_layer(
+            backend,
+            ver,
+            1,
+            torch.randn(n_q, h_q, 128, dtype=q_dtype, device=device),
+            torch.randn(n_q, h_idx, backend.idx_head_dim, dtype=q_dtype, device=device),
+            idx_k,
+            k_cache,
+            v_cache,
+        )
+        if not backend._ppu_msa_attend:
+            _extend_layer_triton(
+                backend,
+                torch.randn(n_q, h_q, 128, dtype=q_dtype, device=device),
+                k_cache,
+                v_cache,
+                ver.topk_buf[:n_q],
+                torch.tensor([0, n_q], dtype=torch.int32, device=device),
+                torch.tensor([2 * _PAGE_SIZE], dtype=torch.int32, device=device),
+                torch.tensor([2 * _PAGE_SIZE - n_q], dtype=torch.int32, device=device),
+                n_q,
+                fake_fb,
+            )
+        ver.need_build = True  # real forwards rebuild with live metadata
 
     msa_ppu_forward_extend(
         backend,
@@ -1480,9 +1699,10 @@ def msa_ppu_warmup(backend) -> None:
     torch.cuda.synchronize()
     logger.info(
         "[MiniMaxSparse][SAIL MSA] warmup done (indexer=msa, main_attn=%s, "
-        "max_bs=%d, k_tiles=%d, select_ws pre-grown to T=%d).",
+        "max_bs=%d, k_tiles=%d, select_ws pre-grown to T=%d, verify_width=%s).",
         "msa(direct_nhd)" if backend._ppu_msa_attend else "triton",
         st.max_bs,
         st.k_tiles,
         t_max,
+        ver.qo_len if ver is not None else "off",
     )
