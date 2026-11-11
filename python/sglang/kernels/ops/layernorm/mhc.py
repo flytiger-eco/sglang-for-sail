@@ -2515,7 +2515,13 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         num_warps=_HC_MIX_NUM_WARPS,
         num_stages=_HC_MIX_NUM_STAGES,
     )
-    _hc_mix_stats_reduce_kernel[(grid_m,)](
+    # Keep K slicing and reduction order unchanged; smaller output-row tiles
+    # avoid the measured PPU reduction slowdown at Decode-sized batches.
+    reduce_block_m = (
+        8 if _is_sail and 8 < m <= 2048 and k == 20480 and mix == 24 else block_m
+    )
+    reduce_grid_m = triton.cdiv(m, reduce_block_m)
+    _hc_mix_stats_reduce_kernel[(reduce_grid_m,)](
         part_mix,
         part_sq,
         mixes,
@@ -2525,7 +2531,7 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         MIX=mix,
         MIX_PAD=mix_pad,
         NUM_SLICES=num_slices,
-        BLOCK_M=block_m,
+        BLOCK_M=reduce_block_m,
         num_warps=4,
     )
     return mixes
