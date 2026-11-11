@@ -18,7 +18,10 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import is_sail, print_info_once
 
+_is_sail = is_sail()
+_FALLBACK_MSG = "MegaGate fallback: the regular router keeps routing"
 # DeepGEMM bf16_mega_gate scores one token block per launch.
 _MEGA_GATE_MAX_ROWS = 2048
 # Per-forward cache of the gate's row masks, installed by mega_gate_forward_scope.
@@ -34,7 +37,7 @@ class MegaGateRouting(NamedTuple):
 
 def mega_gate_supported(moe) -> bool:
     if (
-        _device_sm // 10 != 10
+        (_device_sm < 89 if _is_sail else _device_sm // 10 != 10)
         or moe.config.model_type != "deepseek_v41"
         or moe.topk.enable_waterfill
         or moe.num_fused_shared_experts
@@ -82,11 +85,17 @@ def mega_gate_supported(moe) -> bool:
 
 
 def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> bool:
-    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() or forward_batch is None:
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get():
+        return False
+    if forward_batch is None:
+        print_info_once(_FALLBACK_MSG)
         return False
     # Prefill graph capture clears is_extend_in_batch, so gate on the mode itself.
     mode = forward_batch.forward_mode
-    return (
+    # Idle steps route nothing; they are not a fallback worth reporting.
+    if mode.is_idle():
+        return False
+    use_mega_gate = (
         (mode.is_decode() or mode.is_target_verify())
         and moe.mega_gate_supported
         and 0 < hidden_states.shape[0] <= _MEGA_GATE_MAX_ROWS
@@ -94,6 +103,9 @@ def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> boo
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
     )
+    if not use_mega_gate:
+        print_info_once(_FALLBACK_MSG)
+    return use_mega_gate
 
 
 def _captures_routed_experts(moe) -> bool:
@@ -175,8 +187,10 @@ def run_mega_gate(
         "lp",
         "fake",
     ):
+        print_info_once(_FALLBACK_MSG)
         return None
     if moe.is_hash and input_ids is None:
+        print_info_once(_FALLBACK_MSG)
         return None
     num_tokens = hidden_states.shape[0]
     use_image = (
