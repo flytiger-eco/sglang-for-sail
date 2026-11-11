@@ -363,6 +363,15 @@ jobs:
                   cls.__unittest_skip__ = False
                   cls.__unittest_skip_why__ = ''
                   resource_event('plugin', 'class_unskip', class_name=cls.__name__)
+              method_name = target.rsplit('::', 1)[-1]
+              method = getattr(cls, method_name, None)
+              if getattr(method, '__unittest_skip__', False):
+                  method.__unittest_skip__ = False
+                  method.__unittest_skip_why__ = ''
+                  resource_event(
+                      'plugin', 'method_unskip',
+                      class_name=cls.__name__, method_name=method_name,
+                  )
 
 
           def pytest_configure(config):
