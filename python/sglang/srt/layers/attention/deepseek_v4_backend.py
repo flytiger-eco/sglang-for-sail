@@ -1278,6 +1278,7 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
@@ -2022,9 +2023,27 @@ class DeepseekV4AttnBackend(
         # the eager breaks (attention, low-ratio sources) clip their inputs to the
         # batch's non-padded count, so point it at the real tail rows while the
         # late layers run.
-        saved = saved + (forward_batch.global_num_token_non_padded_cpu,)
-        if tail.real_rows_count is not None:
-            forward_batch.global_num_token_non_padded_cpu = tail.real_rows_count
+        saved = saved + (
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
+        )
+        real_rows = tail.real_rows_count
+        if real_rows is None and tail.cp_metadata is None:
+            real_rows = sum(tail.extend_seq_lens_cpu)
+        if real_rows is not None:
+            forward_batch.global_num_token_non_padded_cpu = real_rows
+            non_padded = forward_batch.global_num_token_non_padded
+            if non_padded is not None:
+                if self._bcg_tail_num_token_non_padded is None:
+                    self._bcg_tail_num_token_non_padded = torch.empty_like(non_padded)
+                bound = torch.clamp(
+                    non_padded,
+                    max=real_rows,
+                    out=self._bcg_tail_num_token_non_padded,
+                )
+                forward_batch.global_num_token_non_padded = bound
+                forward_batch.num_token_non_padded = bound
         # The source layer is the first tail layer, so the late layers' top-k is
         # published inside the tail; nothing to carry from the full metadata.
         tail_core = tail_metadata.core_attn_metadata
@@ -2043,10 +2062,11 @@ class DeepseekV4AttnBackend(
             self.forward_metadata,
             forward_batch.attn_cp_metadata,
             local_dp_buffer_len,
-            non_padded,
+            forward_batch.global_num_token_non_padded_cpu,
+            forward_batch.global_num_token_non_padded,
+            forward_batch.num_token_non_padded,
         ) = saved
         set_local_dp_buffer_len(local_dp_buffer_len)
-        forward_batch.global_num_token_non_padded_cpu = non_padded
         self.tail_source_kv_layer_id = None
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
