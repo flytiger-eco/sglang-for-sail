@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -41,6 +41,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # DeepSeek-V4 DSpark draft stages (DeepseekV4ForCausalLMDSpark.num_stages); a
     # bundled head inherits the target's num_hidden_layers, so that overcounts.
     dspark_num_stages: Optional[int] = None
+    # DFLASH draft KV bytes/token; None when unresolved.
+    dflash_draft_cell_size_per_token: int | None = None
+    # The DFLASH draft pool keeps DCP-collapsed MLA rows (one per target row),
+    # so the target's budget charges it per row, not per widened location.
+    dflash_draft_rows_dcp_collapsed: bool = False
     # The draft checkpoint read in draft mode, and its KV layer count, for
     # every drafting algorithm: the fused-draft placement's input. A private
     # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
@@ -281,3 +286,79 @@ def _resolve_dflash_aux_hidden_state(
         config.draft_model_config = draft_model_config
         config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        (
+            config.dflash_draft_cell_size_per_token,
+            config.dflash_draft_rows_dcp_collapsed,
+        ) = _resolve_dflash_draft_cell_size(
+            draft_model_config=draft_model_config,
+            draft_num_layers=int(draft_num_layers),
+        )
+
+
+def _resolve_dflash_draft_cell_size(
+    *,
+    draft_model_config: ModelConfig,
+    draft_num_layers: int,
+) -> tuple[int | None, bool]:
+    """Bytes/token the DFLASH draft KV pool will cost the target's pool budget,
+    and whether its MLA rows are DCP-collapsed.
+
+    Resolved from the draft's own attention geometry and the KV dtype the draft
+    worker will actually resolve. Returns (None, False) if anything is
+    unresolvable, leaving callers on layer-count scaling.
+    """
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        mla_draft_rows_are_dcp_collapsed,
+    )
+    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+    from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
+
+    try:
+        _, draft_kv_cache_dtype = configure_kv_cache_dtype(
+            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                get_spec().speculative_draft_kv_cache_dtype
+            ),
+            model=None,
+            model_dtype=draft_model_config.dtype,
+            is_draft_worker=True,
+            is_dflash=True,
+            speculative_draft_attention_backend=(
+                get_spec().speculative_draft_attention_backend
+            ),
+        )
+        cell_size = dflash_draft_cell_size_per_token(
+            draft_model_config=draft_model_config,
+            draft_num_layers=draft_num_layers,
+            draft_kv_cache_dtype=draft_kv_cache_dtype,
+            # The draft pool shards KV heads like the target pool (by attention TP).
+            tp_size=get_parallel().attn_tp_size,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Could not resolve DFLASH draft KV bytes/token (%s); falling back to "
+            "layer-count scaling for the KV pool budget.",
+            e,
+        )
+        return None, False
+    if get_parallel().attn_dcp_size <= 1:
+        return cell_size, False
+    try:
+        collapsed = mla_draft_rows_are_dcp_collapsed(
+            model_config=draft_model_config,
+            use_mla_backend=draft_model_config.attention_arch == AttentionArch.MLA,
+            has_mambaish_state=mambaish_config(draft_model_config) is not None,
+            is_hybrid_swa=draft_model_config.is_hybrid_swa,
+            kv_cache_dtype=draft_kv_cache_dtype,
+        )
+    except Exception as e:  # noqa: BLE001
+        # Charging per widened location only over-reserves; keep it on doubt.
+        logger.warning(
+            "Could not resolve the DFLASH draft's DCP row layout (%s); charging it "
+            "per widened location.",
+            e,
+        )
+        collapsed = False
+    return cell_size, collapsed

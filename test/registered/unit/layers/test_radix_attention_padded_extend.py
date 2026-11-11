@@ -96,11 +96,30 @@ class TestPaddedExtendAttention(CustomTestCase):
             (ForwardMode.DECODE, 5, None),
         ]
         for mode, real, expected in cases:
-            with self.subTest(mode=mode, real=real):
+            with (
+                self.subTest(mode=mode, real=real),
+                patch.object(
+                    radix_attention,
+                    "get_attn_backend",
+                    return_value=SimpleNamespace(plans_padded_extend_rows=False),
+                ),
+            ):
                 self.assertEqual(
                     radix_attention.padded_extend_real_tokens(q, _batch(mode, real)),
                     expected,
                 )
+
+    def test_dsa_plans_its_own_padded_extend_rows(self):
+        with patch.object(
+            radix_attention,
+            "get_attn_backend",
+            return_value=SimpleNamespace(plans_padded_extend_rows=True),
+        ):
+            self.assertIsNone(
+                radix_attention.padded_extend_real_tokens(
+                    torch.zeros(8, 2), _batch(ForwardMode.EXTEND, 5)
+                )
+            )
 
     def test_the_backend_sees_the_real_rows_and_the_tail_is_zero(self):
         backend = _RecordingBackend()

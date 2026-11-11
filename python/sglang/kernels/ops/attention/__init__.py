@@ -83,6 +83,14 @@ register_kernel(
         ),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_q_quant_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
 
 
 def can_use_kda_qwen38_qsa_sm121(
@@ -458,6 +466,7 @@ for _bk in ("torch", "triton", "helion"):
 del _bk
 for _mod, _fn in [
     ("mla_qk_prep", "concat_and_cast_q_fp8_pad"),
+    ("mla_qk_prep", "concat_and_cast_q_fp8_heads"),
     ("mla_qk_prep", "absorbed_bmm_concat_cast_q_fp8"),
     ("metadata", "q8kv8_topk_length_from_indices"),
     ("minimax_sparse.decode.topk_sparse", "flash_decode_with_gqa_share_sparse"),

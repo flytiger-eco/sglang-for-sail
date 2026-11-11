@@ -1,4 +1,5 @@
 import concurrent.futures
+import struct
 import threading
 import unittest
 from collections import defaultdict
@@ -22,6 +23,8 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
     group_concurrent_contiguous,
+    pack_int_lists,
+    unpack_int_lists,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -29,11 +32,17 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
+    KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVSender,
     TransferInfo,
 )
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import (
+    KVArgsRegisterInfo as NixlKVArgsRegisterInfo,
+)
+from sglang.srt.disaggregation.nixl.conn import (
+    NixlKVManager,
+)
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_dsa_tail_transfer_blocks,
@@ -150,6 +159,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     )
                     manager.is_mla_backend = True
                     manager.is_hybrid_mla_backend = False
+                    manager._mamba_state_cp_sharded = False
                     manager.attn_tp_size = manager.attn_cp_size = manager.pp_size = 1
                     manager.attn_tp_rank = manager.attn_cp_rank = manager.pp_rank = 0
                     manager.enable_trace = manager.enable_staging = False
@@ -165,6 +175,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
                     manager._staging_outstanding = defaultdict(int)
+                    manager._deferred_ack_targets = {}
                     manager.request_status = {
                         42: KVPoll.Transferring,
                         43: KVPoll.Transferring,
@@ -408,6 +419,53 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
 
+    def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
+        """A TP-sharded MHA draft cannot change TP size across PD; a DCP-collapsed
+        MLA draft is replicated and resliced by the DCP send path."""
+        for collapsed in (False, True):
+            with self.subTest(collapsed=collapsed):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(state_types=[])
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.state_tp_size = 2  # prefill CP2 under TP1
+                manager.attn_tp_size = 1
+                registration_info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_attn_tp_size=8,
+                    dst_draft_rows_dcp_collapsed=collapsed,
+                )
+                with get_context().override_server_args(
+                    enable_unified_memory=False, speculative_algorithm="DFLASH"
+                ):
+                    fully_checked, reason = manager._validate_peer_state_layout(
+                        registration_info
+                    )
+                if collapsed:
+                    self.assertTrue(fully_checked)
+                    self.assertIsNone(reason)
+                else:
+                    self.assertFalse(fully_checked)
+                    self.assertIn("same physical TP size", reason)
+
+        manager.kv_args = SimpleNamespace(
+            state_types=[], num_draft_entries=1, kv_layer_ids=[7], kv_item_lens=[64]
+        )
+        registration_info = SimpleNamespace(
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=False,
+            dst_kv_layer_ids=[7],
+            dst_kv_item_lens=[64],
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(speculative_algorithm="DFLASH"):
+            self.assertEqual(
+                manager._validate_peer_state_layout(registration_info),
+                (True, None),
+            )
+
     def test_mooncake_unpublished_state_metadata_keeps_the_transfer_check(self):
         """An unpublished component cannot be judged; keep the transfer check."""
         manager = object.__new__(MooncakeKVManager)
@@ -623,6 +681,102 @@ class TestDisaggregationWire(unittest.TestCase):
                     ack.assert_called_once_with(42, target)
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
+
+    def test_mooncake_registration_staging_fields(self):
+        msg = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            struct.pack("Q", 0x1000),
+            struct.pack("Q", 0x2000),
+            b"",
+            b"0",
+            b"1",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            struct.pack("Q", 0x3000),
+            b"4096",
+            b"4",
+            b"2",
+        ]
+
+        info = KVArgsRegisterInfo.from_zmq(msg)
+
+        self.assertEqual(info.staging_base_ptr, 0x3000)
+        self.assertEqual(info.staging_total_size, 4096)
+        self.assertEqual(info.dst_dcp_size, 4)
+        self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
+        self.assertFalse(info.dst_draft_rows_dcp_collapsed)
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128), b"1"])
+        self.assertTrue(info.dst_draft_rows_dcp_collapsed)
+
+    def test_nixl_registration_dcp_collapsed_flag_is_backward_compatible(self):
+        frames = [
+            b"room",
+            b"127.0.0.1",
+            b"1234",
+            b"nixl",
+            b"",
+            struct.pack("Q", 0x1000),
+            b"",
+            b"",
+            b"0",
+            b"1",
+            b"0",
+            b"128",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"",
+            struct.pack("Q", 128),
+            b"",
+            struct.pack("I", 7),
+            b"4",
+            b"2",
+        ]
+        self.assertFalse(
+            NixlKVArgsRegisterInfo.from_zmq(frames).dst_draft_rows_dcp_collapsed
+        )
+        self.assertTrue(
+            NixlKVArgsRegisterInfo.from_zmq(
+                frames + [pack_int_lists([[128]], "Q"), b"1"]
+            ).dst_draft_rows_dcp_collapsed
+        )
+
+    def test_int_lists_roundtrip(self):
+        cases = [
+            ("Q", [[1, 2, 3], [4]]),
+            ("I", [[10, 20], [30, 40, 50]]),
+            ("i", [[-1, 2], [3, -4, 5]]),
+        ]
+        for fmt, sample in cases:
+            packed = pack_int_lists(sample, fmt)
+            self.assertEqual(unpack_int_lists(packed, fmt), sample, msg=fmt)
+
+    def test_pack_accepts_ndarray(self):
+        arrs = [
+            np.array([1, 2, 3], dtype=np.int32),
+            np.array([4, 5], dtype=np.int32),
+        ]
+        packed = pack_int_lists(arrs, "i")
+        self.assertEqual(unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
+
+    def test_empty_outer_list(self):
+        self.assertEqual(pack_int_lists([], "Q"), b"")
+        self.assertEqual(unpack_int_lists(b"", "Q"), [])
+
+    def test_empty_inner_list(self):
+        packed = pack_int_lists([[]], "I")
+        self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
@@ -1048,6 +1202,7 @@ class TestQwen4StateWire(unittest.TestCase):
 
     def _qsa_compressed_manager(self, *, src_item_len):
         manager = object.__new__(MooncakeKVManager)
+        manager._mamba_state_cp_sharded = False
         manager.request_status = {42: KVPoll.Transferring}
         manager.attn_tp_size = 4
         manager.pp_size = 1
@@ -1237,6 +1392,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         self, *, backend, src_rank, prefill_tp, total_heads, src_ptrs, item_len
     ):
         prefill = object.__new__(backend)
+        prefill._mamba_state_cp_sharded = False
         prefill.attn_tp_size = prefill_tp
         prefill.is_mla_backend = False
         prefill.pp_size = 1
@@ -1911,6 +2067,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        seed_backend = patch(
+            "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+            return_value=True,
+        )
+        seed_backend.start()
+        self.addCleanup(seed_backend.stop)
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
 
         draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
@@ -1991,6 +2153,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         )
         override.install()
         self.addCleanup(override.restore)
+        seed_backend = patch(
+            "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+            return_value=True,
+        )
+        seed_backend.start()
+        self.addCleanup(seed_backend.stop)
 
         local_slots = [[309, 101, -1], [801, 990, -1]]
         unremapped = [[2, 0, -1], [1, 3, -1]]
@@ -2095,6 +2263,7 @@ class TestDSAKPoolDisaggregationState(CustomTestCase):
         pool.full_kv_pool = SimpleNamespace(
             get_state_buf_infos=lambda: ([30, 31], [300, 310], [40, 41]),
             kpool_use_compress=True,
+            index_kpool=4,
             get_compress_tail_buf_infos=lambda: (
                 [50, 51],
                 [500, 510],

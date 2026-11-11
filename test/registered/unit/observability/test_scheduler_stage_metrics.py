@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -7,7 +8,14 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_FULL,
     FORWARD_OVERLAP_NONE,
     FORWARD_OVERLAP_PARTIAL,
+    SCHEDULER_STAGE_BUILD_BATCH,
+    SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
     SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_LAUNCH_BATCH,
+    SCHEDULER_STAGE_PD_CONSENSUS,
+    SCHEDULER_STAGE_PP_COMM_WAIT,
+    SCHEDULER_STAGE_PP_OUTPUT_WAIT,
+    SCHEDULER_STAGE_PP_RECV_PROXY,
     SCHEDULER_STAGE_PROCESS_QUEUE,
     SCHEDULER_STAGE_PROCESS_REQUESTS,
     SCHEDULER_STAGE_RUN_BATCH,
@@ -101,6 +109,37 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
             },
         )
 
+    def test_pipeline_stages_are_accounted_outside_other(self):
+        # The pipeline loop labels its own steps; only unlabeled time stays in other.
+        stages = (
+            SCHEDULER_STAGE_BUILD_BATCH,
+            SCHEDULER_STAGE_PP_RECV_PROXY,
+            SCHEDULER_STAGE_PP_COMM_WAIT,
+            SCHEDULER_STAGE_PP_OUTPUT_WAIT,
+            SCHEDULER_STAGE_PD_CONSENSUS,
+            SCHEDULER_STAGE_DISAGG_BOOKKEEPING,
+            SCHEDULER_STAGE_LAUNCH_BATCH,
+        )
+        recorder = SchedulerStageMetricsRecorder(enabled=True)
+        recorder.start(wall_ns=0)
+
+        # Each stage is entered at 10 x i + 1 and left ten nanoseconds later.
+        timestamps = [10 * i + offset for i in range(len(stages)) for offset in (1, 11)]
+        with patch(
+            "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+            side_effect=timestamps,
+        ):
+            for stage in stages:
+                with recorder.record(stage):
+                    pass
+
+        wall_ns = recorder.drain(wall_ns=timestamps[-1])
+        self.assertEqual(
+            {stage: wall_ns[stage, FORWARD_OVERLAP_NONE] for stage in stages},
+            {stage: 10 for stage in stages},
+        )
+        self.assertEqual(wall_ns["other", FORWARD_OVERLAP_NONE], 1)
+
     def test_trace_spans_do_not_require_python_stacks(self):
         recorder = SchedulerStageMetricsRecorder(enabled=False)
 
@@ -137,8 +176,10 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
         start.elapsed_time.return_value = 2.0
         next_start.elapsed_time.return_value = 3.0
         with patch(
-            "sglang.srt.utils.device_timer.torch.cuda.Event",
-            side_effect=[start, end, next_start, next_end],
+            "sglang.srt.utils.device_timer.torch.get_device_module",
+            return_value=SimpleNamespace(
+                Event=Mock(side_effect=[start, end, next_start, next_end])
+            ),
         ):
             self.assertFalse(timer.is_active())
             with timer.wrap(metadata={"category": "extend"}):

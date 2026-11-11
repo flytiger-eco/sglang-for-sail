@@ -138,7 +138,7 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
     extend_kwargs = dict(
         ssm_states=sentinel.ssm_states,
         cache_indices=sentinel.cache_indices,
-        query_start_loc=sentinel.query_start_loc,
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
         return_intermediate_states=False,
     )
 
@@ -146,7 +146,12 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
         supports_safe_gate=True, extend=lambda *a, **k: (out, None)
     )
     got, h = dispatcher.extend(
-        sentinel.q, sentinel.k, sentinel.v, sentinel.g, sentinel.beta, **extend_kwargs
+        torch.zeros(1, 2, 4),
+        sentinel.k,
+        sentinel.v,
+        sentinel.g,
+        sentinel.beta,
+        **extend_kwargs,
     )
     assert got is out
     assert h is None
@@ -155,7 +160,12 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
         supports_safe_gate=True, extend=lambda *a, **k: out
     )
     got, h = dispatcher.extend(
-        sentinel.q, sentinel.k, sentinel.v, sentinel.g, sentinel.beta, **extend_kwargs
+        torch.zeros(1, 2, 4),
+        sentinel.k,
+        sentinel.v,
+        sentinel.g,
+        sentinel.beta,
+        **extend_kwargs,
     )
     assert got is out
     assert h is None

@@ -476,6 +476,11 @@ class ExecMamba(msgspec.Struct):
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
     )
+    decode_state_free_radix = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
+        doc="Whether a PD decode server's radix cache holds FULL KV only and "
+        "each request keeps its own single Mamba state slot.",
+    )
     enable_mamba_extra_buffer_lazy = Derived(
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",

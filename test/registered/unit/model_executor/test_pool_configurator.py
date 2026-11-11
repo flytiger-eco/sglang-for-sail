@@ -189,6 +189,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_rows_dcp_collapsed=False,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -846,6 +847,7 @@ class TestPerWorkerRequestSplit(CustomTestCase):
         _publish_config(self, max_running_requests=1)
         kvc = SimpleNamespace(
             attn_dp_size=4,
+            server_args=get_server_args(),
             mambaish_config=None,
             model_config=SimpleNamespace(context_len=8192),
         )
@@ -1391,7 +1393,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 self.assertIs(config.draft_parallel_layout, layout)
 
     def test_dcp_replication_scales_draft_budget(self):
-        """The replicated draft pool spans every DCP virtual location."""
+        """A replicated draft pool spans every DCP virtual location; a
+        DCP-collapsed MLA draft keeps one physical row per target row."""
         draft_kv_per_token = 10_240
         mr = _make_model_runner(self)
         mr.spec_algorithm.is_dflash_family.return_value = True
@@ -1403,8 +1406,17 @@ class TestDflashDraftKvBudget(CustomTestCase):
         mr.dflash_draft_cell_size_per_token = draft_kv_per_token
 
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
-        for dcp_size in (1, 8):
-            with self.subTest(dcp_size=dcp_size):
+        for dcp_size, collapsed in ((1, False), (8, False), (8, True)):
+            mr = _make_model_runner(self)
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_rows_dcp_collapsed=collapsed,
+            )
+            with self.subTest(dcp_size=dcp_size, collapsed=collapsed):
                 # TP=8 makes both topologies valid. The mock deliberately keeps
                 # target geometry fixed so this assertion isolates the draft term.
                 with (
@@ -1419,7 +1431,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
                 self.assertEqual(
                     cfg._cell_size,
-                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                    target_kv_per_token
+                    + draft_kv_per_token * (1 if collapsed else dcp_size),
                 )
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
@@ -1439,6 +1452,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_rows_dcp_collapsed=False,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (

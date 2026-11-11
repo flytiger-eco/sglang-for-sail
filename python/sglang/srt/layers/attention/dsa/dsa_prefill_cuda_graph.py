@@ -140,23 +140,39 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    query, key, _ = indexer._get_q_k_bf16(
+    query, key, weights_raw = indexer._get_q_k_bf16(
         q_lora,
         x,
         positions,
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    # Match eager indexer quantization: PPU SM80 uses INT8 for both Q and K.
-    # act_quant unconditionally produces FP8, which Triton cannot compile there.
-    if indexer.use_int8:
-        from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+    if (
+        _is_cuda
+        and indexer.bf16_head_gate
+        and indexer.skip_rope
+        and indexer.head_dim == indexer.block_size == 128
+        and not indexer.use_int8
+    ):
+        from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 
-        q_fp8, q_scale = per_token_quant_int8(query.contiguous())
+        gate = indexer._weights_proj_bf16_in_fp32_out(x)
+        q_fp8, weights = indexer_q_quant_head_gate(
+            query, gate, indexer.softmax_scale, indexer.scale_fmt
+        )
     else:
-        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
-    # Reuse the compiled head-gate util shared with the eager path.
-    weights = indexer._get_logits_head_gate(x, q_scale)
+        # PPU SM80 uses INT8 for both Q and K; FP8 quantization cannot compile there.
+        if indexer.use_int8:
+            from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+
+            q_fp8, q_scale = per_token_quant_int8(query.contiguous())
+        else:
+            q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+        weights = (
+            indexer._scale_head_gates(weights_raw, q_scale)
+            if indexer.use_dsa_indexer_fusion
+            else indexer._get_logits_head_gate(x, q_scale)
+        )
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.

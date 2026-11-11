@@ -31,6 +31,21 @@ PHYSICAL_PAGE = 64
 WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 
 
+def setUpModule():
+    memory_budget = mock.patch(
+        "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+        return_value=1 << 40,
+    )
+    memory_budget.start()
+    unittest.addModuleCleanup(memory_budget.stop)
+    host_allocator = mock.patch(
+        "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
+        side_effect=lambda dims, dtype: torch.empty(dims, dtype=dtype),
+    )
+    host_allocator.start()
+    unittest.addModuleCleanup(host_allocator.stop)
+
+
 def _fake_mla_device_pool(
     size: int = 1024, dtype: torch.dtype = torch.float16
 ) -> MLATokenToKVPool:

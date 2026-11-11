@@ -905,6 +905,7 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    SGLANG_LINKER_PP_LOOKUP_MAX_AGE_S = EnvFloat(30.0)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
@@ -1582,6 +1583,9 @@ class Envs:
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
+    # Largest M the startup bf16 GEMM warmup covers (the prefill chunk; about
+    # 13 s of startup on K3.1); 0 disables it.
+    SGLANG_WARMUP_BF16_GEMM_MAX_M = EnvInt(16384)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
@@ -1684,6 +1688,12 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # PD decode with --disaggregation-decode-enable-radix-cache on a hybrid-SSM
+    # model: the radix tree keeps FULL KV only. Prefill always sends a
+    # request's final recurrent state and decode never computes a prompt, so a
+    # cached prefix only saves KV transfer and no tree-held state is ever read;
+    # each request keeps its own one state slot. Set 0 to keep tree states.
+    SGLANG_DECODE_STATE_FREE_RADIX = EnvBool(True)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -2043,6 +2053,9 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
+    # (0.2.3 does); set to 0 for an older DeepGEMM.
+    SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
@@ -2173,6 +2186,13 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # DCP MLA decode: push each peer's head partials straight into its
+    # CustomAllReduceV2 push slot and combine by LSE in one kernel, in place of
+    # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).
+    # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
+    # kernels/ops/attention/dcp_push_combine.py.
+    SGLANG_DCP_PUSH_COMBINE = EnvBool(True)
+    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention

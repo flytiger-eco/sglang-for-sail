@@ -155,6 +155,8 @@ def padded_extend_real_tokens(
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens is None or not 0 < real_num_tokens < q.shape[0]:
         return None
+    if get_attn_backend().plans_padded_extend_rows:
+        return None
     return real_num_tokens
 
 

@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -354,12 +355,14 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized: bool = False,
         fp8_channelwise_layers: Optional[list[str]] = None,
         packed_modules_mapping: Optional[dict[str, list[str]]] = None,
+        enable_online_linear: bool = False,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
         self.fp8_channelwise_layers = fp8_channelwise_layers
         self.packed_modules_mapping = packed_modules_mapping or {}
+        self.enable_online_linear = enable_online_linear
 
     @classmethod
     def from_config(cls, config):
@@ -450,6 +453,8 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            elif self.enable_online_linear:
+                return Mxfp4OnlineLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
             # only ppu deepgemm support mxfp4
@@ -551,6 +556,67 @@ class Mxfp4LinearMethod(LinearMethodBase):
         )
         gemm_nt_f4f4bf16(x_q, x_scale, layer.weight.t(), layer.weight_scale, bias, out)
         return out.to(x.dtype)
+
+
+class Mxfp4OnlineLinearMethod(UnquantizedLinearMethod):
+    """Load BF16 weights into MXFP4 and quantize activations per token/block."""
+
+    def __init__(self):
+        if (
+            _is_hip
+            or not torch.cuda.is_available()
+            or not (10, 0) <= get_device_capability() < (11, 0)
+        ):
+            raise ValueError("Online MXFP4 linear requires a CUDA Blackwell GPU")
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        import deep_gemm
+        from deep_gemm.utils import per_token_cast_to_fp4
+
+        n, k = layer.weight.shape
+        if layer.weight.dtype != torch.bfloat16 or k % 128:
+            raise ValueError(
+                "Online MXFP4 linear requires BF16 weights and K % 128 == 0"
+            )
+        weight, scale = per_token_cast_to_fp4(
+            layer.weight.data, use_ue8m0=True, gran_k=32
+        )
+        scale = deep_gemm.transform_sf_into_required_layout(scale, n, k, (1, 32))
+        layer.weight.data = weight
+        layer.register_parameter("weight_scale", Parameter(scale, requires_grad=False))
+
+    def apply(self, layer, x, bias=None):
+        import deep_gemm
+        from flashinfer.quantization.fp4_quantization import SfLayout, mxfp4_quantize
+
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        m, k = x.shape
+        result = x.new_empty((m, layer.weight.shape[0]))
+        if m:
+            if x.dtype != torch.bfloat16:
+                raise ValueError("Online MXFP4 linear requires BF16 activations")
+            packed, scale = mxfp4_quantize(
+                x, backend="cuda", sfLayout=SfLayout.layout_linear
+            )
+            scale = scale.view(m, k // 32).view(torch.int32)
+            # TMA needs a 16-byte aligned leading dimension, including M=1.
+            if m % 4:
+                scale = torch.nn.functional.pad(scale, (0, 0, 0, (-m) % 4))
+            scale = scale.T.contiguous().T[:m]
+            deep_gemm.fp4_gemm_nt(
+                (packed.view(torch.int8), scale),
+                (layer.weight, layer.weight_scale),
+                result,
+                recipe=(1, 1, 32),
+                disable_ue8m0_cast=True,
+            )
+        if bias is not None:
+            result.add_(bias)
+        return result.view(*shape[:-1], layer.weight.shape[0])
+
+    def apply_into(self, layer, x, output, bias=None):
+        return output.copy_(self.apply(layer, x, bias))
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):

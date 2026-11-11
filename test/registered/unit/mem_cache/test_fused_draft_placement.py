@@ -681,6 +681,7 @@ class TestFusedDraftDecision(CustomTestCase):
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,
             dflash_draft_num_layers=1,
+            dflash_draft_rows_dcp_collapsed=False,
             draft_model_config=SimpleNamespace(
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,
