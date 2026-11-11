@@ -337,6 +337,27 @@ _PER_ROW_EXTRA_KWARGS = (
 _KEY_ROW_KWARGS = frozenset({"k_rope", "k_descale", "v_descale", "idx_k", "idx_v"})
 
 
+@contextmanager
+def real_rows_scope(forward_batch: ForwardBatch, real_num_tokens: int):
+    out_cache_loc = forward_batch.out_cache_loc
+    positions = forward_batch.positions
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc = out_cache_loc
+        forward_batch.positions = positions
+
+
+def pad_with_zero_rows(t: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    full = t.new_empty((num_tokens, *t.shape[1:]))
+    full[: t.shape[0]].copy_(t)
+    full[t.shape[0] :].zero_()
+    return full
+
+
 def padded_extend_real_tokens(
     q: torch.Tensor, forward_batch: ForwardBatch
 ) -> Optional[int]:
