@@ -1,28 +1,24 @@
-From 82ab1875ac7c1716cb1813c1d5723c9152bcc544 Mon Sep 17 00:00:00 2001
+From 71689e4a5ffda0892ef0c852516befafd31b4bfa Mon Sep 17 00:00:00 2001
 From: "billding.df" <billding.df@alibaba-inc.com>
-Date: Thu, 22 Oct 2026 15:49:40 +0800
-Subject: [PATCH 1/3] revert(build): drop the hgcc/sailify SAIL build stack
+Date: Mon, 19 Oct 2026 13:40:53 +0800
+Subject: [PATCH 1/3] Revert "feat(build): add initial T-head SAIL platform
+ support"
 
-Partially reverts d3e4720c40 ("feat(build): add initial T-head SAIL
-platform support"): the source-translation build stack is removed in
-favor of a CUDA-compatible SAIL platform that compiles directly with the
-PPU SDK's nvcc.
+This reverts commit a952ddce23f26849e12de0d0fff4ea2893b3765e.
 
-Removed:
-- JIT sailify conversion (compile/sailify.py, loader hook, cache target
-  tag and environment fingerprint, hgcc flag filtering)
-- hgcc compiler discovery, --gpu-architecture selection and hggcrt link
-  flags in compile/toolchain.py
-- capability-based _sail_arch_suffix in JIT arch detection
-- SGLANG_SAIL_GPU_ARCH, the sailify entry in the srt_sail extra, and the
-  hgcc-era AOT setup_sail.py / pyproject_sail.toml
+The hgcc/sailify-based SAIL build stack (sailify JIT conversion,
+setup_sail.py AOT build, common_extension_sail.cc, SGLANG_SAIL_GPU_ARCH,
+srt_sail extras) is dropped in favor of a CUDA-compatible SAIL platform
+following the upstream PPU platform pattern (commit 8f8c2968cf13 of the
+reference tree).
 
-The platform detection layer (PlatformEnum.SAIL, is_sail(),
-is_sail_runtime()) and every model-side SAIL integration stay in place.
-Follow-up commits re-land the CUDA-compatible JIT arch hook and the
-nvcc-based setup_sail.py.
+The SAIL platform detection layer (platforms/sail.py, PlatformEnum.SAIL,
+is_sail()/is_sail_runtime()) is intentionally kept: ~26 downstream
+commits depend on it. A follow-up commit re-lands the CUDA-compatible
+pieces (JIT arch-suffix hook, tests).
 ---
- python/pyproject_other.toml                   |   1 -
+ python/pyproject_other.toml                   |  16 -
+ .../kernels/aot/csrc/common_extension_sail.cc | 300 ----------
  python/sglang/kernels/aot/pyproject_sail.toml |  32 -
  python/sglang/kernels/aot/setup_sail.py       | 545 ------------------
  python/sglang/kernels/jit/utils/arch.py       |  20 +-
@@ -33,23 +29,358 @@ nvcc-based setup_sail.py.
  .../kernels/jit/utils/compile/toolchain.py    |  73 +--
  python/sglang/srt/environ.py                  |   6 -
  .../unit/platforms/test_platform_interface.py |  43 --
- 11 files changed, 11 insertions(+), 1017 deletions(-)
+ 12 files changed, 11 insertions(+), 1332 deletions(-)
+ delete mode 100644 python/sglang/kernels/aot/csrc/common_extension_sail.cc
  delete mode 100644 python/sglang/kernels/aot/pyproject_sail.toml
  delete mode 100644 python/sglang/kernels/aot/setup_sail.py
  delete mode 100644 python/sglang/kernels/jit/utils/compile/sailify.py
 
 diff --git a/python/pyproject_other.toml b/python/pyproject_other.toml
-index ea0066a915..41d2152a24 100755
+index ea0066a915..6241c83b09 100755
 --- a/python/pyproject_other.toml
 +++ b/python/pyproject_other.toml
-@@ -152,7 +152,6 @@ srt_sail = [
-   "deep_gemm>=1.1.0",
-   "flash_attn_3",
-   "flash_mla",
+@@ -144,20 +144,6 @@ diffusion_hip = [
+ # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
+ srt_hpu = ["sglang[runtime_common]"]
+ 
+-# https://docs.sglang.io/hardware-platforms/sail
+-srt_sail = [
+-  "acext>=1.1.0",
+-  "cuda-python>=13.0",
+-  "deep_ep",
+-  "deep_gemm>=1.1.0",
+-  "flash_attn_3",
+-  "flash_mla",
 -  "sailify",
-   "sglang[runtime_common]",
-   "torch-for-sail",
-   "triton-for-sail",
+-  "sglang[runtime_common]",
+-  "torch-for-sail",
+-  "triton-for-sail",
+-]
+-
+ # https://docs.sglang.io/platforms/mthreads_gpu.md
+ srt_musa = [
+   "apache-tvm-ffi==0.1.11.post1+musa.1",
+@@ -231,14 +217,12 @@ test = [
+ all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
+ all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
+ all_hpu = ["sglang[srt_hpu]"]
+-all_sail = ["sglang[srt_sail]"]
+ all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
+ all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
+ 
+ dev_hip = ["sglang[all_hip]", "sglang[test]"]
+ dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
+ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+-dev_sail = ["sglang[all_sail]", "sglang[test]"]
+ dev_musa = ["sglang[all_musa]", "sglang[test]"]
+ dev_mps = ["sglang[all_mps]", "sglang[test]"]
+ 
+diff --git a/python/sglang/kernels/aot/csrc/common_extension_sail.cc b/python/sglang/kernels/aot/csrc/common_extension_sail.cc
+deleted file mode 100644
+index 4f529a5c84..0000000000
+--- a/python/sglang/kernels/aot/csrc/common_extension_sail.cc
++++ /dev/null
+@@ -1,300 +0,0 @@
+-/* Copyright 2025 SGLang Team. All Rights Reserved.
+-
+-Licensed under the Apache License, Version 2.0 (the "License");
+-you may not use this file except in compliance with the License.
+-You may obtain a copy of the License at
+-
+-    http://www.apache.org/licenses/LICENSE-2.0
+-
+-Unless required by applicable law or agreed to in writing, software
+-distributed under the License is distributed on an "AS IS" BASIS,
+-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-See the License for the specific language governing permissions and
+-limitations under the License.
+-==============================================================================*/
+-#include <ATen/core/dispatch/Dispatcher.h>
+-#include <torch/all.h>
+-#include <torch/library.h>
+-
+-#include "sgl_kernel_ops.h"
+-
+-TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+-  /*
+-   * From csrc/allreduce
+-   */
+-  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
+-  m.def("register_graph_buffers", &register_graph_buffers);
+-  m.def("dispose", &dispose);
+-  m.def("meta_size", &meta_size);
+-  m.def("register_buffer", &register_buffer);
+-
+-  m.def(
+-      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
+-      "int rank, bool full_nvlink) -> int");
+-  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
+-
+-  m.def(
+-      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
+-      "int reg_buffer_sz_bytes) -> ()");
+-  m.impl("all_reduce", torch::kCUDA, &all_reduce);
+-
+-  /*
+-   * From csrc/attention
+-   */
+-  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
+-  m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
+-
+-  /*
+-   * From csrc/elementwise
+-   */
+-  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+-  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
+-
+-  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
+-  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
+-
+-  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+-  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
+-
+-  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
+-  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
+-
+-  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
+-  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
+-
+-  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
+-  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
+-
+-  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
+-  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
+-
+-  m.def(
+-      "rotary_embedding(Tensor positions, Tensor! query,"
+-      "                 Tensor!? key, int head_size,"
+-      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
+-  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+-
+-  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
+-  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
+-  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
+-  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
+-
+-  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
+-  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
+-
+-  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
+-  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
+-  m.def(
+-      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
+-      "cu_seqlens_q, Tensor? row_starts) -> ()");
+-  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
+-  m.def(
+-      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
+-      "topk_indices_offset, Tensor ? row_starts) -> ()");
+-  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
+-
+-  /*
+-   * From csrc/gemm
+-   */
+-  m.def(
+-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
+-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
+-  m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
+-
+-  m.def(
+-      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
+-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
+-  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
+-
+-  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+-  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+-
+-  /*
+-   * From csrc/moe
+-   */
+-  m.def(
+-      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+-      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
+-  m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+-
+-  m.def(
+-      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
+-      "moe_softcapping, Tensor? correction_bias) -> ()");
+-  m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
+-
+-  m.def(
+-      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+-      "correction_bias) -> ()");
+-  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
+-
+-  m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+-  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
+-
+-  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
+-  m.impl("moe_sum", torch::kCUDA, &moe_sum);
+-
+-  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the gate/topk path
+-  // now routes through the unified Triton router
+-  // (python/sglang/jit_kernel/moe_fused_gate.py).
+-
+-  m.def(
+-      "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
+-      " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
+-      "()");
+-  m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
+-
+-  m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
+-  m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
+-
+-  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+-  m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
+-
+-  m.def(
+-      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+-      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+-      "Tensor q_weight, Tensor k_weight, float base, "
+-      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
+-      "-> ()");
+-  m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
+-
+-  /*
+-   * From csrc/kvcacheio
+-   */
+-  m.def(
+-      "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+-      "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_per_layer", torch::kCUDA, &transfer_kv_per_layer);
+-  m.def(
+-      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+-      "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
+-  m.def(
+-      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
+-      "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "
+-      "num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_per_layer_ph_lf", torch::kCUDA, &transfer_kv_per_layer_ph_lf);
+-  m.def(
+-      "transfer_kv_all_layer(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
+-      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, int block_quota, int "
+-      "num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
+-  m.def(
+-      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
+-      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int block_quota, int "
+-      "num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_all_layer_lf_pf", torch::kCUDA, &transfer_kv_all_layer_lf_pf);
+-  m.def(
+-      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
+-      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int page_size, int "
+-      "head_num, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_all_layer_lf_ph", torch::kCUDA, &transfer_kv_all_layer_lf_ph);
+-  m.def(
+-      "transfer_kv_per_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
+-      "block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_per_layer_mla", torch::kCUDA, &transfer_kv_per_layer_mla);
+-  m.def(
+-      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
+-      "int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kCUDA, &transfer_kv_per_layer_mla_pf_lf);
+-  m.def(
+-      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor dst_layers, Tensor src_indices, Tensor dst_indices, int "
+-      "item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_all_layer_mla", torch::kCUDA, &transfer_kv_all_layer_mla);
+-  m.def(
+-      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
+-      "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
+-  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
+-  m.def(
+-      "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
+-      "page_size) -> ()");
+-  m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+-  m.def(
+-      "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+-      "Tensor dst_indices, int layer_id, int page_size)->() ");
+-  m.impl("transfer_kv_per_layer_direct_pf_lf", torch::kCUDA, &transfer_kv_per_layer_direct_pf_lf);
+-  m.def(
+-      "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
+-      "Tensor dst_indices, int page_size) ->() ");
+-  m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
+-
+-  /*
+-   * From csrc/memory
+-   */
+-  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+-  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
+-
+-  /*
+-   * From FlashInfer
+-   */
+-  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
+-  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
+-
+-  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
+-  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
+-
+-  /*
+-   * From csrc/grammar
+-   */
+-  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
+-  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
+-
+-  /*
+-   * From csrc/quantization/gguf
+-   */
+-  m.def(
+-      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
+-      "dtype) -> Tensor");
+-  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
+-
+-  m.def(
+-      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
+-      "-> Tensor");
+-  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
+-
+-  m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
+-  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
+-
+-  m.def(
+-      "ggml_moe_a8(Tensor X, Tensor W, "
+-      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
+-      "num_tokens_post_padded, "
+-      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+-  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
+-
+-  m.def(
+-      "ggml_moe_a8_vec(Tensor X, Tensor W, "
+-      "Tensor topk_ids, int top_k, "
+-      "int type, SymInt row, SymInt tokens) -> Tensor");
+-  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
+-
+-  m.def("ggml_moe_get_block_size(int type) -> int");
+-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+-
+-  /*
+-   * From csrc/mamba
+-   */
+-  m.def(
+-      "causal_conv1d_update(Tensor! x,"
+-      "Tensor! conv_state,"
+-      "Tensor! weight,"
+-      "Tensor? bias_,"
+-      "bool silu_activation,"
+-      "Tensor? cache_seqlens_,"
+-      "Tensor? conv_state_indices,"
+-      "int pad_slot_id) -> ()");
+-  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
+-
+-  m.def(
+-      "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
+-      "Tensor? bias_,"
+-      "Tensor!? conv_states,"
+-      "Tensor? query_start_loc,"
+-      "Tensor? cache_indices,"
+-      "Tensor? has_initial_state,"
+-      "bool silu_activation,"
+-      "int pad_slot_id) -> ()");
+-  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
+-}
+-
+-REGISTER_EXTENSION(common_ops)
 diff --git a/python/sglang/kernels/aot/pyproject_sail.toml b/python/sglang/kernels/aot/pyproject_sail.toml
 deleted file mode 100644
 index 9ad7b8fa03..0000000000
@@ -1181,10 +1512,10 @@ index ffa3b65997..5c8752aa0b 100644
          return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
      return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 48698b98ba..175b2029e6 100644
+index d0e4a5de52..79ad2aa1ee 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1304,12 +1304,6 @@ class Envs:
+@@ -1307,12 +1307,6 @@ class Envs:
      # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
      SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
      SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
@@ -1269,31 +1600,31 @@ index ef9cc46ff3..35249d37ba 100644
 2.43.7
 
 
-From 7986ff5f5a0662208fd91c84dc4dd0a88f3a803b Mon Sep 17 00:00:00 2001
+From 07f90549e917539df83d493e56b01d23c9003259 Mon Sep 17 00:00:00 2001
 From: "billding.df" <billding.df@alibaba-inc.com>
-Date: Thu, 22 Oct 2026 15:50:20 +0800
-Subject: [PATCH 2/3] feat(build): add CUDA-compatible SAIL platform JIT
- support
+Date: Mon, 19 Oct 2026 14:01:41 +0800
+Subject: [PATCH 2/3] feat(build): add CUDA-compatible SAIL platform support
 
-Re-add the SAIL-specific JIT compilation hooks on top of the preserved
-platform detection layer, following the upstream PPU platform pattern:
+Re-add SAIL as a CUDA-compatible in-tree platform, following the
+upstream PPU platform pattern (reference commit 8f8c2968cf13):
 
-- SRTPlatform.get_jit_cuda_arch_suffix() hook with a safe "" default for
-  every platform
-- SailSRTPlatform overrides it: device names containing "810" (810/810e,
-  e.g. ZW810E) require the "sm80a" JIT arch variant
+- SRTPlatform.get_jit_cuda_arch_suffix() JIT compilation hook with a
+  safe "" default for all platforms
+- SailSRTPlatform overrides the hook: 810/810e devices (ZW tag in the
+  device name) require the "sm80a" arch variant for JIT compilation
 - JIT arch detection consults current_platform on SAIL instead of the
   removed capability-based _sail_arch_suffix helper
-- Unit tests for SAIL platform identity, capabilities and the arch-suffix
-  hook
+- Unit tests for SAIL platform identity, capabilities and the
+  arch-suffix hook
 
 The platform detection layer (PlatformEnum.SAIL, is_sail(),
-is_sail_runtime(), SailSRTPlatform discovery fallback) is reused as-is.
+is_sail_runtime(), SailSRTPlatform discovery fallback) was preserved
+through the revert and is reused as-is.
 ---
- python/sglang/kernels/jit/utils/arch.py       | 14 +++---
- python/sglang/srt/platforms/interface.py      | 13 ++++++
- python/sglang/srt/platforms/sail.py           |  5 +++
- .../unit/platforms/test_platform_interface.py | 44 +++++++++++++++++++
+ python/sglang/kernels/jit/utils/arch.py       | 14 ++--
+ python/sglang/srt/platforms/interface.py      | 13 +++
+ python/sglang/srt/platforms/sail.py           |  5 ++
+ .../unit/platforms/test_platform_interface.py | 44 ++++++++++
  4 files changed, 71 insertions(+), 5 deletions(-)
 
 diff --git a/python/sglang/kernels/jit/utils/arch.py b/python/sglang/kernels/jit/utils/arch.py
@@ -1346,10 +1677,10 @@ index 70fc60d1ef..c71f520953 100644
      # Speculative decoding support (safe conservative defaults)
      # ------------------------------------------------------------------
 diff --git a/python/sglang/srt/platforms/sail.py b/python/sglang/srt/platforms/sail.py
-index 7e1604927f..e1b8252ce6 100644
+index 334dabdeb2..3d464e0982 100644
 --- a/python/sglang/srt/platforms/sail.py
 +++ b/python/sglang/srt/platforms/sail.py
-@@ -18,6 +18,7 @@ from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+@@ -18,6 +18,7 @@ from sglang.srt.platforms.interface import SRTPlatform
  
  _ZW_TAG = "ZW"
  _ZW810E_NAME = "ZW810E"
@@ -1357,9 +1688,9 @@ index 7e1604927f..e1b8252ce6 100644
  
  
  @lru_cache(maxsize=1)
-@@ -52,6 +53,10 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
-         piecewise_graph=True,
-     )
+@@ -55,6 +56,10 @@ class SailSRTPlatform(SailDeviceMixin, SRTPlatform):
+     def support_piecewise_cuda_graph(self) -> bool:
+         return True
  
 +    def get_jit_cuda_arch_suffix(self) -> str:
 +        # SAIL 810/810e devices require the "sm80a" arch variant for JIT compilation.
@@ -1434,9 +1765,9 @@ index 35249d37ba..d14ff6080a 100644
 2.43.7
 
 
-From 65db2f724cf7a787a42f0516a4cb9d8ce918b192 Mon Sep 17 00:00:00 2001
+From 890b32c666ca22768fbf79ed39f5d9ecad45b8bd Mon Sep 17 00:00:00 2001
 From: "billding.df" <billding.df@alibaba-inc.com>
-Date: Thu, 22 Oct 2026 15:50:34 +0800
+Date: Mon, 19 Oct 2026 14:42:08 +0800
 Subject: [PATCH 3/3] feat(build): add nvcc-based setup_sail.py for
  CUDA-compatible SAIL kernel build
 
@@ -1450,133 +1781,330 @@ through the standard torch CUDAExtension path -- no source translation.
   capability 8.0), real CUDA libs (c10/cuda/cublas/cublasLt), third-party
   actlize/flashinfer/triton clone, sources relativized to satisfy
   setuptools assert_relative. No torch pin in setup() deps.
-- The build compiles the SM80 op surface registered by the existing
-  csrc/common_extension_sail.cc; SM90+/CUTLASS ops stay trimmed and are
-  served by PPU-native backends at runtime.
-- sail.mdx: document the wheel + 'pip install --no-deps' flow so the
-  pyproject.toml torch pin cannot clobber the PPU-customized torch.
+- common_extension_sail.cc: SM80 op surface only; the SM90+/CUTLASS ops
+  (fp8/int8 scaled_mm, cutlass_w4a8_moe, es_sm100_*, dsv4_fused_*,
+  infllm_v2_*) are trimmed -- they don't target ZW810E and are served by
+  PPU-native backends. Trimmed op wrappers resolve torch.ops lazily, so
+  import sgl_kernel stays valid.
+
+Verified in the fengding_step5 container: common_ops.so builds, imports,
+rmsnorm is registered, and torch stays 2.13.0+ppu2.2.0.
 ---
- docs/docs/hardware-platforms/sail.mdx   |  65 +++--
- python/sglang/kernels/aot/setup_sail.py | 358 ++++++++++++++++++++++++
- 2 files changed, 397 insertions(+), 26 deletions(-)
+ .../kernels/aot/csrc/common_extension_sail.cc | 300 +++++++++++++++
+ python/sglang/kernels/aot/setup_sail.py       | 358 ++++++++++++++++++
+ 2 files changed, 658 insertions(+)
+ create mode 100644 python/sglang/kernels/aot/csrc/common_extension_sail.cc
  create mode 100644 python/sglang/kernels/aot/setup_sail.py
 
-diff --git a/docs/docs/hardware-platforms/sail.mdx b/docs/docs/hardware-platforms/sail.mdx
-index 5e223b5af5..2396c0ddee 100644
---- a/docs/docs/hardware-platforms/sail.mdx
-+++ b/docs/docs/hardware-platforms/sail.mdx
-@@ -1,53 +1,66 @@
- ---
--title: "T-HEAD SAILs"
-+title: "T-HEAD SAIL Platform"
- metatags:
--    description: "Run SGLang on T-HEAD SAILs."
-+    description: "Run SGLang on T-HEAD SAIL devices."
- ---
- 
--This document describes how to run SGLang on T-HEAD SAILs. If you
--encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
-+This document describes how to run SGLang on T-HEAD SAILs. If you encounter issues or have questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
+diff --git a/python/sglang/kernels/aot/csrc/common_extension_sail.cc b/python/sglang/kernels/aot/csrc/common_extension_sail.cc
+new file mode 100644
+index 0000000000..4f529a5c84
+--- /dev/null
++++ b/python/sglang/kernels/aot/csrc/common_extension_sail.cc
+@@ -0,0 +1,300 @@
++/* Copyright 2025 SGLang Team. All Rights Reserved.
 +
-+SAIL exposes a CUDA-compatible API through its torch backend, so SGLang runs on
-+SAIL through the standard CUDA platform path — no separate toolchain or kernel
-+source conversion is required.
- 
- ## Prerequisites
- 
--Install the T-HEAD SAIL driver and the PPU SDK before installing SGLang, and export
--the `PPU_SDK` environment variable pointing at the SDK installation (for
--example, `/usr/local/PPU_SDK`). The Triton SAIL backend requires this variable
--when compiling kernels at runtime.
-+Install the T-HEAD SAIL driver and a CUDA-compatible SAIL torch build before
-+installing SGLang.
- 
- Verify that the device is visible:
- 
--```bash Command
-+```bash
- python3 -c 'import torch; print(torch.cuda.get_device_name())'
- # Expected: a ZW-series device, e.g. "ZW810E"
- ```
- 
- ## Install SGLang
- 
--### Install from Source
-+You can install SGLang using one of the methods below.
- 
--Start from an environment with the prerequisites above installed.
-+### Install from Source
- 
--```bash Command
-+```bash
-+# Use the default branch
- git clone https://github.com/sgl-project/sglang.git
- cd sglang
- 
--python -m pip install --upgrade pip wheel
--
--cp python/pyproject_other.toml python/pyproject.toml
--python -m pip install -e "python[all_sail]" \
--  --no-build-isolation
--
--# Install sailify
--python -m pip install sailify
--
--# Build sgl-kernel for SAIL from source
-+# Compile sgl-kernel for SAIL (nvcc/CUDAExtension, sm80 op surface).
-+# Build a wheel and install it with --no-deps: the in-tree pyproject.toml
-+# pins torch==2.14.1, and a dependency-resolving install would overwrite
-+# the SAIL/PPU-customized torch.
-+pip install --upgrade pip
- cd python/sglang/kernels/aot
--python setup_sail.py install
-+python setup_sail.py bdist_wheel
-+pip install --no-deps --force-reinstall dist/sglang_kernel-*.whl
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
 +
-+# Install the sglang python package.
-+# Use --no-build-isolation and protect the preinstalled SAIL torch.
-+cd ../../../..
-+pip install -e python --no-build-isolation --no-deps
- ```
- 
-+<Note>
-+  `setup_sail.py` targets the SAIL nvcc (the PPU SDK's CUDA-compatible
-+  compiler driver) and registers only the SM80 op surface via
-+  `csrc/common_extension_sail.cc`. The SM90+/CUTLASS kernels are excluded —
-+  they do not target ZW810E and are served by PPU-native backends at
-+  runtime. Third-party deps (actlize, flashinfer, triton) are cloned
-+  automatically; set `SGL_KERNEL_SKIP_THIRD_PARTY=1` to reuse an existing
-+  `build/_deps` checkout.
-+</Note>
++    http://www.apache.org/licenses/LICENSE-2.0
 +
- Launch the server:
- 
--```bash Command
-+```bash
- python3 -m sglang.launch_server \
-   --model-path Qwen/Qwen3-8B \
-   --host 0.0.0.0 \
-@@ -61,7 +74,7 @@ successful.
- 
- You can send an OpenAI-compatible request to the engine:
- 
--```bash Command
-+```bash
- curl http://127.0.0.1:30000/v1/chat/completions \
-   -H "Content-Type: application/json" \
-   -d '{
-@@ -73,7 +86,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
- 
- Or run a benchmark:
- 
--```bash Command
-+```bash
- python3 -m sglang.bench_serving \
-   --backend sglang \
-   --dataset-name random \
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++==============================================================================*/
++#include <ATen/core/dispatch/Dispatcher.h>
++#include <torch/all.h>
++#include <torch/library.h>
++
++#include "sgl_kernel_ops.h"
++
++TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
++  /*
++   * From csrc/allreduce
++   */
++  m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
++  m.def("register_graph_buffers", &register_graph_buffers);
++  m.def("dispose", &dispose);
++  m.def("meta_size", &meta_size);
++  m.def("register_buffer", &register_buffer);
++
++  m.def(
++      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
++      "int rank, bool full_nvlink) -> int");
++  m.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
++
++  m.def(
++      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
++      "int reg_buffer_sz_bytes) -> ()");
++  m.impl("all_reduce", torch::kCUDA, &all_reduce);
++
++  /*
++   * From csrc/attention
++   */
++  m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
++  m.impl("merge_state_v2", torch::kCUDA, &merge_state_v2);
++
++  /*
++   * From csrc/elementwise
++   */
++  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
++  m.impl("rmsnorm", torch::kCUDA, &rmsnorm);
++
++  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
++  m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
++
++  m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
++  m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
++
++  m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
++  m.impl("gemma_fused_add_rmsnorm", torch::kCUDA, &gemma_fused_add_rmsnorm);
++
++  m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
++  m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
++
++  m.def("gelu_tanh_and_mul(Tensor! out, Tensor input) -> ()");
++  m.impl("gelu_tanh_and_mul", torch::kCUDA, &gelu_tanh_and_mul);
++
++  m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
++  m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
++
++  m.def(
++      "rotary_embedding(Tensor positions, Tensor! query,"
++      "                 Tensor!? key, int head_size,"
++      "                 Tensor cos_sin_cache, bool is_neox) -> ()");
++  m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
++
++  m.def("copy_to_gpu_no_ce(Tensor input, Tensor! output) -> ()");
++  m.impl("copy_to_gpu_no_ce", torch::kCUDA, &copy_to_gpu_no_ce);
++  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
++  m.impl("concat_mla_k", torch::kCUDA, &concat_mla_k);
++
++  m.def("concat_mla_absorb_q(Tensor a, Tensor b, Tensor! out) -> ()");
++  m.impl("concat_mla_absorb_q", torch::kCUDA, &concat_mla_absorb_q);
++
++  m.def("fast_topk(Tensor score, Tensor indices, Tensor lengths, Tensor? row_starts) -> ()");
++  m.impl("fast_topk", torch::kCUDA, &fast_topk_interface);
++  m.def(
++      "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
++      "cu_seqlens_q, Tensor? row_starts) -> ()");
++  m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
++  m.def(
++      "fast_topk_transform_ragged_fused(Tensor score, Tensor lengths, Tensor topk_indices_ragged, Tensor "
++      "topk_indices_offset, Tensor ? row_starts) -> ()");
++  m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
++
++  /*
++   * From csrc/gemm
++   */
++  m.def(
++      "sgl_per_token_group_quant_8bit(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
++      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
++  m.impl("sgl_per_token_group_quant_8bit", torch::kCUDA, &sgl_per_token_group_quant_8bit);
++
++  m.def(
++      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor! output_q, Tensor! output_s, int group_size,"
++      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
++  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kCUDA, &sgl_per_token_group_quant_8bit_v2);
++
++  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
++  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
++
++  /*
++   * From csrc/moe
++   */
++  m.def(
++      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
++      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
++      "pad_sorted_token_ids, bool ignore_invalid_expert) -> ()");
++  m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
++
++  m.def(
++      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
++      "moe_softcapping, Tensor? correction_bias) -> ()");
++  m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
++
++  m.def(
++      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
++      "correction_bias) -> ()");
++  m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
++
++  m.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
++  m.impl("moe_sum_reduce", torch::kCUDA, &moe_sum_reduce);
++
++  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
++  m.impl("moe_sum", torch::kCUDA, &moe_sum);
++
++  // moe_fused_gate / kimi_k2_moe_fused_gate (AOT) retired: the gate/topk path
++  // now routes through the unified Triton router
++  // (python/sglang/jit_kernel/moe_fused_gate.py).
++
++  m.def(
++      "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
++      " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
++      "()");
++  m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
++
++  m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
++  m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
++
++  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
++  m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
++
++  m.def(
++      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
++      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
++      "Tensor q_weight, Tensor k_weight, float base, "
++      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor, int rotary_dim) "
++      "-> ()");
++  m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
++
++  /*
++   * From csrc/kvcacheio
++   */
++  m.def(
++      "transfer_kv_per_layer(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
++      "dst_indices, int item_size, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_per_layer", torch::kCUDA, &transfer_kv_per_layer);
++  m.def(
++      "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
++      "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
++  m.def(
++      "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
++      "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "
++      "num_warps_per_block) -> ()");
++  m.impl("transfer_kv_per_layer_ph_lf", torch::kCUDA, &transfer_kv_per_layer_ph_lf);
++  m.def(
++      "transfer_kv_all_layer(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, int block_quota, int "
++      "num_warps_per_block) -> ()");
++  m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
++  m.def(
++      "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int block_quota, int "
++      "num_warps_per_block) -> ()");
++  m.impl("transfer_kv_all_layer_lf_pf", torch::kCUDA, &transfer_kv_all_layer_lf_pf);
++  m.def(
++      "transfer_kv_all_layer_lf_ph(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
++      "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int page_size, int "
++      "head_num, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_all_layer_lf_ph", torch::kCUDA, &transfer_kv_all_layer_lf_ph);
++  m.def(
++      "transfer_kv_per_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
++      "block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_per_layer_mla", torch::kCUDA, &transfer_kv_per_layer_mla);
++  m.def(
++      "transfer_kv_per_layer_mla_pf_lf(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int layer_id, "
++      "int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_per_layer_mla_pf_lf", torch::kCUDA, &transfer_kv_per_layer_mla_pf_lf);
++  m.def(
++      "transfer_kv_all_layer_mla(Tensor src_layers, Tensor dst_layers, Tensor src_indices, Tensor dst_indices, int "
++      "item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_all_layer_mla", torch::kCUDA, &transfer_kv_all_layer_mla);
++  m.def(
++      "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
++      "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
++  m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
++  m.def(
++      "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
++      "page_size) -> ()");
++  m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
++  m.def(
++      "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
++      "Tensor dst_indices, int layer_id, int page_size)->() ");
++  m.impl("transfer_kv_per_layer_direct_pf_lf", torch::kCUDA, &transfer_kv_per_layer_direct_pf_lf);
++  m.def(
++      "transfer_kv_all_layer_direct_lf_pf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
++      "Tensor dst_indices, int page_size) ->() ");
++  m.impl("transfer_kv_all_layer_direct_lf_pf", torch::kCUDA, &transfer_kv_all_layer_direct_lf_pf);
++
++  /*
++   * From csrc/memory
++   */
++  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
++  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
++
++  /*
++   * From FlashInfer
++   */
++  m.def("top_k_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_k_arr, int top_k_val) -> ()");
++  m.impl("top_k_renorm_probs", torch::kCUDA, &top_k_renorm_probs);
++
++  m.def("top_p_renorm_probs(Tensor probs, Tensor! renorm_probs, Tensor? maybe_top_p_arr, float top_p_val) -> ()");
++  m.impl("top_p_renorm_probs", torch::kCUDA, &top_p_renorm_probs);
++
++  /*
++   * From csrc/grammar
++   */
++  m.def("apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()");
++  m.impl("apply_token_bitmask_inplace_cuda", &ApplyTokenBitmaskInplace);
++
++  /*
++   * From csrc/quantization/gguf
++   */
++  m.def(
++      "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
++      "dtype) -> Tensor");
++  m.impl("ggml_dequantize", torch::kCUDA, &ggml_dequantize);
++
++  m.def(
++      "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
++      "-> Tensor");
++  m.impl("ggml_mul_mat_vec_a8", torch::kCUDA, &ggml_mul_mat_vec_a8);
++
++  m.def("ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
++  m.impl("ggml_mul_mat_a8", torch::kCUDA, &ggml_mul_mat_a8);
++
++  m.def(
++      "ggml_moe_a8(Tensor X, Tensor W, "
++      "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
++      "num_tokens_post_padded, "
++      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
++  m.impl("ggml_moe_a8", torch::kCUDA, &ggml_moe_a8);
++
++  m.def(
++      "ggml_moe_a8_vec(Tensor X, Tensor W, "
++      "Tensor topk_ids, int top_k, "
++      "int type, SymInt row, SymInt tokens) -> Tensor");
++  m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
++
++  m.def("ggml_moe_get_block_size(int type) -> int");
++  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
++
++  /*
++   * From csrc/mamba
++   */
++  m.def(
++      "causal_conv1d_update(Tensor! x,"
++      "Tensor! conv_state,"
++      "Tensor! weight,"
++      "Tensor? bias_,"
++      "bool silu_activation,"
++      "Tensor? cache_seqlens_,"
++      "Tensor? conv_state_indices,"
++      "int pad_slot_id) -> ()");
++  m.impl("causal_conv1d_update", torch::kCUDA, &causal_conv1d_update);
++
++  m.def(
++      "causal_conv1d_fwd(Tensor! x, Tensor! weight,"
++      "Tensor? bias_,"
++      "Tensor!? conv_states,"
++      "Tensor? query_start_loc,"
++      "Tensor? cache_indices,"
++      "Tensor? has_initial_state,"
++      "bool silu_activation,"
++      "int pad_slot_id) -> ()");
++  m.impl("causal_conv1d_fwd", torch::kCUDA, &causal_conv1d_fwd);
++}
++
++REGISTER_EXTENSION(common_ops)
 diff --git a/python/sglang/kernels/aot/setup_sail.py b/python/sglang/kernels/aot/setup_sail.py
 new file mode 100644
-index 0000000000..e292036d41
+index 0000000000..dbaf07b7c5
 --- /dev/null
 +++ b/python/sglang/kernels/aot/setup_sail.py
 @@ -0,0 +1,358 @@
@@ -1667,8 +2195,8 @@ index 0000000000..e292036d41
 +
 +_ACTLIZE_REPO = _RepoInfo(
 +    name="actlize",
-+    git_repository="https://github.com/NVIDIA/cutlass",
-+    git_tag="57e3cfb47a2d9e0d46eb6335c3dc411498efa198",
++    git_repository="https://github.com/t-head/actlize",
++    git_tag="129651181ed29ec3d3e61df786f610926b739a9b",
 +    git_shallow=False,
 +)
 +
@@ -1940,5 +2468,4 @@ index 0000000000..e292036d41
 +)
 -- 
 2.43.7
-
 
