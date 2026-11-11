@@ -32,14 +32,14 @@ For SWA-only layers callers pass ``topk=0``, ``compressed_base = 0`` (the
 compressed branch becomes a no-op) and any ``compress_ratio >= 1``.
 """
 
-import os
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import triton
 
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import DIM_NOPE, DIM_ROPE
+from sglang.srt.environ import envs
 from sglang.srt.utils import ceil_align
 
 # FlashMLA sparse prefill asserts ``params.topk % B_TOPK == 0``. B_TOPK is 64
@@ -48,7 +48,6 @@ SPARSE_PREFILL_TOPK_ALIGNMENT = 128
 # Bf16 workspace per-token width, matching ``dequantize_k_cache_paged``'s
 # output: 448 fp8 nope (dequanted) + 64 bf16 rope = 512.
 WORKSPACE_DIM = DIM_NOPE + DIM_ROPE
-DSV4_Q8KV8_PREFILL_ENV = "SGLANG_DSV4_Q8KV8_PREFILL"
 DSV4_Q8KV8_PREFILL_LOG_ENV = "SGLANG_DSV4_Q8KV8_PREFILL_LOG"
 
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
@@ -62,37 +61,53 @@ def use_dsv4_q8kv8_sparse_prefill(dsv4_prefill_backend: str = "auto") -> bool:
 
     ``dsv4_prefill_backend`` is the production configuration. The environment
     variable remains as a debug override while the runtime path is being
-    hardened: truthy values force Q8 on, falsy values force it off.
+    hardened: any value forces the override, truthy enables Q8.
+
+    Read through the env registry: only registered variables are forwarded to
+    the DP scheduler processes, which is where this selector runs.
     """
-    env_value = os.getenv(DSV4_Q8KV8_PREFILL_ENV)
-    if env_value is not None:
-        return env_value.lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+    if envs.SGLANG_DSV4_Q8KV8_PREFILL.is_set():
+        return envs.SGLANG_DSV4_Q8KV8_PREFILL.get()
     return dsv4_prefill_backend == "flashmla_sparse_q8"
 
 
-class SparsePrefillWorkspace:
+class SparsePrefillKVBuffer:
     """Backend-owned scratch storage for sparse prefill KV dequantization.
 
-    The workspace contents are fully overwritten before every attention call,
-    so token buckets and compression ratios can safely share one buffer. Sparse
-    prefill executes eagerly and serially on the supported paths, which makes it
-    safe to replace the scratch allocation when a larger extent is needed.
+    Callers overwrite the rows they read, except head rows ``get_with_head``
+    reports as filled, so token buckets and compression ratios can safely share
+    one buffer. Sparse prefill executes eagerly and serially on the supported
+    paths, which makes it safe to replace the scratch allocation when a larger
+    extent is needed.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._buffer: Optional[torch.Tensor] = None
+        self._head_source: Optional[tuple] = None
 
     def get(
         self,
         num_tokens: int,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
+        self._head_source = None
+        return self._reserve(num_tokens, dtype)
+
+    def get_with_head(
+        self, num_tokens: int, head_source: tuple
+    ) -> Tuple[torch.Tensor, bool]:
+        """Returns the rows and whether the head already holds ``head_source``."""
+        buffer = self._reserve(num_tokens, torch.bfloat16)
+        head_filled = head_source == self._head_source
+        self._head_source = head_source
+        return buffer, head_filled
+
+    def forget_head(self) -> None:
+        """Per forward: the next forward's tensors may reuse freed addresses."""
+        self._head_source = None
+
+    def _reserve(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         assert num_tokens > 0
         current_capacity = self._buffer.shape[0] if self._buffer is not None else 0
         current_dtype = self._buffer.dtype if self._buffer is not None else None
@@ -102,6 +117,7 @@ class SparsePrefillWorkspace:
                 dtype=dtype,
                 device=self.device,
             )
+            self._head_source = None
         return self._buffer[:num_tokens]
 
 

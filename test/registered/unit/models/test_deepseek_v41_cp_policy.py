@@ -63,14 +63,38 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
                     )
                 )
 
-    def test_rejects_unsupported_prefill_topologies(self):
+    def test_accepts_attention_dp_on_both_roles(self):
+        # Upstream admits attention DP on either PD role; the PD handshake
+        # requires both servers to agree on the block size and KV layout.
+        for mode in ("prefill", "decode"):
+            for override in (
+                dict(tp_size=8, attn_dp_size=8, ep_size=8),
+                dict(tp_size=8, dp_size=8, ep_size=8),
+                dict(tp_size=8, attn_dp_size=8),
+            ):
+                with self.subTest(mode=mode, override=override):
+                    self.assertTrue(
+                        _dsv41_dspark_pd_parallelism_supported(
+                            self.parallel_config(
+                                disaggregation_mode=mode,
+                                enable_prefill_cp=False,
+                                **override,
+                            )
+                        )
+                    )
+
+    def test_rejects_unsupported_topologies(self):
         for override in (
             dict(cp_strategy="zigzag", attn_cp_size=4),
             dict(enable_prefill_cp=False, attn_cp_size=4),
             dict(disaggregation_mode="null"),
-            dict(attn_dp_size=2),
-            dict(dp_size=2),
             dict(dcp_size=2),
+            dict(disaggregation_mode="decode"),
+            dict(
+                disaggregation_mode="decode",
+                enable_prefill_cp=False,
+                attn_cp_size=4,
+            ),
         ):
             with self.subTest(override=override):
                 self.assertFalse(
@@ -78,37 +102,6 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
                         self.parallel_config(**override)
                     )
                 )
-
-    def test_decode_attention_dp_is_independent_of_system_dp(self):
-        for attn_dp_size in (1, 4):
-            base = dict(
-                disaggregation_mode="decode",
-                enable_prefill_cp=False,
-                attn_dp_size=attn_dp_size,
-            )
-            self.assertTrue(
-                _dsv41_dspark_pd_parallelism_supported(self.parallel_config(**base))
-            )
-            for override in (
-                dict(enable_prefill_cp=True),
-                dict(attn_cp_size=4),
-                dict(dp_size=2),
-            ):
-                with self.subTest(attn_dp_size=attn_dp_size, override=override):
-                    self.assertFalse(
-                        _dsv41_dspark_pd_parallelism_supported(
-                            self.parallel_config(**(base | override))
-                        )
-                    )
-        self.assertFalse(
-            _dsv41_dspark_pd_parallelism_supported(
-                self.parallel_config(
-                    disaggregation_mode="decode",
-                    enable_prefill_cp=False,
-                    attn_dp_size=2,
-                )
-            )
-        )
 
     def test_cp_breakable_graph_preserves_live_context_budget(self):
         for cp, backend, limit, expected in (
@@ -333,6 +326,55 @@ class TestDeepseekV41CPPolicy(CustomTestCase):
         with get_context().override_server_args(enable_prefill_cp=False):
             self.assertFalse(PrefillCudaGraphRunner.can_run_graph(runner, batch))
         runner.prefill_cp_bcg_input.select_replay_bucket_for_batch.assert_not_called()
+
+
+class TestDeepseekV41CPPrepareInputs(CustomTestCase):
+    """CP prefill must embed the FULL ids, never the per-rank row shards.
+
+    A vocab-parallel embedding finishes with a row-wise all-reduce across the TP
+    group, which is only valid when every rank embeds the same ids. CP shards the
+    rows instead, so ``prepare_cp_inputs`` has to hand the runner full-sequence
+    embeddings and let it shard the embeddings (not the ids).
+    """
+
+    class _FakeModel:
+        def __init__(self):
+            self.seen = []
+
+        def get_input_embeddings(self):
+            def embed(ids):
+                self.seen.append(ids)
+                return ids.unsqueeze(-1).float()
+
+            return embed
+
+    def _call(self, model, forward_batch, **kwargs):
+        return DeepseekV4ForCausalLM.prepare_cp_inputs(model, forward_batch, **kwargs)
+
+    def test_prefill_embeds_the_full_sequence(self):
+        model = self._FakeModel()
+        full_ids = torch.tensor([11, 22, 33, 44])
+        batch = NS(input_ids=full_ids, positions=torch.arange(4))
+
+        embeds, positions, kwargs = self._call(model, batch)
+
+        self.assertEqual(len(model.seen), 1)
+        self.assertEqual(model.seen[0].data_ptr(), full_ids.data_ptr())
+        self.assertTrue(torch.equal(embeds, full_ids.unsqueeze(-1).float()))
+        self.assertTrue(torch.equal(positions, batch.positions))
+        self.assertEqual(kwargs, {})
+
+    def test_supplied_embeddings_are_not_recomputed(self):
+        model = self._FakeModel()
+        batch = NS(input_ids=torch.tensor([1, 2]), positions=torch.arange(2))
+        given = torch.zeros(2, 3)
+
+        embeds, positions, kwargs = self._call(model, batch, input_embeds=given)
+
+        self.assertIs(embeds, given)
+        self.assertEqual(model.seen, [])
+        self.assertTrue(torch.equal(positions, batch.positions))
+        self.assertNotIn("input_embeds", kwargs)
 
 
 if __name__ == "__main__":

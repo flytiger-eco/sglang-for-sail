@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
@@ -47,6 +47,14 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # rank's rows are an interleaved subset of the batch's.
     req_rows: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor  # [requests] req_to_token row of each request
+    # [columns] int64 index-K pool slot of each flattened-K column, from
+    # scoring.prefill_k_slots; gathered once with a non-speculative extend's
+    # metadata, per layer otherwise.
+    k_slots: torch.Tensor
+    # ratio -> scoring.PrefillIndexPlan, filled by the first layer of each ratio and
+    # reused by the rest of the forward; None when the metadata has no snapshot, so
+    # every layer builds its own.
+    index_plans: Optional[Dict[int, object]]
     # [rows, pages] int32 at the KV page size; the index-K pool pages it with
     # expand_index_page_table.
     kv_page_table: torch.Tensor
@@ -96,10 +104,14 @@ class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     layer_id: int
     q: torch.Tensor  # [rows, heads, 128] bf16, roped
     weights: torch.Tensor  # [rows, heads] bf16 head weights
-    paged_metadata: PagedIndexerMetadata
     # The selection as pool slots and as request-local compressed positions.
     out_page_indices: torch.Tensor
     out_raw_indices: torch.Tensor
+    # The index-K pool page size at this ratio; the captured consume path reads
+    # the pool through it, with no need for the paged metadata.
+    index_page_size: Optional[int] = None
+    # The static paged metadata of the dense captured path (env switch off).
+    paged_metadata: Optional[PagedIndexerMetadata] = None
 
 
 Metadata = TypeVar("Metadata", bound=CandidateMetadata)

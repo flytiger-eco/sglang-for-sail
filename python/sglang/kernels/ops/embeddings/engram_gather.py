@@ -4,6 +4,9 @@ The table pointers arrive as raw addresses so one kernel serves a device table, 
 pinned host table, or (on Grace-Blackwell, through ATS) a plain host mapping. The
 output is bf16 computed as fp32(row) * 2**(exp - 127) then rounded once, which is
 the arithmetic of the torch lookup it replaces.
+
+Packaged checkpoints may quantize a table per channel instead of per 32-element
+block: then ``scale_ptr`` addresses one f32 per row and the payload may be int8.
 """
 
 import torch
@@ -36,6 +39,7 @@ def _engram_gather_kernel(
     w_ptr,
     s_ptr,
     ids_ptr,
+    dst_ptr,
     out_ptr,
     row_lo,
     row_hi,
@@ -43,31 +47,42 @@ def _engram_gather_kernel(
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
     DECODE_E4M3_BYTES: tl.constexpr,
+    HAS_DST: tl.constexpr,
+    PER_ROW_SCALE: tl.constexpr,
+    INT8_PAYLOAD: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
+    dst = tl.load(dst_ptr + row).to(tl.int64) if HAS_DST else row
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    if DECODE_E4M3_BYTES:
+    if INT8_PAYLOAD:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.int8))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0).to(tl.float32)
+    elif DECODE_E4M3_BYTES:
         w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
         payload = tl.load(w + local * DIM + offs, mask=owned, other=0)
         vals = _e4m3fn_to_float(payload)
     else:
         w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
         vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
-    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
-        tl.int32
-    )
-    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
-    scale = tl.where(exps == 255, float("nan"), scale)
-    out = tl.where(owned, vals * scale, 0.0)
-    tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
+    if PER_ROW_SCALE:
+        sf = s_ptr.to(tl.int64).to(tl.pointer_type(tl.float32))
+        out = tl.where(owned, vals * tl.load(sf + local, mask=owned, other=0.0), 0.0)
+    else:
+        s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
+            tl.int32
+        )
+        # 2**(e - 127) from the exponent bits: exact, no exp2/denormal flush.
+        scale = (exps << 23).to(tl.float32, bitcast=True)
+        scale = tl.where(exps == 0, E8M0_ZERO, scale)
+        scale = tl.where(exps == 255, float("nan"), scale)
+        out = tl.where(owned, vals * scale, 0.0)
+    tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
 
 
 def engram_gather(
@@ -79,12 +94,20 @@ def engram_gather(
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    sort_ids: bool = False,
+    per_row_scale: bool = False,
+    int8_payload: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
-    ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
-    [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
-    may live in device or host memory. Ids outside the range produce zero rows.
+    ``weight_ptr`` addresses [rows, dim] e4m3 (or int8) payload bytes and
+    ``scale_ptr`` [rows, dim // block_size] e8m0 bytes for global rows
+    [row_lo, row_hi), or one f32 per row when ``per_row_scale``. Both may live in
+    device or host memory. Ids outside the range produce zero rows.
+
+    ``sort_ids`` reads the rows in address order and writes each to its original
+    position. Random rows of a host table larger than the GPU's translation reach
+    miss on nearly every row; sorted, neighbouring programs share a page.
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
@@ -95,10 +118,14 @@ def engram_gather(
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
     if n:
+        dst = None
+        if sort_ids:
+            ids, dst = torch.sort(ids)
         _engram_gather_kernel[(n,)](
             weight_ptr,
             scale_ptr,
             ids,
+            dst if dst is not None else ids,
             out,
             row_lo,
             row_hi,
@@ -106,5 +133,8 @@ def engram_gather(
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
             DECODE_E4M3_BYTES=is_sail() and get_device_sm() < 89,
+            HAS_DST=dst is not None,
+            PER_ROW_SCALE=per_row_scale,
+            INT8_PAYLOAD=int8_payload,
         )
     return out

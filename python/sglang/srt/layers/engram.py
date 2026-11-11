@@ -292,13 +292,14 @@ class EngramHasher(nn.Module):
         assert self.history is not None, "EngramHasher.init_history was not called"
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
-        if num_tokens == 0:
+        mode = forward_batch.forward_mode
+        if num_tokens == 0 or mode.is_idle():
+            # A DP-attention idle batch carries pad rows; nothing reads its hashes.
             return torch.empty(
-                (0, self.primes.shape[0], self.offsets.shape[1]),
+                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
                 dtype=torch.int64,
                 device=input_ids.device,
-            )
-        mode = forward_batch.forward_mode
+            ).zero_()
         if (
             mode.is_extend()
             and not mode.is_target_verify()
@@ -610,6 +611,21 @@ def _hip_runtime() -> ctypes.CDLL:
     return lib
 
 
+@functools.cache
+def _sorted_host_reads(device: int) -> bool:
+    """Whether host-table rows are read in address order. Without ATS (no
+    NVLink-C2C) the GPU maps pinned host memory in its own page tables, and
+    random rows of a table far larger than its translation reach miss on nearly
+    every row; with ATS the host page tables serve the reads and order costs."""
+    if _is_hip:
+        return False
+    from cuda.bindings import driver
+
+    attr = driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES
+    err, uses_host_page_tables = driver.cuDeviceGetAttribute(attr, device)
+    return err == driver.CUresult.CUDA_SUCCESS and uses_host_page_tables == 0
+
+
 def _registered_device_ptr(host_ptr: int) -> int:
     """
     Address kernels must use for registered host memory.
@@ -745,6 +761,12 @@ class _HostTable:
             logger.info(msg)
 
 
+def _scale_region_bytes(rows: int, dim: int) -> int:
+    """Scale region: block-32 e8m0 scales, or one f32 per row for per-channel."""
+    nbytes = max(rows * (dim // FP8_BLOCK_SIZE), rows * 4)
+    return -(-nbytes // 4) * 4
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -752,6 +774,12 @@ class EngramEmbedding(nn.Module):
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
+
+    Packaged checkpoints may instead carry per-channel scales (one f32 per row)
+    and an int8 payload; those load into the same table and the lookup switches
+    to decoding them, so no repacking is needed. Each table keeps whichever
+    format its checkpoint uses, so blockwise and per-channel tables can coexist
+    in one model and the format is re-detected on every load.
     """
 
     def __init__(self, num_embeddings: int, dim: int, layer_id: int):
@@ -763,6 +791,9 @@ class EngramEmbedding(nn.Module):
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
+        self._sort_host_reads = False
+        self._per_channel_scale = False
+        self._int8_payload = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -770,20 +801,26 @@ class EngramEmbedding(nn.Module):
                 torch.empty(self.rows, dim, dtype=torch.float8_e4m3fn),
                 requires_grad=False,
             )
+            scale_bytes = torch.empty(
+                _scale_region_bytes(self.rows, dim), dtype=torch.uint8
+            )
             self.scale = nn.Parameter(
-                torch.empty(
-                    self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu
-                ),
+                scale_bytes[: self.rows * (dim // FP8_BLOCK_SIZE)]
+                .view(torch.float8_e8m0fnu)
+                .view(self.rows, dim // FP8_BLOCK_SIZE),
                 requires_grad=False,
             )
+            self._scale_f32 = scale_bytes.view(torch.float32)[: self.rows]
         self.weight.weight_loader = self._load_rows
         self.scale.weight_loader = self._load_rows
 
     def _init_host_table(self, num_embeddings: int, dim: int, layer_id: int):
         layout = envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         n = num_embeddings if layout == "shared" else self.rows
-        w_bytes = n * dim
-        s_bytes = n * (dim // FP8_BLOCK_SIZE)
+        payload_bytes = n * dim
+        # Pad the payload region so the per-channel f32 scales start aligned.
+        w_bytes = -(-payload_bytes // 4) * 4
+        s_bytes = _scale_region_bytes(n, dim)
         self.host_table = _HostTable(
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
@@ -791,12 +828,19 @@ class EngramEmbedding(nn.Module):
             get_parallel().tp_group,
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
-        weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
-        scale = raw[w_bytes:].view(torch.float8_e8m0fnu).view(n, dim // FP8_BLOCK_SIZE)
+        weight = raw[:payload_bytes].view(torch.float8_e4m3fn).view(n, dim)
+        scale_bytes = raw[w_bytes:]
+        scale = (
+            scale_bytes[: n * (dim // FP8_BLOCK_SIZE)]
+            .view(torch.float8_e8m0fnu)
+            .view(n, dim // FP8_BLOCK_SIZE)
+        )
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.scale = nn.Parameter(scale, requires_grad=False)
+        self._scale_f32 = scale_bytes.view(torch.float32)[:n]
         device_ptr = self.host_table.device_ptr
         self._host_table_ptrs = (device_ptr, device_ptr + w_bytes)
+        self._sort_host_reads = _sorted_host_reads(torch.cuda.current_device())
 
     @property
     def _shared(self) -> bool:
@@ -809,17 +853,56 @@ class EngramEmbedding(nn.Module):
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = slice(self.row_start, self.row_start + self.rows)
-        if self._shared:
-            param.data[rows].copy_(loaded_weight[rows])
+        dst = param.data[rows] if self._shared else param.data
+        src = loaded_weight[rows]
+        if param is self.weight:
+            self._load_payload_rows(dst, src)
         else:
-            param.data.copy_(loaded_weight[rows])
+            self._load_scale_rows(dst, src, rows)
         if self.host_table is not None:
             self.host_table.dirty = True
+
+    def _load_payload_rows(self, dst: torch.Tensor, src: torch.Tensor):
+        if src.shape == dst.shape and src.dtype == dst.dtype:
+            dst.copy_(src)
+            self._int8_payload = False
+        elif src.shape == dst.shape and src.dtype == torch.int8:
+            # Keep the bytes; the lookup decodes them as int8 instead of e4m3.
+            dst.view(torch.int8).copy_(src)
+            self._int8_payload = True
+        else:
+            raise ValueError(
+                f"engram weight expects {tuple(dst.shape)} {dst.dtype} or the same "
+                f"shape as int8, got {tuple(src.shape)} {src.dtype}"
+            )
+
+    def _load_scale_rows(self, dst: torch.Tensor, src: torch.Tensor, rows: slice):
+        if src.shape == dst.shape and src.dtype == dst.dtype:
+            dst.copy_(src)
+            self._per_channel_scale = False
+        elif src.numel() == dst.shape[0] and src.is_floating_point():
+            # Per-channel scale: one f32 per row, applied by the lookup.
+            scale = self._scale_f32[rows] if self._shared else self._scale_f32
+            scale.copy_(src.reshape(scale.shape).float())
+            self._per_channel_scale = True
+        else:
+            raise ValueError(
+                f"engram scale expects {tuple(dst.shape)} {dst.dtype} or one float "
+                f"per row, got {tuple(src.shape)} {src.dtype}"
+            )
 
     def finish_load(self, label: str):
         """Collective in the shared layout: every rank calls it after loading."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        logger.info(
+            "engram table %s: %s scales, %s payload",
+            label,
+            "per-channel f32"
+            if self._per_channel_scale
+            else f"block-{FP8_BLOCK_SIZE} e8m0",
+            "int8" if self._int8_payload else "e4m3",
+        )
 
     def forward(
         self,
@@ -838,6 +921,9 @@ class EngramEmbedding(nn.Module):
                 out.view(-1, self.dim),
                 self.dim,
                 FP8_BLOCK_SIZE,
+                sort_ids=self._sort_host_reads,
+                per_row_scale=self._per_channel_scale,
+                int8_payload=self._int8_payload,
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
@@ -887,8 +973,15 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-            values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
+            weight = self.weight.data
+            if self._int8_payload:
+                weight = weight.view(torch.int8)
+            values = weight[local].float()
+            if self._per_channel_scale:
+                values = values * self._scale_f32[local].float().unsqueeze(-1)
+            else:
+                blocks = values.unflatten(-1, (-1, FP8_BLOCK_SIZE))
+                values = (blocks * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self._empty(indices)
         engram_gather(
@@ -899,6 +992,9 @@ class EngramEmbedding(nn.Module):
             FP8_BLOCK_SIZE,
             row_lo=self.row_start,
             row_hi=self.row_start + self.rows,
+            sort_ids=self._sort_host_reads,
+            per_row_scale=self._per_channel_scale,
+            int8_payload=self._int8_payload,
         )
         return out
 

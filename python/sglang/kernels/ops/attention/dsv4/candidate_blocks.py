@@ -80,8 +80,8 @@ def candidate_row_lens(
 
 
 @cache_once
-def _jit_block_amax_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_block_amax_module(in_dtype: torch.dtype, out_dtype: torch.dtype):
+    args = make_cpp_args(is_arch_support_pdl(), in_dtype, out_dtype)
     return load_jit(
         make_name("block_amax"),
         *args,
@@ -105,15 +105,17 @@ def amax8_varlen(
     selected anyway); ``topk=0`` never skips. ``out`` is allocated as
     ``[rows, ceil(max_seqlen / 8)]`` when not given, ``max_seqlen`` defaulting to
     the width of ``scores``; every ``seq_lens[b]`` must fit in ``8 * out.shape[1]``.
-    fp32 only for now; ``scores`` rows must be 32-byte aligned (stride a multiple
-    of 8). Returns ``out``.
+    ``scores`` and ``out`` are each fp32 or bf16 (``out`` defaults to fp32), the
+    rows of ``scores`` aligned to a block of 8 (stride a multiple of 8). Returns
+    ``out``.
     """
     if out is None:
         num_tokens, max_len = scores.shape
         if max_seqlen == 0:
             max_seqlen = max_len
-        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
-    _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
+        out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8, dtype=torch.float32)
+    module = _jit_block_amax_module(scores.dtype, out.dtype)
+    module.amax8_varlen(scores, seq_lens, out, topk)
     return out
 
 
@@ -134,11 +136,49 @@ def amax_topk_blocks(
         max_seq_len = logits.shape[1]
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
     # only, so nothing past a row's keys is initialised (pad for vectorized loads)
-    keys = logits.new_empty(rows, -(-max_seq_len // (4 * block)) * 4)
+    keys = logits.new_empty(
+        rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
+    )
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
     topk_transform_paged(keys, nblocks, None, blocks, 1)
     return blocks
+
+
+def candidate_block_ids(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    topk_blocks: int,
+    *,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Per row the ``topk_blocks`` blocks of ``block_size`` columns with the
+    largest block maximum among its first ``seq_lens[i]`` columns, the newest
+    block always kept, as column ids: block ``b`` covers columns ``b *
+    block_size .. b * block_size + block_size - 1``. Ids are unordered and
+    ``-1`` past ``min(topk_blocks, nblocks[i])``. ``nblocks`` is
+    ``ceil(seq_lens / block_size)`` as int32.
+
+    Together with :func:`topk_transform_candidates` this is how a prefill layer
+    replaces its full-width top-k: the block maxima cost one read of the scores,
+    and the second level reads only the selected blocks.
+    """
+    from .topk import topk_transform_ragged_v2
+
+    rows, width = logits.shape
+    # keys past a row's block count stay unset; the top-k reads a row up to its
+    # block count only (v2 wants the stride a multiple of 4)
+    width_blocks = (width + block_size - 1) // block_size
+    keys = logits.new_empty(rows, (width_blocks + 3) // 4 * 4, dtype=torch.float32)
+    amax8_varlen(logits, seq_lens, out=keys)
+    if out is None:
+        out = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
+    topk_transform_ragged_v2(
+        keys, nblocks, out_offsets=torch.zeros_like(nblocks), out_indices=out
+    )
+    return out
 
 
 def candidate_block_mask(

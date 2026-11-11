@@ -2,7 +2,8 @@
 block selection and the dense implementation of the same protocol."""
 
 import unittest
-from typing import NamedTuple
+from types import SimpleNamespace
+from typing import NamedTuple, Optional
 
 import msgspec
 import torch
@@ -14,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_t
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
+from sglang.srt.utils import is_sail
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,6 +42,9 @@ class Case(NamedTuple):
     kv: tuple  # the flattened index K (int8 [n, 64], int32 [n])
     k_cache: torch.Tensor  # [pages, PAGE, 1, 68] uint8, the index-K pool
     page_table: torch.Tensor  # [rows, pages] int32 at PAGE slots
+    # [rows, HEADS, DIM] bf16, the queries before quantization (the captured
+    # consume path quantizes them itself); None for fixtures compared as tables.
+    q: Optional[torch.Tensor] = None
 
 
 def make_case(rows, ctx, seed) -> Case:
@@ -61,9 +66,8 @@ def make_case(rows, ctx, seed) -> Case:
         ],
         1,
     ).view(n_pages, PAGE, 1, 68)
-    q_fp4, q_sf = quantize_fp4_indexer_tensor(
-        torch.randn(rows * HEADS, DIM, device=dev, dtype=torch.bfloat16), rne=True
-    )
+    q = torch.randn(rows * HEADS, DIM, device=dev, dtype=torch.bfloat16)
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q, rne=True)
     q_fp4, q_sf = q_fp4.view(rows, HEADS, 64), q_sf.view(rows, HEADS)
     weights = torch.rand(rows, HEADS, device=dev)
     lens = torch.linspace(ctx - rows + 1, ctx, rows, device=dev).to(torch.int32)
@@ -95,7 +99,15 @@ def make_case(rows, ctx, seed) -> Case:
         .expand(rows, -1)
         .contiguous()
     )
-    return Case(dense, lens, data, (k_fp4[:width], k_sf[:width]), k_cache, page_table)
+    return Case(
+        dense,
+        lens,
+        data,
+        (k_fp4[:width], k_sf[:width]),
+        k_cache,
+        page_table,
+        q=q.view(rows, HEADS, DIM),
+    )
 
 
 def make_multi_case(rows_per_request, ctx, seed) -> Case:
@@ -286,8 +298,9 @@ def picks(positions: torch.Tensor, row: int) -> set:
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "DeepGEMM's paged sparse MQA logits need SM100",
+    torch.cuda.is_available()
+    and (torch.cuda.get_device_capability()[0] == 10 or is_sail()),
+    "DeepGEMM's paged sparse MQA logits need SM100 or a PPU",
 )
 class TestPrefillSparseIndexer(CustomTestCase):
     @torch.inference_mode()
@@ -406,6 +419,131 @@ class TestPrefillSparseIndexer(CustomTestCase):
             self.assertLess(
                 picked[-1], int(case.lens[row]), f"row {r}: past its length"
             )
+
+    @torch.inference_mode()
+    def test_captured_consume_matches_the_eager_consume(self):
+        """The in-graph consumer (sparse scores of the published blocks, top-k as
+        pool slots and as compressed positions) keeps what the eager consumer
+        keeps; contexts past the 2048 x 8 candidate window are included, since the
+        captured path never scores past the published blocks.
+
+        Compared on the selected scores, not the indices: the sparse top-k breaks
+        ties arbitrarily per launch (bf16 scores tie often), so two runs of the
+        same kernel differ exactly where the logits tie."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            quantize_index_q,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+            SparseTableBackend,
+            _prefill_table_logits,
+        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import (
+            CapturedPrefillInputs,
+        )
+
+        for rows, ctx in CASES:
+            with self.subTest(rows=rows, ctx=ctx):
+                case = make_case(rows, ctx, seed=rows * 5 + ctx)
+                table, _ = publish_sparse(case)
+                q_fp4, q_sf = quantize_index_q(case.q)
+                self.assertTrue(torch.equal(q_fp4, case.data.q_fp4))
+                self.assertTrue(torch.equal(q_sf, case.data.q_sf))
+                eager_raw = select_sparse(table, case.data, case.k_cache)
+
+                page = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
+                raw = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
+                backend = object.__new__(SparseTableBackend)
+                backend.token_to_kv_pool = SimpleNamespace(
+                    get_index_k_with_scale_buffer=lambda layer_id: case.k_cache.view(
+                        case.k_cache.shape[0], PAGE * 68
+                    )
+                )
+                backend.consume_prefill_captured(
+                    CapturedPrefillInputs(
+                        indexer=SimpleNamespace(index_topk=TOPK),
+                        layer_id=0,
+                        q=case.q,
+                        weights=case.data.weights,
+                        out_page_indices=page,
+                        out_raw_indices=raw,
+                        index_page_size=PAGE,
+                    ),
+                    table,
+                )
+
+                # The fixture's identity page table and k_slots = arange make a
+                # pool slot the same number as its compressed position, so the
+                # page buffer is scored through the same column map as raw picks.
+                self.assertTrue(
+                    torch.equal(
+                        case.data.k_slots,
+                        torch.arange(case.data.k_slots.numel(), device="cuda"),
+                    )
+                )
+                # The sparse row is block-major: column j of block k holds the
+                # compressed position ``blocks[b, k] * 8 + j % 8``.
+                logits = _prefill_table_logits(
+                    table,
+                    case.data.q_fp4,
+                    case.data.q_sf,
+                    case.data.weights,
+                    case.k_cache,
+                )
+
+                def selected_scores(picks: torch.Tensor, row: int) -> torch.Tensor:
+                    positions = picks[row][picks[row] >= 0].long()
+                    if not positions.numel():
+                        return logits.new_empty(0)
+                    nblocks = (int(table.valid_lens[row]) + 7) // 8
+                    rank = torch.searchsorted(
+                        table.blocks[row, :nblocks], positions // 8
+                    )
+                    return logits[row, rank * 8 + positions % 8]
+
+                for name, picks in (("raw", raw), ("page", page)):
+                    for row in range(rows):
+                        got = selected_scores(picks, row)
+                        want = selected_scores(eager_raw, row)
+                        self.assertEqual(got.numel(), want.numel(), (name, row))
+                        torch.testing.assert_close(
+                            got.sort(descending=True).values,
+                            want.sort(descending=True).values,
+                            rtol=0,
+                            atol=0,
+                            msg=f"{name} row {row}",
+                        )
+
+    @torch.inference_mode()
+    def test_captured_graph_tail_table_reuses_its_buffers(self):
+        """The late-layer tail binds a table gathered from the source's live table
+        once, and later publishes refresh those same buffers in place: captured
+        consumers read a fixed address."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+            SparseTableBackend,
+        )
+
+        rows, ctx, tail = 64, 20000, 16
+        case = make_case(rows, ctx, seed=13)
+        table, _ = publish_sparse(case)
+        backend = object.__new__(SparseTableBackend)
+        backend._graph_tables = {}
+        backend._graph_live_tables = {5: table}
+        backend._graph_tail_tables = {}
+
+        idx = torch.arange(rows - tail, rows, device="cuda")
+        self.assertIsNone(backend.prefill_graph_tail_table(tail))
+        buf = backend.publish_prefill_graph_tail(
+            idx, backend.prefill_graph_tail_table(tail)
+        )
+        bound = backend.bind_prefill_graph_table(buf)
+        self.assertTrue(torch.equal(bound.blocks, table.blocks[idx]))
+        self.assertTrue(torch.equal(bound.valid_lens, table.valid_lens[idx]))
+        self.assertIs(backend.prefill_graph_tail_table(tail), buf)
+        # A later replay gathers the same rows into the same buffers.
+        self.assertIs(backend.publish_prefill_graph_tail(idx, buf), buf)
+        self.assertTrue(torch.equal(bound.blocks, table.blocks[idx]))
+        # Another tail block size gets its own buffers.
+        self.assertIsNone(backend.prefill_graph_tail_table(tail - 1))
 
     def test_block_ids_tail_does_not_sync_the_host(self):
         """The late-layer tail of published block ids is cut on the device

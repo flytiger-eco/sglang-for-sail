@@ -432,6 +432,11 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # top-k v3 exact-fallback race UT: worker / iteration / row-shape knobs
+    SGLANG_TEST_TOPK_RACE_WORKERS = EnvInt(4)
+    SGLANG_TEST_TOPK_RACE_ITERS = EnvInt(60)
+    SGLANG_TEST_TOPK_RACE_SEQ = EnvInt(100000)
+    SGLANG_TEST_TOPK_RACE_BATCH = EnvInt(576)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -1008,6 +1013,13 @@ class Envs:
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
     SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    # PPU: produce the wq_b input quant inside the q_a RMSNorm launch instead
+    # of running a separate per-token quant kernel on its bf16 output. The
+    # fused launch saves one pass over the activation, but its variance
+    # reduction does not match flashinfer's kernel bit for bit (~1e-6 of the
+    # bf16 rows differ by one ulp), which the DSA indexer's top-k can amplify
+    # into different tokens. Off by default; turn on to accept that trade.
+    SGLANG_OPT_FUSED_Q_A_RMSNORM_QUANT = EnvBool(False)
     # Unified KV wired the fused qk-norm-rope kernel to decode only, so MTP
     # target-verify kept running the norm+RoPE as separate kernels. Set to 0 to
     # go back to the unfused chain on the verify path.
@@ -1750,8 +1762,32 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Prefill CUDA graph candidates: the source layer publishes its block table
+    # at an eager break and the consumers score only those blocks inside the
+    # graph, so the captured indexer no longer needs every block to be a
+    # candidate (the 2048 x 8 window). 0 keeps the dense captured path.
+    SGLANG_OPT_DSV41_PREFILL_CAPTURE_CONSUME = EnvBool(False)
+    # DeepSeek-V4.1 eager prefill indexer top-k: select through the two-level
+    # candidate structure (block maxima, then only the kept blocks) instead of a
+    # full-width pass. 0 restores the dense top-k for A/B.
+    SGLANG_OPT_DSV41_TOPK_CANDIDATES = EnvBool(True)
+    # DeepSeek-V4.1 ratio-1/2 index top-k: select through the DeepSelect library
+    # (the precompiled PPU wheel for the dsv4 adapters, the JIT kernel where it
+    # builds) instead of the generic fp32 top-k kernels. Off by default; the bf16
+    # logits switch only reaches the wheel with this on, otherwise bf16 logits
+    # convert to fp32 and nothing is saved.
+    SGLANG_OPT_DSV41_DEEP_SELECT_TOPK = EnvBool(False)
+    # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels (flat prefill
+    # tiles and the paged decode path) store bf16 instead of fp32 (the reference ranks bf16
+    # scores); every consumer of those logits must take bf16. The sparse indexer APIs are
+    # bf16-only already and ignore this switch.
+    SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # Force the Q8KV8 sparse prefill on/off regardless of --dsv4-prefill-backend.
+    # Registered so the value reaches the DP scheduler processes; an unregistered
+    # variable would only exist in the launcher process.
+    SGLANG_DSV4_Q8KV8_PREFILL = EnvBool(False)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)

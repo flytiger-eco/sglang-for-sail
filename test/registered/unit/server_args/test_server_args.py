@@ -276,6 +276,7 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "overlap"):
                 args.resolve_once()
 
+    @override_platform(is_ppu=False)
     def test_megamoe_requires_sm90_or_sm100(self):
         # is_hip is pinned as well: override_platform only replaces the facts it is
         # given, so on a ROCm host these would otherwise describe a machine that is
@@ -296,6 +297,34 @@ class TestPrepareServerArgs(CustomTestCase):
             is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
         ):
             ServerArgs(model_path="dummy", moe_a2a_backend="megamoe").resolve_once()
+
+    def test_megamoe_requires_ppu_sm89_or_newer(self):
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        for sm in (89, 90):
+            with override_platform(
+                is_cuda=False,
+                is_sm90=False,
+                is_sm100=False,
+                is_hip=False,
+                is_ppu=True,
+                device_sm=sm,
+            ):
+                args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+                args.resolve_once()
+                self.assertEqual(resolved_view(args).moe_a2a_backend, "megamoe")
+
+        with override_platform(
+            is_cuda=False,
+            is_sm90=False,
+            is_sm100=False,
+            is_hip=False,
+            is_ppu=True,
+            device_sm=88,
+        ):
+            args = ServerArgs(model_path="dummy", moe_a2a_backend="megamoe")
+            with self.assertRaisesRegex(ValueError, "SM89"):
+                args.resolve_once()
 
     def test_megamoe_token_budget_must_cover_chunked_prefill(self):
         from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
@@ -319,6 +348,39 @@ class TestPrepareServerArgs(CustomTestCase):
                 16384
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+
+    def test_megamoe_token_budget_uses_resolved_dp_chunked_prefill(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.arg_groups.overrides import declare_resolution
+        from sglang.srt.environ import envs
+
+        with override_platform(
+            is_cuda=True, is_sm90=False, is_sm100=True, is_hip=False
+        ):
+            args = ServerArgs(
+                model_path="dummy",
+                moe_a2a_backend="megamoe",
+                tp_size=2,
+                attn_dp_size=2,
+            )
+            # _handle_data_parallelism already divided the chunk size per rank.
+            per_rank_chunked_prefill = 8192
+            declare_resolution(
+                args,
+                "test_megamoe_token_budget_uses_resolved_dp_chunked_prefill",
+                chunked_prefill_size=per_rank_chunked_prefill,
+            )
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill
+            ):
+                validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                per_rank_chunked_prefill // 2
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, f"required_per_rank={per_rank_chunked_prefill}"
+                ):
+                    validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
     def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
         from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
