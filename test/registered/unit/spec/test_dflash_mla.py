@@ -235,6 +235,83 @@ class TestDFlashMLA(CustomTestCase):
         expected = torch.nn.functional.linear(q, weight.float() * 0.25).view(2, 2, 2)
         torch.testing.assert_close(actual, expected)
 
+    def test_ppu_verify_overlaps_q_projection_and_preserves_attention_math(self):
+        for replicated in (False, True):
+            with self.subTest(replicated=replicated):
+                attn = DFlashMLAAttention(
+                    Qwen3Config(**_export_fields(Q_LORA)), layer_id=0
+                )
+                attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
+                torch.manual_seed(1)
+                with torch.no_grad():
+                    for param in attn.parameters():
+                        param.copy_(
+                            torch.randn_like(param) * 0.2 + (param == 1).float()
+                        )
+                attn.absorb_kv_b_proj()
+                for module in (
+                    attn.rotary_emb,
+                    attn.q_a_layernorm,
+                    attn.kv_a_layernorm,
+                ):
+                    module.forward = module.forward_native
+                current = SimpleNamespace(name="main", wait_stream=lambda stream: None)
+                alternate = SimpleNamespace(
+                    name="alternate", wait_stream=lambda stream: None
+                )
+                active = [current]
+                events = []
+
+                @contextmanager
+                def stream_scope(stream):
+                    previous, active[0] = active[0], stream
+                    try:
+                        yield
+                    finally:
+                        active[0] = previous
+
+                attn.alt_stream = alternate
+                attn.use_dsa = True
+                attn.dsa_decode_absorb_under_indexer = True
+                attn.indexer = lambda **kwargs: events.append(
+                    ("indexer", active[0].name)
+                )
+                attn.is_dcp_q_replicate_phase = lambda batch: replicated
+                if replicated:
+                    attn.w_kc_qrep = attn.w_kc
+                    attn.q_b_proj_qrep = attn.q_b_proj
+                    attn.q_b_proj_qrep_weight = None
+                method = (
+                    "q_b_proj_replicated_forward" if replicated else "q_b_proj_forward"
+                )
+                project = getattr(attn, method)
+
+                def record_projection(q):
+                    events.append(("projection", active[0].name))
+                    return project(q)
+
+                ctx, hidden = torch.randn(5, HIDDEN), torch.randn(4, HIDDEN)
+                ctx_pos, positions = torch.arange(5), torch.arange(10, 14)
+                with torch.no_grad():
+                    expected = _reference_output(
+                        attn, ctx, ctx_pos, hidden, positions, True
+                    )
+                with (
+                    patch.object(forward_mla, "_is_sail", True),
+                    patch(
+                        "sglang.srt.model_executor.runner.get_is_capture_mode",
+                        return_value=True,
+                    ),
+                    patch.object(torch.cuda, "current_stream", return_value=current),
+                    patch.object(torch.cuda, "stream", side_effect=stream_scope),
+                    patch.object(attn, method, side_effect=record_projection),
+                ):
+                    actual = _serve_block(attn, ctx, ctx_pos, hidden, positions)
+                self.assertEqual(
+                    events, [("indexer", "main"), ("projection", "alternate")]
+                )
+                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
     def test_draft_model_config_sizes_compressed_kv_pool(self):
         with tempfile.TemporaryDirectory() as path:
             Path(path, "config.json").write_text(
@@ -328,6 +405,10 @@ class TestDFlashMLA(CustomTestCase):
             Qwen3Config(**_export_fields(), markov_rank=4, markov_head_type="vanilla")
         )
         attn = model.layers[0].self_attn
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in attn.parameters():
+                param.copy_(torch.randn_like(param) * 0.2 + (param == 1).float())
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native

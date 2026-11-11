@@ -821,6 +821,7 @@ class KimiK3MoE(nn.Module):
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
             mma_type=_mega_moe_mma_type(self.experts),
+            **({"activation": "situ"} if is_sail() else {}),
         )
 
     def _forward_mega_experts(
@@ -837,12 +838,14 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _mega_moe_mma_type,
         )
+
+        if not is_sail():
+            from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
         # batch stays on every row.
@@ -859,19 +862,20 @@ class KimiK3MoE(nn.Module):
         mma_type = _mega_moe_mma_type(self.experts)
         buf = self._mega_moe_buffer()
 
+        topk_ids_dtype = torch.int64 if is_sail() else torch.int32
         if num_tokens > 0:
-            topk_ids_in = topk_output.topk_ids.to(torch.int32)
+            topk_ids_in = topk_output.topk_ids.to(topk_ids_dtype)
             topk_weights_in = topk_output.topk_weights.to(torch.float32)
         else:
             topk_ids_in = routed_input.new_empty(
-                (0, self._mega_top_k), dtype=torch.int32
+                (0, self._mega_top_k), dtype=topk_ids_dtype
             )
             topk_weights_in = routed_input.new_empty(
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
         valid_rows = None
-        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+        if valid_token_count is not None and (is_sail() or mma_type == "mxf4xmxf4"):
             # The graph bucket is static; its live CP prefix changes on replay.
             # Mask NaNs as well as routes before quantization/dispatch.
             valid_rows = (
@@ -880,6 +884,11 @@ class KimiK3MoE(nn.Module):
             routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
             topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
             topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        if is_sail():
+            routed_input = routed_input.contiguous()
+            topk_ids_in = topk_ids_in.contiguous()
+            topk_weights_in = topk_weights_in.contiguous()
 
         dispatch_args = (
             routed_input,
@@ -890,7 +899,14 @@ class KimiK3MoE(nn.Module):
             buf.topk_idx,
             buf.topk_weights,
         )
-        if mma_type == "mxf4xmxf4":
+        if is_sail():
+            deep_gemm.mega_moe_pre_dispatch(
+                *dispatch_args,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        elif mma_type == "mxf4xmxf4":
             # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
             deep_gemm.mega_moe_pre_dispatch(
                 *dispatch_args,
@@ -904,21 +920,41 @@ class KimiK3MoE(nn.Module):
                 quant_group_size=32,
                 num_token_non_padded=valid_token_count,
             )
-        # At least one row so the tvm-ffi binding sees a non-null data_ptr.
+        # CUDA's tvm-ffi binding needs a non-null data_ptr; PPU accepts empty ranks.
         y = torch.empty(
-            (max(num_tokens, 1), self.moe_hidden_size),
+            (num_tokens if is_sail() else max(num_tokens, 1), self.moe_hidden_size),
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            deep_gemm.fp8_fp4_mega_moe(
+            if is_sail():
+                mega_moe_kernel = {
+                    "mxf4xmxf4": deep_gemm.fp4_fp4_mega_moe,
+                    "fp8xmxfp4": deep_gemm.fp8_fp4_mega_moe,
+                    "bf16xmxfp4": deep_gemm.bf16_fp4_mega_moe,
+                }[mma_type]
+            else:
+                mega_moe_kernel = deep_gemm.fp8_fp4_mega_moe
+            situ_kwargs = (
+                {
+                    "situ_beta": self.experts.moe_runner_config.gemm1_alpha,
+                    "situ_linear_beta": (
+                        self.experts.moe_runner_config.gemm1_clamp_limit
+                    ),
+                }
+                if is_sail()
+                else {}
+            )
+            if not is_sail() or mma_type == "mxf4xmxf4":
+                situ_kwargs["recipe"] = (1, 1, 32)
+            mega_moe_kernel(
                 y,
                 self.experts.mega_l1_weights,
                 self.experts.mega_l2_weights,
                 buf,
-                recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                **situ_kwargs,
             )
         y = y[:num_tokens]
         # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
@@ -1685,7 +1721,8 @@ class KimiK3DeltaAttention(nn.Module):
         # using attention-TP placement, so it also supports DP attention.
         # The low-rank fused path still uses full-TP-only projection helpers.
         self.do_fuse_qkvbfg = (
-            self.head_tp_size == self.tp_size
+            (quant_config is None or not is_sail())
+            and self.head_tp_size == self.tp_size
         ) or self.use_fused_input_projection
 
         if self.use_full_rank_gate:

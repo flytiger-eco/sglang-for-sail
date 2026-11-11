@@ -82,14 +82,18 @@ def mla_window_sparse_indices(
     page_size: int,
     v2p: Optional[torch.Tensor] = None,
     out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    top_k_alignment: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Rank-local window indices ``[rows, top_k]`` (int32, -1 padded) and
     counts ``[rows]`` for query ``positions`` (``rows`` = requests x a uniform
-    number of query tokens per request, request-major)."""
+    number of query tokens per request, request-major). ``top_k_alignment``
+    pads the index width without changing the key counts."""
     rows = positions.shape[0]
     num_reqs = req_pool_indices.shape[0]
     assert num_reqs > 0 and rows % num_reqs == 0, (rows, num_reqs)
     top_k = mla_window_top_k(window_left, dcp_size)
+    if top_k_alignment != 4:
+        top_k = -(-top_k // top_k_alignment) * top_k_alignment
     if out is None:
         indices = torch.empty((rows, top_k), dtype=torch.int32, device=positions.device)
         counts = torch.empty(rows, dtype=torch.int32, device=positions.device)

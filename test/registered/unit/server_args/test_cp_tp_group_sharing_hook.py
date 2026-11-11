@@ -1,4 +1,4 @@
-"""Kimi-K3.1 CP-TP group sharing gates: PD prefill with DFLASH only."""
+"""Kimi-K3.1 CP-TP group sharing gates for integrated and PD prefill."""
 
 import unittest
 from types import SimpleNamespace
@@ -53,12 +53,12 @@ class TestKimiK31CpTpGroupSharing(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "disaggregation-mode decode"):
             self._resolve(_args(disaggregation_mode="decode"))
 
-    def test_rejects_dflash_without_pd_prefill(self):
-        with self.assertRaisesRegex(ValueError, "DFLASH on a PD prefill node"):
-            self._resolve(_args(speculative_algorithm="DFLASH"))
+    def test_integrated_prefill_with_dflash(self):
+        declare = self._resolve(_args(speculative_algorithm="DFLASH"))
+        self.assertTrue(declare.call_args.kwargs["enable_cp_tp_group_sharing"])
 
     def test_rejects_other_speculative_algorithms(self):
-        with self.assertRaisesRegex(ValueError, "DFLASH on a PD prefill node"):
+        with self.assertRaisesRegex(ValueError, "only supports.*DFLASH"):
             self._resolve(
                 _args(disaggregation_mode="prefill", speculative_algorithm="EAGLE")
             )

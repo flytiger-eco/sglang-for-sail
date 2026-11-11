@@ -10,7 +10,7 @@ attention TP16/4/2/1; T=2..8 cover the dense verify dispatch range.
 
 import copy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -94,7 +94,8 @@ def make_case(heads, steps):
         *(LinearAttnKernelBackend.TRITON,) * 3
     )
     forward = SimpleNamespace(
-        spec_info=SimpleNamespace(draft_token_num=steps, ragged_verify_layout=None)
+        spec_info=SimpleNamespace(draft_token_num=steps, ragged_verify_layout=None),
+        req_pool_indices=torch.arange(batch, device="cuda", dtype=torch.int64),
     )
     return backend, state, layer, inputs, forward
 
@@ -114,7 +115,9 @@ def bind_state(backend, state):
             }
         )
 
-    backend.req_to_token_pool = SimpleNamespace(mamba2_layer_cache=layer_cache)
+    backend.req_to_token_pool = SimpleNamespace(
+        mamba2_layer_cache=layer_cache, size=state.temporal.shape[1] - 1
+    )
 
 
 def verify(backend, state, layer, inputs, forward):
@@ -127,11 +130,12 @@ def verify(backend, state, layer, inputs, forward):
 
 
 @pytest.mark.parametrize(
-    "heads,steps",
-    [(8, 6), (4, 2), (6, 8)]
-    + [(heads, steps) for heads in (12, 24, 48, 96) for steps in range(2, 9)],
+    "heads,steps,dflash",
+    [(8, 6, False), (4, 2, False), (6, 8, False)]
+    + [(heads, steps, False) for heads in (12, 24, 48, 96) for steps in range(2, 9)]
+    + [(6, 5, True), (12, 5, True)],
 )
-def test_verify_commit_and_graph(heads, steps):
+def test_verify_commit_and_graph(heads, steps, dflash):
     from pla.decode import kda_mtp_sglang as pla
 
     from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
@@ -140,6 +144,16 @@ def test_verify_commit_and_graph(heads, steps):
     from sglang.srt.environ import envs
 
     backend, initial, layer, inputs, forward = make_case(heads, steps)
+    if dflash:
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Kimi-K3.1-Dflash2-Preview verifies five tokens, including the bonus.
+        num_tokens = inputs[0].shape[0]
+        forward.spec_info = DFlashVerifyInput(
+            draft_token=torch.zeros(num_tokens, device="cuda", dtype=torch.int64),
+            positions=torch.arange(num_tokens, device="cuda", dtype=torch.int64),
+            draft_token_num=steps,
+        )
     reference = copy.deepcopy(initial)
     if (heads, steps) == (12, 8):
         # Exercise transposed conv pools before backend dispatch.
@@ -267,6 +281,102 @@ def test_verify_commit_and_graph(heads, steps):
             torch.testing.assert_close(
                 graph_state.conv[0], eager_state.conv[0], rtol=0, atol=0
             )
+
+
+@pytest.mark.parametrize("fused_onorm", [True, False])
+def test_dflash_pla_verify_output_norm_handoff(fused_onorm):
+    """PLA's fused norm and the model's fallback must each apply norm once."""
+    from pla.decode import kda_mtp_sglang as pla
+
+    from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.models import kimi_k3
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+    heads, steps = 12, 5
+    backend, initial, layer, inputs, forward = make_case(heads, steps)
+    num_tokens, dim = inputs[0].shape[0], heads * 128
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    forward.forward_mode = ForwardMode.TARGET_VERIFY
+    forward.spec_info = DFlashVerifyInput(
+        draft_token=torch.zeros_like(positions),
+        positions=positions,
+        draft_token_num=steps,
+    )
+    gate = torch.randn(num_tokens, dim, device="cuda", dtype=torch.bfloat16)
+    norm = FusedRMSNormGated(128, eps=1e-5, activation="sigmoid").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        norm.weight.fill_(1)
+    with envs.SGLANG_SAIL_PLA_CUDA.override(False):
+        bind_state(backend, copy.deepcopy(initial))
+        raw = backend._forward_target_verify(layer, forward, *inputs)
+        expected = norm(raw, gate.unflatten(-1, (heads, 128)))
+        expected = expected.squeeze(0).flatten(-2)
+
+    class Attention(SimpleNamespace):
+        def __call__(self, forward_batch, **kwargs):
+            return backend._forward_target_verify(self, forward_batch, **kwargs)
+
+    attn = Attention(**vars(layer))
+    norm_weight = norm.weight.float().contiguous()
+    attn._k3_fused_decode_args = (None,) * 5 + (norm_weight, norm.eps)
+    model = SimpleNamespace(
+        head_dim=128,
+        do_fuse_qkvbfg=True,
+        use_full_rank_gate=True,
+        _kda_fused_decode_ready=fused_onorm,
+        _kda_hip_fused_decode_ready=False,
+        all_reduce_fusion=False,
+        forward_qkvbfg_fused=Mock(
+            return_value=(
+                inputs[0],
+                inputs[2][0],
+                inputs[1].reshape(num_tokens, dim),
+                gate,
+            )
+        ),
+        attn=attn,
+        o_norm=Mock(wraps=norm),
+        o_proj=lambda x: (x, None),
+    )
+    bind_state(backend, copy.deepcopy(initial))
+    with (
+        envs.SGLANG_SAIL_PLA_CUDA.override(True),
+        patch.object(
+            kimi_k3, "cp_interleave_to_sequence_order", side_effect=lambda x, _: x
+        ),
+        patch.object(
+            kimi_k3, "cp_sequence_to_interleave_order", side_effect=lambda x, *_: x
+        ),
+        patch.object(
+            pla, "fused_kda_decode_mtp_dspark", wraps=pla.fused_kda_decode_mtp_dspark
+        ) as hit,
+    ):
+        actual = kimi_k3.KimiK3DeltaAttention.forward(
+            model, torch.empty_like(gate), positions, forward, None
+        )
+    hit.assert_called_once()
+    kwargs = hit.call_args.kwargs
+    if fused_onorm:
+        assert kwargs["onorm_gate"].shape == (1, num_tokens, heads, 128)
+        assert kwargs["onorm_gate"].data_ptr() == gate.data_ptr()
+        assert kwargs["onorm_weight"] is norm_weight
+        assert kwargs["onorm_weight"].dtype == torch.float32
+        assert kwargs["onorm_eps"] == norm.eps
+        assert attn._k3_onorm_consumed is True
+        model.o_norm.assert_not_called()
+    else:
+        for name in ("onorm_gate", "onorm_weight", "onorm_eps"):
+            assert kwargs[name] is None
+        assert not getattr(attn, "_k3_onorm_consumed", False)
+        model.o_norm.assert_called_once()
+    assert getattr(attn, "_k3_onorm_gate", None) is None
+    torch.testing.assert_close(
+        actual[: 3 * steps], expected[: 3 * steps], rtol=0.02, atol=2e-3
+    )
 
 
 def test_ragged_verify_fallback_then_pla_commit():

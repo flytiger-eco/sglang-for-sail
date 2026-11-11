@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention import dsa_backend
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
@@ -24,7 +25,56 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
     backend.dsa_kv_cache_store_fp8 = fp8_kv_cache
     backend.dsa_prefill_impl = prefill_impl
+    backend.attn_dcp_size = 1
     return backend
+
+
+@pytest.mark.parametrize(
+    "dcp_size,dcp_rank,expected",
+    [(1, 0, [65536, 65536]), (8, 0, [1, 1025]), (8, 7, [0, 1024])],
+)
+def test_capture_keeps_dcp_visible_lengths(monkeypatch, dcp_size, dcp_rank, expected):
+    """Schedule capacity must not become the local TopK's visible key count."""
+    backend = _make_backend("fa3", fp8_kv_cache=False)
+    backend.device = torch.device("cpu")
+    backend.attn_dcp_size = dcp_size
+    backend.attn_dcp_rank = dcp_rank
+    backend.physical_page_size = 64
+    backend.real_page_span = 64 * dcp_size
+    backend.dsa_index_topk = 2048
+    backend.dsa_index_kpool = 1
+    backend.speculative_num_draft_tokens = 2
+    backend.dsa_drop_wide_page_table = False
+    backend.dsa_decode_impl = "fa3"
+    backend.enable_auto_select_prefill_impl = False
+    backend._is_in_breakable_cuda_graph = lambda: False
+    backend._is_in_tc_piecewise_cuda_graph = lambda: False
+    backend._get_device_sm = lambda: 100
+    backend._is_blackwell = lambda: True
+    backend.dsa_topk_backend = dsa_backend.DSATopKBackend.TORCH
+    backend.req_to_token = torch.zeros((2, 65536), dtype=torch.int32)
+    backend._arange_buf = torch.arange(3, dtype=torch.int32)
+    backend.decode_cuda_graph_metadata = {
+        "page_table": backend.req_to_token.clone(),
+        "cu_seqlens_q": backend._arange_buf,
+    }
+    # Isolate the external DeepGEMM scheduler; metadata construction stays real.
+    backend._build_paged_mqa_schedule_metadata = lambda lengths: lengths.clone()
+    monkeypatch.setattr(dsa_backend, "is_cuda", lambda: True)
+    seq = torch.tensor([1, 8193], dtype=torch.int32)
+    backend._build_forward_metadata_cuda_graph(
+        2, None, torch.arange(2), seq, seq, ForwardMode.DECODE, None
+    )
+
+    metadata = backend.forward_metadata
+    torch.testing.assert_close(
+        metadata.paged_mqa_ctx_lens_2d,
+        torch.tensor(expected, dtype=torch.int32)[:, None],
+    )
+    torch.testing.assert_close(
+        metadata.paged_mqa_schedule_metadata,
+        torch.full((2, 1), 65536, dtype=torch.int32),
+    )
 
 
 @pytest.mark.parametrize(

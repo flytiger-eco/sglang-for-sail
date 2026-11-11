@@ -61,6 +61,9 @@ class _TopK(torch.nn.Module):
     def forward(self, hidden_states, router_logits):
         return None
 
+    def empty_topk_output(self, device):
+        return None
+
 
 @cache_once
 def _moe() -> kimi_k3.KimiK3MoE:

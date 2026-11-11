@@ -52,12 +52,14 @@ class TestPpuKimiK3Constraints(CustomTestCase):
         with patch.object(jit_arch, "is_sail_runtime", return_value=True):
             self.assertFalse(jit_arch.is_arch_support_pdl.__wrapped__())
 
-    def test_ppu_rejects_megamoe(self):
+    def test_ppu_preserves_megamoe_a2a_selection(self):
         with patch("sglang.srt.utils.common.is_sail", return_value=True):
-            with self.assertRaisesRegex(ValueError, "MegaMoE is not supported on PPU"):
+            self.assertEqual(
                 overrides_module._a2a_backend_overrides(
-                    SimpleNamespace(moe_a2a_backend="megamoe")
-                )
+                    SimpleNamespace(moe_a2a_backend="megamoe", enable_waterfill=False)
+                ),
+                {},
+            )
 
     def test_ppu_w4a16_deep_gemm_moe_accepts_k3_situ(self):
         scheme = object.__new__(CompressedTensorsWNA16DeepGemmMoE)
@@ -691,19 +693,17 @@ def test_non_ppu_keeps_community_fused_decode_preparation_limit():
         assert not hasattr(layer, "_k3_fused_decode_weight")
 
 
-def test_ppu_disables_pdl_and_megamoe():
+def test_ppu_disables_pdl_and_preserves_megamoe_selection():
     with patch.object(jit_arch, "is_sail_runtime", return_value=True):
         assert not jit_arch.is_arch_support_pdl.__wrapped__()
 
     with patch("sglang.srt.utils.common.is_sail", return_value=True):
-        try:
+        assert (
             overrides_module._a2a_backend_overrides(
-                type("View", (), {"moe_a2a_backend": "megamoe"})()
+                SimpleNamespace(moe_a2a_backend="megamoe", enable_waterfill=False)
             )
-        except ValueError as exc:
-            assert "MegaMoE is not supported on PPU" in str(exc)
-        else:
-            raise AssertionError("PPU MegaMoE backend must be rejected")
+            == {}
+        )
 
 
 def test_ppu_w4a16_deep_gemm_moe_accepts_k3_situ():

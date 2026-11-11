@@ -447,7 +447,7 @@ class DeepseekMLAForwardMixin:
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                if not self.dsa_decode_absorb_under_indexer:
+                if not (self.dsa_decode_absorb_under_indexer and not _is_sail):
                     k_nope = k_nope.unsqueeze(1)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
@@ -463,7 +463,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices = maybe_capture_indexer_topk(
                         self.layer_id, prev_topk_indices
                     )
-                if self.dsa_decode_absorb_under_indexer:
+                if self.dsa_decode_absorb_under_indexer and not _is_sail:
                     # Captured after the indexer: graph replay continues after
                     # the join on the stream of the first-captured parent, so
                     # capturing alt first moves the rest of every DSA layer onto
@@ -510,7 +510,10 @@ class DeepseekMLAForwardMixin:
                 else:
                     # Issued after the indexer so the join stays on the main lane at graph replay.
                     with torch.cuda.stream(self.alt_stream):
-                        q = self.q_b_proj_forward(q)
+                        if _is_sail and self.dsa_decode_absorb_under_indexer:
+                            q = self._q_b_proj_maybe_replicated(q, q_replicate_active)
+                        else:
+                            q = self.q_b_proj_forward(q)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)

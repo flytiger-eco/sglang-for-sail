@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import (
+    dflash_grouped_conv,
     selector_walk_triton,
 )
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
@@ -57,12 +58,14 @@ from sglang.srt.utils import (
     BumpAllocator,
     bind_or_assign,
     is_npu,
+    is_sail,
     set_weight_attrs,
 )
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_sail = is_sail()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -683,6 +686,15 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        if _is_sail and hidden_states.is_cuda and hidden_states.dim() == 2:
+            return dflash_grouped_conv(
+                hidden_states,
+                delta,
+                self.base_kernel[side],
+                self.block_size,
+                self.group_size,
+                self.taps,
+            )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)

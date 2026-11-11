@@ -153,7 +153,11 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
-            "cutedsl_mla": self._create_cutedsl_mla_prefill_backend,
+            "cutedsl_mla": (
+                self._create_trtllm_mla_prefill_backend
+                if is_sail()
+                else self._create_cutedsl_mla_prefill_backend
+            ),
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,

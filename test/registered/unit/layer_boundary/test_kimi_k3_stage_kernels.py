@@ -48,6 +48,8 @@ def k3_planning(parallel, **options):
     code reads (prefill CP, pipeline width)."""
     if not hasattr(parallel, "pp_size"):
         parallel.pp_size = 1
+    if not hasattr(parallel, "enable_cp_tp_group_sharing"):
+        parallel.enable_cp_tp_group_sharing = False
     with (
         fixture.planning(parallel, **options),
         patch.object(kimi_k3, "get_parallel", lambda: parallel),

@@ -76,7 +76,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             )
         ):
             raise ValueError(
-                "CP/TP group sharing only supports native MTP with top-k 1."
+                "CP/TP group sharing only supports DFLASH or native MTP with top-k 1."
             )
 
     unsupported = {

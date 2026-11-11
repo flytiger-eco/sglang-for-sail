@@ -109,7 +109,7 @@ class TestOOTDFlashHooks(CustomTestCase):
 class TestDFlashDraftBackendResolution(CustomTestCase):
     """Backends that serve one attention layout follow the draft's layout."""
 
-    def _resolve(self, draft_backend, *, mla, target_backend="fa3"):
+    def _resolve(self, draft_backend, *, mla, target_backend="fa3", sail=False):
         args = _make_dflash_args(draft_backend)
         platform = Mock(spec=SRTPlatform)
         platform.is_out_of_tree.return_value = False
@@ -119,6 +119,10 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
             dflash_config={"attention_mode": "mla" if mla else "gqa"},
         )
         with (
+            patch(
+                "sglang.srt.speculative.draft_worker_common.DFLASH_MLA_ONLY_DRAFT_BACKENDS",
+                ("flashmla",) if sail else ("cutedsl_mla", "trtllm_mla"),
+            ),
             patch(f"{HOOK_MODULE}.current_platform", platform),
             patch(
                 f"{HOOK_MODULE}.get_platform",
@@ -137,6 +141,11 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
         ):
             _resolve_dflash_draft_attention_backend(args)
         return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_ppu_flashmla_requires_mla_draft(self):
+        self.assertEqual(self._resolve("flashmla", mla=True, sail=True), "flashmla")
+        self.assertEqual(self._resolve("flashmla", mla=False, sail=True), "flashinfer")
+        self.assertEqual(self._resolve("flashmla", mla=True, sail=False), "flashinfer")
 
     def test_layout_specific_backends(self):
         self.assertEqual(self._resolve("tokenspeed_mla", mla=True), "tokenspeed_mla")

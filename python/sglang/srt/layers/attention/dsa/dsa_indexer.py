@@ -56,6 +56,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -935,6 +936,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
         key, weights_raw = self._split_k_weights(kw)
+        # The split views have row stride head_dim + n_heads; PPU kernels
+        # downstream (e.g. flashinfer layernorm) assume contiguous rows.
+        if is_sail():
+            return key.contiguous(), weights_raw.contiguous()
         return key, weights_raw
 
     def _split_k_weights(self, kw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2580,9 +2585,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             int(local_lens_cpu.sum()),
             max(int(local_lens_cpu.max()), 1),
         )
-        rows = k_fp8.shape[0]
-        k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
-        s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        k_bytes = k_fp8.view(torch.uint8).flatten(1)
+        s_bytes = k_scale.view(torch.uint8).flatten(1)
         gathered = dcp_gather_request_rows(
             torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
         )
@@ -3286,6 +3290,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not weights_proj_lora
             and isinstance(x, torch.Tensor)
             and not is_cp_active(forward_batch)
+            and not is_sail()
         ):
             q_fp8, weights = self._decode_merged_k_gate(
                 q_lora, x, forward_batch, layer_id, act_quant
@@ -3293,6 +3298,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         elif (
             enable_dual_stream
             and forward_batch.forward_mode.is_decode_or_idle()
+            and (self.use_fp8 or not is_sail())
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)

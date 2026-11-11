@@ -114,6 +114,8 @@ def cp_lse_ag_out_rs_mla(
             cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
         )
         cp_attn_lse = cp_attn_lse.to(torch.float32)
+        if get_platform().is_ppu:
+            cp_attn_lse = cp_attn_lse.contiguous()
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
         cp_attn_out,

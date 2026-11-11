@@ -72,6 +72,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_sail,
     xpu_has_xmx_support,
 )
 
@@ -451,7 +452,11 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
         return view.linear_attn_backend == "triton" or (
-            model_arch == "KimiK3ForConditionalGeneration"
+            model_arch
+            in (
+                "KimiK3ForConditionalGeneration",
+                "KimiK31ForConditionalGeneration",
+            )
             and view.linear_attn_backend == "flashkda"
         )
     return False
@@ -764,6 +769,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
 # Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
 _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+if is_sail():
+    _KIMI_K31_DSA_BACKENDS += ("flashmla_sparse",)
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
@@ -795,7 +802,7 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     # Both phases read one KV pool (and PD peers exchange it), so an unset
     # phase follows the set one.
     chosen = {getattr(view, f) for f in fields} - {None}
-    if len(chosen) > 1:
+    if len(chosen) > 1 and not is_sail():
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
             "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
@@ -811,7 +818,9 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
-        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.",
+        view.dsa_prefill_backend,
+        view.dsa_decode_backend,
     )
     return declared
 

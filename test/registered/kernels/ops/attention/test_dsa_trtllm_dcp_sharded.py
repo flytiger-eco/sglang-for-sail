@@ -8,7 +8,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_heads
+from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_heads
 from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_cast_triton
 from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import _localize_compact_kernel

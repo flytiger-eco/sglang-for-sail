@@ -14,6 +14,7 @@ from sglang.srt.runtime_context import attention_backends, get_platform, get_spe
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -31,6 +32,8 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 
 # Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
 DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+if is_sail():
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("flashmla", "triton")
 
 
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:

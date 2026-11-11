@@ -146,7 +146,10 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   constexpr int kLanesPerBlock = kMxfp4Block / kElemsPerLane;  // 8
   constexpr int64_t kPageBytes = static_cast<int64_t>((kPackedBytesPerToken + kScaleBytesPerToken) << kPageBits);
 
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto* input = param.input;
+  auto* cache = param.cache;
+  const auto* indices = param.indices;
+  const auto num_tokens = param.num_tokens;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
@@ -202,21 +205,23 @@ __global__ void fused_store_indexer_mxfp4_cache(const __grid_constant__ FusedSto
   //   [0, kPageSize * 64):           packed FP4 (64 bytes/token)
   //   [kPageSize * 64, +kPageSize*4): ue8m0 scales (4 bytes/token)
   // DeepGEMM treats each token's 4 ue8m0 bytes as a single int32 (kv_sf).
-  const int32_t page = index >> kPageBits;
-  const int32_t offset = index & ((1 << kPageBits) - 1);
-  const auto page_ptr = pointer::offset(cache, page * kPageBytes);
-  const auto value_ptr = pointer::offset(page_ptr, offset * kPackedBytesPerToken);
-  const auto scale_ptr = pointer::offset(page_ptr, kPackedBytesPerToken << kPageBits, offset * kScaleBytesPerToken);
+  if (index >= 0) {
+    const int32_t page = index >> kPageBits;
+    const int32_t offset = index & ((1 << kPageBits) - 1);
+    const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+    const auto value_ptr = pointer::offset(page_ptr, offset * kPackedBytesPerToken);
+    const auto scale_ptr = pointer::offset(page_ptr, kPackedBytesPerToken << kPageBits, offset * kScaleBytesPerToken);
 
-  // Streaming store: bypass L1/L2 cache for large sequential KV writes.
-  {
-    const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
-    asm volatile("st.global.cs.u16 [%0], %1;" ::"l"(store_addr), "h"(packed) : "memory");
-  }
-  // The first lane in each 8-lane group writes its block's ue8m0 byte.
-  if ((lane_id % kLanesPerBlock) == 0) {
-    const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
-    asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
+    // Streaming store: bypass L1/L2 cache for large sequential KV writes.
+    {
+      const uint16_t* store_addr = reinterpret_cast<const uint16_t*>(value_ptr) + lane_id;
+      asm volatile("st.global.cs.u16 [%0], %1;" ::"l"(store_addr), "h"(packed) : "memory");
+    }
+    // The first lane in each 8-lane group writes its block's ue8m0 byte.
+    if ((lane_id % kLanesPerBlock) == 0) {
+      const uint8_t* scale_addr = static_cast<const uint8_t*>(scale_ptr) + block_idx_in_token;
+      asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(scale_addr), "r"((uint32_t)ue8m0) : "memory");
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();
@@ -228,6 +233,48 @@ struct FusedStoreCacheIndexerMXFP4Kernel {
   // 64 packed FP4 bytes + 4 ue8m0 bytes per token = 68 bytes.
   static constexpr int64_t kPageBytes = 68 * kPageSize;
   static constexpr auto kernel = fused_store_indexer_mxfp4_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
+
+  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
+  static_assert(1 << kLogSize == kPageSize);
+
+  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({N, 128})  // input
+        .with_dtype<KeyT>()
+        .with_device(device_)
+        .verify(input);
+    TensorMatcher({-1, -1})  // cache
+        .with_strides({kPageBytes, 1})
+        .with_dtype<uint8_t>()
+        .with_device(device_)
+        .verify(cache);
+    TensorMatcher({N})  // indices
+        .with_dtype<IndicesT>()
+        .with_device(device_)
+        .verify(indices);
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto params = FusedStoreCacheParam{
+        .input = input.data_ptr(),
+        .cache = cache.data_ptr(),
+        .indices = indices.data_ptr(),
+        .num_tokens = num_tokens,
+    };
+    const auto kBlockSize = 128;
+    const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);
+    LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
+struct FusedStoreCacheIndexerKernel {
+  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
+  /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
+  static constexpr int64_t kPageBytes = 132 * kPageSize;
+  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
 
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
@@ -266,48 +313,6 @@ struct FusedStoreCacheIndexerMXFP4Kernel {
         .num_tokens = num_tokens,
         .dcp_size = dcp_size,
         .dcp_rank = dcp_rank,
-    };
-    const auto kBlockSize = 128;
-    const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);
-    LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
-  }
-};
-
-template <typename KeyT, typename IndicesT, uint32_t kPageSize, bool kUsePDL>
-struct FusedStoreCacheIndexerKernel {
-  static constexpr int32_t kLogSize = std::countr_zero(kPageSize);
-  /// NOTE: 132 = 128 + 4 (128 represent K and 4 represent scale)
-  static constexpr int64_t kPageBytes = 132 * kPageSize;
-  static constexpr auto kernel = fused_store_indexer_cache<KeyT, IndicesT, kLogSize, kUsePDL>;
-
-  static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
-  static_assert(1 << kLogSize == kPageSize);
-
-  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
-    using namespace host;
-
-    auto N = SymbolicSize{"num_tokens"};
-    auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
-    TensorMatcher({N, 128})  // input
-        .with_dtype<KeyT>()
-        .with_device(device_)
-        .verify(input);
-    TensorMatcher({-1, -1})  // cache
-        .with_strides({kPageBytes, 1})
-        .with_dtype<uint8_t>()
-        .with_device(device_)
-        .verify(cache);
-    TensorMatcher({N})  // indices
-        .with_dtype<IndicesT>()
-        .with_device(device_)
-        .verify(indices);
-    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
-    const auto params = FusedStoreCacheParam{
-        .input = input.data_ptr(),
-        .cache = cache.data_ptr(),
-        .indices = indices.data_ptr(),
-        .num_tokens = num_tokens,
     };
     const auto kBlockSize = 128;
     const auto num_blocks = div_ceil(num_tokens * 32, kBlockSize);

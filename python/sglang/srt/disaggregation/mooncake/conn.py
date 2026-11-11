@@ -953,18 +953,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         if (
             get_spec().speculative_algorithm == "DFLASH"
-            # Bootstrap runs concurrently with temporary draft TP scopes.
-            # Use the manager's captured target layout, not scoped CP flags.
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
+            and not registration_info.dst_draft_rows_dcp_collapsed
         ):
-            # Appended draft MHA KV uses physical TP shards, while target MLA
-            # KV is replicated. The draft transfer cannot reslice those shards.
-            return False, (
-                "CP/TP-sharing DFLASH PD requires the same physical TP size: "
-                f"prefill={self.state_tp_size}, "
-                f"decode={registration_info.dst_attn_tp_size}"
+            num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+            draft_ids = getattr(self.kv_args, "kv_layer_ids", ())[-num_draft:]
+            src_lens = getattr(self.kv_args, "kv_item_lens", ())[-num_draft:]
+            dst_ids = getattr(registration_info, "dst_kv_layer_ids", ())
+            dst_lens = getattr(registration_info, "dst_kv_item_lens", ())[-num_draft:]
+            dst_page_scale = (
+                getattr(registration_info, "dst_dcp_size", 1)
+                if getattr(registration_info, "requires_dcp_relayout", False)
+                else 1
             )
+            replicated_draft = (
+                num_draft > 0
+                and len(draft_ids) == len(set(draft_ids)) == num_draft
+                and dst_ids[-num_draft:] == draft_ids
+                and not set(draft_ids).intersection(dst_ids[:-num_draft])
+                and len(src_lens) == len(dst_lens) == num_draft
+                and all(
+                    src > 0 and dst == src * dst_page_scale
+                    for src, dst in zip(src_lens, dst_lens)
+                )
+            )
+            if not replicated_draft:
+                return False, (
+                    "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                    f"prefill={self.state_tp_size}, "
+                    f"decode={registration_info.dst_attn_tp_size}"
+                )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):
@@ -2092,21 +2111,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
-
-    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
-        """Pair target/draft indexer pages before narrowing to this owner."""
-        if len(src_indices) != len(dst_indices):
-            raise RuntimeError(
-                "Sharded DSA state page count mismatch: "
-                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
-            )
-        local_indices, positions = filter_kv_indices_for_shard_rank(
-            kv_indices=np.asarray(src_indices, dtype=np.int32),
-            index_slice=slice(0, len(src_indices)),
-            shard_rank=self.kv_shard_rank,
-            shard_size=self.kv_shard_size,
-        )
-        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
         """Pair target/draft indexer pages before narrowing to this owner."""

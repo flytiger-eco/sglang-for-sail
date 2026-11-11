@@ -2017,9 +2017,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # into the recurrence.
         onorm_gate = getattr(layer, "_k3_onorm_gate", None)
         fused_static = getattr(layer, "_k3_fused_decode_args", None)
-        apply_onorm = (
-            not use_pla and onorm_gate is not None and fused_static is not None
-        )
+        apply_onorm = onorm_gate is not None and fused_static is not None
         if apply_onorm:
             onorm_weight = fused_static[5]
             onorm_eps = fused_static[6]

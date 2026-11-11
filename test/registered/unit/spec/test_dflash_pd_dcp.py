@@ -74,8 +74,13 @@ class TestDFlashEarlierPipelineStage(CustomTestCase):
 
 
 class TestMlaOnlyDraftBackends(CustomTestCase):
-    def _resolve(self, backend, algo_label):
+    def _resolve(self, backend, algo_label, sail=False):
         with (
+            patch.object(
+                draft_worker_common,
+                "DFLASH_MLA_ONLY_DRAFT_BACKENDS",
+                ("flashmla",) if sail else ("cutedsl_mla", "trtllm_mla"),
+            ),
             patch.object(
                 draft_worker_common,
                 "get_spec",
@@ -94,9 +99,28 @@ class TestMlaOnlyDraftBackends(CustomTestCase):
             )
 
     def test_dflash_keeps_mla_only_backends(self):
-        for backend in draft_worker_common.DFLASH_MLA_ONLY_DRAFT_BACKENDS:
-            with self.subTest(backend=backend):
-                self.assertEqual(self._resolve(backend, "DFLASH"), backend)
+        for sail, backends in (
+            (False, ("cutedsl_mla", "trtllm_mla")),
+            (True, ("flashmla",)),
+        ):
+            for backend in backends:
+                with self.subTest(sail=sail, backend=backend):
+                    self.assertEqual(
+                        self._resolve(backend, "DFLASH", sail=sail), backend
+                    )
+
+    def test_ppu_flashmla_is_kept_only_for_dflash(self):
+        cases = (
+            (True, "DFLASH", "flashmla", "flashmla"),
+            (False, "DFLASH", "flashmla", "flashinfer"),
+            (True, "DFLASH", "cutedsl_mla", "flashinfer"),
+            (True, "DFLASH", "trtllm_mla", "flashinfer"),
+            (True, "DSPARK", "flashmla", "flashinfer"),
+            (True, None, "flashmla", "flashinfer"),
+        )
+        for sail, algorithm, backend, expected in cases:
+            with self.subTest(sail=sail, algorithm=algorithm, backend=backend):
+                self.assertEqual(self._resolve(backend, algorithm, sail=sail), expected)
 
     def test_other_algorithms_fall_back(self):
         for algo_label in ("DSPARK", None):

@@ -270,6 +270,7 @@ class TestIndexerAPI(unittest.TestCase):
             "_is_xpu": False,
             "_is_cuda": True,
             "is_sail": lambda: True,
+            "_index_k_dcp": lambda: (1, 0),
         }
         path = ATTENTION / "dsa/dsa_indexer.py"
         paged = load_symbol(path, "_get_topk_paged", namespace)

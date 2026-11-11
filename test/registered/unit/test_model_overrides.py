@@ -3028,6 +3028,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
             )
         )
+        self.assertTrue(
+            supports_mamba_cache_extra_buffer(
+                SimpleNamespace(linear_attn_backend="flashkda"),
+                SimpleNamespace(architectures=["KimiK31ForConditionalGeneration"]),
+            )
+        )
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "KimiK31ForConditionalGeneration",
+                    linear_attn_backend="flashkda",
+                )
+            )["mamba_radix_cache_strategy"],
+            "extra_buffer",
+        )
         # The mamba pass runs before FlashMLA snaps page_size to 64. With PP
         # already disabling overlap, its explicit decode backend must still
         # select extra_buffer rather than the page_size=1-only no_buffer mode.
@@ -3069,6 +3084,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
+                attention_backend=None,
+                decode_attention_backend=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
             )
@@ -3159,6 +3176,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
+                disaggregation_mode="null",
                 mamba_radix_cache_strategy="auto",
                 disable_radix_cache=False,
                 speculative_algorithm=None,
@@ -4074,6 +4092,7 @@ class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
 
         args = SimpleNamespace(
             dcp_size=8,
+            enable_prefill_cp=False,
             dcp_comm_backend="fi_a2a",
             dcp_replicate_q_proj=None,
             enable_symm_mem=False,
@@ -4104,7 +4123,7 @@ class TestKimiK31DcpOverrides(CustomTestCase):
     DCP-1 or same-DCP PD prefill over Mooncake."""
 
     @staticmethod
-    def _overrides(**fields):
+    def _overrides(sail=False, **fields):
         from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
 
         cfg = SimpleNamespace(
@@ -4123,7 +4142,14 @@ class TestKimiK31DcpOverrides(CustomTestCase):
         )
         for name, value in fields.items():
             setattr(cfg, name, value)
-        return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
+        with (
+            patch(
+                "sglang.srt.speculative.draft_worker_common.DFLASH_MLA_ONLY_DRAFT_BACKENDS",
+                ("flashmla",) if sail else ("cutedsl_mla", "trtllm_mla"),
+            ),
+            patch("sglang.srt.utils.is_sail", return_value=sail),
+        ):
+            return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
 
     def test_dflash_defaults_to_cutedsl_mla_draft_and_decode_verify(self):
         overrides = self._overrides(speculative_algorithm="DFLASH")
@@ -4132,8 +4158,57 @@ class TestKimiK31DcpOverrides(CustomTestCase):
         )
         self.assertEqual(overrides["speculative_attention_mode"], "decode")
 
+    def test_ppu_dflash_defaults_to_flashmla_draft(self):
+        overrides = self._overrides(
+            sail=True,
+            speculative_algorithm="DFLASH",
+            tp_size=16,
+            dcp_comm_backend="ag_rs",
+        )
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "flashmla")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+
+    def test_ppu_dflash_preserves_explicit_flashmla_draft(self):
+        overrides = self._overrides(
+            sail=True,
+            speculative_algorithm="DFLASH",
+            tp_size=16,
+            dcp_comm_backend="ag_rs",
+            speculative_draft_attention_backend="flashmla",
+        )
+        self.assertEqual(overrides["speculative_draft_attention_backend"], "flashmla")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+
+    def test_flashmla_dflash_draft_remains_ppu_only(self):
+        with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
+            self._overrides(
+                speculative_algorithm="DFLASH",
+                speculative_draft_attention_backend="flashmla",
+            )
+
+    def test_ppu_dflash_rejects_unsupported_draft_backends(self):
+        for backend in ("cutedsl_mla", "flashinfer", "triton", "trtllm_mla"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "flashmla"):
+                    self._overrides(
+                        sail=True,
+                        speculative_algorithm="DFLASH",
+                        speculative_draft_attention_backend=backend,
+                    )
+
+    def test_dflash_accepts_all_mla_only_backends(self):
+        for backend in ("cutedsl_mla", "trtllm_mla"):
+            with self.subTest(backend=backend):
+                overrides = self._overrides(
+                    speculative_algorithm="DFLASH",
+                    speculative_draft_attention_backend=backend,
+                )
+                self.assertEqual(
+                    overrides["speculative_draft_attention_backend"], "cutedsl_mla"
+                )
+
     def test_dflash_rejects_other_draft_backends(self):
-        for backend in ("flashinfer", "triton", "trtllm_mla"):
+        for backend in ("flashinfer", "triton"):
             with self.subTest(backend=backend):
                 with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
                     self._overrides(
@@ -4227,14 +4302,109 @@ class TestKimiK31DsaBackends(CustomTestCase):
         )
 
     def test_rejects_mixed_backends(self):
-        with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
-            self._resolve(
-                dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
-            )
+        with patch("sglang.srt.arg_groups.overrides.is_sail", return_value=False):
+            with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
+                self._resolve(
+                    dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
+                )
 
     def test_rejects_unsupported_backend(self):
-        with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
-            self._resolve(dsa_decode_backend="flashmla_sparse")
+        with patch(
+            "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+            ("flashmla_kv", "trtllm"),
+        ):
+            with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
+                self._resolve(dsa_decode_backend="flashmla_sparse")
+
+    def test_ppu_sparse_is_available_in_both_phases(self):
+        with (
+            patch("sglang.srt.arg_groups.overrides.is_sail", return_value=True),
+            patch(
+                "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+                ("flashmla_kv", "trtllm", "flashmla_sparse"),
+            ),
+        ):
+            self.assertEqual(
+                self._resolve(dsa_prefill_backend="flashmla_sparse"),
+                {"dsa_decode_backend": "flashmla_sparse"},
+            )
+            self.assertEqual(
+                self._resolve(dsa_decode_backend="flashmla_sparse"),
+                {"dsa_prefill_backend": "flashmla_sparse"},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend="flashmla_kv",
+                ),
+                {},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_kv",
+                    dsa_decode_backend="flashmla_sparse",
+                ),
+                {},
+            )
+            self.assertEqual(
+                self._resolve(
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend="flashmla_kv",
+                    dcp_size=2,
+                ),
+                {},
+            )
+
+    def test_ppu_sparse_prefill_preserves_fp8_kv_cache(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _ppu_flashmla_fp8_kv_cache_fallback,
+        )
+
+        def view(arch, decode="flashmla_kv", dcp_size=1):
+            return ResolvedView(
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=[arch], index_topk=2048)
+                    ),
+                    kv_cache_dtype="fp8_e4m3",
+                    decode_attention_backend=None,
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend=decode,
+                    dcp_size=dcp_size,
+                )
+            )
+
+        with patch("sglang.srt.utils.common.is_sail", return_value=True):
+            self.assertEqual(
+                _ppu_flashmla_fp8_kv_cache_fallback(
+                    view("KimiK31ForConditionalGeneration")
+                ),
+                {},
+            )
+            self.assertEqual(
+                _ppu_flashmla_fp8_kv_cache_fallback(
+                    view("KimiK31ForConditionalGeneration", dcp_size=2)
+                ),
+                {},
+            )
+            for cfg in (
+                view("KimiK31ForConditionalGeneration", decode="trtllm"),
+                view("KimiK31ForConditionalGeneration", decode="flashmla_sparse"),
+                view("GlmMoeDsaForCausalLM"),
+            ):
+                self.assertEqual(
+                    _ppu_flashmla_fp8_kv_cache_fallback(cfg),
+                    {},
+                )
+
+    def test_sparse_prefill_rejected_off_ppu(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides._KIMI_K31_DSA_BACKENDS",
+            ("flashmla_kv", "trtllm"),
+        ):
+            with self.assertRaisesRegex(ValueError, "--dsa-prefill-backend"):
+                self._resolve(dsa_prefill_backend="flashmla_sparse")
 
     def test_trtllm_with_dcp(self):
         self.assertEqual(

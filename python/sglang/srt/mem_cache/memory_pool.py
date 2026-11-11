@@ -4326,6 +4326,13 @@ class HybridLinearKVPool(KVCache):
                 if full_kv_pool_class is not None
                 else DSATokenToKVPool
             )
+            pool_kwargs = {}
+            if is_sail() and index_kpool == 1:
+                from sglang.kernels.ops.attention.dsa.triton_kernel import (
+                    is_fp4_indexer_cache_enabled,
+                )
+
+                pool_kwargs["use_fp4_indexer"] = is_fp4_indexer_cache_enabled()
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4343,6 +4350,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_pow2=kv_scale_pow2,
+                **pool_kwargs,
             )
         else:
             MLAPoolClass = (

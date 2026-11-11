@@ -15,7 +15,7 @@ from sglang.kernels.ops.attention.mla_window_indices import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAGE = 64
 
@@ -60,7 +60,8 @@ def _reference(req_to_token, pool_idx, positions, q_len, window_left, dcp, rank,
 @pytest.mark.parametrize("dcp", [1, 8])
 @pytest.mark.parametrize("window_left", [4095, 127])
 @pytest.mark.parametrize("with_v2p", [False, True])
-def test_window_indices(dcp, window_left, with_v2p):
+@pytest.mark.parametrize("top_k_alignment", [4, 256])
+def test_window_indices(dcp, window_left, with_v2p, top_k_alignment):
     q_len = 8
     ctx = [0, 5, window_left - 3, window_left, window_left + 1, 3 * window_left + 77]
     seq_lens = [c + q_len for c in ctx]
@@ -71,6 +72,7 @@ def test_window_indices(dcp, window_left, with_v2p):
         [c + i for c in ctx for i in range(q_len)], dtype=torch.int64
     )
     top_k = mla_window_top_k(window_left, dcp)
+    top_k = -(-top_k // top_k_alignment) * top_k_alignment
     union = [[] for _ in positions]
     for rank in range(dcp):
         indices, counts = mla_window_sparse_indices(
@@ -82,6 +84,7 @@ def test_window_indices(dcp, window_left, with_v2p):
             dcp_rank=rank,
             page_size=PAGE,
             v2p=None if v2p is None else v2p.cuda(),
+            top_k_alignment=top_k_alignment,
         )
         assert indices.shape == (positions.numel(), top_k)
         ref = _reference(

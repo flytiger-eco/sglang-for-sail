@@ -16,6 +16,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_kimi_k31,
@@ -483,6 +484,8 @@ def _validate_dcp_backend(
         raise ValueError(
             "DSA with --dcp-size > 1 needs the v2 top-k (SGLANG_OPT_USE_TOPK_V2)."
         )
+    if _is_sail and prefill_impl == "flashmla_sparse" and decode_impl == "flashmla_kv":
+        return
     if prefill_impl != decode_impl or decode_impl not in ("flashmla_kv", "trtllm"):
         raise ValueError(
             "DSA with --dcp-size > 1 needs --dsa-prefill-backend and "
@@ -623,9 +626,9 @@ class DeepseekSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
-        kimi_k31 = is_kimi_k31(hf_config)
-        self.dsa_packed_extend_topk = _is_hip or kimi_k31
-        self.kv_scale_pow2 = kimi_k31
+        self.kimi_k31 = is_kimi_k31(hf_config)
+        self.dsa_packed_extend_topk = _is_hip or self.kimi_k31
+        self.kv_scale_pow2 = self.kimi_k31
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
         # Kimi-K3.1 DCP (index-K sharded by token, attn_dcp_size > 1): one
@@ -667,6 +670,7 @@ class DeepseekSparseAttnBackend(
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        self.indexer_n_heads = get_dsa_index_n_heads(hf_config)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -705,7 +709,7 @@ class DeepseekSparseAttnBackend(
         self.trtllm_num_q_heads = _trtllm_padded_heads(self.num_q_heads)
         self._trtllm_fused_q = (
             _is_cuda
-            and kimi_k31
+            and self.kimi_k31
             and "trtllm" in (self.dsa_prefill_impl, self.dsa_decode_impl)
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
@@ -726,7 +730,7 @@ class DeepseekSparseAttnBackend(
         self._flashmla_kv_q_pad_eager: dict[int, torch.Tensor] = {}
         self._flashmla_kv_pad_q_in_place = (
             _is_cuda
-            and kimi_k31
+            and self.kimi_k31
             and self.flashmla_kv_num_q_heads != self.num_q_heads
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
@@ -810,7 +814,7 @@ class DeepseekSparseAttnBackend(
             )
         if self.attn_dcp_size > 1:
             _validate_dcp_backend(
-                kimi_k31=kimi_k31,
+                kimi_k31=self.kimi_k31,
                 use_fused_topk=self.use_fused_topk,
                 use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
                 prefill_impl=self.dsa_prefill_impl,
@@ -1136,10 +1140,19 @@ class DeepseekSparseAttnBackend(
         )
 
     def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+        # Schedule the indexer Q's stored geometry, not the MLA attention heads.
+        indexer_pool = getattr(
+            self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool
+        )
+        head_dim = (
+            self.indexer_head_dim // 2
+            if getattr(indexer_pool, "use_fp4_indexer", False)
+            else self.indexer_head_dim
+        )
         return (
             1,  # next_n
-            self.num_q_heads,  # num_heads
-            self.indexer_head_dim,  # head_dim
+            self.indexer_n_heads,  # num_heads
+            head_dim,
             (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
         )
 
@@ -2024,12 +2037,21 @@ class DeepseekSparseAttnBackend(
             # CUDA graph captures the schedule tensor's shape and data pointer.
             # Reserve schedule capacity for the largest context this graph can
             # replay; per-replay code refreshes the valid prefix in-place.
-            paged_mqa_ctx_lens_2d = torch.full_like(
-                paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
-            )
-            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
-                paged_mqa_ctx_lens_2d
-            )
+            if self.attn_dcp_size > 1:
+                # Keep the actual shard lengths for the indexer and local top-k.
+                capacity_ctx_lens_2d = torch.full_like(
+                    paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+                )
+                paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                    capacity_ctx_lens_2d
+                )
+            else:
+                paged_mqa_ctx_lens_2d = torch.full_like(
+                    paged_mqa_ctx_lens_2d, self.req_to_token.shape[1]
+                )
+                paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                    paged_mqa_ctx_lens_2d
+                )
 
         metadata = DSAMetadata(
             page_size=self.physical_page_size,
@@ -2657,7 +2679,11 @@ class DeepseekSparseAttnBackend(
             # The PPU sparse FlashMLA kernel requires 64 query heads. Preserve
             # its padding contract independently of the community helper's
             # architecture-specific padding.
-            if _is_sail and layer.tp_q_head_num % self.flashmla_padding != 0:
+            if (
+                _is_sail
+                and not self.kimi_k31
+                and layer.tp_q_head_num % self.flashmla_padding != 0
+            ):
                 assert self.flashmla_padding % layer.tp_q_head_num == 0
                 print_info_once(
                     f"padding num_heads to {self.flashmla_padding} due to sparse attn kernel requirement"
@@ -2730,6 +2756,17 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
+                    if (
+                        _is_sail
+                        and self.attn_dcp_size > 1
+                        and dsa_impl == "flashmla_sparse"
+                    ):
+                        # DCP gather packs KV in request/token order, not pool slots.
+                        page_table_1_flattened = torch.arange(
+                            page_table_1_flattened.numel(),
+                            dtype=page_table_1_flattened.dtype,
+                            device=page_table_1_flattened.device,
+                        )
                     kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
                     )
@@ -3120,11 +3157,17 @@ class DeepseekSparseAttnBackend(
 
         # Determine required padding based on GPU architecture (use cached value)
         required_padding = 128 if self.device_sm_major >= 10 else 64
+        if _is_sail and self.kimi_k31:
+            required_padding = (
+                (num_heads + required_padding - 1) // required_padding
+            ) * required_padding
 
         need_padding = num_heads % required_padding != 0
 
         if need_padding:
-            assert required_padding % num_heads == 0, (
+            assert required_padding % num_heads == 0 or (
+                _is_sail and self.kimi_k31 and num_heads < required_padding
+            ), (
                 f"num_heads {num_heads} cannot be padded to {required_padding}. "
                 f"TP size may be too large for this model."
             )

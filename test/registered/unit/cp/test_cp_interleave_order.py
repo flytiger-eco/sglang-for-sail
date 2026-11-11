@@ -39,7 +39,7 @@ def _rank_major(seq, size):
 
 class TestCpInterleaveOrder(CustomTestCase):
     def test_round_trip(self):
-        for size in (2, 4, 8):
+        for size in (2, 4, 8, 16):
             for tokens in (1, 7, 8, 63, 64, 1000):
                 with self.subTest(size=size, tokens=tokens):
                     seq = torch.randn(tokens, 3, 5)
