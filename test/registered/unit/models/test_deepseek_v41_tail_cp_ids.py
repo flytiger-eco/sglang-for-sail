@@ -7,11 +7,13 @@ zero shifts token ownership when the tail starts off the original CP boundary.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
@@ -24,6 +26,115 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestTailTokenCounts(CustomTestCase):
+    def test_tail_bounds_counts_and_restores_full_extend(self):
+        """Tail compaction must update both CPU and GPU counts without
+        modifying the full-extend scalars needed after leaving the tail."""
+        for graph in (False, True):
+            for real in (0, 129):
+                with self.subTest(graph=graph, real=real):
+                    global_count = torch.tensor(real, dtype=torch.int32)
+                    local_count = torch.tensor(min(real, 30), dtype=torch.int32)
+                    batch = NS(
+                        attn_cp_metadata=None,
+                        global_num_token_non_padded_cpu=real,
+                        global_num_token_non_padded=global_count,
+                        num_token_non_padded=local_count,
+                    )
+                    backend = object.__new__(DeepseekV4AttnBackend)
+                    full = object()
+                    backend.forward_metadata = full
+                    backend.tail_forward_metadata = NS(
+                        late_layer_tail=NS(
+                            real_rows_count=128 if graph else None,
+                            extend_seq_lens_cpu=[128],
+                            cp_metadata=None,
+                        ),
+                        core_attn_metadata=NS(),
+                    )
+                    backend._bcg_tail_num_token_non_padded = None
+                    backend.token_to_kv_pool = NS(request_window=None)
+                    with (
+                        patch.object(
+                            deepseek_v4_backend,
+                            "get_local_dp_buffer_len",
+                            return_value=132,
+                        ),
+                        patch.object(deepseek_v4_backend, "set_local_dp_buffer_len"),
+                    ):
+                        saved = backend.enter_late_layer_tail(batch)
+                        self.assertEqual(batch.global_num_token_non_padded_cpu, 128)
+                        self.assertEqual(
+                            batch.global_num_token_non_padded.item(), min(real, 128)
+                        )
+                        self.assertEqual(
+                            batch.num_token_non_padded.item(), min(real, 128)
+                        )
+                        self.assertEqual(global_count.item(), real)
+                        backend.exit_late_layer_tail(saved, batch)
+                    self.assertIs(backend.forward_metadata, full)
+                    self.assertEqual(batch.global_num_token_non_padded_cpu, real)
+                    self.assertIs(batch.global_num_token_non_padded, global_count)
+                    self.assertIs(batch.num_token_non_padded, local_count)
+
+    def test_moe_scatter_rebounds_counts_and_restores_on_error(self):
+        """The final TP shard must not mask live replay-tail rows using its
+        old full-extend count; genuine graph padding must remain masked."""
+        for rows, real, expected in (
+            (128, 128, [32, 32, 32, 32]),
+            (130, 129, [33, 33, 32, 31]),
+            (256, 129, [64, 64, 1, 0]),
+            (128, 0, [0, 0, 0, 0]),
+        ):
+            for rank in range(4):
+                with self.subTest(rows=rows, real=real, rank=rank):
+                    old_count = torch.tensor(30, dtype=torch.int32)
+                    global_count = torch.tensor(real, dtype=torch.int32)
+                    batch = NS(
+                        global_num_token_non_padded=global_count,
+                        num_token_non_padded=old_count,
+                    )
+
+                    def expert(x, forward_batch, **kwargs):
+                        self.assertEqual(
+                            forward_batch.num_token_non_padded.item(), expected[rank]
+                        )
+                        self.assertIs(
+                            forward_batch.global_num_token_non_padded, global_count
+                        )
+                        raise RuntimeError("expert failure")
+
+                    with (
+                        patch.object(deepseek_v4, "is_cp_active", return_value=False),
+                        patch.object(
+                            deepseek_v4,
+                            "get_parallel",
+                            return_value=NS(
+                                attn_tp_size=4, attn_tp_rank=rank, attn_dp_size=1
+                            ),
+                        ),
+                        patch.object(
+                            deepseek_v4,
+                            "get_moe_a2a_backend",
+                            return_value=MoeA2ABackend.MEGAMOE,
+                        ),
+                        patch.object(
+                            deepseek_v4,
+                            "get_forward",
+                            return_value=NS(scoped=lambda **kwargs: nullcontext()),
+                        ),
+                        self.assertRaisesRegex(RuntimeError, "expert failure"),
+                    ):
+                        deepseek_v4.DeepseekV4DecoderLayer._run_moe_ffn_dp_sync(
+                            NS(mlp=expert),
+                            torch.ones(rows, 2),
+                            batch,
+                            input_ids=None,
+                            input_ids_global=None,
+                        )
+                    self.assertIs(batch.num_token_non_padded, old_count)
 
 
 class TestDSV41TailCPRoutingIDs(CustomTestCase):

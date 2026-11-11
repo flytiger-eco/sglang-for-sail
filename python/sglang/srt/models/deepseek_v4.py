@@ -2963,6 +2963,21 @@ def _every_row_routed(forward_batch: ForwardBatch, num_rows: int):
         ) = saved
 
 
+@contextmanager
+def _scattered_rows(forward_batch: ForwardBatch, *, offset: int, num_rows: int):
+    saved = forward_batch.num_token_non_padded
+    global_count = forward_batch.global_num_token_non_padded
+    if global_count is not None:
+        # Tail compaction changes the shard boundaries independently of MLP sync.
+        forward_batch.num_token_non_padded = torch.clamp(
+            global_count - offset, min=0, max=num_rows
+        )
+    try:
+        yield
+    finally:
+        forward_batch.num_token_non_padded = saved
+
+
 def _attn_tp_all_gather_chunks(
     local: torch.Tensor, chunk_rows: List[int]
 ) -> torch.Tensor:
@@ -3801,6 +3816,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
+        if _use_tp_attn_a2a_scatter:
+            gathered_rows = _scattered_rows(
+                forward_batch,
+                offset=sum(chunk.shape[0] for chunk in _a2a_scatter_chunks[:r]),
+                num_rows=hidden_states.shape[0],
+            )
         with (
             get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
             gathered_rows,
