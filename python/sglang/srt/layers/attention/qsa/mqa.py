@@ -1,12 +1,14 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer;
-the torch implementations are the fallback and the reference."""
+"""Weight-free QSA MQA scoring: TileLang, optional SAIL DeepGEMM FP8,
+and torch fallback/reference implementations."""
 
+import functools
 import math
 from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_hip, print_info_once, print_warning_once
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -106,6 +108,117 @@ def torch_qsa_mqa_decode(
     if copy_len:
         logits[:, :copy_len] = scores[:, :copy_len]
     return logits
+
+
+_FP8_E4M3_FMAX = 448.0
+# The installed PPU avg-MQA kernel faults for head_dim=32. Keep the original
+# scorer for configurations outside the dimensions validated on PPU-890P.
+_FP8_AVG_HEAD_DIMS = (64, 128)
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_fp8_avg_mqa_logits():
+    """SAIL DeepGEMM fp8_mqa_avg_logits kernel; None when unavailable."""
+    from sglang.srt.utils import get_device_sm, is_ppu
+
+    # Only enable the PPU0015 FP8 MMA implementation validated on 890P.
+    # Other PPU generations and upstream CUDA DeepGEMM are separate targets.
+    if not is_ppu() or get_device_sm() != 89:
+        print_warning_once(
+            "SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS requires PPU SM89 (890P); "
+            "falling back to the TileLang/torch QSA indexer scoring."
+        )
+        return None
+    try:
+        from deep_gemm import fp8_mqa_avg_logits
+    except ImportError:
+        print_warning_once(
+            "SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS is set but the installed "
+            "deep_gemm has no fp8_mqa_avg_logits; falling back to the "
+            "TileLang/torch QSA indexer scoring."
+        )
+        return None
+    return fp8_mqa_avg_logits
+
+
+def _fp8_e4m3_per_row_quant(x: torch.Tensor):
+    """[rows, dim] -> (fp8_e4m3 [rows, dim], fp32 dequant scale [rows]).
+
+    On CUDA this reuses the in-tree JIT per-token quant kernel (single
+    launch, warp per row); the torch fallback keeps the CPU reference path.
+    """
+
+    if x.is_cuda:
+        from sglang.kernels.ops.quantization.per_token_quant_fp8 import (
+            per_token_quant_fp8,
+        )
+
+        x = x.contiguous()
+        x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+        per_token_quant_fp8(x, x_fp8, scale)
+        return x_fp8, scale.squeeze(1)
+    xf = x.float()
+    scale = xf.abs().amax(dim=-1).clamp_min(1e-12) / _FP8_E4M3_FMAX
+    return (xf / scale.unsqueeze(-1)).to(torch.float8_e4m3fn), scale
+
+
+def deep_gemm_fp8_avg_mqa_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    score_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """SAIL DeepGEMM avg-MQA logits for the QSA indexer prefill scoring.
+
+    Computes sum_h(relu(q·k)) * q_scale * k_scale / sqrt(head_dim): q is
+    quantized per query row and the compressed keys per token, with the
+    dequant scales passed through the kernel's q_scale / k_scales arguments,
+    so the result matches the BF16 weight-free formula up to FP8 rounding.
+    The kernel hardcodes the 1/sqrt(head_dim) score scale.
+    """
+
+    fp8_mqa_avg_logits = _resolve_fp8_avg_mqa_logits()
+    if fp8_mqa_avg_logits is None:
+        raise RuntimeError("fp8_mqa_avg_logits is unavailable")
+    _validate_q(q)
+    _validate_k(k)
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError("QSA query and key head dimensions must match")
+    head_dim = q.shape[-1]
+    if q.shape[1] != 4 or head_dim not in _FP8_AVG_HEAD_DIMS:
+        raise ValueError(
+            "the validated fp8_mqa_avg_logits path requires 4 query heads "
+            "and head_dim 64/128"
+        )
+    if score_scale is not None and not math.isclose(score_scale, math.sqrt(head_dim)):
+        raise ValueError(
+            "fp8_mqa_avg_logits hardcodes score_scale = sqrt(head_dim), "
+            f"got {score_scale} for head_dim {head_dim}"
+        )
+    rows, keys = q.shape[0], k.shape[0]
+    if not rows or not keys:
+        logits = torch.zeros((rows, keys), dtype=torch.float32, device=q.device)
+        return logits.masked_fill_(
+            torch.ones_like(logits, dtype=torch.bool), -float("inf")
+        )
+    q_fp8, q_scale = _fp8_e4m3_per_row_quant(q.reshape(rows, -1))
+    q_fp8 = q_fp8.view(rows, q.shape[1], head_dim)
+    k_fp8, k_scales = _fp8_e4m3_per_row_quant(k[:, 0])
+    print_info_once(
+        "Using SAIL DeepGEMM fp8_mqa_avg_logits for QSA prefill scoring "
+        "(FP8 Q/K, FP32 logits)."
+    )
+    return fp8_mqa_avg_logits(
+        q_fp8.contiguous(),
+        (k_fp8.contiguous(), k_scales.contiguous()),
+        row_starts.to(device=q.device, dtype=torch.int32).contiguous(),
+        row_ends.to(device=q.device, dtype=torch.int32).contiguous(),
+        clean_logits=True,
+        q_scale=q_scale.contiguous(),
+        logits_dtype=torch.float32,
+    )
 
 
 if HAS_TILELANG:
@@ -388,6 +501,24 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if q.is_cuda and envs.SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS.get():
+        _validate_q(q)
+        if q.shape[1] != 4 or q.shape[-1] not in _FP8_AVG_HEAD_DIMS:
+            print_warning_once(
+                "SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS requires 4 query heads "
+                "and validated head_dim 64/128; falling back to TileLang/torch."
+            )
+        elif score_scale is None or math.isclose(score_scale, math.sqrt(q.shape[-1])):
+            if _resolve_fp8_avg_mqa_logits() is not None:
+                return deep_gemm_fp8_avg_mqa_prefill(
+                    q, k, row_starts, row_ends, score_scale
+                )
+        else:
+            print_warning_once(
+                "SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS only supports "
+                "score_scale = sqrt(head_dim); falling back to the "
+                "TileLang/torch QSA indexer scoring."
+            )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -412,6 +543,7 @@ def qsa_mqa_decode(
 
 __all__ = [
     "HAS_TILELANG",
+    "deep_gemm_fp8_avg_mqa_prefill",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "tilelang_qsa_mqa_decode",
