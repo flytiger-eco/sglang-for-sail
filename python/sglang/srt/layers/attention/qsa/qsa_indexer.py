@@ -16,7 +16,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    can_use_deep_gemm_fp8_avg_mqa,
+    deep_gemm_fp8_avg_mqa_prefill,
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -430,6 +435,8 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        *,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
         rows = q.shape[0]
         output = torch.empty(
@@ -440,9 +447,21 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return output
 
-        row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
-        )
+        # Only the in-tree top-k512 consumer is validated for unspecified
+        # padding and the native scorer's non-contiguous, relative columns.
+        use_native = self.block_topk == 512 and can_use_deep_gemm_fp8_avg_mqa(q)
+        if use_native:
+            if max_seqlen_k is None or max_seqlen_k <= 0:
+                raise ValueError("native QSA prefill requires a positive host K bound")
+            topk_starts = torch.zeros_like(row_starts, dtype=torch.int32)
+            topk_ends = (row_ends - row_starts).to(torch.int32)
+            # DeepGEMM aligns FP32 row strides to 1024 bytes, including
+            # capacity that the returned tensor's logical shape does not show.
+            logits_width = (max_seqlen_k + 255) // 256 * 256
+        else:
+            topk_starts, topk_ends = row_starts, row_ends
+            logits_width = compressed_keys.shape[0]
+        row_chunk_size = _qsa_prefill_row_chunk_size(rows, logits_width, q.shape[1])
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
@@ -455,16 +474,25 @@ class QSAIndexer(MultiPlatformOp):
                 )
                 logits = None
             else:
-                logits = qsa_mqa_prefill(
-                    q[chunk_slice],
-                    compressed_keys,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
-                )
+                if use_native:
+                    logits = deep_gemm_fp8_avg_mqa_prefill(
+                        q[chunk_slice],
+                        compressed_keys,
+                        row_starts[chunk_slice],
+                        row_ends[chunk_slice],
+                        max_seqlen_k=max_seqlen_k,
+                    )
+                else:
+                    logits = qsa_mqa_prefill(
+                        q[chunk_slice],
+                        compressed_keys,
+                        row_starts[chunk_slice],
+                        row_ends[chunk_slice],
+                    )
                 block_indices = qsa_fast_topk(
                     logits,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
+                    topk_starts[chunk_slice],
+                    topk_ends[chunk_slice],
                     topk=self.block_topk,
                 )
             selected = expand_qsa_block_indices(
@@ -629,6 +657,21 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            # Metadata already slices this table to the batch's maximum
+            # context length on the host. No new GPU reduction or .item().
+            max_seqlen_k=(
+                max(
+                    1,
+                    (
+                        indexer_metadata.token_slot_table.shape[1]
+                        + self.compress_ratio
+                        - 1
+                    )
+                    // self.compress_ratio,
+                )
+                if getattr(indexer_metadata, "token_slot_table", None) is not None
+                else None
+            ),
         )
 
     def forward_cuda(

@@ -113,10 +113,18 @@ def test_avg_logits_matches_library_accuracy_contract(rows, keys, dim):
         (q8.float().cpu().double() * qs.cpu().double()[:, None]).reshape_as(q),
         k8.float().cpu().double() * ks.cpu().double()[:, None],
     )
-    actual = mqa.deep_gemm_fp8_avg_mqa_prefill(q, k, starts, ends)
+    actual = mqa.deep_gemm_fp8_avg_mqa_prefill(q, k, starts, ends, max_seqlen_k=keys)
     assert actual.dtype == torch.float32
     actual = actual.cpu().double()
-    assert torch.equal(torch.isneginf(actual), ~valid)
+    # New AVG stores each valid window at column zero; invalid columns are
+    # unspecified. Remap the independent global-column references, keeping
+    # exactly the original set of valid values and the same error threshold.
+    columns = torch.arange(keys)[None, :]
+    compressed_valid = columns < (ends - starts).cpu()[:, None]
+    source_columns = (columns + starts.cpu()[:, None]).clamp_max(keys - 1)
+    expected = expected.gather(1, source_columns)
+    quantized_reference = quantized_reference.gather(1, source_columns)
+    valid = compressed_valid
     assert torch.isfinite(actual[valid]).all()
     x, y = actual.masked_fill(~valid, 0), expected.masked_fill(~valid, 0)
     denominator = (x.square() + y.square()).sum()
@@ -130,7 +138,7 @@ def test_avg_logits_matches_library_accuracy_contract(rows, keys, dim):
                 (actual[valid] - quantized_reference[valid]).abs().max()
             ),
             "pointwise_rtol1e-4_atol1e-4_vs_quantized_fp64": torch.allclose(
-                actual, quantized_reference, rtol=1e-4, atol=1e-4
+                actual[valid], quantized_reference[valid], rtol=1e-4, atol=1e-4
             ),
         }
     )
@@ -143,8 +151,8 @@ def test_avg_logits_empty_inputs(monkeypatch, rows, keys):
     q = torch.zeros(rows, 4, 128)
     k = torch.zeros(keys, 1, 128)
     lengths = torch.zeros(rows, dtype=torch.int32)
-    out = mqa.deep_gemm_fp8_avg_mqa_prefill(q, k, lengths, lengths)
-    assert out.shape == (rows, keys)
+    out = mqa.deep_gemm_fp8_avg_mqa_prefill(q, k, lengths, lengths, max_seqlen_k=11)
+    assert out.shape == (rows, 11)
     assert out.dtype == torch.float32
 
 

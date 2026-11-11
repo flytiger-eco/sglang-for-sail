@@ -45,7 +45,7 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 

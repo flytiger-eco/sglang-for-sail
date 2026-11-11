@@ -562,7 +562,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **kwargs: (
                 q.squeeze(1)
             ),
         )
@@ -975,7 +975,7 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 

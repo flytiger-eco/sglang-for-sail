@@ -14,9 +14,15 @@ Minimal single-case entry (same container requirement):
     python3 test/ppu/unit/test_deep_gemm_fp8_mqa_avg_logits_d32.py \
         --case 32 128 32 --output-dir "$PPU_DEV_RUN_DIR/deep-gemm-d32-single"
 
-Default suite: three D32 repro shapes, plus D64/D128 controls. This direct-call
-variant has not yet been run on hardware; the previous repro used a thin SGLang
-wrapper. Raw logs, phase markers, inputs' metadata, and results are retained.
+Default suite: three D32 repro shapes, plus D64/D128 controls. This is a
+version-pinned reproducer for the legacy clean_logits/global-column ABI, not
+a smoke test for the current compressed-output API. On the tested older PPU
+deep-gemm 0.0.0 build, all three D32 cases raised illegal memory access, while
+the three D64/D128 controls completed without importing SGLang. Those failures
+remain failures. Current API documentation rejects D32 before kernel dispatch;
+do not interpret an unsupported-keyword error on a newer build as the old
+device fault. Use test_qsa_ppu_compressed_logits.py for current API coverage.
+Raw logs, phase markers, inputs' metadata, and results are retained.
 """
 
 import argparse
