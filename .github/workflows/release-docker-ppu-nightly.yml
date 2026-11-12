@@ -4,6 +4,8 @@ name: Release Docker Images Nightly (PPU)
 # repository root as the build context, published to GitHub Packages (ghcr.io)
 # with the built-in GITHUB_TOKEN. Runs on a daily schedule and can also be
 # triggered manually. Images are pushed only to ghcr.io.
+# Besides the triggering ref, the v0.5.21 and release/v0.5.23 branches are
+# also built nightly by dedicated jobs.
 on:
   # Debug aid: build on every push to this feature branch. Remove this trigger
   # once the nightly flow is validated on the default branch.
@@ -76,6 +78,134 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
           build-args: |
             SGLANG_BUILD_COMMIT=${{ github.sha }}
+            SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+      - name: Write image address to job summary
+        run: |
+          printf 'PPU image: `%s:%s` (rolling `%s:%s`)\n' \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.rolling }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build-v0-5-21:
+    # Same flow as the build job, but always builds the v0.5.21 branch.
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BUILD_REF: v0.5.21
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # ghcr.io image paths must be lowercase.
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          date_tag=$(date -u +%Y%m%d)
+          # Use the checked-out branch head, not the triggering commit.
+          full_sha=$(git rev-parse HEAD)
+          short_sha="${full_sha::7}"
+          # Docker tags forbid "/" and some git-allowed chars, so sanitize the
+          # branch name (e.g. feat/foo -> feat-foo) before embedding it.
+          branch=$(echo "${BUILD_REF}" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
+          echo "image=ghcr.io/${owner_lc}/sglang-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          # Per-branch rolling tag so it does not overwrite the default "nightly".
+          echo "rolling=nightly-${branch}" >> "$GITHUB_OUTPUT"
+          echo "sha=${full_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ppu.Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
+          build-args: |
+            SGLANG_BUILD_COMMIT=${{ steps.meta.outputs.sha }}
+            SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+
+      - name: Write image address to job summary
+        run: |
+          printf 'PPU image: `%s:%s` (rolling `%s:%s`)\n' \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.tag }}" \
+            "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.rolling }}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build-release-v0-5-23:
+    # Same flow as the build job, but always builds the release/v0.5.23 branch.
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BUILD_REF: release/v0.5.23
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # ghcr.io image paths must be lowercase.
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          date_tag=$(date -u +%Y%m%d)
+          # Use the checked-out branch head, not the triggering commit.
+          full_sha=$(git rev-parse HEAD)
+          short_sha="${full_sha::7}"
+          # Docker tags forbid "/" and some git-allowed chars, so sanitize the
+          # branch name (e.g. feat/foo -> feat-foo) before embedding it.
+          branch=$(echo "${BUILD_REF}" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
+          echo "image=ghcr.io/${owner_lc}/sglang-ppu-nightly" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          # Per-branch rolling tag so it does not overwrite the default "nightly".
+          echo "rolling=nightly-${branch}" >> "$GITHUB_OUTPUT"
+          echo "sha=${full_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/ppu.Dockerfile
+          platforms: linux/amd64
+          push: ${{ inputs.push || github.event_name != 'workflow_dispatch' }}
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
+          build-args: |
+            SGLANG_BUILD_COMMIT=${{ steps.meta.outputs.sha }}
             SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
