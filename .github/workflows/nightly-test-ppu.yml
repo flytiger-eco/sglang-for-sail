@@ -214,24 +214,34 @@ jobs:
                   if required_file not in files:
                       continue
                   path = Path(current)
-                  if any(name in path.parts for name in names) and complete(path):
+                  if any(name in path.parts for name in names):
                       yield path
 
 
           def select_candidate(repo_id, names, repo_type, root, required_file, complete):
-              candidates = {}
+              observed = {}
               for path in cached_snapshots(repo_id, names, repo_type):
-                  if complete(path):
-                      candidates[str(path.resolve())] = path
+                  observed[str(path.resolve())] = path
               for path in nas_candidates(root, names, required_file, complete):
-                  candidates[str(path.resolve())] = path
+                  observed[str(path.resolve())] = path
+              candidates = {
+                  resolved: path for resolved, path in observed.items()
+                  if complete(path)
+              }
               if repo_id == 'swiss-ai/Apertus-8B':
                   candidates = {
                       resolved: path for resolved, path in candidates.items()
                       if 'Apertus-8B-2509' in resolved
                   }
               if not candidates:
-                  raise FileNotFoundError(f'No complete source found for {repo_id} under {root} or {CACHE}')
+                  details = []
+                  for resolved, path in sorted(observed.items()):
+                      files = sorted(item.name for item in path.iterdir() if item.is_file())
+                      details.append({'path': resolved, 'files': files[:80]})
+                  raise FileNotFoundError(
+                      f'No complete source found for {repo_id} under {root} or {CACHE}; '
+                      f'observed={json.dumps(details)}'
+                  )
 
               def score(item):
                   resolved, path = item
@@ -268,7 +278,7 @@ jobs:
               else:
                   destination.symlink_to(source, target_is_directory=True)
               for ref in refs:
-                  (entry / 'refs' / ref).write_text(revision + '\n')
+                  (entry / 'refs' / ref).write_text(revision)
               return entry, revision
 
 
