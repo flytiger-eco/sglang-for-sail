@@ -10,11 +10,17 @@ token-interleaved V4.1 caches (``KVLayout.V41_NEW`` / ``V41_FP4_NEW``) take
 ``use_legacy=False``. CUDA only: HIP and XPU keep their own sgl-kernel ops.
 """
 
+import functools
+import inspect
 from typing import Optional, Tuple, Union
 
 import flash_mla
 import torch
 from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+from sglang.srt.utils import is_sail
+
+_is_sail = is_sail()
 
 # MegaAttention only exists from FlashMLA's 2026.09.30 release on; a fork that
 # tracks the pre-Mega interface (e.g. the PPU wheel) exports everything else.
@@ -33,19 +39,47 @@ _MEGA_IMPORT_ERROR = ImportError(
     "the MegaAttention entry points need the FlashMLA 2026.09.30 or newer wheel."
 )
 
+
+# These wrappers follow the FlashMLA 2026.09.30 API, whose MegaAttention has two
+# kernel sets picked by ``use_legacy`` (block-split vs token-interleaved V4.1
+# caches). The PPU wheel ships a single kernel set that reads the interleaved
+# layout and does not declare ``use_legacy``, so passing it raises TypeError.
+# Filtering by the callee's own signature keeps wheels that declare the kwarg
+# unchanged and needs no platform check; the signature is parsed once per
+# function because the mega entry points run on every attention layer.
+@functools.lru_cache(maxsize=None)
+def _accepted_kwargs(fn) -> Optional[frozenset]:
+    """Keyword names ``fn`` declares, or None when it takes ``**kwargs``."""
+    params = inspect.signature(fn).parameters
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return None
+    return frozenset(params)
+
+
+def _filter_kwargs(fn, kwargs):
+    """``kwargs`` minus the keywords ``fn`` does not declare."""
+    accepted = _accepted_kwargs(fn)
+    if accepted is None:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in accepted}
+
+
 # 512 fp8 values + 4 fp32 scales; the V4.1 formats have the same size, which is
 # why the tensor-metadata API (it predates V4.1) reads such a cache as V3.2.
 _V32_NO_ROPE_BYTES_PER_TOKEN = 528
 
-# The only RoPE / output-cast configuration MegaAttention accepts:
-# both kernel sets assert every one of these values.
+# The only RoPE / output-cast configuration MegaAttention accepts: both kernel
+# sets assert every one of these values. PPU builds MegaAttention with
+# FLASHMLA_FUSED_OUTPUT_CHANNELWISE=1, which emits one fp32 scale per
+# (token, wv group) over the 8 heads x 512 contraction dim: PPU DeepGEMM has no
+# per-32 UE8M0 fp8_einsum, so wo_a runs on its per-channel path instead.
 _MEGA_FIXED_PARAMS = dict(
     is_rope_neox_style=False,
     rope_dim=64,
-    num_per_channels=32,
-    use_tma_aligned_col_major_sf=True,
-    round_sf=True,
-    use_packed_ue8m0=True,
+    num_per_channels=4096 if _is_sail else 32,
+    use_tma_aligned_col_major_sf=not _is_sail,
+    round_sf=not _is_sail,
+    use_packed_ue8m0=not _is_sail,
 )
 
 # The current (use_legacy=False) decode kernel splits the KV only past this
@@ -213,8 +247,9 @@ def flash_mla_mega_prefill(
         topk_length=topk_length,
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
-        use_legacy=use_legacy,
         **_MEGA_FIXED_PARAMS,
+        # The PPU MegaAttention has a single kernel set and no ``use_legacy``.
+        **_filter_kwargs(_mega.prefill, {"use_legacy": use_legacy}),
     )
 
 
@@ -253,6 +288,7 @@ def flash_mla_mega_decode(
         extra_topk_length=extra_topk_length,
         enable_q_norm=enable_q_norm,
         rms_norm_eps=rms_norm_eps,
-        use_legacy=use_legacy,
         **_MEGA_FIXED_PARAMS,
+        # The PPU MegaAttention has a single kernel set and no ``use_legacy``.
+        **_filter_kwargs(_mega.decode, {"use_legacy": use_legacy}),
     )

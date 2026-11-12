@@ -233,7 +233,13 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
-    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega" and mode != "v41_new":
+    # The PPU MegaAttention reads the interleaved V4.1 rows that SAIL's "auto"
+    # already selects; only CUDA MegaAttention needs the block-split layout.
+    if (
+        get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
+        and mode != "v41_new"
+        and not is_sail()
+    ):
         mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (

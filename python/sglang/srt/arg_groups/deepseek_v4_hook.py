@@ -113,13 +113,18 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.dsv4_attn_backend == "flashmla_mega":
-        from sglang.srt.utils.common import is_sm100_supported
+        from sglang.srt.utils.common import is_sail, is_sm100_supported
 
+        # The PPU MegaAttention kernels are built for SAIL sm89+ (890P family).
+        ppu_mega = is_sail() and get_platform().device_sm >= 89
         assert (
             model_config_of(server_args).hf_config.model_type == "deepseek_v41"
             and cfg.device == "cuda"
-            and is_sm100_supported()
-        ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
+            and (is_sm100_supported() or ppu_mega)
+        ), (
+            "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on "
+            "SM100/SM103 or SAIL (PPU) sm89+."
+        )
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported

@@ -1564,8 +1564,11 @@ class MQALayer(MqaAttentionBase):
 
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
+        self.mega_wo_a_recipe = (1, 1, 32)
         self.mega_wq_b_permuted = False
-        if self.use_mega_attention:
+        # The DeepGEMM MXFP8-pair input is a Blackwell path; PPU MegaAttention
+        # feeds wo_a with per-token fp8 and keeps wo_b on its bf16 input.
+        if self.use_mega_attention and not _is_sail:
             self.wo_b.deepgemm_mxfp8_input = (
                 self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
             )
@@ -1634,8 +1637,32 @@ class MQALayer(MqaAttentionBase):
                 )
                 self.wq_b.weight_scale_inv.data = sf.contiguous()
                 method.weight_block_size = [16, block_k]
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+        elif self.n_local_heads in (64, 128) and self._wq_b_is_ppu_per_channel_fp8():
+            # One scale per output row: permuting rows and scales together makes
+            # wq_b emit the kernel's [32][heads][16] q directly, so pack_query's
+            # strided copy is skipped.
+            for param in (self.wq_b.weight, self.wq_b.weight_scale):
+                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
+            self.mega_wq_b_permuted = True
+        G, R = self.n_local_groups, self.o_lora_rank
+        if _is_sail:
+            # PPU DeepGEMM has no per-32 UE8M0 einsum, so MegaAttention emits one
+            # fp32 scale per (token, wv group) and wo_a runs as per-token x
+            # per-channel fp8_einsum. wo_a was dequantized to bf16 on load; requantize
+            # it per output channel and permute the contraction dim to the
+            # kernel's [16 tiles][8 heads][32] order.
+            weight = self.wo_a.weight.data
+            assert weight.dtype == torch.bfloat16 and weight.shape[0] == G * R, (
+                "PPU MegaAttention needs a bf16 [G*R, D] wo_a, got "
+                f"{weight.dtype} {tuple(weight.shape)}"
+            )
+            w_fp8, w_scale = sglang_per_token_quant_fp8(weight)
+            w_fp8 = interleave_output_columns(w_fp8.view(G, R, -1))
+            self.mega_wo_a = (w_fp8, w_scale.view(G, R, 1))
+            self.mega_wo_a_recipe = (1, 1, weight.shape[-1])
+        else:
+            wo_a = self.wo_a.weight.view(G, R, -1)
+            self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
@@ -1650,6 +1677,11 @@ class MQALayer(MqaAttentionBase):
             )
             and backend is not None
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def _wq_b_is_ppu_per_channel_fp8(self) -> bool:
+        return _is_sail and isinstance(
+            getattr(self.wq_b, "quant_method", None), W8A8Fp8LinearMethod
         )
 
     def _forward_mega(
@@ -1720,11 +1752,13 @@ class MQALayer(MqaAttentionBase):
                 o_fp8,
                 o_s,
                 *self.mega_wo_a,
-                recipe=(1, 1, 32),
+                recipe=self.mega_wo_a_recipe,
                 out=(y.view(rows, groups, -1), y_sf),
             )
             return y, y_sf
-        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
+        return _fp8_wo_a_einsum(
+            o_fp8, o_s, *self.mega_wo_a, recipe=self.mega_wo_a_recipe, out=out
+        )
 
     def _get_npu_rope_position_cache(
         self,
