@@ -19,6 +19,8 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
+    can_use_deep_gemm_fp8_avg_mqa,
+    deep_gemm_fp8_avg_mqa_prefill,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -457,16 +459,15 @@ class QSAIndexer(MultiPlatformOp):
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
         max_row_keys: Optional[int] = None,
+        *,
+        max_seqlen_k: int | None = None,
     ) -> torch.Tensor:
-        """Top-k token selection for packed prefill rows.
+        """Select request-local blocks from native or original scorer layouts.
 
-        ``max_row_keys`` (host int, the longest request's compressed-block count)
-        switches scoring to request-relative logits: [rows, max_row_keys] instead
-        of [rows, all compressed keys of the batch]. The latter caps a chunk at
-        a few dozen rows once a batch holds many long prefixes, so the scoring
-        kernel ran as thousands of one-CTA launches. Selection is unchanged: the
-        top-k reads only each row's own section and returns indices relative to
-        the row's start either way."""
+        Keep the target branch's relative TileLang path when native scoring is
+        disabled. Its host-known max_row_keys also bounds native output; callers
+        of the earlier adapter may still supply max_seqlen_k explicitly.
+        """
         rows = q.shape[0]
         output = torch.empty(
             (rows, self.token_topk + self.compress_ratio - 1),
@@ -476,17 +477,33 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return output
 
+        use_native = (
+            self.block_topk == 512
+            and compressed_keys.shape[0] > 0
+            and can_use_deep_gemm_fp8_avg_mqa(q)
+            and compressed_keys.dtype == torch.bfloat16
+        )
         relative = (
             max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
         )
-        row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows,
-            max_row_keys if relative else compressed_keys.shape[0],
-            q.shape[1],
-        )
+        native_capacity = max_seqlen_k if max_seqlen_k is not None else max_row_keys
+        if use_native:
+            if native_capacity is None:
+                # Shape-only upper bound for callers without host request lengths;
+                # never read GPU sequence lengths back to choose a capacity.
+                native_capacity = compressed_keys.shape[0]
+            if native_capacity <= 0:
+                raise ValueError("native QSA prefill requires a positive host K bound")
+            # FP32 native rows have a 1024-byte-aligned physical stride.
+            logits_width = (native_capacity + 255) // 256 * 256
+        else:
+            logits_width = max_row_keys if relative else compressed_keys.shape[0]
+        row_chunk_size = _qsa_prefill_row_chunk_size(rows, logits_width, q.shape[1])
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
+            chunk_starts = row_starts[chunk_slice]
+            chunk_ends = row_ends[chunk_slice]
             if compressed_keys.shape[0] == 0:
                 block_indices = torch.full(
                     (row_end - row_start, self.block_topk),
@@ -495,34 +512,37 @@ class QSAIndexer(MultiPlatformOp):
                     device=q.device,
                 )
                 logits = None
-            elif relative:
-                chunk_starts = row_starts[chunk_slice]
-                chunk_lengths = row_ends[chunk_slice] - chunk_starts
-                logits = qsa_mqa_prefill_relative(
-                    q[chunk_slice],
-                    compressed_keys,
-                    chunk_starts,
-                    row_ends[chunk_slice],
-                    max_row_keys,
-                )
-                block_indices = qsa_fast_topk(
-                    logits,
-                    torch.zeros_like(chunk_starts),
-                    chunk_lengths,
-                    topk=self.block_topk,
-                )
             else:
-                logits = qsa_mqa_prefill(
-                    q[chunk_slice],
-                    compressed_keys,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
+                if use_native:
+                    logits = deep_gemm_fp8_avg_mqa_prefill(
+                        q[chunk_slice],
+                        compressed_keys,
+                        chunk_starts,
+                        chunk_ends,
+                        max_seqlen_k=native_capacity,
+                    )
+                elif relative:
+                    logits = qsa_mqa_prefill_relative(
+                        q[chunk_slice],
+                        compressed_keys,
+                        chunk_starts,
+                        chunk_ends,
+                        max_row_keys,
+                    )
+                else:
+                    logits = qsa_mqa_prefill(
+                        q[chunk_slice], compressed_keys, chunk_starts, chunk_ends
+                    )
+                topk_starts = (
+                    torch.zeros_like(chunk_starts)
+                    if use_native or relative
+                    else chunk_starts
+                )
+                topk_ends = (
+                    chunk_ends - chunk_starts if use_native or relative else chunk_ends
                 )
                 block_indices = qsa_fast_topk(
-                    logits,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
-                    topk=self.block_topk,
+                    logits, topk_starts, topk_ends, topk=self.block_topk
                 )
             selected = expand_qsa_block_indices(
                 block_indices,
