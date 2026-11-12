@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -54,12 +55,73 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    is_hip,
+    is_sail,
+    is_sm100_supported,
+    is_sm120,
+    print_warning_once,
+)
 
 logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+@lru_cache(maxsize=1)
+def _resolve_ppu_fa3_qsa_with_kvcache():
+    """SAIL FA3 flash_attn_with_kvcache with the QSA top-k page_table overload.
+
+    The QSA mode (page_table carries one row of selected token slots per
+    query token) requires a flash_attn_interface build with
+    FLASH_ATTENTION_ENABLE_QSA; detect it through the qsa_allow_aiu
+    parameter and fall back to the packed FA2 path when it is absent.  The
+    flash-attn-3 wheel ships the QSA build either as the top-level
+    flash_attn_interface module or packaged under hopper/.
+    """
+    import importlib
+    import inspect
+
+    if not is_sail():
+        return None
+    # Both packages can register the same flash_attn_3_ops custom operators.
+    # Importing the second wrapper before returning the first can invalidate
+    # the first wrapper's OpOverload handles. Load alternatives lazily.
+    for module_name in ("flash_attn_interface", "hopper.flash_attn_interface"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        fn = getattr(module, "flash_attn_with_kvcache", None)
+        if fn is None:
+            continue
+        try:
+            if "qsa_allow_aiu" not in inspect.signature(fn).parameters:
+                continue
+        except (TypeError, ValueError):
+            continue
+        # The Python wrapper and the compiled op can drift apart across
+        # installs; the QSA argument must exist in the registered fwd
+        # schema too, otherwise the call dies inside torch.ops.
+        try:
+            import torch
+
+            schemas = torch.ops.flash_attn_3.fwd._schemas
+            if schemas and not any(
+                "qsa_allow_aiu" in str(schema) for schema in schemas.values()
+            ):
+                print_warning_once(
+                    "flash_attn_interface advertises QSA but the compiled "
+                    "flash_attn_3::fwd op lacks qsa_allow_aiu; rebuild "
+                    "flash-attn-3 with FLASH_ATTENTION_ENABLE_QSA. Falling "
+                    "back to the packed FA2 path."
+                )
+                continue
+        except (AttributeError, RuntimeError):
+            pass
+        return fn
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -1331,9 +1393,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
-    @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        self, logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
@@ -1342,10 +1403,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             0, sequence_ids
         )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        if metadata.is_cuda_graph:
+            # Graph metadata keeps only a one-column dummy slot table. The
+            # replay kernels refresh request IDs, so gather from the stable
+            # request pool just like the original decode KV-extraction path.
+            if self.req_to_token is None or metadata.row_req_pool_indices is None:
+                raise RuntimeError("QSA CUDA graph request mapping is incomplete")
+            table = self.req_to_token
+            table_rows = metadata.row_req_pool_indices.long()
+        else:
+            table = metadata.token_slot_table
+            table_rows = sequence_ids
+        safe = logical_indices.clamp(min=0, max=table.shape[1] - 1).long()
+        slots = table[table_rows[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
@@ -1456,6 +1526,97 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    def _fa3_qsa_supported(self, q, layer, k_buffer, v_buffer) -> bool:
+        """Shape/capability gate for the SAIL FA3 QSA sparse-attention path."""
+        if not envs.SGLANG_SAIL_QSA_FA3_SPARSE_ATTN.get():
+            return False
+        if not is_sail():
+            return False
+        if (
+            q.dtype not in (torch.bfloat16, torch.float16)
+            or k_buffer.dtype != q.dtype
+            or v_buffer.dtype != q.dtype
+        ):
+            print_warning_once(
+                "SGLANG_SAIL_QSA_FA3_SPARSE_ATTN requires matching BF16/FP16 "
+                "Q/K/V; falling back for quantized or mismatched KV caches."
+            )
+            return False
+        if (
+            layer.head_dim != 256
+            or k_buffer.shape[-1] != 256
+            or v_buffer.shape[-1] != 256
+        ):
+            print_warning_once(
+                "SGLANG_SAIL_QSA_FA3_SPARSE_ATTN requires head dim 256 (QSA "
+                f"instantiation), got head_dim={layer.head_dim}, "
+                f"k={k_buffer.shape[-1]}, v={v_buffer.shape[-1]}; falling back."
+            )
+            return False
+        num_kv_heads = k_buffer.shape[1]
+        group = layer.tp_q_head_num // max(num_kv_heads, 1)
+        if num_kv_heads <= 0 or layer.tp_q_head_num % num_kv_heads != 0 or group > 32:
+            print_warning_once(
+                "SGLANG_SAIL_QSA_FA3_SPARSE_ATTN supports at most 32 query "
+                f"heads per KV head, got {layer.tp_q_head_num}/{num_kv_heads}; "
+                "falling back."
+            )
+            return False
+        if _resolve_ppu_fa3_qsa_with_kvcache() is None:
+            print_warning_once(
+                "SGLANG_SAIL_QSA_FA3_SPARSE_ATTN requires a QSA-enabled "
+                "flash_attn_interface build (FLASH_ATTENTION_ENABLE_QSA); "
+                "falling back."
+            )
+            return False
+        return True
+
+    def _forward_fa3_qsa_sparse(
+        self,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        metadata: QwenSparseAttnMetadata,
+        topk_indices: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+    ) -> torch.Tensor:
+        """SAIL FA3 QSA: the per-row top-k table is passed as page_table.
+
+        Entries are physical KV-pool slots (the kernel reads one pool token
+        per entry and skips negative padding itself), so the K/V buffers are
+        presented with page size 1.  cache_seqlens carries the full per-request
+        length: the causal column bound then never cuts a front-packed valid
+        entry (the indexer's selection is causal by construction), for both
+        one-row decode and multi-row extend batches.
+        """
+        flash_attn_with_kvcache = _resolve_ppu_fa3_qsa_with_kvcache()
+        rows = topk_indices.shape[0]
+        num_heads = q.shape[1]
+        if rows == 0:
+            return q.new_zeros((0, num_heads * q.shape[-1]))
+        # Logical token indices -> physical pool slots, one row per query row.
+        # Eager metadata owns the slot table; graph replay owns a persistent
+        # request-pool mapping instead. Reuse both paths' row-length mask.
+        slots = self._logical_to_physical(topk_indices, metadata).contiguous()
+        total_slots, num_kv_heads, head_dim = k_buffer.shape
+        output = flash_attn_with_kvcache(
+            q=q.contiguous(),
+            k_cache=k_buffer.view(total_slots, 1, num_kv_heads, head_dim),
+            v_cache=v_buffer.view(total_slots, 1, num_kv_heads, head_dim),
+            cache_seqlens=metadata.sequence_lengths,
+            page_table=slots.unsqueeze(1),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            num_splits=0,
+            pack_gqa=True,
+            qsa_allow_aiu=False,
+        )
+        return output.reshape(rows, -1)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1520,9 +1681,28 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
         cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(
+                0, dtype=torch.int32
+            ),
             (1, 0),
         ).contiguous()
+        if envs.SGLANG_SAIL_QSA_FA3_SPARSE_ATTN.get():
+            pool = self.token_to_kv_pool
+            k_buffer = pool.get_key_buffer(layer.layer_id)
+            v_buffer = pool.get_value_buffer(layer.layer_id)
+            if self._fa3_qsa_supported(q, layer, k_buffer, v_buffer):
+                metadata = self._resolve_metadata(forward_batch)
+                output = self._forward_fa3_qsa_sparse(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    layer,
+                    metadata,
+                    topk_indices,
+                    cu_seqlens_q,
+                    max(extend_lens, default=1),
+                )
+                return self._pad_extend_output(output, num_output_rows)
         if not any(prefix_lens):
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
@@ -1930,6 +2110,25 @@ class QwenSparseAttnBackend(AttentionBackend):
             return output.reshape(q.shape[0], -1)
 
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        if self._fa3_qsa_supported(q, layer, k_buffer, v_buffer):
+            if metadata.is_cuda_graph:
+                cu_seqlens_q = metadata.fa2_cu_seqlens_q
+                if cu_seqlens_q is None:
+                    raise RuntimeError("QSA CUDA graph FA3 metadata is incomplete")
+            else:
+                cu_seqlens_q = torch.arange(
+                    topk_indices.shape[0] + 1, dtype=torch.int32, device=q.device
+                )
+            return self._forward_fa3_qsa_sparse(
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                metadata,
+                topk_indices,
+                cu_seqlens_q,
+                max_seqlen_q=1,
+            )
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(

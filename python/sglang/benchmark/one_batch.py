@@ -84,6 +84,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
@@ -97,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_model,
     get_schedule,
+    get_spec,
     publish,
     spawn_world_rank,
 )
@@ -329,6 +331,26 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    spec_algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+
+    if not spec_algorithm.is_none():
+        rank_print("Using speculative decoding: " + cfg.speculative_algorithm)
+        bootstrap.init_parallel_runtime(
+            server_args=server_args,
+            device=get_device().device,
+            dist_port=port_args.nccl_port,
+        )
+        bootstrap.init_layer_runtime(
+            model_config=ModelConfig.from_server_args(server_args)
+        )
+        model_runner = _SpecBenchRunner(server_args, port_args, gpu_id)
+        rank_print(
+            f"max_total_num_tokens={model_runner._model_runner.max_total_num_tokens}"
+        )
+        if cfg.tp_size > 1:
+            dist.barrier()
+        return model_runner, model_runner.tokenizer
+
     model_config = ModelConfig.from_server_args(server_args)
     runner_kwargs = dict(
         model_config=model_config,
@@ -558,6 +580,118 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=set(),
         )
+
+
+class _SpecBenchRunner:
+    """Wraps TpModelWorker + draft worker for speculative decode benchmark."""
+
+    def __init__(self, server_args, port_args, gpu_id):
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
+        self.tp_worker = TpModelWorker(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            nccl_port=port_args.nccl_port,
+        )
+        if get_model().is_startup_weight_load_overlap:
+            self.tp_worker.start_startup_weight_load()
+        DraftWorkerClass = self.spec_algorithm.create_worker(server_args)
+        self.draft_worker = DraftWorkerClass(
+            server_args=server_args,
+            gpu_id=gpu_id,
+            nccl_port=port_args.nccl_port,
+            target_worker=self.tp_worker,
+        )
+        self.model_worker = self.draft_worker
+        self._model_runner = self.tp_worker.model_runner
+        self._model_runner.account_preloaded_weights(
+            self.tp_worker.preloaded_weights_bytes
+            + self.draft_worker.preloaded_weights_bytes
+        )
+        self.tp_worker.alloc_memory_pool(
+            draft_parallel_layout=self.draft_worker.draft_parallel_layout
+        )
+        pool, allocator = self.tp_worker.get_memory_pool()
+        self.draft_worker.alloc_memory_pool(
+            memory_pool_config=self._model_runner.memory_pool_config,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        self.tp_worker.init_attention_backends()
+        self.draft_worker.init_attention_backends()
+        if mambaish_config(self._model_runner.model_config) is not None:
+            from sglang.kernels.ops.mamba.triton_ops import (
+                initialize_mamba_selective_state_update_backend,
+            )
+
+            initialize_mamba_selective_state_update_backend(server_args)
+        self.tp_worker.init_cuda_graphs()
+        self.draft_worker.init_cuda_graphs()
+        if get_model().is_startup_weight_load_overlap:
+            self.tp_worker.finalize_startup_weight_load()
+        self.tokenizer = self.tp_worker.tokenizer
+
+    def clear(self):
+        self._model_runner.req_to_token_pool.clear()
+        self._model_runner.token_to_kv_pool_allocator.clear()
+
+    def extend(self, reqs):
+        dummy_tree_cache = TreeCacheNamespace(
+            page_size=get_schedule().page_size,
+            device=self._model_runner.device,
+            token_to_kv_pool_allocator=self._model_runner.token_to_kv_pool_allocator,
+        )
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self._model_runner.req_to_token_pool,
+            token_to_kv_pool_allocator=self._model_runner.token_to_kv_pool_allocator,
+            tree_cache=dummy_tree_cache,
+            model_config=self._model_runner.model_config,
+            enable_overlap=False,
+            spec_algorithm=self.spec_algorithm,
+        )
+        batch.prepare_for_extend()
+
+        result = self.model_worker.forward_batch_generation(batch)
+        if result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+            batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+        next_token_ids = result.next_token_ids
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return next_token_ids, logits, batch
+
+    def decode(self, next_token_ids, batch):
+        batch.output_ids = next_token_ids
+        batch.prepare_for_decode()
+        result = self.model_worker.forward_batch_generation(batch)
+        if result.next_draft_input is not None:
+            batch.spec_info = result.next_draft_input
+        if result.new_seq_lens is not None:
+            batch.seq_lens = result.new_seq_lens
+            batch.seq_lens_cpu = result.new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+        next_token_ids = result.next_token_ids
+        logits = (
+            result.logits_output.next_token_logits if result.logits_output else None
+        )
+        return next_token_ids, logits
+
+    def cleanup(self, batch):
+        pass
+
+    def synchronize(self):
+        synchronize(self._model_runner.device)
+
+    def max_batch_size(self, input_len, output_len):
+        return self._model_runner.max_total_num_tokens // (input_len + output_len)
 
 
 class _TorchBenchRunner:
@@ -798,11 +932,23 @@ def latency_test_run_once(
             trace_filename=trace_filename_prefill,  # pass it in here for the MLX path only
         )
 
+    use_cuda_events = get_device().device == "cuda"
+    if use_cuda_events:
+        prefill_start_event = torch.cuda.Event(enable_timing=True)
+        prefill_end_event = torch.cuda.Event(enable_timing=True)
     model_runner.synchronize()
-    tic = time.perf_counter()
+    if use_cuda_events:
+        prefill_start_event.record()
+    else:
+        tic = time.perf_counter()
     next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
-    prefill_latency = time.perf_counter() - tic
+    if use_cuda_events:
+        prefill_end_event.record()
+        prefill_end_event.synchronize()
+        prefill_latency = prefill_start_event.elapsed_time(prefill_end_event) / 1000.0
+    else:
+        prefill_latency = time.perf_counter() - tic
 
     if enable_profile_prefill:
         stop_profile(
@@ -823,6 +969,9 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     decode_latencies = []
+    if use_cuda_events:
+        decode_start_event = torch.cuda.Event(enable_timing=True)
+        decode_end_event = torch.cuda.Event(enable_timing=True)
     # Determine profiling start step and end step
     profile_start = (
         profile_start_step if profile_start_step is not None else (output_len // 2)
@@ -831,6 +980,7 @@ def latency_test_run_once(
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     trace_filename_decode = None
     profiler = None
+    profiler_stopped = False
     for i in range(output_len - 1):
         model_runner.synchronize()
         # Start profiler at the specified step
@@ -845,13 +995,22 @@ def latency_test_run_once(
                 trace_filename=trace_filename_decode,
             )
 
-        tic = time.perf_counter()
+        if use_cuda_events:
+            decode_start_event.record()
+        else:
+            tic = time.perf_counter()
         next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         model_runner.synchronize()
-        latency = time.perf_counter() - tic
+        if use_cuda_events:
+            decode_end_event.record()
+            decode_end_event.synchronize()
+            latency = decode_start_event.elapsed_time(decode_end_event) / 1000.0
+        else:
+            latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
-        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
+        # For CUDA_PROFILER, profiler is None but stop_profile still calls cudaProfilerStop
+        if enable_profile_decode and not profiler_stopped and i >= profile_end - 1:
             stop_profile(
                 profiler,
                 profile_activities,
@@ -861,6 +1020,7 @@ def latency_test_run_once(
                 stage="decode",
             )
             profiler = None
+            profiler_stopped = True
 
         tot_latency += latency
         throughput = batch_size / latency

@@ -6,7 +6,10 @@ import triton.language as tl
 
 @triton.jit
 def _row_offset(loc, col, PAGE, DATA, DATA_STRIDE, SCALE_BASE, SCALE_STRIDE):
-    # Byte `col` of token `loc`'s data-then-scales, from its page start; padding is untouched.
+    # Byte `col` of token `loc`'s data-then-scales, from its page start; padding
+    # is untouched. The strides come from ``KVLayout.row_addressing``, so both
+    # the block-split and the interleaved (V41_NEW / V41_FP4_NEW) arrangements
+    # copy the bytes the decode kernel reads.
     slot = loc % PAGE
     return tl.where(
         col < DATA,

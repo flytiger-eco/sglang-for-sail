@@ -20,6 +20,9 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
+    _ppu_fa3_chunked_prefix_cache_threshold,
+    _ppu_fa3_flashmla_qv_fallback,
+    _ppu_flashmla_fp8_kv_cache_fallback,
     attention_backends_of,
     declare_resolution,
     mamba_extra_buffer_of,
@@ -118,6 +121,12 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
+
+    # PPU: fa3+flashmla combo crashes with "q_v not support" under certain
+    # configs; fall back to a unified flashmla backend. Also, flashmla does
+    # not support fp8_e4m3 KV cache on PPU; disable FP8 KV cache.
+    run_post_process_pass(server_args, _ppu_fa3_flashmla_qv_fallback)
+    run_post_process_pass(server_args, _ppu_flashmla_fp8_kv_cache_fallback)
 
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
@@ -277,6 +286,9 @@ def handle_attention_backend_compatibility(server_args: Any):
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 
+    # PPU FA3 cannot consume a chunked prefix cache: force the threshold to 0.
+    run_post_process_pass(server_args, _ppu_fa3_chunked_prefix_cache_threshold)
+
 
 def handle_linear_attn_backend(server_args: Any):
     cfg = resolving_view(server_args)
@@ -379,6 +391,13 @@ def handle_linear_attn_backend(server_args: Any):
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
     # for correctness and best performance.
     prefill = cfg.linear_attn_prefill_backend or cfg.linear_attn_backend
+
+    # The PPU KDA prefill default (SAIL PLA / "flashkda") is intentionally NOT
+    # written here: a process-wide arg would also bind a speculative draft
+    # runner whose model may not be KDA. It is applied per runner in
+    # attention_registry via resolve_linear_attn_backends(prefill_default=...),
+    # so only the KDA runner opts in and an explicit
+    # --linear-attn-prefill-backend still wins.
     cuda_version = torch.version.cuda
     cuda_major = int(cuda_version.split(".")[0]) if cuda_version is not None else 0
     if (

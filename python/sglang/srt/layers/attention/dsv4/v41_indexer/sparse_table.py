@@ -1,4 +1,4 @@
-"""The candidate scheme carried by a DeepGEMM sparse table (SM100): a source
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100 or PPU SM89+): a source
 publishes its blocks with the schedule ``fp8_fp4_paged_sparse_mqa_logits`` needs,
 a consumer scores only those blocks out of the index-K pool."""
 
@@ -10,8 +10,8 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax8_varlen,
     amax_topk_blocks,
+    candidate_block_ids,
     candidate_row_lens,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
@@ -24,14 +24,12 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_v2,
-    topk_transform_ragged_v2,
+    topk_transform_candidates,
+    topk_transform_paged,
     topk_transform_sparse,
 )
-from sglang.srt.layers.attention.dsv4.indexer import (
-    topk_transform_paged_bf16,
-    topk_transform_paged_from_metadata,
-)
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_bf16
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.common import async_h2d
 
@@ -287,6 +285,7 @@ class SparseTableBackend:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=metadata.request_indices,
         )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
@@ -302,13 +301,12 @@ class SparseTableBackend:
                 metadata.compressed_page_size,
             )
         else:
-            topk_transform_paged_v2(
+            topk_transform_paged(
                 logits,
                 seq_lens,
                 metadata.page_table,
                 inputs.out_page_indices,
                 metadata.compressed_page_size,
-                metadata.topk_metadata,
             )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
@@ -353,9 +351,7 @@ class SparseTableBackend:
         block_chunks = []
         phys_block_chunks = []
         valid_len_chunks = []
-        topk_plans = metadata.topk_metadata_chunks
-        assert not metadata.use_topk_v2 or topk_plans is not None
-        for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+        for rows, plan in metadata.row_chunks():
             q, lens, table = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
@@ -365,22 +361,34 @@ class SparseTableBackend:
                 table,
                 plan,
                 metadata.max_compressed_seq_len,
-            )
-            topk_transform_paged_from_metadata(
-                logits,
-                metadata,
-                inputs.out_page_indices,
-                None,
-                rows=rows,
-                topk_metadata=(
-                    topk_plans[chunk_idx] if topk_plans is not None else None
+                indices=(
+                    metadata.request_indices[rows]
+                    if metadata.request_indices is not None
+                    else None
                 ),
             )
+            if logits.dtype == torch.bfloat16:
+                topk_transform_paged_bf16(
+                    logits,
+                    seq_lens[rows],
+                    metadata.page_table[rows],
+                    inputs.out_page_indices[rows],
+                    metadata.compressed_page_size,
+                )
+            else:
+                topk_transform_paged(
+                    logits,
+                    seq_lens[rows],
+                    metadata.page_table[rows],
+                    inputs.out_page_indices[rows],
+                    metadata.compressed_page_size,
+                )
             chunk_seq_lens = seq_lens[rows]
             nblocks, row_valid_lens = candidate_row_lens(
                 chunk_seq_lens, self.topk_blocks
             )
             blocks = amax_topk_blocks(logits, chunk_seq_lens, nblocks, self.topk_blocks)
+            del logits  # last use; release it before scoring the next chunk
             phys_blocks = sort_candidate_blocks(
                 blocks,
                 chunk_seq_lens,
@@ -517,25 +525,31 @@ def publish_prefill_table(
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
     zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+    # Two levels instead of one full-width pass: the block maxima cost one read
+    # of the scores, and the selection then reads only the kept blocks (the
+    # block keys are needed for the published table either way). Exact while
+    # index_topk < topk_blocks, see `topk_transform_candidates`.
+    two_level = (
+        envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+        and 0 < out_positions.shape[1] < topk_blocks
+    )
     # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv):
         lens = data.compress_lens[tile]
-        topk_ragged(logits, lens, out=out_positions[tile], offsets=zero_offsets[tile])
-        # keys past a row's block count stay unset; the top-k reads a row
-        # up to its block count only (v2 wants the stride a multiple of 4)
-        width_blocks = (
-            logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1
-        ) // CANDIDATE_BLOCK_SIZE
-        keys = logits.new_empty(
-            logits.shape[0], (width_blocks + 3) // 4 * 4, dtype=torch.float32
-        )
-        amax8_varlen(logits, lens, out=keys)
-        topk_transform_ragged_v2(
-            keys,
-            nblocks[tile],
-            out_offsets=zero_offsets[: logits.shape[0]],
-            out_indices=blocks[tile],
-        )
+        candidate_block_ids(logits, lens, nblocks[tile], topk_blocks, out=blocks[tile])
+        if two_level and logits.dtype == torch.float32:
+            topk_transform_candidates(
+                logits,
+                lens,
+                blocks[tile],
+                out_offsets=zero_offsets[tile],
+                out_indices=out_positions[tile],
+            )
+        else:
+            topk_ragged(
+                logits, lens, out=out_positions[tile], offsets=zero_offsets[tile]
+            )
+        del logits  # release this tile before the next one is scored
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

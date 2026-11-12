@@ -71,6 +71,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
@@ -222,7 +223,10 @@ def handle_shared_experts_tp(server_args: Any):
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
@@ -749,6 +753,21 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.enable_eplb_async:
+        assert cfg.enable_eplb, (
+            "EPLB async requires --enable-eplb and --enable-eplb-async to be "
+            "passed together."
+        )
+        assert cfg.device == "cuda", "EPLB async is only supported on CUDA."
+        assert cfg.elastic_ep_backend is None, (
+            "EPLB async is incompatible with elastic EP."
+        )
+        envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.set(True)
+        envs.SGLANG_WARMUP_TIMEOUT.set(3600)
+
+        if envs.SGLANG_PROFILE_NVTX.get():
+            envs.SGLANG_EPLB_RUNTIME_NVTX.set(True)
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,

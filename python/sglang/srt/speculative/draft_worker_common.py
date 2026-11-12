@@ -14,6 +14,7 @@ from sglang.srt.runtime_context import attention_backends, get_platform, get_spe
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -27,6 +28,12 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_model_runner: ModelRunner
     draft_model: torch.nn.Module
     resolved_attention_backend: str
+
+
+# Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+if is_sail():
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("flashmla", "triton")
 
 
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
@@ -46,8 +53,15 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
+        # tokenspeed_mla serves only MLA layers, so a draft gets it only when
+        # it is named explicitly.
+        if draft_backend == "tokenspeed_mla":
+            draft_backend = None
     if draft_backend is None:
         return platform_fallback
+    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        # MLA-only backends: the DFLASH hook admits them for MLA drafts only.
+        return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
         if algo_label is not None:

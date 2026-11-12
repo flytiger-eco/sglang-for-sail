@@ -142,6 +142,7 @@ def _resolve_ffn(
     dense_tp_size=None,
     output_complete=False,
     terminal_accepts_update=False,
+    output_on_cp_shards=False,
 ):
     parallel = get_parallel()
     if dense_tp_size not in (None, 1, parallel.attn_tp_size, parallel.tp_size):
@@ -242,8 +243,23 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
+    # A complete output of rows gathered over attention CP that the compute
+    # already leaves on this rank's CP rows: the residual's.
+    on_residual_cp_shards = (
+        output_on_cp_shards
+        and complete
+        and variant is BatchVariant.CONTEXT_PARALLEL
+        and not on_rank_rows
+        and not on_attention_rows
+        and TokenAxis.ATTN_CP in attention.sharded
+        and TokenAxis.ATTN_CP not in rows.sharded
+    )
     produced = (
-        OutputContract(rows, update=update, transform=output_transform)
+        OutputContract(
+            attention if on_residual_cp_shards else rows,
+            update=update,
+            transform=output_transform,
+        )
         if complete
         else OutputContract(
             rows,
@@ -309,6 +325,12 @@ class StageDeclaration:
         row_transport: Explicit source, compute and return rows for a stage
             whose operand moves independently of its residual. The bound
             invocation owns output completion and inverse transport.
+        output_on_cp_shards: Whether, on a CP extend whose FFN input is
+            gathered over attention CP, the compute returns only this rank's
+            CP rows, every one valid, with the sum complete (how is its own
+            choice). The output then lands on the residual's rows with no
+            take-back. Requires a complete sparse output; every other path
+            keeps the gathered-rows output.
         attn_tp_gather: Optional implementation of the gather over attention
             TP that brings rows into this stage: at its own entry, or at its
             producer's exit, which runs its consumer's gather. Given this rank's
@@ -342,6 +364,7 @@ class StageDeclaration:
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
     output_complete: bool = False
+    output_on_cp_shards: bool = False
     attn_tp_gather: Optional[Callable] = None
     sum_impl: Optional[SumImplementation] = None
     row_transport: Optional[RowTransport] = None
@@ -357,6 +380,16 @@ class StageDeclaration:
                 raise TypeError("stage sources must be declarations")
         _check_update(self.update)
         _check_read(self.read)
+        if self.output_on_cp_shards and not (
+            self.kind is StageKind.FFN
+            and self.sparse
+            and self.output_complete
+            and self.output_transform is None
+        ):
+            raise ValueError(
+                "output_on_cp_shards needs a sparse FFN whose compute completes "
+                "its output, with no custom sum, transport or output transform"
+            )
 
 
 # The members every ResidualUpdate and ResidualReadout must set: the binding
@@ -501,6 +534,7 @@ def declare_ffn(
     output_complete=False,
     sum_impl=None,
     row_transport=None,
+    output_on_cp_shards=False,
 ):
     """Declare a dense or MoE FFN independently of its compute module.
 
@@ -520,6 +554,8 @@ def declare_ffn(
         sum_impl: Model-specific implementation and deferral eligibility of
             the output sum. Cannot be combined with output_complete.
 
+        output_on_cp_shards: Whether the compute returns only this rank's CP
+            rows of a CP extend's gathered input (see StageDeclaration).
 
     Returns:
         A StageDeclaration with no norm, tensors or execution plan.
@@ -535,6 +571,7 @@ def declare_ffn(
         output_complete=output_complete,
         sum_impl=sum_impl,
         row_transport=row_transport,
+        output_on_cp_shards=output_on_cp_shards,
     )
 
 
@@ -672,6 +709,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            output_on_cp_shards=stage.output_on_cp_shards,
             terminal_accepts_update=stage.terminal
             and takes_pending_update(final_read, stage.update),
         )

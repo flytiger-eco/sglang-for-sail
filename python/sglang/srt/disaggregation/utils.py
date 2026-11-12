@@ -27,7 +27,9 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -128,6 +130,20 @@ def poll_and_all_reduce_prefill_pp(
     return polls
 
 
+def dsa_seed_backend_enabled() -> bool:
+    prefill_backend, decode_backend = attention_backends()
+    spec = get_spec()
+    draft_backend = spec.speculative_draft_attention_backend
+    draft_extend_backend = (
+        decode_backend
+        if spec.speculative_attention_mode == "decode"
+        else prefill_backend
+    )
+    return (draft_backend or decode_backend) in ("dsa", "nsa") and (
+        draft_backend or draft_extend_backend
+    ) in ("dsa", "nsa")
+
+
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
@@ -145,6 +161,15 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     if req_pool_idx is None:
         raise ValueError("QSA pending-state transfer requires an allocated request row")
     return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
+def should_bypass_dsa_cp_prefix_cache(*, is_dsa: bool = True) -> bool:
+    """Whether PD DSA prefill CP must bypass the legacy radix cache."""
+    return (
+        is_dsa
+        and get_disagg().disaggregation_mode != "null"
+        and get_parallel().enable_prefill_cp
+    )
 
 
 class DisaggregationMode(Enum):
@@ -1481,6 +1506,8 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
+    kv_args.mamba_state_shard_on_attn_cp = False
+    kv_args.dsa_index_k_token_bytes = None
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1496,6 +1523,15 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    def set_dsa_index_k_token_bytes(kv_args, pool) -> None:
+        # Per-token bytes of an index-K page: the fp8 keys of every token,
+        # then their scales. A PD DCP relayout moves the two parts separately.
+        if pool.index_kpool != 1:
+            return
+        value_bytes = pool.index_head_dim
+        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
+        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1597,6 +1633,10 @@ def setup_state_kv_args(
                         c128_item_lens,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+            state_pool = getattr(token_to_kv_pool, "mamba_pool", token_to_kv_pool)
+            kv_args.mamba_state_shard_on_attn_cp = getattr(
+                state_pool, "state_shard_on_attn_cp", False
+            )
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
@@ -1634,14 +1674,56 @@ def setup_state_kv_args(
             if getattr(token_to_kv_pool, "use_dsa", False):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
+                draft_dsa_pool = (
+                    draft_token_to_kv_pool.full_kv_pool
+                    if isinstance(draft_token_to_kv_pool, HybridLinearKVPool)
+                    else draft_token_to_kv_pool
+                )
+                dsa_layer_ids = None
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "Hybrid DSA draft state transfer requires total_kv_layers"
+                        )
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_dsa_pool.get_state_buf_infos()
+                    )
+                    dsa_ptrs += draft_ptrs
+                    dsa_lens += draft_lens
+                    dsa_item_lens += draft_item_lens
+                    # Index-K is separate from ordinary draft KV. Reserve the
+                    # same draft layer band so PP/CP peers pair both correctly.
+                    dsa_layer_ids = list(
+                        token_to_kv_pool.full_attention_layer_id_mapping
+                    ) + _remap_draft_layer_ids(
+                        list(range(draft_dsa_pool.layer_num)), total_kv_layers
+                    )
                 append_state_component(
                     kv_args,
                     StateType.DSA,
                     dsa_ptrs,
                     dsa_lens,
                     dsa_item_lens,
+                    layer_ids=dsa_layer_ids,
                 )
-                append_dsa_tail(dsa_pool)
+                set_dsa_index_k_token_bytes(kv_args, dsa_pool)
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    tail_ptrs, tail_lens, tail_item_lens = (
+                        dsa_pool.get_compress_tail_buf_infos()
+                    )
+                    draft_tail_ptrs, draft_tail_lens, draft_tail_item_lens = (
+                        draft_dsa_pool.get_compress_tail_buf_infos()
+                    )
+                    if tail_ptrs or draft_tail_ptrs:
+                        append_state_component(
+                            kv_args,
+                            StateType.DSA_TAIL,
+                            tail_ptrs + draft_tail_ptrs,
+                            tail_lens + draft_tail_lens,
+                            tail_item_lens + draft_tail_item_lens,
+                        )
+                else:
+                    append_dsa_tail(dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
@@ -1864,6 +1946,10 @@ def setup_state_kv_args(
     ):
         data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
         if data_ptrs:
+            state_pool = getattr(req_to_token_pool, "mamba_pool", req_to_token_pool)
+            kv_args.mamba_state_shard_on_attn_cp = getattr(
+                state_pool, "state_shard_on_attn_cp", False
+            )
             dim = (
                 req_to_token_pool.get_state_dim_per_tensor()
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")

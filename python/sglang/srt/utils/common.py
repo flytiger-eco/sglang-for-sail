@@ -224,15 +224,21 @@ def is_cpu() -> bool:
     return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
+# Import torchada eagerly (at module load) so that dynamo never traces an
+# import statement when is_musa() is called from a fullgraph torch.compile
+# region: a failed import inside tracing raises "Import failure" and breaks
+# CUDA graph capture.
+try:
+    import torchada  # noqa: F401
+
+    _MUSA_VERSION = getattr(torch.version, "musa", None)
+except ImportError:
+    _MUSA_VERSION = None
+
+
 @lru_cache(maxsize=1)
 def is_musa() -> bool:
-    if not hasattr(torch.version, "musa") or torch.version.musa is None:
-        return False
-    try:
-        import torchada  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    return _MUSA_VERSION is not None
 
 
 @lru_cache(maxsize=1)
@@ -1045,6 +1051,8 @@ def is_mnnvl_fabric_device() -> bool:
     by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
+    if is_sail():
+        return True
     name = (torch.cuda.get_device_name(0) or "").upper()
     if any(tag in name for tag in ("GB200", "GB300")):
         return True
@@ -4069,6 +4077,7 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+    from sglang.srt.runtime_context import process_model_config
 
     if moe_a2a_backend is None:
         moe_a2a_backend = get_moe_a2a_backend()
@@ -4080,6 +4089,18 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
         assert get_parallel().num_dp_ranks > 1, (
             "attention DP needs more than one DP rank"
         )
+        # Engram tables are sharded over the full TP group even with DeepEP.
+        # Their lookup gathers IDs across attention-DP ranks, so graph capture
+        # needs DP-sized token metadata and replay must pick a common DP bucket.
+        # Reuse the gathered-buffer bookkeeping without changing MoE dispatch.
+        # A shared host table owns all rows and bypasses this collective.
+        if getattr(process_model_config().hf_config, "engram_layer_ids", ()):
+            shared_engram = (
+                envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get()
+                and envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get() == "shared"
+            )
+            if not shared_engram:
+                return True
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -5142,3 +5163,25 @@ def init_cublas():
     b = torch.ones((16, 16), dtype=dtype, device=device)
     c = a @ b
     return c
+
+
+def set_acext_token_limit(acext_num_tokens: int = 6144):
+    if "ACEXT_NUM_TOKENS_LIMIT" not in os.environ:
+        os.environ["ACEXT_NUM_TOKENS_LIMIT"] = str(acext_num_tokens)
+    logger.warning(f"acext token limit: {os.environ['ACEXT_NUM_TOKENS_LIMIT']}")
+
+
+def check_acext_version_compatibility(acext_version: int = 1050100):
+    if get_device_sm() >= 89:
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+        return
+    from acext import get_version as acext_get_version
+
+    current_ver = acext_get_version()
+    if current_ver < acext_version:
+        logger.warning(
+            f"acext version {current_ver} don't satisfy minimum version {acext_version}. Fallback to triton"
+        )
+        envs.SGLANG_SAIL_USE_ACEXT_CUDA.set(0)
+    else:
+        logger.warning(f"Current acext version: {current_ver}")

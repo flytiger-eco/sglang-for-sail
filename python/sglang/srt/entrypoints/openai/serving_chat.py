@@ -107,6 +107,7 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
     strip_structural_tag_excludes,
+    without_schema_identifiers,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -244,6 +245,36 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
+
+
+# K3 exposes three thinking tiers and K3.1 adds "medium". The OpenAI tiers map
+# onto the nearest one so a standard client is neither rejected nor silently
+# upgraded to the strongest tier; a float is an sglang extension K3 cannot
+# express at all.
+_KIMI_K3_EFFORT_TIERS = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+_KIMI_K31_EFFORT_TIERS = {**_KIMI_K3_EFFORT_TIERS, "medium": "medium"}
+
+
+def kimi_k3_thinking_effort(
+    reasoning_effort: Any, tiers: dict = _KIMI_K3_EFFORT_TIERS
+) -> Optional[str]:
+    """Map a request's reasoning effort onto K3's thinking_effort, or None."""
+    if reasoning_effort is None or reasoning_effort == "none":
+        return None
+    if isinstance(reasoning_effort, str) and reasoning_effort in tiers:
+        return tiers[reasoning_effort]
+    supported = ", ".join(repr(t) for t in dict.fromkeys(tiers.values()))
+    raise ValueError(
+        f"Kimi K3 supports reasoning_effort {supported} (the other OpenAI tiers "
+        f"map onto them); got {reasoning_effort!r}."
+    )
 
 
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
@@ -638,6 +669,15 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    def _kimi_k3_effort_tiers(self) -> dict:
+        """K3.1 adds a native "medium" thinking tier on top of K3's three."""
+        model_type = getattr(
+            self.tokenizer_manager.model_config.hf_config, "model_type", None
+        )
+        if model_type == "kimi_k31":
+            return _KIMI_K31_EFFORT_TIERS
+        return _KIMI_K3_EFFORT_TIERS
+
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
         tools = list(request.tools or [])
         for message in request.messages:
@@ -756,28 +796,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
             if (
-                request.reasoning_effort in ("low", "high", "max")
-                and "thinking_effort" not in template_kwargs
+                "thinking_effort" not in template_kwargs
+                and template_kwargs.get("thinking") is not False
             ):
-                template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
+                effort = kimi_k3_thinking_effort(
+                    request.reasoning_effort, self._kimi_k3_effort_tiers()
                 )
+                if effort is not None:
+                    template_kwargs["thinking_effort"] = effort
 
             effective_tools = self._effective_tools(request)
-            if (
-                effective_tools
-                and isinstance(request.tool_choice, str)
-                and request.tool_choice in ("required", "none")
+            # The encoder renders tool_choice=none as a control message with or
+            # without tools, so a client's explicit "none" reaches it either way
+            # (the server's default "none" for a tool-less request does not).
+            if isinstance(request.tool_choice, str) and (
+                (effective_tools and request.tool_choice in ("required", "none"))
+                or (request.tool_choice == "none" and request._tool_choice_explicit)
             ):
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
             if request.response_format is not None:
@@ -1129,6 +1163,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if media_error:
             return media_error
 
+        if self.chat_encoding_spec == "kimi_k3":
+            try:
+                kimi_k3_thinking_effort(
+                    request.reasoning_effort, self._kimi_k3_effort_tiers()
+                )
+            except ValueError as exc:
+                return str(exc)
+
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
             isinstance(message, ChatCompletionMessageGenericParam)
@@ -1168,7 +1210,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                # Identifier keywords are checked for URI form by the 2020-12
+                # metaschema but constrain no instance, so a draft-07-style
+                # `$id: "#name"` would 400 a schema this stack renders and
+                # constrains correctly. Validate without them.
+                Draft202012Validator.check_schema(
+                    without_schema_identifiers(tool.function.parameters)
+                )
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1880,6 +1928,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
+                    # With reasoning off, the K3 encoder's generation prompt
+                    # opens the response channel, so a forced call has to close
+                    # it before the tools section.
+                    response_channel_open=(
+                        self.chat_encoding_spec == "kimi_k3" and not thinking_mode
+                    ),
                 )
                 if (
                     tool_call_constraint is not None
@@ -2033,15 +2087,19 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        strict_tool_call_arguments = (
-            self._encoding_adapter.strict_tool_call_arguments
-            if self._encoding_adapter is not None
-            else self.chat_encoding_spec != "kimi_k3"
-        )
-        for message in messages:
-            normalize_assistant_tool_call_arguments(
-                message, strict=strict_tool_call_arguments
+        # The K3 encoder parses string arguments itself, one level deep, and
+        # keeps nested values' original bytes; a parsed dict would be
+        # re-serialized and change the prompt.
+        if self.chat_encoding_spec != "kimi_k3":
+            strict_tool_call_arguments = (
+                self._encoding_adapter.strict_tool_call_arguments
+                if self._encoding_adapter is not None
+                else True
             )
+            for message in messages:
+                normalize_assistant_tool_call_arguments(
+                    message, strict=strict_tool_call_arguments
+                )
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -3132,10 +3190,9 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int,
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
-        if self.tool_call_parser == "kimi_k3":
-            return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
-            # A simple uuid is sufficient for all models except for Kimi-K2.
+            # A UUID is sufficient except for Kimi-K2, whose template
+            # requires positional functions.<name>:<index> IDs.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
         tool_call_id = (
@@ -3787,6 +3844,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments

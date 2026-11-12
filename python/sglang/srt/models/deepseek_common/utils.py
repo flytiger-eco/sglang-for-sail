@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
+    is_sail,
     is_xpu,
 )
 
@@ -41,6 +42,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_sail = is_sail()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -72,6 +74,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "cutedsl_mla",
     "ascend",
     "intel_xpu",
+    "flashmla",
 ]
 
 
@@ -101,7 +104,7 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")

@@ -73,6 +73,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         ):
             with (
                 self.subTest(attn_tp_size=attn_tp_size, dense_tp_size=dense_tp_size),
+                patch(
+                    "sglang.srt.runtime_context.process_model_config",
+                    return_value=SimpleNamespace(hf_config=SimpleNamespace()),
+                ),
                 get_parallel().override(
                     tp_size=8,
                     moe_ep_size=1,

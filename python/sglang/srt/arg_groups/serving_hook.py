@@ -24,6 +24,7 @@ from sglang.srt.utils.common import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
+    is_sail,
 )
 from sglang.utils import is_in_ci
 
@@ -462,7 +463,10 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
+        (is_sail() and get_platform().device_sm >= 89)
+        or get_platform().is_sm100
+        or get_platform().is_sm120
+        or is_gfx95_supported()
     ):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
@@ -472,7 +476,8 @@ def handle_environment_variables(server_args: Any):
     # run it, mirroring the forward scale split: the default sm100 UE8M0
     # path, or explicit opt-in on sm90 (FP32 scales) and sm120 (UE8M0).
     # SM120 API compatibility is centralized in deep_gemm_wrapper.configurer.
-    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+    # PPU always supports channelwise wo_a einsum; skip the disable.
+    if not is_sail() and get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
         sm = get_platform().device_sm

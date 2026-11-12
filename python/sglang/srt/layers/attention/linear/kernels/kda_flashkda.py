@@ -1,10 +1,13 @@
+from numbers import Integral
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.utils import is_sail, logger
 
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
@@ -12,6 +15,48 @@ _FLASHKDA_CHUNK_SIZE = 64
 # FlashKDA's max sequence length, Batches whose longest sequence exceeds this
 # fall back to Triton for the whole batch.
 _FLASHKDA_MAX_SEQ_LEN = 2048
+
+
+def ppu_pla_prefill_gate_open() -> bool:
+    """Whether KDA prefill/extend may run on the PPU SAIL PLA kernel.
+
+    Same gate as the decode fast-path: SGLANG_SAIL_PLA_CUDA (SAIL PLA master
+    gate; SGLANG_SAIL_FLA_CUDA is its deprecated alias), which defaults to True
+    on PPU. Off-PPU this is always False -- other platforms use the external
+    ``flash_kda`` package instead of PLA.
+    """
+    if not is_sail():
+        return False
+    return envs.SGLANG_SAIL_PLA_CUDA.get()
+
+
+def _pla_host_offsets(
+    seq_lens_cpu: Optional[list],
+    query_start_loc: torch.Tensor,
+    num_tokens: int,
+) -> Optional[tuple[int, ...]]:
+    """Build trusted offsets only from the current packed batch's CPU lengths."""
+    # Captured graphs replay changing device offsets without re-running Python.
+    # Keep their metadata device-driven; eager graph breaks can rebuild this
+    # tuple on every call because their stream is not capturing.
+    if query_start_loc.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    if not isinstance(seq_lens_cpu, (list, tuple)) or not seq_lens_cpu:
+        return None
+    if len(seq_lens_cpu) + 1 != query_start_loc.numel():
+        return None
+
+    offsets = [0]
+    for length in seq_lens_cpu:
+        # Do not coerce tensor scalars (possibly on device) or fractional values.
+        if not isinstance(length, Integral) or isinstance(length, bool) or length < 0:
+            return None
+        offsets.append(offsets[-1] + int(length))
+    # KDAAttnBackend trims physical padding before calling this adapter. If CPU
+    # metadata describes another slice/batch, retain the device-only path.
+    if offsets[-1] != num_tokens:
+        return None
+    return tuple(offsets)
 
 
 def _load_flash_kda():
@@ -132,9 +177,17 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # radix extra_buffer track path needs; route tracked batches through
         # the Triton chunk_kda fallback instead of silently skipping the
         # snapshot (that would corrupt prefix-cache restores).
-        if return_intermediate_states or self._should_fall_back(
-            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
-        ):
+        reason = self._fallback_reason(
+            lower_bound,
+            is_spec_decode,
+            query_start_loc,
+            extend_seq_lens_cpu,
+            return_intermediate_states,
+        )
+        if reason is not None:
+            logger.info_once(
+                "KDA extend uses the community Triton chunk kernel: " + reason + "."
+            )
             return _triton_fallback(
                 q,
                 k,
@@ -153,23 +206,53 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        # Only reachable when return_intermediate_states is False (the True case
+        # is served by the Triton fallback above), so honor the (out) vs (out, h)
+        # return contract and hand back just the output tensor -- kda_nvidia and
+        # kda_ptx do the same. Wrapping into (out, None) here made non-track
+        # batches (track_ssm=False, which never unpack) receive a tuple and fail
+        # on `.shape` downstream (o_norm / fused_norm_gate).
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
+
+    def _fallback_reason(
+        self,
+        lower_bound: Optional[float],
+        is_spec_decode: bool,
+        query_start_loc: torch.Tensor,
+        extend_seq_lens_cpu: Optional[list],
+        return_intermediate_states: bool,
+    ) -> Optional[str]:
+        """Why this batch must stay on the Triton chunk kernel (None = fast path)."""
+        if return_intermediate_states:
+            return (
+                "the mamba track path needs per-chunk fp32 states "
+                "(why=intermediate-states), which the fused kernel does not emit"
+            )
+        if is_sail() and not ppu_pla_prefill_gate_open():
+            return "the PPU SAIL PLA prefill gate is closed (SGLANG_SAIL_PLA_CUDA)"
+        if not self._should_fall_back(
+            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+        ):
+            return None
+        if lower_bound is None:
+            return "the fused kernel requires the safe (lower-bounded) KDA gate"
+        if is_spec_decode:
+            return "draft-extend must stay rollback-able"
+        return "the batch's sequence lengths are outside the fused kernel window"
 
     @staticmethod
     def _should_fall_back(
@@ -189,6 +272,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # gate them here rather than relying on the decode/target_verify stubs.
         if is_spec_decode:
             return True
+        if is_sail():
+            return False
         # Short sequences (< chunk size) and long sequences (> the crossover
         # where Triton's chunked prefill wins) are faster on Triton. Read the
         # per-request lengths from the CPU-side extend_seq_lens to avoid a
@@ -222,9 +307,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
+        extend_seq_lens_cpu: Optional[list] = None,
     ) -> torch.Tensor:
-        flash_kda = _load_flash_kda()
-
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
         #   g    = [1, packed_seq, HV, K]  beta = [1, packed_seq, H]
@@ -262,21 +346,49 @@ class FlashKDAKernel(LinearAttnKernelBase):
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
 
-        flash_kda.fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            scale,
-            out_buf,
-            A_log,
-            dt_bias,
-            lower_bound,
-            initial_state=initial_state,
-            final_state=final_state,
-            cu_seqlens=cu_seqlens,
-        )
+        if is_sail():
+            from pla.prefill.flashkdapro import flashkda_fwd
+
+            logger.info_once(
+                "USE PPU SAIL CUDA PLA kernel: flashkda_fwd (KDA prefill/extend)"
+            )
+
+            batch_size, seq_len, num_heads, head_dim = q.shape
+            flashkda_fwd(
+                q=q.view(batch_size * seq_len, num_heads, head_dim),
+                k=k.view(batch_size * seq_len, num_heads, head_dim),
+                v=v.view(batch_size * seq_len, num_heads, head_dim),
+                g=g.view(batch_size * seq_len, num_heads, head_dim),
+                beta=beta.view(batch_size * seq_len, num_heads),
+                A_log=A_log,
+                dt_bias=dt_bias,
+                out=out_buf.view(batch_size * seq_len, num_heads, head_dim),
+                scale=scale,
+                lower_bound=lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+                raw_cu_seqlens=_pla_host_offsets(
+                    extend_seq_lens_cpu, query_start_loc, batch_size * seq_len
+                ),
+            )
+        else:
+            flash_kda = _load_flash_kda()
+            flash_kda.fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                out_buf,
+                A_log,
+                dt_bias,
+                lower_bound,
+                initial_state=initial_state,
+                final_state=final_state,
+                cu_seqlens=cu_seqlens,
+            )
 
         ssm_states[cache_indices] = final_state
 

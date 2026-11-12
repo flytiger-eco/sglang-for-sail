@@ -13,6 +13,7 @@ from torch.nn.parameter import Parameter
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -40,11 +41,13 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -105,6 +108,139 @@ def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
         and x.is_contiguous()
         and weight.is_contiguous()
     )
+
+
+_is_ppu = is_sail()
+# PPU1.0 (SM80, e.g. 810E) and later satisfy DeepGEMM's own configurer floor
+# (sm_version >= 80); the switch below is what actually gates the BF16 path.
+_PPU_BF16_DENSE_MIN_SM = 80
+# Cached at import (same pattern as deep_gemm_wrapper.compile_utils) so the
+# per-layer hot path does not re-query the device capability.
+_PPU_BF16_DENSE_DEVICE_SM = get_device_sm() if _is_ppu else 0
+
+
+def _ppu_bf16_dense_enabled() -> bool:
+    """Whether the unquantized BF16 dense GEMM may take the PPU DeepGEMM path.
+
+    OFF by default (see envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16): on 810E the
+    DeepGEMM path is slower than the acblas/vendor GEMM it replaces (see the
+    linked issue), so it stays opt-in pending DeepGEMM-side tuning. The env is
+    read per call so the value can also come from ServerArgs after import.
+    """
+    return (
+        _is_ppu
+        and envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get()
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and _PPU_BF16_DENSE_DEVICE_SM >= _PPU_BF16_DENSE_MIN_SM
+        # Batch-invariant mode replaces aten::mm/aten::addmm with deterministic
+        # kernels, but it cannot intercept this opaque kernel call, so routing
+        # here would silently opt the layer out of --enable-deterministic-
+        # inference. Keep the acblas path, same as `_can_accumulate_into_addend`.
+        and not is_batch_invariant_mode_enabled()
+        # Keep Dynamo/export graphs untouched: the tested scope of this patch
+        # is eager/CUDA-graph inference only.
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _is_k_major_bf16_dense(x, weight, bias) -> bool:
+    """Only K-major (nt) bf16 operands are supported and the DeepGEMM kernel
+    requires an even N plus a 16-element K alignment. Bias-carrying layers are
+    excluded as well, but for a precision reason rather than a shape one:
+    `F.linear` adds the bias inside the fp32 accumulator, while this path would
+    add it to the already rounded bf16 result, which is both less accurate and
+    slower. Every unsupported layer keeps the acblas path, so enabling the
+    switch never changes its behaviour.
+    """
+    if not (
+        x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and x.dim() >= 1
+        # A zero-length feature dim would divide by zero when the caller
+        # computes the flattened M.
+        and x.shape[-1] > 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and bias is None
+    ):
+        return False
+    n, k = weight.shape
+    return n % 2 == 0 and k % 16 == 0 and x.shape[-1] % 16 == 0
+
+
+def _ppu_gemm_nt_bf16_fake(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+    # Fake impl for export/tracing: C is mutated in place, nothing to return.
+    return None
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=_ppu_gemm_nt_bf16_fake)
+def _ppu_gemm_nt_bf16(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+    deep_gemm_wrapper.gemm_nt_bf16bf16bf16(A, B, C)
+
+
+# Counters used as evidence for the DeepGEMM bf16 dense route:
+#   hit      - the DeepGEMM kernel was called successfully
+#   fallback - the switch is on but the shape/dtype gate did not match; every
+#              bias-carrying layer lands here by construction
+#              (see _is_k_major_bf16_dense), behaviour is acblas
+#   error    - the kernel raised and we fell back; this is a DEFECT signal and
+#              must be 0 in a validation run
+_PPU_BF16_DENSE_STATS = {"hit": 0, "fallback": 0, "error": 0}
+
+
+def _ppu_bf16_dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # `bias` is deliberately not accepted: the gate only routes bias-free
+    # layers so the GEMM result is the final result.
+    x_shapes = x.shape
+    m = x.numel() // x_shapes[-1]
+    if m == 0:
+        return torch.empty(
+            (*x_shapes[:-1], weight.shape[0]),
+            dtype=torch.bfloat16,
+            device=x.device,
+        )
+    out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device=x.device)
+    try:
+        _ppu_gemm_nt_bf16(x.view(-1, x_shapes[-1]), weight, out)
+    except Exception as exc:  # noqa: BLE001
+        # Never take the server down on an opt-in path: count it, log once with
+        # the failing shape, and serve this layer from acblas instead.
+        _PPU_BF16_DENSE_STATS["error"] += 1
+        if _PPU_BF16_DENSE_STATS["error"] == 1:
+            logger.warning(
+                "DeepGEMM bf16 dense fallback (M=%s N=%s K=%s): %s",
+                m,
+                weight.shape[0],
+                weight.shape[1],
+                exc,
+            )
+        # Release every strong reference to the routed (M, N) buffer before the
+        # fallback allocates its own, otherwise a large prefill needs two output
+        # buffers at once and can OOM where plain F.linear would have fitted.
+        # Three things can hold it: this local, the callee frame kept alive by
+        # the exception traceback (its output argument is the same buffer), and
+        # a chained exception's cause/context. The diagnostic text is already in
+        # the log line above, so dropping the traceback loses nothing. Rebinding
+        # to None rather than `del` keeps the following success-path reference
+        # analysable.
+        out = None
+        exc.with_traceback(None)
+        exc.__cause__ = None
+        exc.__context__ = None
+        return F.linear(x, weight)
+    _PPU_BF16_DENSE_STATS["hit"] += 1
+    # SAIL-DG-BF16-HIT is the kernel-hit evidence marker used by the 810E
+    # validation; keep the message and cadence stable.
+    if _PPU_BF16_DENSE_STATS["hit"] <= 20 or _PPU_BF16_DENSE_STATS["hit"] % 500 == 0:
+        logger.warning(
+            "SAIL-DG-BF16-HIT n=%s M=%s N=%s K=%s",
+            _PPU_BF16_DENSE_STATS["hit"],
+            m,
+            weight.shape[0],
+            weight.shape[1],
+        )
+    return out.view(*x_shapes[:-1], -1)
 
 
 class Bf16GemmBackend(Enum):
@@ -610,6 +746,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 # keeping the per-shape kernel choice.
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
+
+        # PPU: route K-major BF16 dense GEMM to DeepGEMM only when the switch
+        # is explicitly enabled; everything else keeps the acblas path below.
+        if _ppu_bf16_dense_enabled():
+            if _is_k_major_bf16_dense(x, layer.weight, bias):
+                return _ppu_bf16_dense_linear(x, layer.weight)
+            _PPU_BF16_DENSE_STATS["fallback"] += 1
 
         return F.linear(x, layer.weight, bias)
 
@@ -1170,7 +1313,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and is_sail()
+            and (
+                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
+            )
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -1189,8 +1340,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel = NPUUnquantMoEMethod()
             moe_runner_config.layer = layer
             backend = MoeRunnerBackend.ASCEND
+        elif (
+            get_moe_runner_backend().is_auto()
+            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        ):
+            backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
+        if backend.is_deep_gemm() and is_sail():
+            import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401 – triggers @register_fused_func
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
@@ -1279,7 +1438,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
             # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
             # otherwise use_fp8=True for FP8 dispatch path
-            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            use_fp8 = (
+                not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+                and w13_weight.dtype == torch.float8_e4m3fn
+            )
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,

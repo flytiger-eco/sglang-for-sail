@@ -150,7 +150,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -199,6 +199,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_sail,
     _is_xpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
@@ -390,6 +391,33 @@ class DeepseekV2MLP(nn.Module):
                 x = (x, None, y)
 
             gate_up, _ = self.gate_up_proj(x)
+
+        # Only Support for PPU fp8 channelwise.
+        if (
+            _is_sail
+            and self.allow_fused_down
+            and getattr(self.down_proj, "weight", None) is not None
+            and self.down_proj.weight.dtype == torch.float8_e4m3fn
+            and getattr(self.down_proj, "weight_scale", None) is not None
+            and self.down_proj.weight_scale.numel() == self.down_proj.weight.shape[1]
+        ):
+            from sglang.kernels.ops.elementwise.silu_mul_quant import (
+                silu_and_mul_post_per_token_quant_fp8,
+            )
+
+            M = gate_up.shape[0]
+            down_input_fp8, down_input_scale = silu_and_mul_post_per_token_quant_fp8(
+                gate_up, swiglu_limit=self.swiglu_limit
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (down_input_fp8, down_input_scale),
+                (self.down_proj.weight.t(), self.down_proj.weight_scale),
+                down_output,
+            )
+            return down_output
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -776,6 +804,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                is_draft=is_nextn,
             )
             # Hash routing folds the factor only when its flag asks for it.
             self.routed_scaling_factor_fused_in_topk = (
@@ -796,6 +825,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                is_draft=is_nextn,
                 # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
                 # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
@@ -935,6 +965,8 @@ class DeepseekV2MoE(nn.Module):
                     "awq",
                     "awq_marlin",
                     "moe_wna16",
+                    "gptq",
+                    "gptq_marlin",
                 }
             )
             shared_gate_up_weight = getattr(
@@ -962,6 +994,10 @@ class DeepseekV2MoE(nn.Module):
                     == "compressed-tensors"
                 ):
                     # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                elif _is_sail:
+                    # The following code is specific to intel_amx_backend.
+                    # Can be safely skipped when running on PPU.
                     pass
                 else:
                     assert (
@@ -1122,7 +1158,10 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(
-                hidden_states, forward_batch, input_ids_global=input_ids_global
+                hidden_states,
+                forward_batch,
+                input_ids_global=input_ids_global,
+                use_vision_topk=use_vision_topk,
             )
 
     def forward_normal_dual_stream(
@@ -1526,6 +1565,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: Optional[torch.Tensor] = None,
+        use_vision_topk: bool = False,
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
@@ -1560,11 +1600,20 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                **topk_kwargs,
-            )
+            if use_vision_topk:
+                # IDs follow the same local row order as hidden_states, including
+                # CP sharding and the attention-TP scatter before DeepEP.
+                topk_output = vision_topk(
+                    self,
+                    router_logits,
+                    input_ids_global,
+                )
+            else:
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device,
@@ -1980,10 +2029,13 @@ class DeepseekV2MoE(nn.Module):
 
     def op_combine_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.combine_a(
-                combine_input=state.pop("combine_input"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                self.experts.dispatcher.combine_a(
+                    combine_input=state.pop("combine_input"),
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
             state.pop("dispatch_output")
 
     def op_combine_b(self, state):
@@ -2036,6 +2088,8 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
+        attn_type: AttentionType = AttentionType.DECODER,
+        sliding_window_size: int = -1,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -2187,7 +2241,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
@@ -2199,7 +2255,9 @@ class DeepseekV2AttentionMLA(
                 num_kv_heads=1,
                 layer_id=layer_id,
                 v_head_dim=self.kv_lora_rank,
+                sliding_window_size=sliding_window_size,
                 quant_config=quant_config,
+                attn_type=attn_type,
                 prefix=add_prefix("attn_mqa", prefix),
             )
 
@@ -2210,7 +2268,9 @@ class DeepseekV2AttentionMLA(
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            sliding_window_size=sliding_window_size,
             quant_config=quant_config,
+            attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
 
@@ -2240,7 +2300,7 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            in {"awq", "awq_marlin", "moe_wna16", "gptq", "gptq_marlin"}
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
@@ -3246,8 +3306,9 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -3391,6 +3452,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if is_wint4afp8_or_wint4a16_config(quant_config):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
+        if quant_config and quant_config.get_name() == "mixed_precision_w4":
+            return (
+                "Deepseek V3/R1 mixed_precision_w4 model uses different quant "
+                "method for routed experts and shared experts."
+            )
         return None
 
     @classmethod

@@ -14,18 +14,23 @@ from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
+from sglang.srt.eplb.expert_location_updater import get_global_expert_location_updater
 from sglang.srt.layers.moe.topk import (
     _RENORMALIZE_SUM_EPSILON,
     StandardTopKOutput,
     TopKConfig,
     _mask_topk_ids_padded_region,
+    _mask_topk_ids_padded_region_to_int64,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
     resolve_routing_inputs,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    is_deepep_class_backend,
+)
 from sglang.srt.runtime_context import get_flags, get_model
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_sail, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,7 @@ class HashTopK(nn.Module):
         self.topk = topk + self.num_shared_topk_slots
         self.routed_scaling_factor = routed_scaling_factor
         self.score_func = scoring_func
+        self.layer_id = layer_id
         self.tid2eid = nn.Parameter(
             torch.empty(vocab_size, topk, dtype=torch.int32),
             requires_grad=False,
@@ -233,6 +239,10 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_draft)
+            updater.wait_gpu_stage()
         num_token_non_padded, expert_location_dispatch_info = resolve_routing_inputs(
             layer_id=self.layer_id,
             is_draft=self.is_draft,
@@ -311,6 +321,12 @@ class HashTopK(nn.Module):
             topk_ids = routed_cols
         if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
+        elif is_sail() and topk_ids.dtype == torch.int32 and is_deepep_class_backend():
+            topk_ids = _mask_topk_ids_padded_region_to_int64(
+                topk_ids, num_token_non_padded
+            )
+            if recorder_topk_ids is not None:
+                _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
             if recorder_topk_ids is not None:

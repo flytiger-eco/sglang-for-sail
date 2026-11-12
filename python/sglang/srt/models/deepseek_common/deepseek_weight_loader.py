@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
+from sgl_kernel import gptq_dequantize
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -55,13 +56,14 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_sail,
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
     is_wint4afp8_or_wint4a16_config,
 )
-from sglang.srt.utils import bind_or_assign, log_info_on_rank0
+from sglang.srt.utils import bind_or_assign, is_sail, log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -112,6 +114,19 @@ def _resolve_layer_weight_block_size(
     return getattr(selected_quant_config, "weight_block_size", None)
 
 
+def _dequant_indexer_shard(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    quant_config: Optional[QuantizationConfig],
+) -> torch.Tensor:
+    """Dequantize one indexer shard to bf16, per the scale's granularity."""
+    if scale.numel() == weight.shape[0]:
+        # per-output-channel scale (w8a8 int8 / channelwise fp8)
+        return (weight.float() * scale.float()).to(torch.bfloat16)
+    block_size = _get_indexer_weight_block_size(quant_config)
+    return block_quant_dequant(weight, scale, block_size, torch.bfloat16)
+
+
 def _load_fused_indexer_wk(
     name: str,
     loaded_weight: torch.Tensor,
@@ -134,7 +149,10 @@ def _load_fused_indexer_wk(
 
     if ".indexer.weights_proj." in name:
         is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-        if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+        if not is_scale and loaded_weight.dtype not in (
+            torch.float8_e4m3fn,
+            torch.int8,
+        ):
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
             return True
@@ -145,16 +163,19 @@ def _load_fused_indexer_wk(
         )
         if "weight" in entry and "scale" in entry:
             pending.pop(fused_name + ".weights_proj")
-            block_size = _get_indexer_weight_block_size(quant_config)
-            weights_bf16 = block_quant_dequant(
-                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            weights_bf16 = _dequant_indexer_shard(
+                entry["weight"], entry["scale"], quant_config
             )
             fused_param.data[-weights_bf16.shape[0] :].copy_(weights_bf16)
         return True
 
-    # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    # wk: a bf16 checkpoint copies straight in; quantized checkpoints (block-fp8
+    # with weight_scale_inv, channelwise int8/fp8 with weight_scale) need dequant.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+    if not is_scale and loaded_weight.dtype not in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ):
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
         return True
@@ -165,10 +186,7 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
-        )
+        wk_bf16 = _dequant_indexer_shard(entry["weight"], entry["scale"], quant_config)
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return True
 
@@ -438,6 +456,10 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
+                            # Skip loading g_idx for GPTQ models.
+                            if name.endswith(".g_idx"):
+                                continue
+
                             cached_a_proj[name] = _clone_if_runai_streamed_tensor(
                                 loaded_weight
                             )
@@ -470,6 +492,8 @@ class DeepseekV2WeightLoaderMixin:
                                         self.quant_config.get_name() == "awq"
                                         or self.quant_config.get_name() == "awq_marlin"
                                         or self.quant_config.get_name() == "moe_wna16"
+                                        or self.quant_config.get_name() == "gptq"
+                                        or self.quant_config.get_name() == "gptq_marlin"
                                     ):
                                         cat_dim = 1
 
@@ -624,17 +648,36 @@ class DeepseekV2WeightLoaderMixin:
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
-                awq_dequantize_f = awq_dequantize_func()
-                if awq_dequantize_f is not None:
-                    w = awq_dequantize_f(
+                if is_sail() and (
+                    self.quant_config.get_name()
+                    in [
+                        "gptq",
+                        "gptq_marlin",
+                    ]
+                    or (
+                        self.quant_config.get_name() == "moe_wna16"
+                        and self.quant_config.linear_quant_method == "gptq"
+                    )
+                ):
+                    w = None
+                    w = gptq_dequantize(
                         self_attn.kv_b_proj.qweight,
                         self_attn.kv_b_proj.scales,
                         self_attn.kv_b_proj.qzeros,
                     ).T
+                    assert w is not None
                 else:
-                    raise ValueError(
-                        "AWQ dequantize function is not supported for the current device"
-                    )
+                    awq_dequantize_f = awq_dequantize_func()
+                    if awq_dequantize_f is not None:
+                        w = awq_dequantize_f(
+                            self_attn.kv_b_proj.qweight,
+                            self_attn.kv_b_proj.scales,
+                            self_attn.kv_b_proj.qzeros,
+                        ).T
+                    else:
+                        raise ValueError(
+                            "AWQ dequantize function is not supported for the current device"
+                        )
             else:
                 w = self_attn.kv_b_proj.weight
 
@@ -726,17 +769,19 @@ class DeepseekV2WeightLoaderMixin:
                         if weight_scale.dim() == 1:
                             weight_scale = weight_scale.view(-1, 1)
 
-                    w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
-                    self_attn.w_scale = scale
+                    if _is_sail:
+                        # dequant channel-wise fp8 to bf16
+                        w = w.to(torch.bfloat16) * weight_scale.to(torch.bfloat16)
+                    else:
+                        w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
+                        self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
-                weight_block_size = (
-                    self.quant_config.weight_block_size
-                    if self.quant_config is not None
-                    else None
-                )
-                if weight_block_size is not None:
+                # only enter block quant path when block size is not None
+                # otherwise will return non dequant weight in some mix-quant-config like w4a8
+                if getattr(self.quant_config, "weight_block_size", None) is not None:
                     # block-wise int8 need it
+                    weight_block_size = self.quant_config.weight_block_size
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     weight = w
                     weight_scale = self_attn.kv_b_proj.weight_scale_inv

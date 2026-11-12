@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
+    "KimiK31ForConditionalGeneration",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
@@ -54,6 +56,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         is_deepseek_dsa,
+        is_kimi_k31,
         unwrap_modelopt_quantization_config,
     )
 
@@ -97,7 +100,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg))
+        if not is_kimi_k31(hf_config):  # K3.1 DCP: _kimi_k31_dcp_overrides
+            overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
@@ -120,9 +124,18 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "zigzag DSA CP requires moe_dense_tp_size=1, "
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
-                assert cfg.tp_size <= 8, (
-                    "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                )
+                else:
+                    assert cfg.dp_size == 1, (
+                        "interleave DSA CP does not support DP attention."
+                    )
+                if "810E" not in current_platform.get_device_name():
+                    assert cfg.tp_size <= 8, (
+                        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    )
+                else:
+                    assert cfg.tp_size <= 16, (
+                        "Context parallel only supports single machine (tp_size <= 16 on 810e). Cross-machine CP has precision issues."
+                    )
                 # Interleave can shard attention heads within each CP rank.
                 # Keep an explicit CP width; default to attention TP1 as before.
                 # Zigzag still requires attention TP1.

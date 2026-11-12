@@ -1283,6 +1283,13 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
@@ -1430,4 +1437,4 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         return quant_config
 
 
-EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM, GlmMoeDsaForCausalLMNextN]
+EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]

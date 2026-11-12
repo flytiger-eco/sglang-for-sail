@@ -26,6 +26,127 @@ MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
 MQA_LOGITS_ROW_ALIGN_ELEMS = 256
 
 
+def sail_mqa_logits(q, kv, weights, starts, ends, *, max_seqlen_k=0):
+    """PPU weighted logits: request-relative MXFP4 columns, weights-selected INT8 dtype."""
+    import deep_gemm
+
+    if isinstance(q, tuple):
+        if max_seqlen_k <= 0:
+            raise ValueError("MXFP4 indexer requires a positive max_seqlen_k")
+        q = (q[0].contiguous().view(torch.int8), q[1].contiguous())
+        kv = (kv[0].contiguous().view(torch.int8), kv[1].contiguous())
+        return deep_gemm.fp8_fp4_mqa_logits(
+            q,
+            kv,
+            weights.to(torch.bfloat16).contiguous(),
+            starts,
+            ends,
+            max_seqlen_k,
+        )
+    fn = (
+        deep_gemm.int8_mqa_logits if q.dtype == torch.int8 else deep_gemm.fp8_mqa_logits
+    )
+    dtype = weights.dtype if q.dtype == torch.int8 else torch.float32
+    return fn(
+        q,
+        kv,
+        weights.to(dtype).contiguous(),
+        starts,
+        ends,
+        clean_logits=False,
+        max_seqlen_k=max_seqlen_k,
+    )
+
+
+def sail_paged_mqa_metadata(
+    context_lens, page_size, heads, head_dim, qk_dtype, indices=None
+):
+    """Use logical D and torch.dtype in the hint; weighted next_n is fixed at 1."""
+    import deep_gemm
+
+    context_lens = context_lens.to(torch.int32).reshape(-1, 1).contiguous()
+    if indices is not None:
+        indices = indices.to(device=context_lens.device, dtype=torch.int32).contiguous()
+        if indices.ndim != 1 or indices.numel() != context_lens.shape[0]:
+            raise ValueError("request indices must contain one owner per query row")
+    return deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens,
+        page_size,
+        deep_gemm.get_num_sms(),
+        indices=indices,
+        metadata_extra=(1, heads, head_dim, qk_dtype),
+    )
+
+
+def sail_paged_mqa_logits(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_table,
+    schedule_meta,
+    max_context_len,
+    *,
+    indices=None,
+):
+    """Generate the schedule with the compute SM configuration for graph replay."""
+    import deep_gemm
+
+    packed = isinstance(q, tuple)
+    values = q[0] if packed else q
+    if values.ndim != 4 or values.shape[1] != 1:
+        raise ValueError("PPU weighted paged indexer requires [Q, 1, H, Dstorage]")
+    context_lens = context_lens.to(torch.int32).reshape(-1, 1).contiguous()
+    block_table = block_table.to(torch.int32).contiguous()
+    if (
+        context_lens.shape[0] != values.shape[0]
+        or block_table.ndim != 2
+        or block_table.shape[0] != values.shape[0]
+    ):
+        raise ValueError("context lengths and block table must have one row per query")
+    if packed:
+        if indices is None:
+            raise ValueError("MXFP4 paged indexer requires real request indices")
+        indices = indices.to(device=values.device, dtype=torch.int32).contiguous()
+        if indices.ndim != 1 or indices.numel() != values.shape[0]:
+            raise ValueError("request indices must contain one owner per query row")
+        # Give zero-context graph padding rows distinct dummy groups.
+        dummy_ids = -torch.arange(
+            1, values.shape[0] + 1, device=values.device, dtype=torch.int32
+        )
+        indices = torch.where(context_lens[:, 0] == 0, dummy_ids, indices)
+        q = (values.contiguous().view(torch.int8), q[1].contiguous())
+        dtype, head_dim = torch.int8, values.shape[-1] * 2
+        weights = weights.to(torch.bfloat16).contiguous()
+        fn = deep_gemm.fp8_fp4_paged_mqa_logits
+    else:
+        if indices is not None:
+            raise ValueError("FP8/INT8 paged indexer does not accept request indices")
+        dtype, head_dim = values.dtype, values.shape[-1]
+        weights = weights.to(
+            weights.dtype if dtype == torch.int8 else torch.float32
+        ).contiguous()
+        fn = (
+            deep_gemm.int8_paged_mqa_logits
+            if dtype == torch.int8
+            else deep_gemm.fp8_paged_mqa_logits
+        )
+    # Schedules are backend-opaque; do not reuse SGLang JIT or other-device metadata.
+    schedule_meta = sail_paged_mqa_metadata(
+        context_lens, kv_cache.shape[1], values.shape[2], head_dim, dtype, indices
+    )
+    return fn(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_context_len,
+        indices=indices,
+    )
+
+
 def mqa_logits_free_mem_fraction() -> float:
     return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 

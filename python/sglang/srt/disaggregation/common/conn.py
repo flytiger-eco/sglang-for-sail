@@ -325,7 +325,8 @@ class CommonKVManager(BaseKVManager):
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        # Per state component: bytes one of its indices moves (summed over layers).
+        self.state_item_lens_sums = [sum(comp) for comp in args.state_item_lens]
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -382,10 +383,15 @@ class CommonKVManager(BaseKVManager):
         # state and linear-attention head shard r. It transfers as TP rank r of
         # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
         cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        # DSV4.1 CP materializes global token order before cache writes. Split the
+        # replicated page set across CP senders; request-scoped state remains
+        # canonical on CP rank 0 via _get_dsa_cache_transfer_skip_flags.
+        dsv41_dspark_pd = self.dsv41_spec_layout is not None
         self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            or dsv41_dspark_pd
             # No sharded rank holds a full page, so every CP rank sends.
             or self.kv_shard_size > 1
         )
@@ -549,7 +555,10 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -566,8 +575,9 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
+            is_draft_entry = i >= num_entries - num_draft
             dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
+                dst_dcp_size if is_draft_entry and not draft_rows_collapsed else 1
             )
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(
@@ -1372,20 +1382,31 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-
-            decode_tp_size_aligns_prefill_world_size = (
-                info.attn_cp_size > 1
-                and (self.is_mla_backend or self.is_hybrid_mla_backend)
-                and self.attn_cp_size == 1
-                and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
-            )
+            if self.attn_cp_size != 1:
+                raise RuntimeError("DeepSeek-V4.1 DSpark PD requires Decode CP=1")
+            # MQA KV rows, target/draft SWA and C2 request state are not
+            # head-sharded. With attention TP=1 on both sides, prefill CP splits
+            # one request's pages while decode attention DP assigns whole requests;
+            # every decode request therefore waits for all prefill CP senders.
+            if self.attn_dp_size > 1 and self.attn_tp_size != 1:
+                raise RuntimeError(
+                    "DeepSeek-V4.1 DSpark PD with Decode attention DP requires "
+                    "attention TP=1"
+                )
+            prefill_attention_width = info.attn_tp_size * info.attn_cp_size
+            decode_attention_width = self.attn_tp_size * self.attn_dp_size
+            independent_cp_dp = info.attn_tp_size == self.attn_tp_size == 1
             if (
-                info.attn_tp_size != self.attn_tp_size
-                and not decode_tp_size_aligns_prefill_world_size
+                not independent_cp_dp
+                and prefill_attention_width != decode_attention_width
             ):
                 raise RuntimeError(
-                    "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
-                    "servers (including prefill CP ranks for MLA)"
+                    "DeepSeek-V4.1 DSpark PD with attention TP>1 requires "
+                    "matching Prefill TP*CP and Decode attention TP*DP widths; "
+                    "independent CP/DP sizes require attention TP=1 on both "
+                    "servers: "
+                    f"prefill={info.attn_tp_size}x{info.attn_cp_size}, "
+                    f"decode={self.attn_tp_size}x{self.attn_dp_size}"
                 )
 
         # Every send path rejects head-sharded MXFP8 block scales across
@@ -2135,6 +2156,7 @@ class CommonKVSender(BaseKVSender):
             if not self.trace_ctx.tracing_enable:
                 self.trace_ctx = TraceNullContext()
         self.trace_ctx.trace_req_start()
+        self._transfer_state_bytes = 0
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -2237,9 +2259,7 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
+        total_bytes += self._transfer_state_bytes
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -2252,9 +2272,15 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            # Components index different units (a request slot, one row per
+            # page), so each count is priced by its own component's item lens.
+            for component, component_indices in enumerate(state_indices):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+                    self._transfer_state_bytes += (
+                        len(component_indices)
+                        * self.kv_mgr.state_item_lens_sums[component]
+                    )
 
     def _prepare_send_indices(
         self,
@@ -2458,11 +2484,10 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
+        self.kv_mgr.conclude_failure(
+            bootstrap_room=self.bootstrap_room,
+            failure_reason="Aborted by AbortReq.",
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()

@@ -18,6 +18,33 @@ from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
+# The PPU path drives DeepGEMM's MXFP4 MegaMoE kernels directly instead of the
+# MoE runner, so the build has to expose all four entry points.
+_PPU_MEGA_MOE_DEEP_GEMM_APIS = (
+    "get_symm_buffer_for_mega_moe",
+    "mega_moe_pre_dispatch",
+    "fp4_fp4_mega_moe",
+    "transform_weights_for_mega_moe",
+)
+
+
+def _require_ppu_mega_moe_deep_gemm_apis() -> None:
+    try:
+        import deep_gemm
+    except ImportError as exc:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires the PPU DeepGEMM build"
+        ) from exc
+
+    missing = [
+        name for name in _PPU_MEGA_MOE_DEEP_GEMM_APIS if not hasattr(deep_gemm, name)
+    ]
+    if missing:
+        raise ValueError(
+            "--moe-a2a-backend megamoe on PPU requires a DeepGEMM build with the "
+            "PPU MegaMoE entry points; missing: " + ", ".join(missing)
+        )
+
 
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
@@ -36,7 +63,11 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
-    if not (
+    if platform.is_ppu:
+        if platform.device_sm < 89:
+            raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
+        _require_ppu_mega_moe_deep_gemm_apis()
+    elif not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
     ):
@@ -52,6 +83,9 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",
@@ -170,6 +204,22 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
+        if model_label == "KimiK31ForConditionalGeneration":
+            # Kimi repacks its experts at load and has no oversized eager fallback.
+            if cfg.max_running_requests is None:
+                raise ValueError(
+                    "Kimi MegaMoE needs --max-running-requests to bound eager decode / verify rows."
+                )
+            eager_requests = ceil_align(
+                cfg.max_running_requests // cfg.attn_dp_size,
+                cfg.tp_size // cfg.attn_dp_size,
+            )
+            tokens_per_request = (
+                (cfg.speculative_num_draft_tokens or 1)
+                if cfg.speculative_algorithm
+                else 1
+            )
+            decode_tokens = max(decode_tokens, eager_requests * tokens_per_request)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "
@@ -196,21 +246,31 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             "token requirement would not have a strict prefill-forward bound."
         )
 
+    prefill_tokens = cfg.chunked_prefill_size
+    kimi = model_label == "KimiK31ForConditionalGeneration"
+    if kimi:
+        prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
+        graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
+        if graph is not None and graph.backend != "disabled":
+            prefill_tokens = max(
+                prefill_tokens, graph.max_bs or 0, max(graph.bs or [0])
+            )
+
     if cfg.enable_prefill_cp:
         token_partition_size = cfg.attn_cp_size
         token_partition_name = "attn_cp_size"
-        token_alignment = 1
+        token_alignment = token_partition_size if kimi else 1
         local_chunked_prefill_size = (
-            cfg.chunked_prefill_size + token_partition_size - 1
+            prefill_tokens + token_partition_size - 1
         ) // token_partition_size
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
-        token_partition_name = "attn_dp_size"
+        token_partition_name = "attn_dp_size (already applied)"
         token_alignment = max(
             cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+        local_chunked_prefill_size = cfg.chunked_prefill_size
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1
@@ -220,7 +280,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             cfg.tp_size // token_partition_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size
+        local_chunked_prefill_size = prefill_tokens
 
     if local_chunked_prefill_size <= 0:
         raise ValueError(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-dynamic = ["version"]
+version = "0.5.23"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -164,6 +164,13 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/hardware-platforms/sail
 srt_sail = [
+  "acext>=1.1.0",
+  "cuda-python>=13.0",
+  "deep_ep",
+  "deep_gemm>=1.1.0",
+  "flash_attn_3",
+  "flash_mla",
+  "msa_for_sail==0.1.1",
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch-for-sail",

@@ -13,8 +13,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    sail_mqa_logits,
+    sail_paged_mqa_logits,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, get_device_sm, is_sail
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 
@@ -29,11 +31,20 @@ def _is_sm100() -> bool:
 
 
 @functools.cache
+def _auto_bf16_index_logits() -> bool:
+    """bf16 where the ranking kernels take bf16 scores: SM100, and SAIL/PPU from
+    sm89, where the precompiled DeepSelect wheel is the bf16 top-k."""
+    if is_sail():
+        return get_device_sm() >= 89
+    return _is_sm100()
+
+
+@functools.cache
 def index_logits_dtype() -> torch.dtype:
-    """bf16 on SM100, where the reference kernels score in bf16; fp32 elsewhere.
+    """bf16 where the reference kernels score in bf16; fp32 elsewhere.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS, when set, overrides the choice."""
     forced = envs.SGLANG_OPT_DSV41_BF16_INDEX_LOGITS.get()
-    bf16 = _is_sm100() if forced is None else forced
+    bf16 = _auto_bf16_index_logits() if forced is None else forced
     return torch.bfloat16 if bf16 else torch.float32
 
 
@@ -41,6 +52,8 @@ def index_logits_dtype() -> torch.dtype:
 def index_weights_dtype() -> torch.dtype:
     """DeepGEMM reduces in the head weights' dtype and takes bf16 weights only on
     SM100 with bf16 logits."""
+    if is_sail():
+        return torch.bfloat16
     if index_logits_dtype() == torch.bfloat16 and _is_sm100():
         return torch.bfloat16
     return torch.float32
@@ -93,6 +106,14 @@ def flat_index_logits_tiles(
     width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
     if rows == 0 or width == 0:
         return
+    if is_sail():
+        max_logits_mb = envs.SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB.get()
+        if max_logits_mb <= 0:
+            raise ValueError("SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB must be positive")
+        # PPU obeys the same MB knob as the INT8 indexer in place of the
+        # caller's generic budget; the sliced tile is its only live logits
+        # tensor, so the planner's row accounting applies as-is.
+        budget_bytes = max_logits_mb * 1024 * 1024
     rows_per_chunk = flat_index_logits_rows_per_tile(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
@@ -100,20 +121,27 @@ def flat_index_logits_tiles(
     logits_dtype = index_logits_dtype()
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
-        tile_starts = starts[tile]
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
+        if is_sail():
+            logits = sail_mqa_logits(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
-                tile_starts,
-                tile_starts + lengths[tile],
+                starts[tile],
+                starts[tile] + lengths[tile],
+                max_seqlen_k=width,
+            )
+        else:
+            logits = fp8_fp4_mqa_logits(
+                (q[0][tile], q[1][tile]),
+                kv,
+                weights[tile],
+                starts[tile],
+                starts[tile] + lengths[tile],
                 False,
                 width,
                 logits_dtype=logits_dtype,
-            ),
-        )
+            )
+        yield tile, logits
 
 
 def deep_gemm_fp4_paged_mqa_logits(
@@ -124,10 +152,23 @@ def deep_gemm_fp4_paged_mqa_logits(
     page_table: torch.Tensor,
     deep_gemm_metadata,
     max_seq_len: int,
+    *,
+    indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
     from deep_gemm import fp8_fp4_paged_mqa_logits
 
+    if is_sail():
+        return sail_paged_mqa_logits(
+            q_fp4,
+            k_cache,
+            weights,
+            seq_lens,
+            page_table,
+            deep_gemm_metadata,
+            max_seq_len,
+            indices=indices,
+        )
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)

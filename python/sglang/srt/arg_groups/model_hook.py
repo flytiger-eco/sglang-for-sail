@@ -21,6 +21,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
+    decode_state_free_radix_of,
     mamba_cache_chunk_size,
     mamba_extra_buffer_of,
     model_config_of,
@@ -45,6 +46,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     get_quantization_config,
     is_mps,
+    is_sail,
     parse_connector_type,
 )
 
@@ -239,6 +241,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -276,6 +279,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -429,6 +433,20 @@ def handle_model_specific_adjustments(server_args: Any):
                     ),
                 )
 
+            # A captured prefill graph pins MLA to the absorbed path, which
+            # hands the backend a non-None q_v; the PPU FA3 interface rejects
+            # that argument, so MLA prefill must stay eager on PPU.
+            if is_sail() and use_mla_backend(server_args):
+                declare_resolution(
+                    server_args,
+                    "_handle_model_specific_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        backend=Backend.DISABLED,
+                    ),
+                )
+
         # Set moe backend for DeepSeek: the sm100 quant/moe resolution
         # moved to the resolution pipeline (arg_groups/overrides.py:
         # _deepseek_moe_quant_resolution -- a slot pass, because the DSA
@@ -475,7 +493,7 @@ def handle_model_specific_adjustments(server_args: Any):
             validate_deepseek_v41_features,
         )
 
-        # Before the CP validation: V4.1 rejects CP outright, the actionable message.
+        # Validate V4.1 features before resolving the CP topology.
         validate_deepseek_v41_features(server_args)
         validate_deepseek_v4_cp(server_args)
 
@@ -1072,7 +1090,9 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so neither the extra buffer
+        # nor no_buffer's page-1 / non-overlap requirements apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

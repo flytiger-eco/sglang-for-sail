@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_sail, logger
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -96,6 +96,51 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     return None
 
 
+def needs_intermediate_states(
+    track_ssm: bool, track_ssm_h_src: Optional[torch.Tensor]
+) -> bool:
+    """Whether an extend batch must run a kernel that emits per-chunk states.
+
+    ``track_ssm_h_src`` carries one row per chunk-unaligned tracked sequence
+    (see ``MambaAttnBackendBase._init_track_ssm_indices``). Chunk-aligned
+    tracked sequences snapshot the final state from ``ssm_states`` instead, so
+    for them the intermediate states are never read and must not be requested
+    -- asking for them forces kernels that cannot emit ``h`` (e.g. the PPU PLA
+    FlashKDA path) onto the Triton fallback.
+    """
+    return bool(
+        track_ssm and track_ssm_h_src is not None and track_ssm_h_src.numel() > 0
+    )
+
+
+def ppu_pla_prefill_default(model_config) -> Optional[str]:
+    """This runner's PPU prefill default: the SAIL PLA kernel for KDA models.
+
+    Returned as a *per-runner default* (fed into
+    ``resolve_linear_attn_backends(prefill_default=...)``) rather than written
+    into the process-wide ``--linear-attn-prefill-backend`` value, because a
+    target and its speculative draft coexist in one process and can want
+    different prefill kernels. KDA target models opt in here; a draft runner
+    whose model is GDN keeps its own backend (GDNKernelDispatcher has no
+    FlashKDA prefill kernel and rejects it). An explicit
+    ``--linear-attn-prefill-backend`` still wins over this default.
+    """
+    if not is_sail():
+        return None
+    # The SAIL PLA master gate guards the PLA kernels (same gate as decode).
+    if not envs.SGLANG_SAIL_PLA_CUDA.get():
+        return None
+    try:
+        hf_config = model_config.hf_config
+    except Exception:  # noqa: BLE001 - resolution must not fail on this probe
+        return None
+    from sglang.srt.configs.model_config import uses_kda_attention
+
+    if not uses_kda_attention(hf_config):
+        return None
+    return "flashkda"
+
+
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
 
@@ -105,6 +150,21 @@ class KDAKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: LinearAttnKernelBackend,
     ):
+        if is_sail():
+            if (
+                not decode_backend.is_triton()
+                or not (prefill_backend.is_triton() or prefill_backend.is_flashkda())
+                or not verify_backend.is_triton()
+            ):
+                rank0_log(
+                    "SAIL KDA only supports fused decode and FlashKDA prefill; "
+                    "using Triton for unsupported backends."
+                )
+            decode_backend = LinearAttnKernelBackend.TRITON
+            if not prefill_backend.is_flashkda():
+                prefill_backend = LinearAttnKernelBackend.TRITON
+            verify_backend = LinearAttnKernelBackend.TRITON
+
         self.verify_backend = verify_backend
         self.prefill_backend = prefill_backend
         triton_kernel = TritonKDAKernel()
@@ -274,10 +334,14 @@ class KDAKernelDispatcher:
             self.decode_kernel, "supports_packed_decode_safe_gate", False
         )
 
+        extend_name = self.extend_kernel.__class__.__name__
+        if is_sail() and extend_name == "FlashKDAKernel":
+            # On PPU the FlashKDA backend interface is served by SAIL PLA.
+            extend_name += "(PLA)"
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"verify={self.verify_kernel.__class__.__name__}, "
-            f"extend={self.extend_kernel.__class__.__name__} "
+            f"extend={extend_name} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -433,7 +497,7 @@ class KDAKernelDispatcher:
         kernel = self.effective_extend_kernel(
             kwargs.get("lower_bound"), q.shape[1], query_start_loc.numel() - 1
         )
-        return kernel.extend(
+        result = kernel.extend(
             q,
             k,
             v,
@@ -444,6 +508,14 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
+        # Backends disagree on the "no intermediate states" contract: Triton and
+        # FlashKDA return a bare output tensor, while CuteDSL always returns
+        # ``(out, None)`` even when ``return_intermediate_states`` is False.
+        # Normalize here so callers never have to know which kernel ran (an
+        # un-normalized tuple used to leak into tensor ops on the CuteDSL path).
+        if isinstance(result, tuple):
+            return result
+        return result, None
 
 
 def ragged_verify_dense_scatter_indices(
@@ -926,6 +998,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     scale=layer.head_k_dim**-0.5,
                     onorm_eps=onorm_eps,
                     lower_bound=layer.lower_bound,
+                    fused_weight=getattr(layer, "_k3_fused_decode_weight", None),
+                    actual_batch_size=getattr(
+                        forward_batch, "_original_batch_size", None
+                    ),
                 )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
@@ -1143,7 +1219,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.float32,
                 device=ssm_states.device,
             )
-        core_attn_out = self.kernel_dispatcher.extend(
+        # Per-chunk states (h) are only consumed by chunk-unaligned tracked rows
+        # (track_ssm_h_src rows of h). Chunk-aligned tracked rows copy the final
+        # state from ssm_states and snapshot-buffer rows read h_track_buf, so
+        # neither needs h. Asking for it unconditionally forced every tracked
+        # prefill onto kernels that can emit per-chunk states, which kept the
+        # PPU PLA extend kernel out of the dense path entirely.
+        need_intermediate_states = needs_intermediate_states(
+            track_ssm, self.forward_metadata.track_ssm_h_src
+        )
+        core_attn_out, h = self.kernel_dispatcher.extend(
             q=q,
             k=k,
             v=v,
@@ -1162,7 +1247,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
+            return_intermediate_states=need_intermediate_states,
             # Which global chunk rows of h the track snapshot will read; lets
             # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
@@ -1182,11 +1267,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if track_ssm:
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
-            # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
+            # ping-pong track slots (see _init_track_ssm_indices). The
+            # dispatcher normalizes every kernel to ``(out, h)``; h is only
+            # meaningful when this batch asked for it (see
+            # need_intermediate_states), so drop it otherwise.
             self._track_mamba_state_extend(
                 forward_batch,
-                h,
+                h if need_intermediate_states else None,
                 ssm_states,
                 self.forward_metadata,
                 h_track_buf=h_track_buf,
@@ -1276,7 +1363,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
             forward_batch.req_pool_indices,
-            cache_indices[: query_start_loc.shape[0] - 1] >= 0,
+            lambda: cache_indices[: query_start_loc.shape[0] - 1] >= 0,
             self.req_to_token_pool.size,
         )
 
@@ -1314,6 +1401,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
         if ragged_layout is None:
+            physical_num_tokens = seq_len
+            # Derive logical token count via host-side arithmetic to avoid
+            # GPU->CPU sync (illegal during CUDA graph capture).  In the dense
+            # verify branch, query_start_loc == arange(0, physical+1,
+            # draft_token_num), so logical = floor(physical / draft) * draft.
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
@@ -1371,6 +1463,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     lower_bound=layer.lower_bound,
                     **ring_kwargs,
                 )
+            logical_num_tokens = batch_size * draft_token_num
+            if logical_num_tokens < physical_num_tokens:
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens] if a.ndim >= 3 else a[:logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+                seq_len = logical_num_tokens
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1467,6 +1565,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # stay finite. Uncovered == clamped-to-ghost.
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
+
+        # Pad output back to physical length if we trimmed (mirrors forward_extend)
+        if ragged_layout is None and logical_num_tokens < physical_num_tokens:
+            pad = core_attn_out.new_zeros(
+                (1, physical_num_tokens - logical_num_tokens)
+                + tuple(core_attn_out.shape[2:])
+            )
+            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+
         return core_attn_out
 
     def _can_run_fused_chain_verify(
@@ -1729,18 +1836,23 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token: Optional[torch.Tensor],
         replayssm_rawv: Optional[torch.Tensor],
     ) -> bool:
-        """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
-        if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
-            return False
-        if importlib.util.find_spec("cutlass") is None:
-            return False
-        if torch.cuda.get_device_capability()[0] != 10:
-            return False
+        """Check the fused dense KDA verify contract for PLA or CuTe DSL."""
+        use_pla = is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get()
+        if not use_pla:
+            if (
+                not self.kernel_dispatcher.verify_backend.is_nv_cutedsl()
+                or not is_cuda()
+            ):
+                return False
+            if importlib.util.find_spec("cutlass") is None:
+                return False
+            if torch.cuda.get_device_capability()[0] != 10:
+                return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
-        # specialized per block size and capped at 8 by shared-memory growth.
-        if not 2 <= draft_token_num <= 8:
+        # CuTe retains its eight-token shared-memory limit; PLA stages the
+        # recurrent state independently of the verification window.
+        if not 2 <= draft_token_num <= (16 if use_pla else 8):
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
@@ -1784,6 +1896,58 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
             return False
+        if use_pla:
+            # PLA verify writes raw-input rings, not per-token SSM snapshots.
+            # Unsupported serving layouts keep the existing Triton path.
+            if intermediate_state_cache is not None or replayssm_rawv is None:
+                return False
+            cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            rings = (
+                replayssm_rawv,
+                cache.replayssm_rawk,
+                cache.replayssm_g,
+                cache.replayssm_beta,
+            )
+            dtypes = (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
+            if any(t is None or t.dtype != dtype for t, dtype in zip(rings, dtypes)):
+                return False
+            if (
+                layer.A_log.dtype != torch.float32
+                or layer.dt_bias.dtype != torch.float32
+            ):
+                return False
+            if (
+                conv_states.dtype != torch.bfloat16
+                or intermediate_conv_window_cache.dtype != torch.bfloat16
+            ):
+                return False
+            seq_len, dim = mixed_qkv.shape[0], layer.num_v_heads * 128
+            if (
+                mixed_qkv.shape[1] != 3 * dim
+                or mixed_qkv.stride(-1) != 1
+                or a.shape
+                not in (
+                    (seq_len, dim),
+                    (1, seq_len, dim),
+                    (1, seq_len, layer.num_v_heads, 128),
+                )
+                or b.shape
+                not in ((seq_len, layer.num_v_heads), (1, seq_len, layer.num_v_heads))
+                or a.stride(-1) != 1
+                or b.stride(-1) != 1
+                or (a.ndim == 4 and a.stride(-2) != 128)
+            ):
+                return False
+            # PLA reads/writes conv windows by stride; commit accepts either
+            # dense axis order for conv state.
+            if not intermediate_conv_window_cache.is_contiguous() and any(
+                s <= 0 for s in intermediate_conv_window_cache.stride()
+            ):
+                return False
+            return (
+                conv_states.is_contiguous()
+                or conv_states.transpose(-1, -2).is_contiguous()
+            ) and all(t.is_contiguous() for t in (ssm_states, *rings))
         if intermediate_state_cache is None:
             # ReplaySSM: the ring replaces the per-step snapshots. The kernel
             # wrapper validates ring layout/dtypes and raises loudly (there is
@@ -1818,9 +1982,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.kda_decode_mtp import (
-            fused_kda_decode_mtp_dspark,
-        )
+        use_pla = is_sail() and envs.SGLANG_SAIL_PLA_CUDA.get()
+        if use_pla:
+            from pla.decode import kda_mtp_sglang
+
+            fused_kda_decode_mtp_dspark = kda_mtp_sglang.fused_kda_decode_mtp_dspark
+        else:
+            from sglang.kernels.ops.attention.kda_decode_mtp import (
+                fused_kda_decode_mtp_dspark,
+            )
 
         seq_len = mixed_qkv.shape[0]
         h = layer.num_v_heads
@@ -1868,8 +2038,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cs_q=cs_q,
             cs_k=cs_k,
             cs_v=cs_v,
-            g=a,
-            beta=b,
+            g=a.view(1, seq_len, h, 128) if use_pla else a,
+            beta=b.view(1, seq_len, h) if use_pla else b,
             A_log=layer.A_log.reshape(-1),
             dt_bias=layer.dt_bias.reshape(-1),
             recurrent_state=ssm_states,
@@ -1890,6 +2060,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
         )
+        if use_pla:
+            logger.info_once(
+                "USE PPU SAIL CUDA PLA kernel: fused_kda_decode_mtp_dspark (direct layout)"
+            )
         if apply_onorm:
             layer._k3_onorm_consumed = True
         return out

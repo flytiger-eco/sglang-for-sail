@@ -100,6 +100,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -1563,6 +1564,33 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
 
+        sender = req.disagg_kv_sender
+        async_indices = (
+            # Only Mooncake's worker consumes the async host snapshots under
+            # indices_event. Other backends keep synchronous .cpu().numpy().
+            getattr(sender, "supports_host_tensor_indices", False)
+            and get_disagg().disaggregation_transfer_backend == "mooncake"
+            # KV-sharded sends filter host values before enqueueing them.
+            # Preserve the existing CP transfer compatibility gate as well.
+            and getattr(sender.kv_mgr, "kv_shard_size", 1) == 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
+        )
+
+        def _host_indices(indices):
+            if async_indices:
+                # NumPy retains the pinned tensor storage without reading it.
+                # The transfer worker waits on indices_event before consuming
+                # either KV pages or state indices. Resolve mappings here so
+                # PP and pending-bootstrap sends use the same readback path.
+                return async_d2h(indices).numpy()
+            return indices.cpu().numpy()
+
+        def _page_indices(indices):
+            return _host_indices(indices[::page_size] // page_size)
+
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -1576,13 +1604,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.kv.req_pool_idx
-                        ]
+                    _host_indices(
+                        self.req_to_token_pool.translate_mamba_indices(
+                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                                req.kv.req_pool_idx
+                            ]
+                        )
                     )
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -1609,13 +1637,20 @@ class SchedulerDisaggregationPrefillMixin:
                         window_kv_indices_full
                     )
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
+                return _page_indices(window_kv_indices_swa)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
-                return kv_to_page_indices(kv_indices_full, page_size)
+                return _page_indices(kv_indices_full)
+
+            def _dsa_pages_payload():
+                return _page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
+                )
 
             def _minimax_payload():
                 return minimax_index_transfer_pages(

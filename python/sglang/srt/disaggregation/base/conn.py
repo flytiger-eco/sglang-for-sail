@@ -73,6 +73,8 @@ class KVArgs:
     aux_data_lens: List[int]
     aux_item_lens: List[int]
     state_types: List[StateType]
+    # Whether recurrent state is head-sharded over attention CP instead of TP.
+    mamba_state_shard_on_attn_cp: bool = False
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
@@ -94,6 +96,9 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    # Decode side: its draft pool stores DCP owner rows, so PD transfer maps
+    # the draft like the target instead of raw widened rows.
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

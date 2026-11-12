@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
@@ -57,6 +62,15 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.adler32:adler32_strided_checksum",
         capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
 register_kernel(

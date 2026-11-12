@@ -486,6 +486,11 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
 def draft_attn_parallel_group() -> str:
     """The group an attention-owning draft uses, resolved in the target scope.
 
@@ -1824,6 +1829,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
 _PLATFORM_PROBES: Dict[str, str] = {
     "is_cuda": "is_cuda",
     "is_hip": "is_hip",
+    "is_ppu": "is_sail",
     "is_npu": "is_npu",
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",

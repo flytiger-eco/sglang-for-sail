@@ -1828,7 +1828,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if self.is_layer_sparse or hidden_states.shape[0] != 0:
+            if self.is_layer_sparse:
+                hidden_states = self.mlp(
+                    hidden_states=hidden_states, forward_batch=forward_batch
+                )
+            elif hidden_states.shape[0] != 0:
                 hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return ffn_exit.finish(hidden_states)
 
@@ -1975,7 +1979,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        # no index_v_proj in the M3 checkpoint
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }

@@ -659,6 +659,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
+        kv_args.draft_rows_dcp_collapsed = (
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool.rows_are_dcp_collapsed
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
@@ -863,12 +867,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len = self._pre_alloc_fill_len(req)
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be
-        # freshly allocated, including when the prefix comes from L2/L3.
+        # freshly allocated, including when the prefix comes from L2/L3. Prefill
+        # always sends the final Mamba state, so a Mamba tree needs no cached
+        # state at the hit: match FULL KV past the last one.
+        full_kv_only = self.tree_cache.supports_full_kv_only_match()
         result = match_kv_cache(
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and not full_kv_only,
+            full_kv_only=full_kv_only,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)

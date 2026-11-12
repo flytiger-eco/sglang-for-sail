@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
     get_minimax_sparse_score_type,
+    get_minimax_sparse_window_blocks,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -24,6 +24,7 @@ from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_spec,
 )
@@ -126,7 +127,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(
-            resolving_view(runner.server_args)
+            SimpleNamespace(
+                kv_cache_dtype=runner.kv_cache_dtype_str,
+                attention_backend=get_exec().kernel.attention_backend,
+            )
         )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
@@ -162,23 +166,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
         self._linear_verify_meta: Optional[SimpleNamespace] = None
+        # TARGET_VERIFY pre/post-write KV lengths derived INSIDE the decode graph
+        # (init_forward_metadata_in_graph), so a replay reads that step's seq_lens
+        # instead of the capture-time fill value. None on the eager path.
+        self._graph_verify_meta: Optional[SimpleNamespace] = None
 
         self.block_size_q = 1
         self.block_size_k = sparse_cfg["sparse_block_size"]
-        if "sparse_init_block" in sparse_cfg:
-            self.init_blocks = sparse_cfg["sparse_init_block"]
-        else:
-            init_tokens = sparse_cfg["sparse_init_tokens"]
-            self.init_blocks = (
-                init_tokens + self.block_size_k - 1
-            ) // self.block_size_k
-        if "sparse_local_block" in sparse_cfg:
-            self.local_blocks = sparse_cfg["sparse_local_block"]
-        else:
-            local_tokens = sparse_cfg["sparse_local_tokens"]
-            self.local_blocks = (
-                local_tokens + self.block_size_k - 1
-            ) // self.block_size_k + 1
+        self.init_blocks, self.local_blocks = get_minimax_sparse_window_blocks(
+            sparse_cfg
+        )
         self.topk_blocks = sparse_cfg["sparse_topk_blocks"]
         if self.hisparse_coordinator is not None:
             selected_tokens = self.topk_blocks * self.block_size_k
@@ -338,6 +335,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
         self._topk_cache: dict = {}
         self._topk_cache_owner: Optional[ForwardBatch] = None
+        # For CUDA-graph capture of TARGET_VERIFY batches: the sparse prefill
+        # kernel requires seq_lens >= extend_seq_lens (i.e. prefix_lens >= 0).
+        # During capture seq_lens is initialised from
+        # get_cuda_graph_seq_len_fill_value(), which must be ≥ draft_token_num
+        # when speculative decoding is active.
+        _spec_alg = spec.speculative_algorithm
+        if _spec_alg is not None:
+            self._spec_draft_token_num = max(spec.speculative_num_draft_tokens or 1, 1)
+        else:
+            self._spec_draft_token_num = 0
 
         from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
             make_indexer_cp,
@@ -417,6 +424,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        # Dropped per forward; only init_forward_metadata_in_graph (a captured
+        # op) may install graph-owned verify lengths for this capture.
+        self._graph_verify_meta = None
         # New forward -> drop the per-forward index-cache top-k (prefill only).
         if self.index_cache_enabled:
             self._topk_cache = {}
@@ -448,21 +458,30 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
         else:
-            self._max_seqlen_q = 1
+            # TARGET_VERIFY: infer max query length from spec_info so the sparse
+            # prefill kernel gets the correct query block layout.
+            spec_info = getattr(forward_batch, "spec_info", None)
+            if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+                self._max_seqlen_q = spec_info.draft_token_num
+            else:
+                self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (
-                (self.is_npu or self.is_hip)
-                and forward_batch.forward_mode.is_target_verify()
-            )
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
-                self._max_seqlen_k += self.speculative_num_draft_tokens
+            if forward_batch.forward_mode.is_target_verify():
+                # TARGET_VERIFY keeps seq_lens at the committed prefix and
+                # writes draft_token_num new KV entries after it.
+                spec_info = getattr(forward_batch, "spec_info", None)
+                if spec_info is not None and hasattr(spec_info, "draft_token_num"):
+                    self._max_seqlen_k += int(spec_info.draft_token_num)
+                elif self.is_hip:
+                    self._max_seqlen_k += self.speculative_num_draft_tokens
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -567,8 +586,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
-            if self.is_hip and forward_batch.forward_mode.is_target_verify():
-                self._init_rocm_linear_verify_metadata(forward_batch)
+            if forward_batch.forward_mode.is_target_verify():
+                # TARGET_VERIFY's pre/post-write KV lengths depend on the live
+                # seq_lens; deriving them here makes them captured ops that
+                # re-run on every replay with the refreshed seq_lens buffer.
+                # Computing them in forward_extend would freeze the capture
+                # fill value into the graph and verify against a bogus prefix.
+                ndt = int(self.speculative_num_draft_tokens or 0)
+                if ndt > 0:
+                    base = forward_batch.seq_lens.to(torch.int32)
+                    self._graph_verify_meta = SimpleNamespace(
+                        prefix_lens=base,
+                        seq_lens=base + ndt,
+                    )
+                    # Warmups and the capture run share one ForwardBatch, so the
+                    # per-forward seqblock cache would otherwise hand the capture
+                    # run warmup-allocated (non-graph-pool) lengths and the graph
+                    # would bind stale/garbage prefix lengths at replay.
+                    self._prefill_seqblock_meta = None
+                if self.is_hip:
+                    self._init_rocm_linear_verify_metadata(forward_batch)
             return
         # Layer-invariant decode/verify metadata as captured ops (re-read at replay).
         fm = forward_batch.forward_mode
@@ -615,7 +652,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         pass
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1
+        # The sparse prefill kernel requires seq_lens >= extend_seq_lens.
+        # For TARGET_VERIFY capture, extend_seq_lens == draft_token_num, so
+        # seq_lens must be at least that large (see _spec_draft_token_num above).
+        return max(1, self._spec_draft_token_num)
 
     def _merge_sparse_blocks(
         self,
@@ -1391,7 +1431,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
 
-    def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
+    def _resolve_extend_meta(
+        self,
+        forward_batch: ForwardBatch,
+        q: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+    ):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
         # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
         # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
@@ -1419,19 +1464,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             m = self._extend_meta
             return m.cu_seqlens, m.seq_lens, m.prefix_lens
 
+        resolved_extend_seq_lens = (
+            forward_batch.extend_seq_lens if self.is_npu else extend_seq_lens
+        )
         cu_seqlens = torch.cat(
             [
                 torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
+                    1, dtype=torch.int32, device=resolved_extend_seq_lens.device
                 ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
+                resolved_extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
             ]
         )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-        if forward_batch.extend_prefix_lens is not None:
+        base_seq_lens = forward_batch.seq_lens.to(torch.int32)
+        if forward_batch.forward_mode.is_target_verify() and not self.is_npu:
+            # EAGLE TARGET_VERIFY leaves seq_lens at the committed prefix. The
+            # draft tokens are written after it, so sparse attention needs the
+            # pre-write prefix and post-write total KV lengths separately.
+            # Under a decode graph use the lengths init_forward_metadata_in_graph
+            # derived inside the captured region: those re-read each replay's
+            # seq_lens, whereas the tensors built below are frozen at capture.
+            gm = self._graph_verify_meta
+            if gm is not None:
+                prefix_lens, seq_lens = gm.prefix_lens, gm.seq_lens
+            else:
+                prefix_lens = base_seq_lens
+                seq_lens = base_seq_lens + resolved_extend_seq_lens
+        elif forward_batch.extend_prefix_lens is not None:
+            seq_lens = base_seq_lens
             prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            seq_lens = base_seq_lens
+            prefix_lens = (
+                torch.zeros_like(seq_lens)
+                if self.is_npu
+                else seq_lens - resolved_extend_seq_lens
+            )
 
         # NPU cache write.
         if self.is_npu:
@@ -1475,6 +1542,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_k=idx_k,
                 idx_v=idx_v,
             )
+
+        # TARGET_VERIFY batches do not populate extend metadata. Materialize it
+        # from spec_info before the shared extend path consumes these fields.
+        # The CPU mirror avoids a device-to-host sync while CUDA graphs capture.
+        if forward_batch.extend_seq_lens is None:
+            spec_info = getattr(forward_batch, "spec_info", None)
+            if spec_info is None or not hasattr(spec_info, "draft_token_num"):
+                raise RuntimeError(
+                    "MiniMax sparse forward_extend called without extend_seq_lens "
+                    f"(forward_mode={forward_batch.forward_mode!r}). "
+                    "If using speculative decoding, ensure spec_info.draft_token_num "
+                    "is set."
+                )
+            draft_token_num = spec_info.draft_token_num
+            bs = forward_batch.seq_lens.shape[0]
+            forward_batch.extend_seq_lens = torch.full(
+                (bs,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+            forward_batch.extend_seq_lens_cpu = [draft_token_num] * bs
+            if forward_batch.extend_prefix_lens is None:
+                forward_batch.extend_prefix_lens = (
+                    forward_batch.seq_lens.to(torch.int32) - draft_token_num
+                ).clamp(min=0)
+
         disable_value = layer.layer_id in self.disable_value_layer_ids
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
@@ -1502,7 +1596,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cached = self._prefill_seqblock_meta
         if cached is None or cached[0] is not forward_batch:
             cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
-                forward_batch, q
+                forward_batch, q, forward_batch.extend_seq_lens
             )
             if self.is_npu:
                 cu_seqblocks_q = max_seqblock_q = all_seqblock_q = None

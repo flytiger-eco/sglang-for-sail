@@ -5,9 +5,16 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.ops.attention.dsa.triton_kernel import _supports_fp8
+from sglang.kernels.ops.attention.dsv4 import (
+    dequantize_k_cache_paged_cuda as _dequantize_k_cache_paged_cuda,
+)
+from sglang.kernels.ops.attention.dsv4 import (
+    dequantize_k_cache_paged_v2_cuda as _dequantize_k_cache_paged_v2_cuda,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_sail, print_warning_once
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -22,6 +29,37 @@ TILE_SIZE = 64  # one nope scale tile = 64 fp8 values
 NUM_SCALE_TILES = DIM_NOPE // TILE_SIZE  # 7
 NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
+
+# One warp per token: the warp then reads that token's 576 cache bytes and
+# writes its 1024 output bytes as contiguous 16-byte vectors. Fastest of
+# 8/16/32 measured on 890.
+VECTORIZED_THREADS_PER_TOKEN = 32
+
+
+def _vector_access_ok(cache_u8: torch.Tensor, out: torch.Tensor) -> bool:
+    """Whether both buffers support the 16-byte accesses the vector kernel needs.
+
+    Warns once per unmet condition when they do not: the scalar fallback is
+    correct but roughly 18x slower, so staying quiet about it would hide a
+    large slowdown behind identical numerics. The message names the failed
+    conditions rather than their pointer values so the warning stays a single
+    line no matter how many distinct buffers trip it.
+    """
+    checks = (
+        ("k_cache data_ptr must be 16-byte aligned", cache_u8.data_ptr() % 16 == 0),
+        ("out data_ptr must be 16-byte aligned", out.data_ptr() % 16 == 0),
+        ("out stride(0) must be a multiple of 8", out.stride(0) % 8 == 0),
+        ("bytes_per_page must be a multiple of 16", cache_u8.shape[-1] % 16 == 0),
+    )
+    failed = [name for name, ok in checks if not ok]
+    if failed:
+        print_warning_once(
+            "dequantize_k_cache_paged is using the scalar kernel instead of the "
+            "vectorized one; results are unaffected but it is ~18x slower. "
+            "Unmet condition(s): " + "; ".join(failed)
+        )
+        return False
+    return True
 
 
 def dequantize_k_cache_paged_dsv4(
@@ -53,17 +91,8 @@ def dequantize_k_cache_paged_dsv4(
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
 
-    # The buffer's dtype is whatever the pool exposes (often bf16); the
-    # underlying storage is uint8. Reinterpret to byte-space first.
     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
     num_tokens = page_table_1_flattened.shape[0]
-    bytes_per_page = quant_k_cache_u8.shape[-1]
-    s_offset_bytes = page_size * NOPE_ROPE_BYTES
-
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
-    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
-    buf_uint8 = quant_k_cache_u8.reshape(-1)
 
     if out is None:
         out = torch.empty(
@@ -75,26 +104,51 @@ def dequantize_k_cache_paged_dsv4(
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
 
-    tokens_per_prog = 4
-    _dequantize_k_cache_paged_kernel[(triton.cdiv(num_tokens, tokens_per_prog),)](
-        out,
-        buf_fp8,
-        buf_bf16,
-        buf_uint8,
-        page_table_1_flattened,
-        out.stride(0),
-        num_tokens,
-        BYTES_PER_PAGE=bytes_per_page,
-        PAGE_SIZE=page_size,
-        DIM_NOPE=DIM_NOPE,
-        DIM_ROPE=DIM_ROPE,
-        TILE_SIZE=TILE_SIZE,
-        NUM_SCALE_TILES=NUM_SCALE_TILES,
-        NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
-        PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
-        S_OFFSET_BYTES=s_offset_bytes,
-        TOKENS_PER_PROG=tokens_per_prog,
-    )
+    if is_sail():
+        page_table_i32 = page_table_1_flattened.to(torch.int32)
+        if _vector_access_ok(quant_k_cache_u8, out):
+            _dequantize_k_cache_paged_v2_cuda(
+                out=out,
+                k_cache=quant_k_cache_u8,
+                page_table=page_table_i32,
+                page_size=page_size,
+                use_fp8_native=_supports_fp8(),
+                threads_per_token=VECTORIZED_THREADS_PER_TOKEN,
+            )
+        else:
+            _dequantize_k_cache_paged_cuda(
+                out=out,
+                k_cache=quant_k_cache_u8,
+                page_table=page_table_i32,
+                page_size=page_size,
+                use_fp8_native=_supports_fp8(),
+            )
+    else:
+        bytes_per_page = quant_k_cache_u8.shape[-1]
+        s_offset_bytes = page_size * NOPE_ROPE_BYTES
+        buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+        buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
+        buf_uint8 = quant_k_cache_u8.reshape(-1)
+        tokens_per_prog = 4
+        _dequantize_k_cache_paged_kernel[(triton.cdiv(num_tokens, tokens_per_prog),)](
+            out,
+            buf_fp8,
+            buf_bf16,
+            buf_uint8,
+            page_table_1_flattened,
+            out.stride(0),
+            num_tokens,
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            TILE_SIZE=TILE_SIZE,
+            NUM_SCALE_TILES=NUM_SCALE_TILES,
+            NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+            PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+            S_OFFSET_BYTES=s_offset_bytes,
+            TOKENS_PER_PROG=tokens_per_prog,
+        )
     return out
 
 
@@ -114,6 +168,9 @@ def dequantize_k_cache_paged_v41(
     assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
         supported = is_gfx95_supported()
+    elif is_sail():
+        # SAIL (PPU) runs the same Triton dequant on sm89; verified bit-exact.
+        supported = get_jit_cuda_arch().major >= 8
     else:
         supported = get_jit_cuda_arch().major >= 10
     if not supported:
@@ -373,6 +430,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
     token_data_base = page_byte_base + in_page * DATA_STRIDE
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
@@ -411,6 +471,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
+    # The strides come from KVLayout.row_addressing: block-split layouts keep a
+    # page-level scale block, the interleaved V41_NEW / V41_FP4_NEW put each
+    # token's scales right after its data.
     token_data_base = page_byte_base + in_page * DATA_STRIDE
     token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 

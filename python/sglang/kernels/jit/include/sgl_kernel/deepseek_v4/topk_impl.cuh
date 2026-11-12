@@ -41,6 +41,12 @@
 #include <cooperative_groups.h>
 #endif
 
+// 1: the large-tie radix select resolves equal scores to the smallest indices
+// (built only into the module the DSA decode context-parallel merge uses)
+#ifndef SGL_TOPK_STABLE_TIES
+#define SGL_TOPK_STABLE_TIES 0
+#endif
+
 namespace sglang {
 
 namespace device::topk {
@@ -191,6 +197,7 @@ struct TopKConfig {
   static constexpr uint32_t kTopKItems = (kMaxTopK + kBlockSize - 1) / kBlockSize;
   // tie candidates owned per thread in the strided handle_tie loops
   static constexpr uint32_t kTieItems = kMaxNumTie / kBlockSize;
+  static constexpr bool kStableTies = SGL_TOPK_STABLE_TIES;
   static_assert(kMaxNumTie >= kMaxTopK && kMaxNumTie % kBlockSize == 0 && kBlockSize % kNumWarps == 0);
 
   struct TieHandleSmem {
@@ -336,7 +343,11 @@ struct TopKConfig {
 
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
-  /// num_ties <= kItems * kBlockSize.
+  /// num_ties <= kItems * kBlockSize. Rounds 0-3 select on the score; equal
+  /// scores at the k-th place fill the last slots arbitrarily, unless
+  /// kStableTies: then, while they still outnumber the free slots, rounds 4-7
+  /// select on the inverted index, so they resolve to the smallest indices (the
+  /// `is_greater` order of the small-tie paths).
   template <uint32_t kItems>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
@@ -368,17 +379,19 @@ struct TopKConfig {
     __syncthreads();
     uint32_t total_active = num_ties;
 
+    constexpr int kRounds = kStableTies ? 8 : 4;
 #pragma unroll
-    for (int round = 0; round < 4; round++) {
-      const uint32_t shift = 24 - round * 8;
+    for (int round = 0; round < kRounds; round++) {
+      const uint32_t shift = 24 - (round % 4) * 8;
       const auto hist_idx = round % 2;
       const auto histogram = smem->histogram[hist_idx];
+      const auto radix_key = [&](uint32_t i) { return round < 4 ? key[i] : ~idx[i]; };
 
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
-        if (active[i]) atomicAdd(&histogram[(key[i] >> shift) & 0xFFu], 1);
+        if (active[i]) atomicAdd(&histogram[(radix_key(i) >> shift) & 0xFFu], 1);
       }
-      if (round < 3 && tx < kRadixSize) {
+      if (round < kRounds - 1 && tx < kRadixSize) {
         smem->histogram[hist_idx ^ 1][tx] = 0;
       }
       __syncthreads();
@@ -403,26 +416,29 @@ struct TopKConfig {
       __syncthreads();
 
       const auto [threshold_bin, above_count, equal_count] = smem->match;
-      if (round < 3) total_active = equal_count;
+      total_active = equal_count;
       topk_remain -= above_count;
+      // Stable: once the whole threshold bin fits, take it (round 7 always ends
+      // here since indices are unique). Otherwise round 3 takes it as is.
+      const bool last = kStableTies ? equal_count == topk_remain : round == kRounds - 1;
 
       // 4. Scatter
 #pragma unroll
       for (uint32_t i = 0; i < kItems; ++i) {
         if (!active[i]) continue;
-        const uint32_t bin = (key[i] >> shift) & 0xFFu;
+        const uint32_t bin = (radix_key(i) >> shift) & 0xFFu;
         if (bin > threshold_bin) {
           write_pos[i] = atomicAdd(&smem->counter, 1);
           active[i] = false;
         } else if (bin < threshold_bin) {
           active[i] = false;
-        } else if (round == 3) {
+        } else if (last) {
           write_pos[i] = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
         }
-        // my_bin == thr && round < 3: stay active for next round
+        // my_bin == thr && !last: stay active for next round
       }
 
-      if (round == 3 || topk_remain == 0) break;
+      if (last || topk_remain == 0) break;
     }
 
 #pragma unroll
@@ -767,6 +783,117 @@ struct TopKRegister : TopKRadixBase<12> {
       // Buffer holds an arrival-order subset; re-stage it on the exact key.
       refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
     }
+    const auto count_gt = smem->count_gt;
+    const auto count_eq = smem->count_eq;
+    const auto remain_topk = count_gt < topk ? topk - count_gt : 0;
+    const auto tie_count = min(count_eq, kMaxNumTie);
+    handle_tie(smem->tie_values, problem, count_gt, tie_count, remain_topk, &smem->tie_handle);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Candidate path: the two-level indexer's second level -- a top-k restricted to
+// the blocks a block-max pass already picked. The compact sequence is a gather:
+// vector `v` holds the four floats at `block[v >> 1] * 8 + (v & 1) * 4`, so every
+// vector stays inside one 8-column block and the 16-byte load is legal. The
+// emitted index is the gathered column itself, i.e. the position the caller
+// scored, not the compact offset.
+// ---------------------------------------------------------------------------
+
+template <uint32_t kLocalVecs_>
+struct TopKCandidate : TopKRadixBase<12> {
+  static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kBlockPositions = 8;  // columns per candidate block
+  static constexpr uint32_t kMaxVectors = kBlockSize * kLocalVecs;
+  static constexpr uint32_t kMaxBlocks = kMaxVectors * kVecSize / kBlockPositions;
+  using Smem = typename TopKRadixBase<12>::Smem;
+
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(  //
+      const TopKProblem& problem,
+      const int32_t* __restrict__ blocks,
+      const uint32_t num_blocks,
+      void* _smem) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+
+    init_histogram(smem->histogram, tx);
+    if (tx == 0) {
+      smem->count_eq = 0;
+      smem->count_gt = 0;
+    }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    const auto seq_len = problem.seq_len;
+    const auto num_vectors = num_blocks * (kBlockPositions / kVecSize);
+    // Every block but the newest covers kBlockPositions columns; the newest is
+    // the row's partial one and is always a candidate (amax8_varlen marks it
+    // +inf), so the compact length is exact without scanning the ids.
+    const auto num_positions = (num_blocks - 1) * kBlockPositions + (seq_len - 1) % kBlockPositions + 1;
+    // Phase 1: gather the candidate columns into registers + build the histogram.
+    // A block past the row's causal length is never read (the gather count stops
+    // at the row's block count), so only the newest block can be partial.
+    vec_t local_vecs[kLocalVecs];
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto v = tx + kBlockSize * i;
+      if (v >= num_vectors) break;
+      const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+      local_vecs[i].load(problem.in, static_cast<int64_t>(start) / kVecSize);
+      if (start + kVecSize > seq_len) {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          if (start + j < seq_len) {
+            atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+          }
+        }
+      } else {
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+        }
+      }
+    }
+    __syncthreads();
+
+    // Phase 2: Find the threshold bin
+    find_threshold(problem.topk, num_positions, smem, [&](uint32_t threshold_bin) {
+      const auto [v_lo, v_hi] = coarse_bin_bounds<kHistBits>(threshold_bin);
+      smem->v_hi = v_hi;
+      smem->v_lo = v_lo;
+    });
+
+    // Phase 3: collect by two fp32 boundaries, emitting the gathered column
+    const auto topk = problem.topk;
+    const auto v_hi = smem->v_hi;
+    const auto v_lo = smem->v_lo;
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto v = tx + kBlockSize * i;
+      if (v >= num_vectors) break;
+      const auto start = static_cast<uint32_t>(blocks[v >> 1]) * kBlockPositions + (v & 1u) * kVecSize;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        const auto idx = start + j;
+        if (idx >= seq_len) continue;
+        const auto val = local_vecs[i][j];
+        if (val >= v_hi) {
+          const auto pos = atomicAdd(&smem->count_gt, 1);
+          if (pos < topk) [[likely]] {
+            problem.emit(pos, idx);
+          }
+        } else if (val >= v_lo) {
+          const auto pos = atomicAdd(&smem->count_eq, 1);
+          if (pos < kMaxNumTie) [[likely]] {
+            smem->tie_values[pos] = {val, idx};
+          }
+        }
+      }
+    }
+
+    // Phase 4: Handle ties.
+    __syncthreads();
     const auto count_gt = smem->count_gt;
     const auto count_eq = smem->count_eq;
     const auto remain_topk = count_gt < topk ? topk - count_gt : 0;

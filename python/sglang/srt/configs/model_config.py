@@ -207,6 +207,9 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "KimiK3LinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -223,6 +226,7 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
 
@@ -418,6 +422,19 @@ def resolve_spec_hidden_size(
     return hc_hidden_size, hc_hidden_size
 
 
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config)
+        in (
+            "KimiK31ForConditionalGeneration",
+            "KimiLinearForCausalLM",
+            "KimiK3LinearForCausalLM",
+        )
+        and _hf_attr(config, "index_topk") is not None
+    )
+
+
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
@@ -469,6 +486,24 @@ def get_minimax_sparse_disable_value_layer_ids(sparse_cfg: dict) -> list[int]:
     if flags is None:
         return []
     return [i for i, f in enumerate(flags) if f != 0]
+
+
+def get_minimax_sparse_window_blocks(sparse_cfg: dict) -> tuple[int, int]:
+    """Return (init_blocks, local_blocks) of the always-attended sparse window."""
+    block_size_k = sparse_cfg["sparse_block_size"]
+    if "sparse_init_block" in sparse_cfg:
+        init_blocks = sparse_cfg["sparse_init_block"]
+    else:
+        init_blocks = (
+            sparse_cfg["sparse_init_tokens"] + block_size_k - 1
+        ) // block_size_k
+    if "sparse_local_block" in sparse_cfg:
+        local_blocks = sparse_cfg["sparse_local_block"]
+    else:
+        local_blocks = (
+            sparse_cfg["sparse_local_tokens"] + block_size_k - 1
+        ) // block_size_k + 1
+    return init_blocks, local_blocks
 
 
 def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
@@ -1034,7 +1069,6 @@ class ModelConfig:
             "DeepseekV32ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
-
         if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
             self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
 
@@ -1331,6 +1365,19 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
+        self.is_dflash_mla_draft = False
+        # Only DFlash-family draft checkpoints carry a dflash_config.
+        if getattr(self.hf_config, "dflash_config", None):
+            from sglang.srt.speculative.dflash_utils import (
+                is_dflash_mla_draft_config,
+                validate_dflash_mla_draft_config,
+            )
+
+            self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
+            if self.is_dflash_mla_draft:
+                # Validate before the generic defaults below fill missing fields.
+                validate_dflash_mla_draft_config(self.hf_config)
+
         # Pure SSM models have no attention heads; use head_dim == 0 so the
         # KV-cell size is 0 rather than a division on a missing head count.
         is_pure_ssm = any(
@@ -1365,7 +1412,8 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            "DeepseekV2ForCausalLM" in self.hf_config.architectures
+            self.is_dflash_mla_draft
+            or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
@@ -1405,6 +1453,10 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            if self.is_dflash_mla_draft:
+                # Sliding draft layers share the full layers' latent rows; the
+                # template's GQA head_dim would size a separate triton buffer.
+                self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)
@@ -1464,6 +1516,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1472,6 +1525,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -2478,6 +2534,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
     "Glm5NextForConditionalGeneration",
+    "GlmMoeDsaForCausalLMNextN",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]

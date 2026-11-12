@@ -11,11 +11,11 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -31,6 +31,7 @@ from sglang.srt.configs.model_config import (
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -105,15 +106,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dflash_draft_loc_scale(kvc: KVCacheConfigurator) -> int:
+    """Draft KV rows per target row under DCP: a replicated draft spans the
+    widened virtual location space (attn_dcp_size), a DCP-collapsed MLA draft
+    keeps one physical row per target row."""
+    if kvc.spec_aux_config.dflash_draft_rows_dcp_collapsed:
+        return 1
+    return get_parallel().attn_dcp_size
+
+
+def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
+    # DFLASH and DSPARK only build the draft on the final PP stage.
+    return (
+        not kvc.is_draft_worker
+        and kvc.spec_algorithm.is_dflash_family()
+        and (kvc.pp_size == 1 or kvc.pp_group.is_last_rank)
+    )
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
-    """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
-    ranks because the draft pool spans the widened virtual location space."""
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+    """Bytes/token the DFLASH draft KV pool adds per target row, 0 if none."""
+    if not _has_dflash_draft_kv(kvc):
         return 0
     cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * get_parallel().attn_dcp_size
+    return int(cell_size) * _dflash_draft_loc_scale(kvc)
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -284,7 +302,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    target_indexer_size *= dcp_size
+                    if not dsa_shards_index_k():
+                        target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -315,7 +334,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if _has_dflash_draft_kv(kvc):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -333,7 +352,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
+                    * _dflash_draft_loc_scale(kvc),
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
@@ -404,7 +423,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                if not kvc.is_draft_worker:
+                # Index-K spans the widened slot space unless K3.1 shards it
+                if not kvc.is_draft_worker and not dsa_shards_index_k():
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
@@ -435,16 +455,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             num_indexer_kv = num_sparse - num_indexer_k_only
 
-            kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
                 get_minimax_sparse_index_dtype(
                     fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
-                        resolving_view(kvc.server_args)
+                        SimpleNamespace(
+                            kv_cache_dtype=kvc.kv_cache_dtype_str,
+                            attention_backend=get_exec().kernel.attention_backend,
+                        )
                     ),
                     kv_cache_dtype=kvc.kv_cache_dtype,
                     model_dtype=kvc.model_dtype,
+                    model_config=model_config,
+                    page_size=kvc.pool_page_size,
                 )
             )
 
@@ -1165,10 +1190,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        # The low-ratio indexer pools are built with force_fp4=True
-        # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
+        from sglang.srt.layers.attention.dsv4.indexer_quant import (
+            use_dsv41_int8_indexer,
+        )
+
+        # Match the low-ratio pool format independently of C4.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
-            self.indexer_head_dim, use_fp4_indexer=True
+            self.indexer_head_dim, use_fp4_indexer=not use_dsv41_int8_indexer()
         )
 
         # kvc.sliding_window_size is None on a runner without SWA layers.

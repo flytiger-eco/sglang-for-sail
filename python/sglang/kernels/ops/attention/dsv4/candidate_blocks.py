@@ -18,7 +18,7 @@ from sglang.kernels.jit.utils import (
 )
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
-from .topk import plan_topk_v2, topk_transform_paged_v2
+from .topk import topk_transform_paged
 from .utils import make_name
 
 
@@ -134,17 +134,51 @@ def amax_topk_blocks(
     block = CANDIDATE_BLOCK_SIZE
     if max_seq_len is None:
         max_seq_len = logits.shape[1]
-    # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
-    plan = plan_topk_v2(nblocks)
     # block maxima, the newest block +inf; the top-k reads each row up to nblocks
-    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
+    # only, so nothing past a row's keys is initialised (pad for vectorized loads)
     keys = logits.new_empty(
         rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
     )
     amax8_varlen(logits, seq_lens, out=keys)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
-    topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
+    topk_transform_paged(keys, nblocks, None, blocks, 1)
     return blocks
+
+
+def candidate_block_ids(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    nblocks: torch.Tensor,
+    topk_blocks: int,
+    *,
+    out: Optional[torch.Tensor] = None,
+    block_size: int = CANDIDATE_BLOCK_SIZE,
+) -> torch.Tensor:
+    """Per row the ``topk_blocks`` blocks of ``block_size`` columns with the
+    largest block maximum among its first ``seq_lens[i]`` columns, the newest
+    block always kept, as column ids: block ``b`` covers columns ``b *
+    block_size .. b * block_size + block_size - 1``. Ids are unordered and
+    ``-1`` past ``min(topk_blocks, nblocks[i])``. ``nblocks`` is
+    ``ceil(seq_lens / block_size)`` as int32.
+
+    Together with :func:`topk_transform_candidates` this is how a prefill layer
+    replaces its full-width top-k: the block maxima cost one read of the scores,
+    and the second level reads only the selected blocks.
+    """
+    from .topk import topk_transform_ragged_v2
+
+    rows, width = logits.shape
+    # keys past a row's block count stay unset; the top-k reads a row up to its
+    # block count only (v2 wants the stride a multiple of 4)
+    width_blocks = (width + block_size - 1) // block_size
+    keys = logits.new_empty(rows, (width_blocks + 3) // 4 * 4, dtype=torch.float32)
+    amax8_varlen(logits, seq_lens, out=keys)
+    if out is None:
+        out = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
+    topk_transform_ragged_v2(
+        keys, nblocks, out_offsets=torch.zeros_like(nblocks), out_indices=out
+    )
+    return out
 
 
 def candidate_block_mask(
@@ -168,16 +202,21 @@ def select_candidate_block_ids(
     """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
     block of position ``compress_lens - 1`` always kept: int32
     ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
-    ``logits`` must be ``-inf`` past each row's causal length."""
+    ``compress_lens`` is a nonnegative int or a ``[rows, 1]`` tensor. Logits past each
+    row's causal length may be uninitialized; the input is not modified."""
     width = logits.size(-1)
     padding = -width % block_size
     scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
     last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
-    )
+    block_ids = torch.arange(num_blocks, device=logits.device)
+    # Earlier blocks are wholly valid. The newest (possibly partial) block is
+    # forced to +inf, so its invalid tail cannot affect selection. Drop later
+    # blocks after reduction, avoiding a full [rows, width] causal mask. This
+    # also overwrites NaNs from uninitialized tails; length zero has last=-1.
+    scores.masked_fill_(block_ids > last, -torch.inf)
+    scores.masked_fill_(block_ids == last, torch.inf)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 

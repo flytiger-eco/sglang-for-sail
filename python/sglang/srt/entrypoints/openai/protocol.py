@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import unicodedata
 import uuid
@@ -225,7 +226,6 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
@@ -894,6 +894,40 @@ ReasoningEffortType = Optional[
 ]
 
 
+# Dynamic tools may only be declared in a system (or its developer alias)
+# message. The name shape is Moonshot's, which is stricter than OpenAI's
+# ``^[a-zA-Z0-9_-]+$``: a leading digit is rejected, and the ceiling is 256.
+_DYNAMIC_TOOL_ROLES = ("system", "developer")
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_TOOL_NAME_MAX_LEN = 256
+
+
+class ThinkingParam(BaseModel):
+    """Moonshot-style thinking control, as Kimi K3 and compatible surfaces send it.
+
+    ``type`` gates reasoning and ``effort`` outranks ``reasoning_effort``.
+
+    ``keep`` selects how much earlier reasoning is replayed; "all" is the only
+    mode implemented here, and any other value is normalized to it rather than
+    rejected. A deployment is expected to force "all" this way -- rejecting the
+    request would fail one the reference service answers. ``adaptive`` is
+    accepted as an alias for enabled so an Anthropic-shaped value reaching this
+    surface does not 400.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    # Accepted and normalized to "all"; see the class docstring.
+    keep: Optional[str] = None
+    effort: ReasoningEffortType = None
+
+    @property
+    def enabled(self) -> bool:
+        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
+        return self.type != "disabled"
+
+
 def _has_message_level_tools(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -1067,22 +1101,98 @@ class ChatCompletionRequest(PDRoutingFields):
         "repetition_penalty": 1.0,
     }
 
+    # Whether the client sent tool_choice: set_tool_choice_default fills in
+    # "none" for a request without tools, which the K3 encoder must not render
+    # as an explicit tool_choice=none.
+    _tool_choice_explicit: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        if not explicit:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
             ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        return request
+
+    # Dynamic tools are declared in a system message that carries no content;
+    # every other placement is a client error, and the model would never see the
+    # tool. Runs "before" because pydantic drops an unknown `tools` key on a user
+    # message, leaving an "after" validator nothing to reject.
+    @model_validator(mode="before")
+    @classmethod
+    def validate_message_level_tools(cls, values):
+        messages = values.get("messages") if isinstance(values, dict) else None
+        if not isinstance(messages, list):
+            return values
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            tools = message.get("tools")
+            if not tools:
+                continue
+            role = message.get("role")
+            role = role.lower() if isinstance(role, str) else role
+            if role == "root":
+                continue
+            if role not in _DYNAMIC_TOOL_ROLES:
+                raise ValueError(
+                    f"messages[{index}]: message-level 'tools' are only valid on a "
+                    f"system or developer message, not {role!r}"
+                )
+            if message.get("content"):
+                raise ValueError(
+                    f"messages[{index}]: a message declaring 'tools' must not also "
+                    "carry content"
+                )
+            if not isinstance(tools, list):
+                raise ValueError(f"messages[{index}]: 'tools' must be a list")
+            for tool_index, tool in enumerate(tools):
+                cls._validate_dynamic_tool(index, tool_index, tool)
         return values
+
+    @classmethod
+    def _validate_dynamic_tool(cls, index: int, tool_index: int, tool: Any) -> None:
+        where = f"messages[{index}].tools[{tool_index}]"
+        if not isinstance(tool, dict):
+            raise ValueError(f"{where}: must be an object")
+        # `type` has a default on the Tool model, so an omitted or bogus value
+        # would otherwise be accepted and silently treated as a function.
+        tool_type = tool.get("type")
+        if tool_type != "function":
+            raise ValueError(
+                f"{where}: 'type' must be 'function'"
+                + (" (missing)" if tool_type is None else f", got {tool_type!r}")
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise ValueError(f"{where}: 'function' is required")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{where}: 'function.name' is required")
+        if len(name) > _TOOL_NAME_MAX_LEN:
+            raise ValueError(
+                f"{where}: 'function.name' must be at most "
+                f"{_TOOL_NAME_MAX_LEN} characters, got {len(name)}"
+            )
+        if not _TOOL_NAME_RE.match(name):
+            raise ValueError(
+                f"{where}: 'function.name' must start with a letter or underscore "
+                f"and contain only letters, digits, '_' or '-'; got {name!r}"
+            )
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -1134,9 +1244,26 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
+        # thinking.effort outranks reasoning.effort and the top-level field.
+        # chat_template_kwargs stays above all three: the renderers only fill
+        # thinking_effort when the caller has not set it themselves.
+        thinking_type = None
+        thinking_config = values.get("thinking")
+        if isinstance(thinking_config, dict):
+            thinking_effort = thinking_config.get("effort")
+            if thinking_effort is not None:
+                values["reasoning_effort"] = thinking_effort
+            thinking_type = thinking_config.get("type")
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
+        if thinking_type is not None:
+            thinking = thinking_type != "disabled"
+        elif thinking_config is not None and thinking is None:
+            # A thinking object with no explicit type still means "reasoning on",
+            # but never contradicts an effort that already resolved it.
+            thinking = True
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")
@@ -1265,13 +1392,27 @@ class ChatCompletionRequest(PDRoutingFields):
                 self.tool_choice == "required"
                 or isinstance(self.tool_choice, ToolChoice)
             ):
-                raise ValueError(
-                    "tool_choice 'required' or a named tool cannot be combined with "
-                    "response_format, regex, or ebnf: the tool-call constraint and the "
-                    "output constraint cannot both be honored."
+                if self.regex or self.ebnf:
+                    raise ValueError(
+                        "tool_choice 'required' or a named tool cannot be combined "
+                        "with regex or ebnf: the tool-call constraint and the "
+                        "output constraint cannot both be honored."
+                    )
+                # A forced tool call produces a tool_calls message with no
+                # content, so a response_format constraint has nothing left to
+                # constrain — honor the tool call (OpenAI/Moonshot behavior).
+                logger.warning(
+                    "tool_choice forces a tool call; ignoring response_format "
+                    "for this request."
                 )
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
+                sampling_params.pop("json_schema", None)
+                sampling_params.pop("structural_tag", None)
+                has_existing_constraints = False
+            else:
+                logger.warning(
+                    "Constrained decoding is not compatible with tool calls."
+                )
+        if tool_call_constraint and not has_existing_constraints:
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(

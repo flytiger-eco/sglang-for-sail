@@ -7,12 +7,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_sail
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -25,6 +23,18 @@ class TopkTransformMethod(IntEnum):
     PAGED = auto()
     # Transform topk indices to indices to ragged kv (non-paged)
     RAGGED = auto()
+
+
+def _sail_topk_fp32(logits: torch.Tensor) -> torch.Tensor:
+    """Cast BF16 losslessly with 16-byte row alignment for fused/v2 Top-K."""
+    width = logits.shape[1]
+    if width % 4 == 0:
+        return logits.float()
+    aligned_width = (width + 3) // 4 * 4
+    output = torch.empty(
+        (logits.shape[0], aligned_width), dtype=torch.float32, device=logits.device
+    )[:, :width]
+    return output.copy_(logits)
 
 
 class DSATopKBackend(Enum):
@@ -62,6 +72,8 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if is_sail() and score.dtype == torch.bfloat16 and self.is_sgl_kernel():
+            score = _sail_topk_fp32(score)
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -93,6 +105,65 @@ class DSATopKBackend(Enum):
             )
         raise RuntimeError(f"Unsupported {self = }.")
 
+    def _topk_transform_dsv4_bf16(
+        self,
+        logits: torch.Tensor,
+        seq_lens_topk: torch.Tensor,
+        page_table_size_1: torch.Tensor,
+        cu_seqlens_q_topk: torch.Tensor,
+        topk: int,
+        ks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """PAGED topk via dsv4's bf16 per-row prefill kernel.
+
+        Expands NSA per-request page table to dsv4's per-query layout and
+        performs topk-select plus page-table gather in a single kernel.
+
+        NOTE(perf): expanding to per-query [B, P] costs B*P*4 bytes extra.
+        Gated behind SGLANG_DSA_USE_DSV4_BF16_TOPK (default on).
+        """
+        from sglang.kernels.ops.attention.dsv4 import top_k_per_row_prefill_bf16
+
+        assert logits.dim() == 2
+        assert logits.dtype == torch.bfloat16
+        device = logits.device
+        num_q = logits.shape[0]
+
+        # row_starts / row_ends (per query). NSA passes ks as row_starts; the dsv4
+        # kernel needs an explicit row_ends = row_starts + length.
+        row_starts = (
+            torch.zeros(num_q, dtype=torch.int32, device=device)
+            if ks is None
+            else ks.to(torch.int32)
+        )
+        row_ends = row_starts + seq_lens_topk.to(torch.int32)
+
+        # Expand the per-request page table to per-query rows. Each query block bid
+        # belongs to request r where cu_seqlens_q_topk[r] <= bid < cu_seqlens_q_topk[r+1],
+        # mirroring topk_transform_prefill_kernel's cu_seqlens_q scan.
+        q_ids = torch.arange(num_q, device=device)
+        req_idx = torch.searchsorted(
+            cu_seqlens_q_topk[1:].contiguous(), q_ids, right=True
+        )
+        page_table_per_query = page_table_size_1.index_select(
+            0, req_idx.to(torch.long)
+        ).contiguous()
+
+        # Use new_full(-1) so unfilled slots are safe when logits has fewer positions than topk.
+        page_indices = logits.new_full((num_q, topk), -1, dtype=torch.int32)
+        # page_size = 1 (NSA PAGED uses page_table_1); page_bits = 0 so the dsv4
+        # built-in transform reduces to a plain gather, matching the fused kernel.
+        top_k_per_row_prefill_bf16(
+            logits,
+            row_starts,
+            row_ends,
+            page_table_per_query,
+            page_indices,
+            1,
+            None,
+        )
+        return page_indices
+
     def topk_transform(
         self,
         logits: torch.Tensor,
@@ -105,6 +176,7 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        packed_extend_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
@@ -130,6 +202,8 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
+            if is_sail() and logits.dtype == torch.bfloat16:
+                logits = _sail_topk_fp32(logits)
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
         # Extend-shaped RAGGED top-k for the SGL backend routes to the same v2
@@ -148,11 +222,17 @@ class DSATopKBackend(Enum):
             and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
         ):
             return _topk_transform_v2_ragged(
-                logits, lengths, topk, topk_indices_offset, row_starts
+                logits,
+                lengths,
+                topk,
+                topk_indices_offset,
+                row_starts,
+                attn_metadata=attn_metadata,
             )
 
-        # Packed PAGED extend (GLM DSA prefill), ROCm-only: CUDA gets the same
-        # fusion from RAGGED above. Unsupported shapes fall back, not raise.
+        # Packed PAGED extend (DSA prefill on ROCm and Kimi-K3.1): exact, where the
+        # legacy fused transform truncates the threshold bin. Unsupported shapes
+        # fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call
         # and the chunk's own `batch_idx_list` when the indexer split the logits.
         if batch_idx_list is None:
@@ -163,7 +243,7 @@ class DSATopKBackend(Enum):
             # The prefill-CP list selects requests, not rows: leave it on legacy.
             row_to_batch = None
         if (
-            _is_hip
+            packed_extend_topk
             and self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.PAGED
             and 0 < topk <= 2048
@@ -201,6 +281,23 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
+                # Route PAGED path through dsv4's bf16 topk kernel when gate is on
+                # and logits are bf16; falls back to fast_topk_transform_fused otherwise.
+                if (
+                    is_sail()
+                    and envs.SGLANG_DSA_USE_DSV4_BF16_TOPK.get()
+                    and logits.dtype == torch.bfloat16
+                ):
+                    return self._topk_transform_dsv4_bf16(
+                        logits=logits,
+                        seq_lens_topk=lengths,
+                        page_table_size_1=page_table_size_1,
+                        cu_seqlens_q_topk=cu_seqlens_q_topk,
+                        topk=topk,
+                        ks=row_starts,
+                    )
+                if is_sail() and logits.dtype == torch.bfloat16:
+                    logits = _sail_topk_fp32(logits)
                 return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
@@ -215,8 +312,19 @@ class DSATopKBackend(Enum):
                         "RAGGED topk_transform requires topk_indices_offset; "
                         "expected extend-without-speculative metadata."
                     )
+                # fast_topk_transform_ragged_fused requires fp32 scores. An fp8 KV
+                # store makes the indexer emit bf16 logits (it previously saw fp32
+                # from the bf16 KV path), which fails inside sgl_kernel with
+                # "expected scalar type Float but found BFloat16".
+                # bf16 -> fp32 is value preserving, so the selected indices are
+                # unchanged; this restores the pre-fp8 dtype instead of changing
+                # the selection semantics.
+                if is_sail() and logits.dtype == torch.bfloat16:
+                    score = _sail_topk_fp32(logits)
+                else:
+                    score = logits if logits.dtype == torch.float32 else logits.float()
                 return fast_topk_transform_ragged_fused(
-                    score=logits,
+                    score=score,
                     lengths=lengths,
                     topk_indices_offset=topk_indices_offset,
                     topk=topk,
@@ -227,6 +335,8 @@ class DSATopKBackend(Enum):
         if self.is_flashinfer():
             import flashinfer
 
+            if is_sail() and logits.dtype == torch.bfloat16:
+                logits = _sail_topk_fp32(logits)
             if topk_transform_method == TopkTransformMethod.PAGED:
                 row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
@@ -434,6 +544,8 @@ def _topk_transform_v2_ragged(
     topk: int,
     topk_indices_offset: torch.Tensor,
     row_starts: Optional[torch.Tensor],
+    *,
+    attn_metadata=None,
 ) -> torch.Tensor:
     """Fused ragged top-k via the DeepSeek-V4 v2 JIT kernel.
 
@@ -446,6 +558,29 @@ def _topk_transform_v2_ragged(
     16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
     construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
     """
+    if is_sail() and logits.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.dsa.deep_select import (
+            topk_transform_ragged,
+        )
+
+        if attn_metadata is not None:
+            seq_lens_cpu = attn_metadata.indexer_seq_lens_cpu
+            if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+                # Ragged K concatenates requests; a single request starts at zero.
+                # CPU lengths also bound the packed width without a GPU sync.
+                return topk_transform_ragged(
+                    logits,
+                    lengths,
+                    topk,
+                    topk_indices_offset,
+                    None if seq_lens_cpu.numel() == 1 else row_starts,
+                    max_seq_len=int(seq_lens_cpu.max()),
+                )
+
+        return topk_transform_ragged(
+            logits, lengths, topk, topk_indices_offset, row_starts
+        )
+
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)

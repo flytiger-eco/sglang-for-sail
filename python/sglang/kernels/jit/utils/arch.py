@@ -146,12 +146,15 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
     else:
         if arch is None:
             arch = get_jit_cuda_arch()
-        return [
+        flags = [
             arch.jit_flag,
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
         ]
+        if is_sail_runtime():
+            flags.append("-DSGL_SAIL=1")
+        return flags
 
 
 def make_jit_cuda_arch(major: int, minor: int) -> ArchInfo:
@@ -193,7 +196,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
-    if is_hip_runtime() or is_musa_runtime():
+    if is_sail_runtime() or is_hip_runtime() or is_musa_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
 

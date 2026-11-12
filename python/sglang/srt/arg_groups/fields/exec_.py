@@ -476,6 +476,11 @@ class ExecMamba(msgspec.Struct):
         doc="Whether the hybrid-mamba radix cache keeps its extra state "
         "buffer: the radix cache is on and the strategy asks for one.",
     )
+    decode_state_free_radix = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.decode_state_free_radix_of",
+        doc="Whether a PD decode server's radix cache holds FULL KV only and "
+        "each request keeps its own single Mamba state slot.",
+    )
     enable_mamba_extra_buffer_lazy = Derived(
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
@@ -920,6 +925,7 @@ class ExecMoe(msgspec.Struct):
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
+    enable_eplb_async: A[bool, "Enable EPLB async copy algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
@@ -966,6 +972,10 @@ class ExecMoe(msgspec.Struct):
     enable_waterfill: A[
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
+    ] = False
+    enable_deepep_waterfill: A[
+        bool,
+        "Enable DeepEP-specific waterfill optimization for MoE expert dispatch.",
     ] = False
     ep_join_mode: A[
         Optional[Literal["scale", "recover"]],

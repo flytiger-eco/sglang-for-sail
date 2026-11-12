@@ -6,7 +6,7 @@ from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,22 @@ def configure_kv_cache_dtype(
         )
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
+        resolved_kv_cache_dtype = "auto"
+
+    if (
+        is_draft_worker
+        and is_dflash
+        and is_sail()
+        and speculative_draft_attention_backend == "flashmla"
+        and kv_cache_dtype != model_dtype
+    ):
+        logger.info(
+            "PPU DFLASH FlashMLA draft: overriding KV cache dtype %s -> %s "
+            "(sliding-window sparse attention requires compute-dtype KV).",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

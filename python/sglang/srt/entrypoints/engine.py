@@ -138,6 +138,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_mnnvl_fabric_device,
+    is_sail,
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
@@ -1919,6 +1920,9 @@ def _set_envs_and_config(server_args: ServerArgs):
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+
+    if is_sail():
+        os.environ["CUDA_MODULE_LOADING"] = "AUTO"
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels

@@ -3,6 +3,9 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx, in_sparse_range
+
 try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
 except Exception as _e:
@@ -41,6 +44,18 @@ class FlashMLASchedMeta:
     num_splits: Optional[torch.Tensor] = None
 
 
+# Add for nvtx profiling
+SGLANG_PROFILE_NVTX = envs.SGLANG_PROFILE_NVTX.get()
+SGLANG_PROFILE_NVTX_PRINT_SEQLEN = envs.SGLANG_PROFILE_NVTX_PRINT_SEQLEN.get()
+if SGLANG_PROFILE_NVTX:
+    try:
+        from torch.cuda.nvtx import range_pop as th_nvtx_range_pop
+        from torch.cuda.nvtx import range_push as th_nvtx_range_push
+    except ImportError as e:
+        SGLANG_PROFILE_NVTX = False
+        SGLANG_PROFILE_NVTX_PRINT_SEQLEN = False
+
+
 def get_mla_metadata(
     cache_seqlens: Optional[torch.Tensor] = None,
     num_q_tokens_per_head_k: Optional[int] = None,
@@ -48,6 +63,7 @@ def get_mla_metadata(
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
     topk: Optional[int] = None,
+    topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -57,6 +73,9 @@ def get_mla_metadata(
         num_heads_q: The number of q heads. This argument is optional when sparse attention is not enabled
         is_fp8_kvcache: Whether the k_cache and v_cache are in fp8 format.
         topk: If not None, sparse attention will be enabled, and only tokens in the `indices` array passed to `flash_mla_with_kvcache_sm90` will be attended to.
+        topk_length: (batch_size), dtype torch.int32. If provided, scheduler will use
+            per-item actual token counts instead of global topk, eliminating the
+            scheduler/kernel topk semantic mismatch that causes SM80 HS64 page-walk faults.
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
@@ -87,6 +106,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -169,6 +189,18 @@ def flash_mla_with_kvcache(
         "descale_q and descale_k should be both None or both not None"
     )
 
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        batch_size = q.shape[0]
+        max_seqlen_q = q.shape[-3] if q.dim() == 4 else 1
+        if torch.cuda.is_current_stream_capturing():
+            nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:D,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        elif SGLANG_PROFILE_NVTX_PRINT_SEQLEN:
+            cu_seqlens_k_list = cache_seqlens.flatten().cpu().tolist()
+            nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal},num_blocks:{k_cache.shape[-4]},page_block_size:{k_cache.shape[-3]},cu_seqlens_k:{cu_seqlens_k_list}"
+        else:
+            nvtx_message = f"[FW_FMHA] --format=MLA,Forward,type:P,seqlen_q:{max_seqlen_q},head_dim:{q.shape[-1]},head_dim_v:{head_dim_v},num_heads_kv:{k_cache.shape[-2]},num_heads:{q.shape[-2]},batch_size:{batch_size},data_type:{q.dtype},causal:{causal}"
+        th_nvtx_range_push(nvtx_message)
+
     if indices is not None:
         assert is_fp8_kvcache, "is_fp8_kvcache must be True for sparse attention"
         # The tensor-metadata API predates V4.1, so its 528 B/token cache is V3.2 without RoPE.
@@ -193,6 +225,8 @@ def flash_mla_with_kvcache(
             softmax_scale,
             kv_format,
         )
+        if SGLANG_PROFILE_NVTX and not in_sparse_range():
+            th_nvtx_range_pop()
         return out, softmax_lse
 
     assert kv_format is None, "kv_format only applies to sparse attention"
@@ -229,6 +263,8 @@ def flash_mla_with_kvcache(
             topk_length,
             extra_topk_length,
         )
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
+        th_nvtx_range_pop()
     return out, softmax_lse
 
 

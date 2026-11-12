@@ -29,7 +29,10 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_mega import (
+    can_use_mega_mhc_prefill,
+    try_mhc_mega_boundary,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
@@ -651,11 +654,14 @@ def _compute_triplet(
     return coefficients
 
 
-def _can_use_mega_mhc(cfg: HcConfig) -> bool:
+def _can_use_mega_mhc(cfg: HcConfig, forward_batch: Optional[ForwardBatch]) -> bool:
     return (
-        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        and get_platform().is_sm100
+        cfg.pre_from_prev
+        and cfg.mult == 4
         and not cfg.cp_prefill
+        and not get_forward().sp_active
+        and forward_batch is not None
+        and can_use_mega_mhc_prefill(forward_batch)
     )
 
 
@@ -665,6 +671,7 @@ def _post_fusion(
     residual: torch.Tensor,
     coefficients: HcTriplet,
     next: Optional[HcNextBoundary],
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> HcState:
     """Step 4 without a collective: the wide-tile kernel folds the next combine +
     norm in where it serves this seam, otherwise the pure post runs and the next
@@ -675,7 +682,11 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and next.hc is not None
-        and _can_use_mega_mhc(cfg)
+        and next.hc.cfg.pre_from_prev
+        and next.hc.cfg.mult == cfg.mult
+        and next.hc.cfg.hidden == cfg.hidden
+        and not next.hc.cfg.cp_prefill
+        and _can_use_mega_mhc(cfg, forward_batch)
         and y.shape[0] > 0
     ):
         next_hc = next.hc
@@ -684,7 +695,7 @@ def _post_fusion(
             y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
-        updated, normalized, stats = mhc_mega_boundary(
+        result = try_mhc_mega_boundary(
             y,
             residual,
             pre,
@@ -702,11 +713,17 @@ def _post_fusion(
             y_gemm_sf=y_sf,
             moe_input=None if moe_input is None else moe_input.views(),
         )
-        if y_fp8 is not None:
-            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
-        if moe_input is not None:
-            moe_input.mark(normalized)
-        return HcState(updated, pre, HcNormed(normalized), stats)
+        if result is not None:
+            updated, normalized, stats = result
+            # Pre belongs to this post; input/stats belong to the next rows.
+            # Existing take_rows/with_residual/release own their lifecycle.
+            if y_fp8 is not None:
+                return HcState(
+                    updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats
+                )
+            if moe_input is not None:
+                moe_input.mark(normalized)
+            return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None
         and next.norm_fusable
@@ -744,6 +761,7 @@ def run_attn_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> HcState:
     """The attention post. An `AttnOutput` rides the collective kernel (which also
     folds ``next``'s norm); the attention may decline the handover even when asked,
@@ -767,7 +785,7 @@ def run_attn_post(
         )
         return HcState(updated, pre, HcNormed(normalized))
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
-    return _post_fusion(hc, out, residual, coefficients, next)
+    return _post_fusion(hc, out, residual, coefficients, next, forward_batch)
 
 
 def run_moe_post(
@@ -779,6 +797,7 @@ def run_moe_post(
     next: Optional[HcNextBoundary],
     world_size: int,
     precomputed: Optional[HcTriplet] = None,
+    forward_batch: Optional[ForwardBatch] = None,
 ) -> HcState:
     """The MoE post. A deferred finalize the push plane can carry rides the
     collective kernel (finalize + shared add + all-reduce, quantizing ``next``'s
@@ -850,4 +869,4 @@ def run_moe_post(
         ):
             out += pieces.shared
     coefficients = _compute_triplet(hc, residual, stats_stream, precomputed)
-    return _post_fusion(hc, out, residual, coefficients, next)
+    return _post_fusion(hc, out, residual, coefficients, next, forward_batch)

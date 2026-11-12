@@ -113,6 +113,7 @@ class TestDSABackendDPPadding(CustomTestCase):
             use_mha=False,
             use_fused_topk=True,
             hisparse_coordinator=None,
+            attn_dcp_size=1,
             dsa_index_kpool=1,
             forward_metadata=SimpleNamespace(max_seq_len_k=64),
             token_to_kv_pool=SimpleNamespace(
@@ -177,6 +178,8 @@ class TestDSABackendDPPadding(CustomTestCase):
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
+            attn_dcp_size=1,
+            _trtllm_fused_q=False,
             kv_cache_dtype=torch.bfloat16,
             token_to_kv_pool=SimpleNamespace(
                 get_key_buffer=lambda _layer_id: torch.zeros((24, 3))

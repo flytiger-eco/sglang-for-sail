@@ -110,8 +110,15 @@ constexpr int64_t kv_page_bytes(int64_t page_size) {
   return (page_size * Traits::kBytesPerToken + Traits::kPageAlign - 1) / Traits::kPageAlign * Traits::kPageAlign;
 }
 
-/// Addressing of a paged cache of `1 << kPageBits` tokens per page, padded to kPageAlign:
-/// slot `i`'s data at `i * kDataStride`, its scales at `kScaleBase + i * kScaleStride`.
+/// Addressing of a paged cache: slot `i`'s data at `i * kDataStride`, its scales
+/// at `kScaleBase + i * kScaleStride`. The block-split layouts place all data
+/// rows first and then all scale rows; V41_NEW / V41_FP4_NEW interleave them so
+/// each token's scales are the tail of its own row, which is what the FlashMLA
+/// kernels on PPU read (`slot * bytes_per_token + data_bytes`; see
+/// FlashMLA-for-sail `csrc/ppu/decode/sparse/sparse_decode_wg.cuh`). Picking the
+/// wrong arrangement makes the reader treat neighbour data bytes as ue8m0
+/// exponents (scale = 2**(b-127), up to inf), overflow the logits and zero the
+/// attention output.
 template <KVLayout kLayout, uint32_t kPageBits>
 struct PagedKV {
   using Traits = KVLayoutTraits<kLayout>;
@@ -216,6 +223,11 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
   // the low byte of the pack's 16-bit storage, whether fp8x2_e4m3_t is an integer or HIP's fp8 pair
   const auto scale_bits = static_cast<uint8_t>(std::bit_cast<uint16_t>(fp8::pack_fp8(scale, scale)));
+#elif defined(SGL_SAIL) || defined(__HGGCCC__)
+  // SAIL's scalar e4m3 conversion rounds ties toward zero; round to the grid in software
+  // first, after which the conversion of the on-grid value is exact.
+  const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
+  const uint8_t scale_bits = __nv_fp8_e4m3{scale}.__x;
 #else
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
@@ -225,7 +237,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     // IEEE division by the rounded scale, as the reference does; a reciprocal multiply could cross an e2m1 tie.
-#ifdef USE_ROCM
+#ifdef SGL_SOFTWARE_E2M1
     out[i] = static_cast<uint8_t>(fp4::e2m1x2_code({__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}));
 #else
     out[i] = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(

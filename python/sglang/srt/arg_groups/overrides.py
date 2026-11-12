@@ -45,6 +45,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _invoke_provider,
     _register_for,
     attention_backends_of,
+    decode_state_free_radix_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -71,6 +72,7 @@ from sglang.srt.utils.common import (
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
+    is_sail,
     xpu_has_xmx_support,
 )
 
@@ -269,7 +271,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
@@ -370,6 +372,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -427,6 +430,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
@@ -443,10 +447,18 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
-    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+    model_arch = hf_config.architectures[0]
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        return view.linear_attn_backend == "triton" or (
+            model_arch
+            in (
+                "KimiK3ForConditionalGeneration",
+                "KimiK31ForConditionalGeneration",
+            )
+            and view.linear_attn_backend == "flashkda"
+        )
     return False
 
 
@@ -476,7 +488,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):
@@ -490,10 +506,11 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     """Default DSA KV-cache dtype before resolving split attention backends."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -506,6 +523,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             )
             return {"kv_cache_dtype": "bfloat16"}
         return {}
+
+    if kimi_k31:
+        return _kimi_k31_kv_cache_dtype(view)
 
     import torch
 
@@ -603,10 +623,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     HiSparse settings take precedence when enabled.
     """
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_kimi_k31
 
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    kimi_k31 = is_kimi_k31(hf_config)
+    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS and not kimi_k31:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -640,6 +661,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and kv_cache_dtype == "fp8_e4m3"
         and not get_platform().is_hip
     )
+
+    if kimi_k31:
+        return _kimi_k31_dsa_backends(view)
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
@@ -741,6 +765,66 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     return declared
 
 
+# Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
+_KIMI_K31_DSA_BACKEND = "flashmla_kv"
+# Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+if is_sail():
+    _KIMI_K31_DSA_BACKENDS += ("flashmla_sparse",)
+
+
+def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
+    if get_platform().is_hip:
+        raise ValueError("Kimi-K3.1 DSA requires CUDA (FlashMLA / DeepGEMM).")
+    if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
+        raise ValueError(
+            "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
+            f"fp8_ds_mla format); got {view.kv_cache_dtype!r}."
+        )
+    if view.kv_cache_dtype != "fp8_e4m3":
+        logger.warning("Setting KV cache dtype to fp8_e4m3 for Kimi-K3.1.")
+        return {"kv_cache_dtype": "fp8_e4m3"}
+    return {}
+
+
+def _kimi_k31_dsa_backends(view: Any) -> dict:
+    if view.enable_hisparse:
+        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
+    fields = ("dsa_prefill_backend", "dsa_decode_backend")
+    for field in fields:
+        value = getattr(view, field)
+        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(
+                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
+                f"got {value!r}."
+            )
+    # Both phases read one KV pool (and PD peers exchange it), so an unset
+    # phase follows the set one.
+    chosen = {getattr(view, f) for f in fields} - {None}
+    if len(chosen) > 1 and not is_sail():
+        raise ValueError(
+            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
+            f"layouts); got {view.dsa_prefill_backend!r} and "
+            f"{view.dsa_decode_backend!r}."
+        )
+    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    if backend == "trtllm":
+        logger.warning(
+            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
+            "use trtllm."
+        )
+    declared = {f: backend for f in fields if getattr(view, f) is None}
+    logger.warning(
+        "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.",
+        view.dsa_prefill_backend,
+        view.dsa_decode_backend,
+    )
+    return declared
+
+
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.
 _DEEPSEEK_FAMILY_ARCHS = frozenset(
     {
@@ -756,6 +840,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "KimiK31ForConditionalGeneration",
     }
 )
 
@@ -1338,6 +1423,100 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
 
 
 @register_post_process
+def _ppu_fa3_chunked_prefix_cache_threshold(view: Any) -> dict:
+    # PPU FA3 cannot consume a chunked prefix cache; force the threshold to 0
+    # so the FA3 prefill path never takes the chunked prefix branch on PPU.
+    from sglang.srt.utils.common import is_sail
+
+    if is_sail() and (
+        view.attention_backend == "fa3"
+        or view.decode_attention_backend == "fa3"
+        or view.prefill_attention_backend == "fa3"
+    ):
+        envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
+    return {}
+
+
+@register_post_process
+def _ppu_fa3_flashmla_qv_fallback(view: Any) -> dict:
+    # [q_v-not-support fallback] On PPU, fa3+flashmla combo crashes with
+    # "q_v not support" under certain configs; detect and fall back to flashmla.
+    from sglang.srt.utils.common import is_sail
+
+    if not (
+        is_sail()
+        and view.prefill_attention_backend == "fa3"
+        and view.decode_attention_backend == "flashmla"
+    ):
+        return {}
+
+    mtp_wo_decode_sam = (
+        view.speculative_algorithm is not None
+        and view.speculative_attention_mode != "decode"
+    )
+    prefill_cg_enabled = (
+        view.cuda_graph_config is not None
+        and view.cuda_graph_config.prefill.backend != Backend.DISABLED
+    )
+    chunked_prefix_disabled = view.disable_chunked_prefix_cache
+    if not (mtp_wo_decode_sam or prefill_cg_enabled or chunked_prefix_disabled):
+        return {}
+
+    reasons = []
+    if mtp_wo_decode_sam:
+        reasons.append(
+            "MTP enabled without --speculative-attention-mode decode "
+            "(draft-extend would run on the fa3 prefill backend)"
+        )
+    if prefill_cg_enabled:
+        reasons.append(
+            "prefill-phase CUDA graph is not disabled "
+            "(fa3 prefill backend would be captured)"
+        )
+    if chunked_prefix_disabled:
+        reasons.append(
+            "--disable-chunked-prefix-cache is set (MLA dispatch would pass q_v to fa3)"
+        )
+    logger.warning(
+        "Unsafe attention backend combo detected: "
+        "--prefill-attention-backend fa3 --decode-attention-backend "
+        "flashmla with "
+        + "; ".join(reasons)
+        + ". This triggers the 'q_v not support' crash. Falling back "
+        "to a unified flashmla backend (--prefill-attention-backend "
+        "flashmla), which is MLA-native and supports q_v and CUDA "
+        "graph capture. To keep the fa3 prefill backend, set "
+        "--speculative-attention-mode decode, disable the prefill "
+        "CUDA graph (--disable-piecewise-cuda-graph), and do NOT set "
+        "--disable-chunked-prefix-cache."
+    )
+    return {"prefill_attention_backend": "flashmla"}
+
+
+@register_post_process
+def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
+    # [fp8-kv-cache fallback] On PPU only the dense FlashMLA path lacks an
+    # fp8_e4m3 kv-cache kernel; keep the fallback for it and leave every other
+    # backend untouched. In particular --dsa-prefill-backend flashmla_sparse is
+    # supported: the pool stores fp8 (quantize_k_cache on write) and the
+    # framework dequantizes the prefix KV (dequantize_k_cache_paged) before the
+    # bf16 sparse kernel, so forcing bf16 here would only lose the memory win.
+    from sglang.srt.utils.common import is_sail
+
+    if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
+        return {}
+    if view.decode_attention_backend != "flashmla":
+        return {}
+
+    logger.warning(
+        "On PPU, --decode-attention-backend flashmla does not support "
+        "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
+        "(falling back to --kv-cache-dtype auto)."
+    )
+    return {"kv_cache_dtype": "auto"}
+
+
+@register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
@@ -1594,7 +1773,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _a2a_backend_overrides(view: Any) -> dict:
-
     moe_a2a_backend = view.moe_a2a_backend
     if view.enable_waterfill and moe_a2a_backend not in ("deepep", "megamoe"):
         logger.warning(

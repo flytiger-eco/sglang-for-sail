@@ -46,7 +46,9 @@ from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
+    sglang_per_token_quant_fp8,
 )
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -77,10 +79,12 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
     attn_tp_all_reduce,
     dp_gather_replicate,
     get_global_dp_buffer_len,
@@ -100,12 +104,21 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsLinearMethod,
+    CompressedTensorsW8A8Fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+from sglang.srt.layers.quantization.w8a8_int8 import (
+    W8A8Int8Config,
+    W8A8Int8LinearMethod,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -171,6 +184,7 @@ from sglang.srt.models.deepseek_v2 import (
     _is_cuda,
     _is_hip,
     _is_npu,
+    _is_sail,
     _is_xpu,
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
@@ -203,6 +217,7 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_device_sm,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
@@ -278,13 +293,19 @@ _FP8_WO_A_UE8M0 = _FP8_WO_A_GEMM and DEEPGEMM_SCALE_UE8M0
 
 
 def wo_a_fp8_gemm_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
-    """The fp8 wo_a absorb GEMM (DeepGEMM fp8_einsum, aiter mxscale) takes 128x128
-    block scales only; any other layout dequantizes wo_a to bf16 at load."""
-    return (
-        _FP8_WO_A_GEMM
-        and isinstance(quant_config, Fp8Config)
-        and quant_config.weight_block_size == [128, 128]
-    )
+    """Select quantized wo_a einsum; PPU also supports channelwise INT8.
+
+    Keep the historical FP8 switch for the release's INT8 DeepGEMM path.
+    Other devices still require the upstream 128x128 block-FP8 layout.
+    """
+    if not _FP8_WO_A_GEMM:
+        return False
+    if _is_sail and isinstance(quant_config, W8A8Int8Config):
+        return True
+    return isinstance(quant_config, Fp8Config) and quant_config.weight_block_size == [
+        128,
+        128,
+    ]
 
 
 _NPU_BF16_WO_A_GEMM = _is_npu and envs.SGLANG_OPT_NPU_BF16_WO_A_GEMM.get()
@@ -341,12 +362,15 @@ def _flashinfer_hc_pre(
     num_tokens, hc_mult, hidden_size = x.shape
     hc_hidden_size = hc_mult * hidden_size
     mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
-    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+    n_splits = (
+        1 if _is_sail else _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+    )
 
-    dot_mix = torch.empty(
+    alloc_buffer = torch.zeros if _is_sail else torch.empty
+    dot_mix = alloc_buffer(
         (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
     )
-    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    sqrsum = alloc_buffer((n_splits, num_tokens), dtype=torch.float32, device=x.device)
     tf32_hc_prenorm_gemm(
         x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
     )
@@ -973,7 +997,11 @@ bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_i
 
 def _engram_image_token_id(config) -> Optional[int]:
     """The image token Engram hashes as blocked and leaves ungated (V4.1 vision)."""
-    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+    if (
+        config.model_type == "deepseek_v41"
+        and config.vision_n_layers > 0
+        and not getattr(config, "language_model_only", False)
+    ):
         return config.image_token_id
     return None
 
@@ -1085,6 +1113,7 @@ class MqaAttentionBase(nn.Module):
             wo_a_quant_config = quant_config
         else:
             wo_a_quant_config = None
+        self.quant_config = quant_config
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
@@ -1133,7 +1162,13 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
-        if quantize_wo_a:
+        if quantize_wo_a and (
+            not _is_sail
+            or (
+                isinstance(quant_config, Fp8Config)
+                and quant_config.weight_block_size is not None
+            )
+        ):
             assert hasattr(self.wo_a, "weight_scale_inv"), (
                 "FP8 quant_config must create weight_scale_inv"
             )
@@ -1143,7 +1178,7 @@ class MqaAttentionBase(nn.Module):
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
-        elif fp8:
+        elif fp8 and hasattr(self.wo_a, "weight_scale_inv"):
             self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
@@ -1155,6 +1190,10 @@ class MqaAttentionBase(nn.Module):
             # in place (same shape, dtype and strides) and makes this GEMM
             # return noise.
             self.wo_a.keep_plain_weight_layout = True
+        elif fp8 and _is_sail:
+            assert hasattr(self.wo_a, "weight_scale"), (
+                "FP8 quant_config must create weight_scale"
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1214,6 +1253,12 @@ class MqaAttentionBase(nn.Module):
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
         if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        if _is_sail:
+            # PPU FlashMLA accepts the native per-rank query width; padding to
+            # 64 heads would mismatch the backend's PPU attn_sink slice
+            # (attn_sink is sharded to n_local_heads there, not padded).
             return self.n_local_heads
 
         if get_platform().is_sm120:
@@ -1519,8 +1564,11 @@ class MQALayer(MqaAttentionBase):
 
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
+        self.mega_wo_a_recipe = (1, 1, 32)
         self.mega_wq_b_permuted = False
-        if self.use_mega_attention:
+        # The DeepGEMM MXFP8-pair input is a Blackwell path; PPU MegaAttention
+        # feeds wo_a with per-token fp8 and keeps wo_b on its bf16 input.
+        if self.use_mega_attention and not _is_sail:
             self.wo_b.deepgemm_mxfp8_input = (
                 self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
             )
@@ -1589,8 +1637,32 @@ class MQALayer(MqaAttentionBase):
                 )
                 self.wq_b.weight_scale_inv.data = sf.contiguous()
                 method.weight_block_size = [16, block_k]
-        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+        elif self.n_local_heads in (64, 128) and self._wq_b_is_ppu_per_channel_fp8():
+            # One scale per output row: permuting rows and scales together makes
+            # wq_b emit the kernel's [32][heads][16] q directly, so pack_query's
+            # strided copy is skipped.
+            for param in (self.wq_b.weight, self.wq_b.weight_scale):
+                param.data.copy_(interleave_query_rows(param.data, self.n_local_heads))
+            self.mega_wq_b_permuted = True
+        G, R = self.n_local_groups, self.o_lora_rank
+        if _is_sail:
+            # PPU DeepGEMM has no per-32 UE8M0 einsum, so MegaAttention emits one
+            # fp32 scale per (token, wv group) and wo_a runs as per-token x
+            # per-channel fp8_einsum. wo_a was dequantized to bf16 on load; requantize
+            # it per output channel and permute the contraction dim to the
+            # kernel's [16 tiles][8 heads][32] order.
+            weight = self.wo_a.weight.data
+            assert weight.dtype == torch.bfloat16 and weight.shape[0] == G * R, (
+                "PPU MegaAttention needs a bf16 [G*R, D] wo_a, got "
+                f"{weight.dtype} {tuple(weight.shape)}"
+            )
+            w_fp8, w_scale = sglang_per_token_quant_fp8(weight)
+            w_fp8 = interleave_output_columns(w_fp8.view(G, R, -1))
+            self.mega_wo_a = (w_fp8, w_scale.view(G, R, 1))
+            self.mega_wo_a_recipe = (1, 1, weight.shape[-1])
+        else:
+            wo_a = self.wo_a.weight.view(G, R, -1)
+            self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
 
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
@@ -1605,6 +1677,11 @@ class MQALayer(MqaAttentionBase):
             )
             and backend is not None
             and (backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl())
+        )
+
+    def _wq_b_is_ppu_per_channel_fp8(self) -> bool:
+        return _is_sail and isinstance(
+            getattr(self.wq_b, "quant_method", None), W8A8Fp8LinearMethod
         )
 
     def _forward_mega(
@@ -1675,11 +1752,13 @@ class MQALayer(MqaAttentionBase):
                 o_fp8,
                 o_s,
                 *self.mega_wo_a,
-                recipe=(1, 1, 32),
+                recipe=self.mega_wo_a_recipe,
                 out=(y.view(rows, groups, -1), y_sf),
             )
             return y, y_sf
-        return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
+        return _fp8_wo_a_einsum(
+            o_fp8, o_s, *self.mega_wo_a, recipe=self.mega_wo_a_recipe, out=out
+        )
 
     def _get_npu_rope_position_cache(
         self,
@@ -1733,6 +1812,36 @@ class MQALayer(MqaAttentionBase):
         self._accepts_mxfp8_swizzled_input = ok
         return ok
 
+    def _wq_b_quant_kind(self) -> Optional[str]:
+        """How ``wq_b`` quantizes its activation per token, if it does.
+
+        Only then can a fused rmsnorm+quant producer hand it an already
+        quantized ``(payload, scale)`` pair instead of the bf16 row.
+        """
+        cached = self.__dict__.get("_wq_b_quant_kind_cache")
+        if cached is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8LinearMethod
+            from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8LinearMethod
+
+            method = getattr(self.wq_b, "quant_method", None)
+            if isinstance(method, W8A8Int8LinearMethod):
+                cached = "int8"
+            # W8A8 fp8 always quantizes the activation per token; the generic fp8
+            # method only does so for the dynamic (non-block, non-mxfp8) variant.
+            elif isinstance(method, W8A8Fp8LinearMethod) or (
+                isinstance(method, Fp8LinearMethod)
+                and not getattr(method, "use_mxfp8", False)
+                and not getattr(method, "block_quant", False)
+                and not getattr(method, "use_marlin", False)
+                and getattr(self.wq_b, "input_scale", None) is None
+            ):
+                cached = "fp8"
+            else:
+                cached = ""
+            self.__dict__["_wq_b_quant_kind_cache"] = cached
+        return cached or None
+
     def _normalize_q_lora(
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
@@ -1740,6 +1849,39 @@ class MQALayer(MqaAttentionBase):
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
         method = self.wq_b.quant_method
+        quant_kind = self._wq_b_quant_kind() if _is_sail else None
+        if (
+            quant_kind is not None
+            and envs.SGLANG_OPT_FUSED_Q_A_RMSNORM_QUANT.get()
+            # The fp8 producer feeds the deepgemm branch, which needs sm >= 89.
+            and (quant_kind == "int8" or get_device_sm() >= 89)
+            and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
+            and q.ndim == 2
+            and q.shape[0] > 0
+            and q.shape[1] % 16 == 0
+            and q.stride(1) == 1
+        ):
+            from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+            from sglang.srt.runtime_context import get_exec
+
+            if not (
+                is_batch_invariant_mode_enabled()
+                or get_exec().deterministic.enable_deterministic_inference
+            ):
+                from sglang.kernels.ops.quantization.per_token_quant_fp8 import (
+                    fused_rmsnorm_per_token_quant_fp8,
+                    fused_rmsnorm_per_token_quant_int8,
+                )
+
+                produce = (
+                    fused_rmsnorm_per_token_quant_int8
+                    if quant_kind == "int8"
+                    else fused_rmsnorm_per_token_quant_fp8
+                )
+                y, quant, scale = produce(
+                    q, self.q_norm.weight, self.q_norm.variance_epsilon
+                )
+                return y, (quant, scale, torch.bfloat16)
         if (
             _is_cuda
             and self.is_dsv41
@@ -2604,6 +2746,47 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _get_wo_a_channel_einsum_args(
+        self, G: int, R: int, D: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int]]:
+        # Lazy-build the (weight, scale, recipe) for fp8_einsum on the
+        # channelwise FP8 path. (block-FP8 doesn't come through here.)
+        #
+        # Channelwise stores wo_a transposed:
+        #   wo_a.weight       : qweight.t()         -> [D, G*R], non-contig
+        #   wo_a.weight_scale : scale.t().contig()  -> [1, G*R]
+        # We restore weight to [G, R, D], reshape scale to [G, R, 1], and
+        # set recipe[2]=D (contract-block size; channelwise == full row,
+        # not the 128 used by block-FP8).
+        #
+        # Lazy on first forward (not post_load_weights): the quant hook
+        # may run again after post_load_weights (hot reload, draft copy,
+        # offloader requant), so this is the safest snapshot point.
+        # .clone() decouples the cache from later in-place writes.
+        wo_a = self.wo_a
+        cached = getattr(wo_a, "_einsum_args_cache", None)
+        if cached is not None:
+            return cached
+
+        w = wo_a.weight.data
+        assert w.shape == (D, G * R), (
+            f"channelwise wo_a.weight expected ({D}, {G * R}), got {tuple(w.shape)}"
+        )
+        weight_3d = w.t().contiguous().clone().view(G, R, D)
+
+        ws = wo_a.weight_scale.data
+        assert ws.numel() == G * R, (
+            f"channelwise weight_scale expected {G * R} elems, "
+            f"got shape {tuple(ws.shape)}"
+        )
+        scale = ws.reshape(G * R).contiguous().clone().view(G, R, 1)
+
+        recipe = (1, 1, D)
+
+        out = (weight_3d, scale, recipe)
+        wo_a._einsum_args_cache = out
+        return out
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2754,7 +2937,9 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink(kernel_num_heads)
+        attn_sink = (
+            self._local_attn_sink(kernel_num_heads) if not _is_sail else self.attn_sink
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -2961,7 +3146,80 @@ class MQALayer(MqaAttentionBase):
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
 
-            if fuse_rope_wo_a:
+            # Exclusive chain branch: the wo_a absorb einsum must run exactly
+            # once. If this PPU dispatch is hoisted out as a standalone `if`
+            # before the chain, the generic `_FP8_WO_A_GEMM` branch below also
+            # fires on the already-absorbed [T, G, R] output and crashes
+            # viewing the weight (rank mistaken for the head dim).
+            if self.wo_a_fp8 and _is_sail:
+                import deep_gemm
+
+                T, G, D = o.shape
+                R = self.o_lora_rank
+                if isinstance(self.wo_a.quant_method, Fp8LinearMethod) and (
+                    self.quant_config.weight_block_size is not None
+                ):
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                        o.reshape(T * G, D).contiguous(),
+                        group_size=128,
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (
+                            self.wo_a.weight.view(G, R, D),
+                            self.wo_a.weight_scale_inv.data,
+                        ),
+                        output,
+                        recipe=(1, 1, 128),
+                    )
+                # rely on deep_gemm commit "[DeepGemm] : add int8 einsum"
+                # w8a8 int8 and w4a8 int8 both use int8_einsum
+                elif isinstance(self.wo_a.quant_method, W8A8Int8LinearMethod):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_int8, o_s = per_token_quant_int8(o.reshape(T * G, D).contiguous())
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.int8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_int8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                elif isinstance(
+                    self.wo_a.quant_method, (Fp8LinearMethod, W8A8Fp8LinearMethod)
+                ) or (
+                    isinstance(self.wo_a.quant_method, CompressedTensorsLinearMethod)
+                    and isinstance(self.wo_a.scheme, CompressedTensorsW8A8Fp8)
+                ):
+                    wo_a_weight_3d, wo_a_scale, wo_a_recipe = (
+                        self._get_wo_a_channel_einsum_args(G, R, D)
+                    )
+                    o_fp8, o_s = sglang_per_token_quant_fp8(
+                        o.reshape(T * G, D).contiguous()
+                    )
+                    output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+                    deep_gemm.fp8_einsum(
+                        "bhr,hdr->bhd",
+                        (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
+                        (wo_a_weight_3d, wo_a_scale),
+                        output,
+                        recipe=wo_a_recipe,
+                    )
+                else:
+                    quant_name = type(self.wo_a.quant_method).__name__
+                    scheme_obj = getattr(self.wo_a, "scheme", None)
+                    scheme_name = (
+                        type(scheme_obj).__name__ if scheme_obj is not None else "None"
+                    )
+                    raise NotImplementedError(
+                        f"Unsupported wo_a quant_method on PPU: quant_method={quant_name}, scheme={scheme_name}"
+                    )
+                o = output
+            elif fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 out = fused_rope_wo_a_bf16(
                     o,
@@ -3470,11 +3728,22 @@ class DeepseekV4DecoderLayerBase(nn.Module):
 
             m, k = x_flat.shape
             mix_hc = hc_fn.size(0)
-            d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
-            s_out = torch.empty((m,), dtype=torch.float, device=x.device)
+            if _is_sail:
+                d_out = torch.zeros((1, m, mix_hc), dtype=torch.float, device=x.device)
+                s_out = torch.zeros((1, m), dtype=torch.float, device=x.device)
+            else:
+                d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
+                s_out = torch.empty((m,), dtype=torch.float, device=x.device)
             tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
+                x_flat,
+                hc_fn.float().contiguous(),
+                d_out,
+                s_out,
+                num_splits=1 if _is_sail else None,
             )
+            if _is_sail:
+                d_out = d_out.squeeze(0)
+                s_out = s_out.squeeze(0)
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
@@ -3746,6 +4015,21 @@ DeepseekV4DecoderLayer = (
 )
 
 
+def _tail_cp_routing_ids(
+    *, local_input_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Routing IDs for a CP tail; ``local_input_ids`` already follows its rows."""
+    if get_moe_a2a_backend().is_none():
+        # The MoE path all-gathers hidden rows rank-major; all-gather the IDs too.
+        cp_size = get_parallel().attn_cp_size
+        gathered = local_input_ids.new_empty(
+            (local_input_ids.shape[0] * cp_size, *local_input_ids.shape[1:])
+        )
+        attn_cp_all_gather_into_tensor(gathered, local_input_ids)
+        return local_input_ids, gathered
+    return local_input_ids, local_input_ids
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
@@ -3984,19 +4268,27 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        complete_input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        # CP routing uses a rank-major order, but image masks and Engram need
+        # the original sequence order with model IDs, not scheduler hash IDs.
+        if complete_input_ids is None:
+            complete_input_ids = forward_batch.input_ids
+        local_input_ids = (
+            cp_shard_hidden_states(complete_input_ids, forward_batch)
+            if cp_extend
+            else input_ids
+        )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                hash_ids = self.engram_hasher(complete_input_ids[:total], forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4140,11 +4432,21 @@ class DeepseekV4Model(nn.Module):
                 state = state.take_rows(tail.rows)
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
-                input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                local_input_ids = tail.rows(local_input_ids)
+                if tail.cp_metadata is not None:
+                    # These IDs already follow the tail's rank-local hidden rows.
+                    # Re-sharding the compact tail would change CP ownership.
+                    input_ids, input_ids_global = _tail_cp_routing_ids(
+                        local_input_ids=local_input_ids
+                    )
+                else:
+                    input_ids = tail.rows(input_ids)
+                    local_input_ids = input_ids
+                    if not (
+                        get_parallel().attn_dp_size > 1
+                        and get_moe_a2a_backend().is_none()
+                    ):
+                        input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4194,7 +4496,7 @@ class DeepseekV4Model(nn.Module):
                     state.residual,
                     hash_ids[:, engram.layer_hash_index],
                     forward_batch,
-                    input_ids=input_ids,
+                    input_ids=local_input_ids,
                     cp_all_tokens=cp_extend,
                 )
                 state = state.with_residual(hidden_states)
@@ -4427,6 +4729,15 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        complete_input_ids = forward_batch.input_ids
+        if (
+            self.config.model_type == "deepseek_v41"
+            and self.config.vision_n_layers > 0
+            and not getattr(self.config, "language_model_only", False)
+        ):
+            complete_input_ids = complete_input_ids.masked_fill(
+                complete_input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+            )
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4513,6 +4824,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                complete_input_ids=complete_input_ids,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4632,11 +4944,44 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
 
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+        packed_modules_mapping["wqkv_a"] = ["wq_a", "wkv"]
+
+    # To ensure correct weight loading and mapping.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "attn": "self_attn",
+            "ffn": "mlp",
+        },
+        orig_to_new_suffix={
+            "w1": "gate_proj",
+            "w2": "down_proj",
+            "w3": "up_proj",
+        },
+        orig_to_new_prefix={
+            "mtp.0.self_attn": "model.decoder.self_attn",
+            "mtp.0.mlp": "model.decoder.mlp",
+            "mtp.0.e_proj": "model.e_proj",
+            "mtp.0.h_proj": "model.h_proj",
+        },
+    )
 
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
         # The loader hands this mapper to every quant config; other formats were
         # written against different names, so only Quark checkpoints get it.
+        # On PPU we still need it: hybrid checkpoints (MoE MXFP4 + dense FP8
+        # per-channel) list `fp8_channelwise_layers` in HF naming, and without
+        # the mapping none of those layers match -> dense linears are built as
+        # MXFP4 and weight loading fails on shape mismatch.
+        if _is_sail:
+            return cls.hf_to_sglang_mapper
         return _QUARK_CKPT_TO_SGLANG_MAPPER if _is_quark_checkpoint(config) else None
 
     def __init__(
@@ -4680,17 +5025,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+            if get_parallel().pp_group.world_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or get_moe_a2a_backend().is_deepep()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
-                    "MoE A2A requires CUDA MegaMoE"
+                    "V4.1 vision supports TP/EP/DP/CP without PP; "
+                    "MoE A2A requires DeepEP or CUDA MegaMoE"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4733,6 +5075,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Expose start_layer/end_layer for model_runner PP support
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
+
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
+            self.cp_rank = get_parallel().attn_cp_rank
+            self.cp_size = get_parallel().attn_cp_size
+        else:
+            self.cp_rank = None
+            self.cp_size = None
 
         # update_weights_from_disk/_tensor/_distributed re-enter load_weights
         # mid-serving (RL refit sends many partial batches); the prewarm and
@@ -4847,6 +5197,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
+    def prepare_cp_inputs(self, forward_batch, **kwargs):
+        """Pass full-sequence language inputs to the runner's CP boundary."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None:
+            # A vocab-parallel embedding all-reduces row-wise across TP ranks, which
+            # is only valid when every rank embeds the same ids. CP shards the rows
+            # instead, so embed the full sequence here (identical on all ranks) and
+            # let the runner shard the embeddings, never the ids.
+            input_embeds = self.get_input_embeddings()(forward_batch.input_ids)
+        return input_embeds, forward_batch.positions, kwargs
+
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
 
@@ -4872,6 +5233,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
+            )
+        if (
+            hf_config.model_type == "deepseek_v41"
+            and hf_config.vision_n_layers > 0
+            and not getattr(hf_config, "language_model_only", False)
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            return (
+                "V4.1 vision routing with DeepEP requires separate shared experts; "
+                "per-rank fused shared slots are not supported."
             )
         if get_parallel().moe_ep_size > 1 and not uses_per_rank_fused_shared_slots():
             return (
@@ -4907,18 +5278,13 @@ class DeepseekV4ForCausalLM(nn.Module):
         """
         if (
             getattr(self, "vision", None) is not None
-            and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
         ):
-            if input_embeds is not None:
-                raise ValueError("Cannot combine input_embeds and image inputs")
-            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
+            if forward_batch.contains_mm_inputs():
+                if input_embeds is not None:
+                    raise ValueError("Cannot combine input_embeds and image inputs")
+                input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
             # Decode/verify IDs are already vocabulary IDs; remap prompt image
             # hashes for Engram and routing.
             input_ids = input_ids.masked_fill(
@@ -4938,6 +5304,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_ids, input_embeds = self.prepare_language_model_inputs(
             input_ids, forward_batch, input_embeds
         )
+        # CP (including Sail V1) is prepared at the runner boundary. Reindexing
+        # here would shard already-local query metadata a second time.
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4995,11 +5363,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
-            )
+            output.hidden_states_token_indices = tail.output_token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
@@ -5057,11 +5421,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
-        if self.wo_a_fp8:
+        # PPU keeps wo_a weight scales in the correct layout already; skip setup.
+        if self.wo_a_fp8 and not _is_sail:
             self._setup_fp8_wo_a_scales(is_nextn)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
+                cached = getattr(module.wo_a, "_einsum_args_cache", None)
+                if _is_sail and cached is not None:
+                    weight, scale, _ = cached
+                    weight.copy_(module.wo_a.weight.data.t().view_as(weight))
+                    scale.copy_(module.wo_a.weight_scale.data.view_as(scale))
                 module.setup_mega_attention()
 
         if is_nextn:
@@ -5114,6 +5484,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         name: str,
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> str:
         if name.startswith("vision."):
             return name.replace(".attn.wqkv.", ".attn.qkv_proj.").replace(
@@ -5177,6 +5548,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
+
+        if _is_sail:
+            if quant_config and quant_config.get_name() == "fp8":
+                if quant_config.weight_block_size is None or (
+                    quant_config.is_fp4_experts and "mlp.experts" in name
+                ):
+                    name = name.replace(".weight_scale_inv", ".weight_scale")
+            else:
+                name = name.replace(".weight_scale_inv", ".weight_scale")
 
         return name
 
@@ -5323,11 +5703,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.wo_a_fp8
                     and name.endswith(".wo_a.weight")
                     and loaded_weight.dtype != torch.float8_e4m3fn
+                    and not (_is_sail and loaded_weight.dtype == torch.int8)
                 ):
                     raise ValueError(
                         f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
-                        "torch.float8_e4m3fn. This checkpoint does not provide "
+                        "torch.float8_e4m3fn"
+                        + (" or torch.int8 (PPU)" if _is_sail else "")
+                        + ". This checkpoint does not provide "
                         "a supported fp8-quantized wo_a; rerun with "
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
@@ -5338,6 +5721,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
+                        quant_config=self.quant_config,
                     )
 
                     # V4.1 checkpoint tensors with no module in the text model yet.
@@ -5530,8 +5914,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and ".engram." not in name
                                 and (
                                     name.endswith(".wq_a.weight")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wkv.weight_scale_inv")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
@@ -5671,9 +6057,10 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert weight.dtype == torch.float8_e4m3fn, (
-        f"expected fp8_e4m3fn, got {weight.dtype}"
-    )
+    assert weight.dtype in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    ), f"expected fp8_e4m3fn or int8, got {weight.dtype}"
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,
@@ -5702,7 +6089,6 @@ def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
-    saw_wo_a_scale = False
     emitted = False
 
     for name, tensor in weights:
@@ -5718,9 +6104,16 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
-            saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+        scale_suffix = next(
+            (
+                suffix
+                for suffix in (".scale", ".weight_scale", ".weight_scale_inv")
+                if name.endswith(".wo_a" + suffix)
+            ),
+            None,
+        )
+        if scale_suffix is not None:
+            prefix = name[: -len(scale_suffix)]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
@@ -5734,13 +6127,16 @@ def _dequant_fp8_wo_a_streaming(
         yield name, tensor
 
     if emitted:
-        logger.info("Finished streaming dequant fp8 wo_a")
+        logger.info("Finished streaming dequant FP8/INT8 wo_a to BF16")
     for prefix, bucket in pending.items():
         if "weight" in bucket:
-            assert not saw_wo_a_scale, f"{prefix}.scale is missing"
+            if bucket["weight"].dtype in (torch.int8, torch.float8_e4m3fn):
+                raise ValueError(
+                    f"{prefix}: quantized wo_a weight is missing its scale"
+                )
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
-            yield prefix + ".scale", bucket["scale"]
+            raise ValueError(f"{prefix}: wo_a scale is missing its weight")
 
 
 def _dequant_fp8_wo_a(
