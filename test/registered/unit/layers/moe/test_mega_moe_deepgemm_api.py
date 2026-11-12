@@ -777,6 +777,69 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
 
+    def test_glm_mxfp4_shapes_pass_alignment_check(self):
+        # GLM mxfp4 W4A4 checkpoints (verified against the on-disk configs):
+        # GLM-5.3 (glm_moe_dsa): hidden 6144, moe_intermediate 2048, 256 experts.
+        # GLM-5.3-Flash (glm5_next): hidden 4096, moe_intermediate 2048, 288 experts.
+        for hidden, intermediate in ((6144, 2048), (4096, 2048)):
+            mega_moe.check_mega_moe_shapes(hidden, intermediate, "mxf4xmxf4")
+
+    def test_glm_megamoe_inheritance_chain(self):
+        # GLM-5.3 (glm_moe_dsa) reuses the DeepseekV2 stack and GLM-5.3-Flash
+        # aliases DeepseekV2MoE directly, so both inherit the megamoe forward
+        # hook without model-side code. Guard against future refactors that
+        # break this assumption.
+        from sglang.srt.models import glm5_next as glm5_next_module
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV2MoE
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
+
+        self.assertTrue(issubclass(GlmMoeDsaForCausalLM, DeepseekV2ForCausalLM))
+        self.assertIs(
+            getattr(glm5_next_module, "Glm5NextMoE", None)
+            or getattr(glm5_next_module, "DeepseekV2MoE", None),
+            DeepseekV2MoE,
+        )
+        self.assertTrue(
+            hasattr(DeepseekV2MoE, "forward"), "mega hook lives in DeepseekV2MoE.forward"
+        )
+
+    def _fake_hit_moe(self, tag):
+        experts = SimpleNamespace(
+            num_experts=256,
+            _mega_moe_nvfp4=False,
+            _mega_moe_w4a4=True,
+            _mega_moe_mma_type="mxf4xmxf4",
+        )
+        return SimpleNamespace(prefix=tag, experts=experts, n_shared_experts=1)
+
+    def _reset_hit_marker(self):
+        self.addCleanup(setattr, mega_moe, "_MEGA_HIT_LOGGED", mega_moe._MEGA_HIT_LOGGED)
+        mega_moe._MEGA_HIT_LOGGED = False
+
+    def test_mega_moe_hit_marker_logs_once_for_all_layers(self):
+        # The marker is one line per process (the first admitted batch is the
+        # startup warmup), not one line per MoE layer.
+        self._reset_hit_marker()
+        with self.assertLogs("mega_moe", level="WARNING") as captured:
+            for tag in ("layers.0.mlp", "layers.1.mlp", "layers.2.mlp"):
+                mega_moe._log_mega_moe_hit(self._fake_hit_moe(tag))
+        self.assertEqual(len(captured.output), 1, captured.output)
+        self.assertIn("MEGA_MOE_HIT", captured.output[0])
+        self.assertIn("layers.0.mlp", captured.output[0])
+        self.assertIn("experts=256", captured.output[0])
+        self.assertIn("mxf4xmxf4", captured.output[0])
+        self.assertTrue(mega_moe._MEGA_HIT_LOGGED)
+
+    def test_mega_moe_hit_marker_stays_silent_after_first_hit(self):
+        self._reset_hit_marker()
+        mega_moe._MEGA_HIT_LOGGED = False
+        with patch.object(mega_moe._MEGA_HIT_LOGGER, "warning") as warning:
+            mega_moe._log_mega_moe_hit(self._fake_hit_moe("layers.0.mlp"))
+            self.assertEqual(warning.call_count, 1)
+            for tag in ("layers.1.mlp", "layers.2.mlp", "layers.3.mlp"):
+                mega_moe._log_mega_moe_hit(self._fake_hit_moe(tag))
+            self.assertEqual(warning.call_count, 1)
+
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)
         expected = torch.tensor(
