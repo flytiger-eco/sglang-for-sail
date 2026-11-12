@@ -2282,6 +2282,18 @@ class Envs:
     SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
     SGLANG_SAIL_NORMAL_DISPATCH_TIMEOUT = EnvInt(1000)
     SGLANG_SAIL_BF16_INDEXER = EnvBool(False)
+    # QSA (Qwen sparse attention) sparse-attention compute: route through the
+    # SAIL FA3 flash_attn_with_kvcache, passing the per-row top-k token-slot
+    # table as page_table, instead of the Triton prefill / packed-FA2 decode
+    # paths. Requires a flash_attn_interface build with QSA support; falls
+    # back to the original paths otherwise.
+    SGLANG_SAIL_QSA_FA3_SPARSE_ATTN = EnvBool(False)
+    # QSA indexer prefill scoring: route the weight-free MQA logits through
+    # the SAIL DeepGEMM fp8_mqa_avg_logits kernel (q/k are quantized to
+    # fp8 e4m3 on the fly, dequant scales ride the kernel's q_scale/k_scales)
+    # instead of the TileLang BF16 kernel. FP8 MMA requires PPU SM89 (890P);
+    # on 810E this falls back to the TileLang/torch path with a warning.
+    SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
     SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
     # SAIL PLA CUDA: master switch for every SAIL PLA kernel on PPU -- the KDA
