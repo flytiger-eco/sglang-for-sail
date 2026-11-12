@@ -54,6 +54,9 @@ def _fetching_receiver(connection_pool):
     receiver.kv_mgr._deduplicate_mla_senders = (
         CommonKVManager._deduplicate_mla_senders.__get__(receiver.kv_mgr)
     )
+    receiver.kv_mgr._validate_prefill_transfer_capability = (
+        CommonKVManager._validate_prefill_transfer_capability.__get__(receiver.kv_mgr)
+    )
     receiver.prefill_info = None
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1

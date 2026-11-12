@@ -22,6 +22,8 @@ class TestMooncakeWholePageCompat(CustomTestCase):
         m.dcp_size = dcp
         m.dcp_rank = rank
         m.kv_args.draft_kv_head_num = 2
+        m.kv_args.prefill_start_layer = 0
+        m.kv_args.prefill_end_layer = 1
         m.kv_args.draft_kv_token_major = token_major
         m.kv_args.kv_item_lens = [64, 2048 * dcp, 2048 * dcp]
         m.kv_args.kv_data_ptrs = [1000000, 2000000, 3000000]

@@ -284,7 +284,7 @@ class TestMooncakeEntryMapping(CustomTestCase):
     def test_one_sided_ids_reject_ambiguous_layouts(self):
         cases = (
             ("pp_bad_span", {"pp_size": 2}, {"prefill_start_layer": 1}, 0),
-            ("cp_layer_split", {"attn_cp_size": 2}, {}, 0),
+            ("cp_missing_span", {"attn_cp_size": 2}, {"prefill_end_layer": None}, 0),
             ("hybrid", {"is_hybrid_mla_backend": True}, {}, 0),
             ("not_mla", {"is_mla_backend": False}, {}, 0),
             ("native_draft", {}, {"num_draft_entries": 1}, 0),
@@ -302,17 +302,19 @@ class TestMooncakeEntryMapping(CustomTestCase):
                         setattr(m, key, value)
                     for key, value in arg_changes.items():
                         setattr(m.kv_args, key, value)
-                    with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "Layer metadata|MLA|draft"
+                    ):
                         m._resolve_kv_entry_indices(dst_ids, 2, dst_draft)
         for src_ids, dst_ids in (([1, 0], []), ([], [1, 0])):
             with self.subTest(unordered=(src_ids, dst_ids)):
                 m = self._plain_manager(src_ids)
-                with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+                with self.assertRaisesRegex(RuntimeError, "Layer metadata|MLA|draft"):
                     m._resolve_kv_entry_indices(dst_ids, 2)
-        for src_ids, dst_ids in (([0, 1], []), ([], [0, 1, 2])):
+        for src_ids, dst_ids in (([0, 1], []), ([], [0, 1, 99])):
             with self.subTest(extra_destination_entry=(src_ids, dst_ids)):
                 m = self._plain_manager(src_ids)
-                with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+                with self.assertRaisesRegex(RuntimeError, "Layer metadata|MLA|draft"):
                     m._resolve_kv_entry_indices(dst_ids, 3)
 
     def test_invalid_draft_entry_counts_rejected(self):
@@ -391,7 +393,7 @@ class TestMooncakeEntryMapping(CustomTestCase):
                 m.pp_size = 2
                 m.kv_args.prefill_start_layer = 2
                 m.kv_args.prefill_end_layer = 4
-                with self.assertRaisesRegex(RuntimeError, "Layer metadata"):
+                with self.assertRaisesRegex(RuntimeError, "Layer metadata|MLA|draft"):
                     m._resolve_kv_entry_indices(dst_ids, 4)
 
     def test_plain_mla_metadata_keeps_old_wire_but_preserves_layer_shards(self):

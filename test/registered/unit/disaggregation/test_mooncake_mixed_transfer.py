@@ -446,6 +446,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                                 "target_pp_rank",
                             ]
                         }
+                        | {"kv_transfer_capabilities": "1"}
                     )
                 )
             )
@@ -508,6 +509,7 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                                     "target_pp_rank",
                                 )
                             }
+                            | {"kv_transfer_capabilities": "1"}
                         )
                     )
                 )
@@ -549,6 +551,9 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                         rank_ip="localhost",
                         rank_port=1000 + cp * 16 + tp,
                         sender=tp * 2 + cp,
+                        mixed_kv_transfer_version=1,
+                        dcp_size=1,
+                        dcp_rank=0,
                     )
                     r._register_kv_args = Mock(return_value=True)
                     r._setup_bootstrap_infos()
@@ -682,7 +687,12 @@ class TestMooncakeMixedTransfer(CustomTestCase):
                     r._connection_pool_entries = {}
                     m.connection_pool = {}
                     r._get_bootstrap_info_from_server = lambda dp, cp, tp, pp: dict(
-                        rank_ip="localhost", rank_port=1000 + tp, tp=tp
+                        rank_ip="localhost",
+                        rank_port=1000 + tp,
+                        tp=tp,
+                        mixed_kv_transfer_version=1,
+                        dcp_size=1,
+                        dcp_rank=0,
                     )
                     r._register_kv_args = Mock(return_value=True)
                     r._setup_bootstrap_infos()

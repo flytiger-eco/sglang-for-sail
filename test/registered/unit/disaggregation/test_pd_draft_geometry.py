@@ -661,6 +661,7 @@ class TestPDDraftGeometry(CustomTestCase):
             kv_layer_ids=[],
             draft_kv_token_major=True,
             draft_kv_entry_count=1,
+            num_draft_entries=1,
             draft_kv_head_num=1,
             draft_total_kv_head_num=16,
             engine_rank=0,

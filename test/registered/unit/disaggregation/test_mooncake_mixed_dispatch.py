@@ -482,11 +482,13 @@ class TestMooncakeMixedDispatch(CustomTestCase):
                         m._transfer_data = Mock(return_value=0)
                         if cp == 0:
                             m.kv_args.draft_kv_entry_count = 0
+                            m.kv_args.num_draft_entries = 0
                             m.kv_args.kv_data_ptrs = m.kv_args.kv_data_ptrs[:1]
                             m.kv_args.kv_item_lens = m.kv_args.kv_item_lens[:1]
                             m.kv_args.kv_layer_ids = [0]
-                        else:
-                            m.prepare_dcp_entry_geometry(info)
+                        # Revalidate the final CP-local pool and peer layout,
+                        # rather than retaining mixed_manager's original map.
+                        m.prepare_dcp_entry_geometry(info)
                         m._should_skip_cp_replicated_state_transfer = Mock(
                             return_value=False
                         )

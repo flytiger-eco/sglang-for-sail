@@ -998,6 +998,73 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def build_mla_target_entry_pairs(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+    *,
+    prefill_start_layer: Optional[int],
+    prefill_end_layer: Optional[int],
+    allow_same_pp_layout: bool = False,
+) -> List[Tuple[int, int]]:
+    """Pair ordinary MLA targets using a verified global layer span.
+
+    Callers must exclude compressed/hybrid pools and remove source drafts.
+    Explicit IDs may describe a CP-owned subset of the prefill stage. Missing
+    IDs describe a continuous pool, never an arbitrary positional fallback.
+    """
+    start, end = prefill_start_layer, prefill_end_layer
+    if start is None or end is None or start < 0 or end < start:
+        raise RuntimeError("Ordinary MLA mapping requires a valid prefill layer span")
+    if src_layer_ids:
+        if (
+            len(src_layer_ids) != n_src
+            or src_layer_ids != sorted(src_layer_ids)
+            or len(set(src_layer_ids)) != n_src
+            or any(lid < start or lid >= end for lid in src_layer_ids)
+        ):
+            raise RuntimeError("Source MLA target IDs do not match the prefill span")
+        source_ids = src_layer_ids
+    else:
+        if end - start != n_src:
+            raise RuntimeError("Missing MLA target IDs require a continuous pool")
+        source_ids = list(range(start, end))
+    if dst_layer_ids:
+        if len(dst_layer_ids) != n_dst:
+            raise RuntimeError("Destination layer metadata length differs from entries")
+        # A matched PP stage may append a native draft or repeated K/V IDs.
+        # Recognize only the consecutive reserved band above its target span.
+        draft_ids = sorted(set(dst_layer_ids[end - start :]))
+        if dst_layer_ids != sorted(dst_layer_ids) or (
+            dst_layer_ids
+            and dst_layer_ids[0] != 0
+            and not (
+                allow_same_pp_layout
+                and dst_layer_ids[: end - start] == list(range(start, end))
+                and draft_ids == list(range(end, end + len(draft_ids)))
+            )
+        ):
+            raise RuntimeError(
+                "Destination MLA target IDs do not describe a known span"
+            )
+        positions = {}
+        for index, lid in enumerate(dst_layer_ids):
+            positions.setdefault(lid, []).append(index)
+        if any(len(positions.get(lid, [])) != 1 for lid in source_ids):
+            raise RuntimeError("Decode peer must expose each requested MLA target once")
+        return [(i, positions[lid][0]) for i, lid in enumerate(source_ids)]
+    if (
+        allow_same_pp_layout
+        and n_src == n_dst
+        and source_ids == list(range(start, end))
+    ):
+        return [(i, i) for i in range(n_src)]
+    if any(lid >= n_dst for lid in source_ids):
+        raise RuntimeError("Decode MLA target pool does not cover the prefill span")
+    return [(i, lid) for i, lid in enumerate(source_ids)]
+
+
 def build_kv_layer_ids(
     *,
     token_to_kv_pool,

@@ -111,6 +111,8 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     draft_kv_entry_count: Optional[int] = None
+    mixed_kv_transfer_version: int = 0
+    dcp_size: Optional[int] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -146,6 +148,9 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    mixed_kv_transfer_version: int = 0
+    dcp_size: Optional[int] = None
+    dcp_rank: Optional[int] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -162,6 +167,9 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_carries_reason: bool = False
 
     dsv41_spec_layout: Optional[dict] = None
+    # Independently negotiated from draft presence: legacy senders may expose
+    # drafts without implementing mixed target/draft remapping.
+    mixed_kv_transfer_version: int = 0
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -1041,6 +1049,9 @@ class CommonKVManager(BaseKVManager):
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
         if bootstrap_addr in self.prefill_info_table:
+            self._validate_prefill_transfer_capability(
+                self.prefill_info_table[bootstrap_addr]
+            )
             return True
 
         info: PrefillServerInfo = None
@@ -1049,6 +1060,7 @@ class CommonKVManager(BaseKVManager):
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
+                "&kv_transfer_capabilities=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -1140,6 +1152,7 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
+        self._validate_prefill_transfer_capability(info)
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
@@ -1147,6 +1160,12 @@ class CommonKVManager(BaseKVManager):
 
     def _deduplicate_mla_senders(self, info: PrefillServerInfo) -> bool:
         return self.is_mla_backend
+
+    def _validate_prefill_transfer_capability(
+        self, info: PrefillServerInfo, rank_info: Optional[dict] = None
+    ) -> None:
+        """Backend-specific protocol check, before caching or registration."""
+        pass
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1305,6 +1324,14 @@ class CommonKVManager(BaseKVManager):
         # advertise it when head-sharded draft buffers require extra senders.
         if self.kv_args.draft_kv_entry_count:
             payload["draft_kv_entry_count"] = self.kv_args.draft_kv_entry_count
+        # The Rust registry has its own schema. Until it exposes this extension,
+        # leave capability unknown rather than claiming support through it.
+        if self.mixed_kv_transfer_version and not envs.SGLANG_RUST_SERVER.get():
+            payload.update(
+                mixed_kv_transfer_version=self.mixed_kv_transfer_version,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+            )
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -1975,6 +2002,9 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
+                if not self._validate_bootstrap_infos():
+                    self.invalidate_cached_bootstrap_infos()
+                    return
                 self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
                 # Register kv_args only once to prefill KVManager according to the info fetched
@@ -1995,11 +2025,28 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_infos = cached_bootstrap_infos
 
             self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
+            if not self._validate_bootstrap_infos():
+                self.invalidate_cached_bootstrap_infos()
+                return
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
 
         self.bootstrap_infos = all_bootstrap_infos
+
+    def _validate_bootstrap_infos(self) -> bool:
+        try:
+            for info in self.bootstrap_infos:
+                self.kv_mgr._validate_prefill_transfer_capability(
+                    self.prefill_info, info
+                )
+        except RuntimeError as exc:
+            self.kv_mgr.record_failure(self.bootstrap_room, str(exc))
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            self.bootstrap_infos = None
+            return False
+        return True
 
     def invalidate_cached_bootstrap_infos(self) -> None:
         with self.kv_mgr.connection_lock:
@@ -2013,7 +2060,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}&kv_transfer_capabilities=1"
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -2374,6 +2421,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                mixed_kv_transfer_version=int(data.get("mixed_kv_transfer_version", 0)),
+                dcp_size=data.get("dcp_size"),
+                dcp_rank=data.get("dcp_rank"),
             )
 
             self._registered_count += 1
@@ -2385,6 +2435,24 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         return web.Response(text="OK", status=200)
+
+    def _transfer_capabilities(self):
+        # Inspect every expected rank. A maximum (or registration count) could
+        # hide an old/missing PP stage or a rank replaced during rolling upgrade.
+        versions, dcp_sizes = [], set()
+        for dp in range(self.dp_size):
+            for cp in range(self.attn_cp_size):
+                for tp in range(self.attn_tp_size):
+                    for pp in range(self.pp_size):
+                        try:
+                            rank = self.prefill_port_table[dp][cp][tp][pp]
+                        except KeyError:
+                            return 0, None
+                        versions.append(rank.mixed_kv_transfer_version)
+                        dcp_sizes.add(rank.dcp_size)
+        return min(versions, default=0), (
+            dcp_sizes.pop() if len(dcp_sizes) == 1 else None
+        )
 
     async def _handle_route_get(self, request: web.Request):
         prefill_dp_rank = request.query.get("prefill_dp_rank")
@@ -2429,9 +2497,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 draft_kv_entry_count=self.draft_kv_entry_count,
             )
             payload = dataclasses.asdict(info)
+            if request.query.get("kv_transfer_capabilities") == "1":
+                version, dcp_size = self._transfer_capabilities()
+                payload.update(mixed_kv_transfer_version=version, dcp_size=dcp_size)
+            else:
+                payload.pop("mixed_kv_transfer_version")
+                payload.pop("dcp_size")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
-            if not info.draft_kv_entry_count:
+            if (
+                request.query.get("kv_transfer_capabilities") != "1"
+                or not info.draft_kv_entry_count
+            ):
                 payload.pop("draft_kv_entry_count")
             return web.json_response(payload, status=200)
 
@@ -2455,7 +2532,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        payload = dataclasses.asdict(bootstrap_info)
+        if request.query.get("kv_transfer_capabilities") != "1":
+            for key in ("mixed_kv_transfer_version", "dcp_size", "dcp_rank"):
+                payload.pop(key)
+        return web.json_response(payload, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()
