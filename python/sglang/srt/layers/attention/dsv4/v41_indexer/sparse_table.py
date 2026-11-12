@@ -285,6 +285,7 @@ class SparseTableBackend:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=metadata.request_indices,
         )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
@@ -360,6 +361,11 @@ class SparseTableBackend:
                 table,
                 plan,
                 metadata.max_compressed_seq_len,
+                indices=(
+                    metadata.request_indices[rows]
+                    if metadata.request_indices is not None
+                    else None
+                ),
             )
             if logits.dtype == torch.bfloat16:
                 topk_transform_paged_bf16(

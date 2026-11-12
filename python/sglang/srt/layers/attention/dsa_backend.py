@@ -87,11 +87,11 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.dsa_nvtx import dsa_sparse_nvtx
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
-from sglang.srt.layers.attention.dsa_nvtx import dsa_sparse_nvtx
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
@@ -977,7 +977,10 @@ class DeepseekSparseAttnBackend(
     def _build_paged_mqa_schedule_metadata(
         self,
         seqlens_32_2d: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        if _is_sail and not envs.SGLANG_SAIL_BF16_INDEXER.get():
+            # Build PPU schedules at indexer compute with the actual Q, owners, and SM count.
+            return None
         return resolve_paged_mqa_logits_metadata_fn()(
             seqlens_32_2d,
             64,
@@ -3463,7 +3466,7 @@ class DeepseekSparseAttnBackend(
 
         topk_length = None
         if _is_sail and self.dsa_index_kpool > 1:
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48] KPool tails: pad the
+            # [Ported from v0.5.18_rel feat/glm-5.3-flash 28925f0d48] KPool tails: pad the
             # index list to a kernel-friendly multiple and pass per-item lengths.
             assert (
                 page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1
@@ -3479,7 +3482,7 @@ class DeepseekSparseAttnBackend(
                 )
             topk_length = cache_seqlens[: page_table_1.shape[0]]
         else:
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash 28925f0d48 - replace strict topk assert with KPool tail padding] 旧代码：
+            # [Ported from v0.5.18_rel feat/glm-5.3-flash 28925f0d48 - replace strict topk assert with KPool tail padding] Previous code:
             # indices = page_table_1.unsqueeze(1)
             # assert (
             #     indices.shape[-1] == self.dsa_index_topk
@@ -4297,14 +4300,14 @@ class DeepseekSparseAttnBackend(
 
         num_heads_q = self.flashmla_kv_num_q_heads
 
-        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] Pass topk_length to
+        # [Ported from v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e] Pass topk_length to
         # scheduler so it builds metadata based on actual per-item token counts
         # instead of global topk=2048, eliminating the scheduler/kernel topk
         # semantic mismatch that causes SM80 HS64 page-walk faults on odd batch
         # sizes. Condition mirrors _forward_flashmla_kv: only PPU with kpool>1.
         topk_length = cache_seqlens if (_is_sail and self.dsa_index_kpool > 1) else None
 
-        # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] 旧代码：
+        # [Ported from v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e - propagate topk_length] Previous code:
         # flashmla_metadata, num_splits = get_mla_metadata(
         #     cache_seqlens=cache_seqlens,
         #     # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
@@ -4324,7 +4327,7 @@ class DeepseekSparseAttnBackend(
             num_heads_q=num_heads_q,
             is_fp8_kvcache=self._flashmla_decode_compute_fp8,
             topk=self.dsa_index_topk,
-            # [迁移自 v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
+            # [Ported from v0.5.18_rel feat/glm-5.3-flash B1 6dd5c0cc6e]
             topk_length=topk_length,
         )
 

@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
     mqa_logits_should_chunk,
+    sail_paged_mqa_logits,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
@@ -119,7 +120,7 @@ def _mqa_logits_row_chunks(
     # pool sized by mem_fraction_static, so only the free-memory budget bounds them.
     need_chunk, budget_bytes = mqa_logits_should_chunk(
         num_rows=num_rows,
-        num_cols=num_cols,
+        num_cols=mqa_logits_row_bytes(num_cols) // 4 if is_sail() else num_cols,
         get_budget_bytes=lambda: mqa_logits_budget_bytes(
             device_index=device_index, allow_sync=True
         ),
@@ -862,7 +863,11 @@ class IndexerKPool(MultiPlatformOp):
                     block_tables, self.index_kpool
                 ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
-            if pool_schedule_metadata is None and build_schedule_metadata:
+            if (
+                pool_schedule_metadata is None
+                and build_schedule_metadata
+                and not is_sail()
+            ):
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
                 )
@@ -902,7 +907,7 @@ class IndexerKPool(MultiPlatformOp):
             ]
 
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-        if pool_schedule_metadata is None and build_schedule_metadata:
+        if pool_schedule_metadata is None and build_schedule_metadata and not is_sail():
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 pool_context_lens.clamp(min=1), blocksize, self.sm_count
             )
@@ -1097,6 +1102,16 @@ class IndexerKPool(MultiPlatformOp):
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+            )
+        elif is_sail():
+            logits = sail_paged_mqa_logits(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8,
+                weights,
+                pool_context_lens,
+                pool_block_tables,
+                None,
+                pool_max_seq_len,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (

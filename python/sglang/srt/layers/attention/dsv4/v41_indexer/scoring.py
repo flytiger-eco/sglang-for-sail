@@ -62,7 +62,7 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
-        if n > 1:
+        if n > 1 and not is_sail():
             heads = q_fp4.shape[2]
             q_fp4 = q_fp4.view(-1, n, heads, 64)
             q_sf = q_sf.view(-1, n, heads)
@@ -642,13 +642,8 @@ def decode_score_chunks(
 
     def score_rows(rows, plan):
         if indexer.use_int8:
-            # The INT8 kernel takes the same rows_per_request grouping the plan
-            # was built for; its rows are flattened back below.
-            group = metadata.rows_per_request
-            assert (rows.stop - rows.start) % group == 0, (
-                f"indexer chunk of {rows.stop - rows.start} rows does not group "
-                f"by {group}"
-            )
+            # Weighted PPU schedules use one query per row, so chunks may split
+            # an MTP request; the adapter rebuilds metadata for each row chunk.
             return int8_paged_index_logits(
                 q[rows],
                 weights[rows],
@@ -658,7 +653,7 @@ def decode_score_chunks(
                 plan,
                 metadata.max_compressed_seq_len,
                 metadata.compressed_page_size,
-                rows_per_request=group,
+                rows_per_request=metadata.rows_per_request,
             )[:, :lmax]
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4[rows].unsqueeze(1), q_sf[rows].unsqueeze(1)),
@@ -668,6 +663,7 @@ def decode_score_chunks(
             metadata.page_table[rows],
             plan,
             metadata.max_compressed_seq_len,
+            indices=req[rows],
         )[:, :lmax]
 
     for rows, plan in metadata.row_chunks():

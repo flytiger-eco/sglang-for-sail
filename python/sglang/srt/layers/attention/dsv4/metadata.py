@@ -88,7 +88,7 @@ def plan_indexer_row_chunks(
     if budget_bytes is not None:
         need_chunk, budget_bytes = mqa_logits_should_chunk(
             num_rows=num_rows,
-            num_cols=num_cols,
+            num_cols=mqa_logits_row_bytes(num_cols) // 4 if is_sail() else num_cols,
             get_budget_bytes=lambda: budget_bytes,
             rocm=is_hip(),
         )
@@ -187,6 +187,7 @@ class PagedIndexerMetadata:
     # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
     compress_ratio: int = 4
     rows_per_request: int = 1
+    request_indices: Optional[torch.Tensor] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     build_paged_mqa_logits_metadata: bool = True
     deep_gemm_metadata: Any = field(init=False, repr=False)
@@ -204,7 +205,27 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
+        if is_sail():
+            # Update opaque PPU schedules with graph compute; init only plans row chunks.
+            num_rows = self.compressed_seq_lens.numel()
+            self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
+            self.rows_per_chunk = plan_indexer_row_chunks(
+                num_rows=num_rows,
+                num_cols=self.max_compressed_seq_len,
+                budget_bytes=self.mqa_logits_budget_bytes,
+                sm120_row_cap=None,
+            )
+            self.deep_gemm_metadata = (
+                [
+                    None
+                    for _ in iter_row_chunks(
+                        num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
+                    )
+                ]
+                if self.rows_per_chunk is not None
+                else None
+            )
+        elif (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
@@ -316,7 +337,12 @@ class PagedIndexerMetadata:
         if self.use_prefill_cuda_graph or not self.compressed_seq_lens.is_cuda:
             return None
         if not mqa_logits_needs_budget_check(
-            num_rows=num_rows, num_cols=self.max_compressed_seq_len
+            num_rows=num_rows,
+            num_cols=(
+                mqa_logits_row_bytes(self.max_compressed_seq_len) // 4
+                if is_sail()
+                else self.max_compressed_seq_len
+            ),
         ):
             return None
         if (
@@ -371,7 +397,7 @@ class PagedIndexerMetadata:
         else:
             copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += ["topk_metadata", "request_indices"]
         assign_fields += [
             "rows_per_chunk",
             "mqa_logits_budget_bytes",

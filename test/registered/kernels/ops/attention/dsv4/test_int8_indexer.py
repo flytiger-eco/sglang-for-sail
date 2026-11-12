@@ -102,8 +102,8 @@ class TestInt8IndexerCache(CustomTestCase):
         for width in (1, 128, 257, 1024):
             for budget_mb in (1, 16, 4096):
                 budget = budget_mb * 1024 * 1024
-                stride = (width + 256 + 3) // 4 * 4
-                expect = max(1, budget // (stride * 4) // 4 * 4)
+                row_bytes = (width * 4 + 1023) // 1024 * 1024
+                expect = max(1, budget // row_bytes // 4 * 4)
                 self.assertEqual(int8_logits_rows_per_chunk(width, budget), expect)
 
     def test_quantize_query_folds_q_scales_into_weights(self):

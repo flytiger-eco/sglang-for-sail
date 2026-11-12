@@ -1562,6 +1562,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         rows_per_request: int = 1,
         build_paged_mqa_logits_metadata: bool = True,
+        request_indices: Optional[torch.Tensor] = None,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1586,6 +1587,14 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        if is_sail() and request_indices is not None:
+            if (
+                request_indices.ndim != 1
+                or request_indices.numel() != c_seq_lens.numel()
+            ):
+                raise ValueError("Indexer request owners must match query rows")
+            request_indices = request_indices.to(torch.int32).contiguous()
+            c_seq_lens = c_seq_lens.masked_fill(request_indices < 0, 0)
         query_head_dim = self.index_head_dim
         if not use_dsv41_int8_indexer() and (
             compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer
@@ -1607,11 +1616,14 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,
+            request_indices=request_indices if is_sail() else None,
             build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             q_fp8_shape=torch.Size(
                 (
-                    c_seq_lens.shape[0] // rows_per_request,
-                    rows_per_request,
+                    c_seq_lens.shape[0]
+                    if is_sail()
+                    else c_seq_lens.shape[0] // rows_per_request,
+                    1 if is_sail() else rows_per_request,
                     self.index_n_heads,
                     query_head_dim,
                 )
@@ -1715,9 +1727,25 @@ class DeepseekV4AttnBackend(
                 num_tokens=num_write_tokens, local_index=cp_metadata.local_index
             )
             core_attn_metadata.init_flashmla_related(is_prefill=True)
+        indexer_request_indices = req_pool_indices_repeated
+        if is_sail():
+            row_ids = torch.arange(
+                indexer_request_indices.numel(), device=indexer_request_indices.device
+            )
+            indexer_request_indices = torch.where(
+                row_ids < num_tokens, indexer_request_indices, -row_ids - 1
+            )
+            if cp_active:
+                cp_index = cp_metadata.local_index
+                if cp_index is None:
+                    cp_index = slice(
+                        get_parallel().attn_cp_rank, None, get_parallel().attn_cp_size
+                    )
+                indexer_request_indices = indexer_request_indices[cp_index].contiguous()
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
+                request_indices=indexer_request_indices,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 build_paged_mqa_logits_metadata=build_paged_mqa_logits_metadata,
             )
@@ -2382,9 +2410,19 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             num_groups=bs,
         )
+        indexer_request_indices = req_pool_indices_repeated
+        if is_sail():
+            row_ids = torch.arange(
+                indexer_request_indices.numel(), device=indexer_request_indices.device
+            )
+            indexer_request_indices = torch.where(
+                row_ids < num_q_tokens, indexer_request_indices, -row_ids - 1
+            )
         indexer_metadata = (
             self.init_forward_metadata_indexer(
-                core_attn_metadata, use_prefill_cuda_graph=graph_backed
+                core_attn_metadata,
+                use_prefill_cuda_graph=graph_backed,
+                request_indices=indexer_request_indices,
             )
             if self.has_c4
             else None
@@ -2416,6 +2454,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=1,
                     rows_per_request=rows_per_request,
+                    request_indices=indexer_request_indices,
                     use_prefill_cuda_graph=graph_backed,
                 )
                 if 1 in low
@@ -2426,6 +2465,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=2,
                     rows_per_request=rows_per_request,
+                    request_indices=indexer_request_indices,
                     use_prefill_cuda_graph=graph_backed,
                 )
                 if 2 in low
@@ -2452,19 +2492,25 @@ class DeepseekV4AttnBackend(
             need_compress=True,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata, request_indices=req_pool_indices
+            )
             if self.has_c4
             else None
         )
 
         low = core_attn_metadata.low_ratios
         c1_indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata, compress_ratio=1, request_indices=req_pool_indices
+            )
             if 1 in low
             else None
         )
         c2_indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata, compress_ratio=2, request_indices=req_pool_indices
+            )
             if 2 in low
             else None
         )

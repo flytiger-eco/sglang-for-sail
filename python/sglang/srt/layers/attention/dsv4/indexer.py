@@ -43,6 +43,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
@@ -51,6 +52,8 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
+    sail_mqa_logits,
+    sail_paged_mqa_logits,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -78,9 +81,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang.kernels.ops.attention.dsa.triton_kernel import (
-    _supports_fp8,
-)
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -90,7 +90,7 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 # Determine which quant dtype to use based on hardware capability
-_USE_INT8 = is_sail() and (not _supports_fp8() or envs.SGLANG_SAIL_DSV4_USE_INT8.get())
+_USE_INT8 = use_dsv41_int8_indexer()
 
 
 def split_indexer_prefill_chunks(
@@ -1068,15 +1068,15 @@ class C4IndexerBackendMixin:
             q_packed_chunk = q_packed[global_token_start:global_token_end]
             q_sf_chunk = q_sf[global_token_start:global_token_end]
             q_packed_int8 = q_packed_chunk.contiguous().view(torch.int8)
-            logits = deep_gemm.fp8_fp4_mqa_logits(
+            logits = sail_mqa_logits(
                 (q_packed_int8, q_sf_chunk),
                 (kv_packed, kv_sf),
                 weights,
                 ks,
                 ke,
-                clean_logits=False,
-                logits_dtype=torch.bfloat16,
+                max_seqlen_k=max_c4_seq_len,
             )
+            return logits, torch.zeros_like(ks), ke - ks
         else:
             q_fp8 = q_fp8[global_token_start:global_token_end]
             kv_fp8 = k_buf.view(FP8_DTYPE)
@@ -1308,7 +1308,8 @@ class C4IndexerBackendMixin:
             return F.pad(tensor, pad, value=value)
 
         c4_seq_lens = match_num_queries(
-            indexer_metadata.compressed_seq_lens, value=0 if use_aiter_fp4 else 1
+            indexer_metadata.compressed_seq_lens,
+            value=0 if use_aiter_fp4 or is_sail() else 1,
         )
         _c4sl = c4_seq_lens
         page_table = match_num_queries(indexer_metadata.page_table, value=0)
@@ -1529,21 +1530,38 @@ class C4IndexerBackendMixin:
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
                 row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
-                logits = fn(
-                    row_q,
-                    c4_indexer_kv_cache,
-                    weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
-                    metadata,
-                    indexer_metadata.max_compressed_seq_len,
-                    False,
-                    **(
-                        {"logits_dtype": torch.bfloat16}
-                        if _USE_INT8 and not use_fp4_indexer
-                        else {}
-                    ),
-                )
+                if is_sail() and not (_use_tilelang or _use_aiter or _use_torch_fn):
+                    request_indices = None
+                    if use_fp4_indexer:
+                        request_indices = indexer_metadata.request_indices
+                        if request_indices is None:
+                            raise RuntimeError(
+                                "PPU MXFP4 metadata is missing query request owners"
+                            )
+                        request_indices = match_num_queries(request_indices, value=-1)[
+                            rows
+                        ]
+                    logits = sail_paged_mqa_logits(
+                        row_q,
+                        c4_indexer_kv_cache,
+                        weights[rows],
+                        _c4sl[rows],
+                        page_table[rows],
+                        metadata,
+                        indexer_metadata.max_compressed_seq_len,
+                        indices=request_indices,
+                    )
+                else:
+                    logits = fn(
+                        row_q,
+                        c4_indexer_kv_cache,
+                        weights[rows],
+                        _c4sl[rows],
+                        page_table[rows],
+                        metadata,
+                        indexer_metadata.max_compressed_seq_len,
+                        False,
+                    )
                 run_topk_transform(rows, logits, topk_plan)
 
             deep_gemm_metadata = indexer_metadata.deep_gemm_metadata

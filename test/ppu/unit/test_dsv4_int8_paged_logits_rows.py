@@ -1,11 +1,10 @@
 """INT8 paged indexer logits with several query rows per request.
 
-The verify forward of DSpark/MTP hands the low-ratio INT8 indexer one group of
-``rows_per_request`` rows per request, and the DeepGEMM plan is built for those
-groups. This pins the kernel contract: a grouped call must reproduce the
-per-row calls on every row's visible columns. Rows of one request carry
-non-decreasing lengths (later draft positions see at least as much context),
-which is what lets the schedule size the K walk from the group's last row.
+The verify forward of DSpark/MTP hands the low-ratio INT8 indexer several
+``rows_per_request`` rows per request. Weighted PPU kernels require next_n=1,
+so the adapter keeps per-query lengths and block-table rows and builds the
+schedule at compute time. A batched call must reproduce per-row calls on
+every row's visible columns, even when row chunks split an MTP request.
 
 Runs on PPU (where the low-ratio indexer is INT8) and skips elsewhere.
 """
@@ -37,17 +36,13 @@ def _page_table_pool(batch: int, pages: int, device: str):
         -64, 64, (batch * pages, PAGE_SIZE, HEAD_DIM), dtype=torch.int8, device=device
     )
     flat[:, : PAGE_SIZE * HEAD_DIM] = k.reshape(batch * pages, -1).view(torch.uint8)
-    flat[:, PAGE_SIZE * HEAD_DIM :] = (
-        torch.tensor([0, 0, 128, 63], dtype=torch.uint8, device=device)
-        .repeat_interleave(PAGE_SIZE)
-        .repeat(batch * pages, 1)
-    )
+    flat[:, PAGE_SIZE * HEAD_DIM :] = torch.ones(
+        batch * pages, PAGE_SIZE, dtype=torch.float32, device=device
+    ).view(torch.uint8)
     return flat
 
 
 def test_grouped_rows_match_per_row_calls():
-    import deep_gemm
-
     from sglang.kernels.ops.attention.dsv4.int8_indexer import int8_paged_index_logits
 
     device = "cuda"
@@ -71,23 +66,13 @@ def test_grouped_rows_match_per_row_calls():
         dtype=torch.int32,
         device=device,
     ).reshape(-1)
-    grouped_lens = lens.view(batch, GROUP)
-
-    def plan_of(lens_arg):
-        return deep_gemm.get_paged_mqa_logits_metadata(
-            lens_arg,
-            PAGE_SIZE,
-            deep_gemm.get_num_sms(),
-            metadata_extra=(1, HEADS, HEAD_DIM, 1),
-        )
-
     grouped = int8_paged_index_logits(
         q,
         weights,
         cache,
         lens,
         row_table,
-        plan_of(grouped_lens),
+        None,
         width,
         PAGE_SIZE,
         rows_per_request=GROUP,
@@ -102,7 +87,7 @@ def test_grouped_rows_match_per_row_calls():
                 cache,
                 lens[row : row + 1],
                 row_table[row : row + 1],
-                plan_of(lens[row : row + 1].view(1, 1)),
+                None,
                 width,
                 PAGE_SIZE,
             )
@@ -113,3 +98,21 @@ def test_grouped_rows_match_per_row_calls():
     visible = torch.arange(width, device=device)[None, :] < lens[:, None]
     assert torch.isfinite(grouped[visible]).all()
     assert torch.equal(grouped[visible], per_row[visible])
+
+    chunked = torch.cat(
+        [
+            int8_paged_index_logits(
+                q[start : start + 4],
+                weights[start : start + 4],
+                cache,
+                lens[start : start + 4],
+                row_table[start : start + 4],
+                None,
+                width,
+                PAGE_SIZE,
+                rows_per_request=GROUP,
+            )
+            for start in range(0, batch * GROUP, 4)
+        ]
+    )
+    assert torch.equal(grouped[visible], chunked[visible])

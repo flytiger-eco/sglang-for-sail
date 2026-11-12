@@ -27,6 +27,18 @@ class TopkTransformMethod(IntEnum):
     RAGGED = auto()
 
 
+def _sail_topk_fp32(logits: torch.Tensor) -> torch.Tensor:
+    """Cast BF16 losslessly with 16-byte row alignment for fused/v2 Top-K."""
+    width = logits.shape[1]
+    if width % 4 == 0:
+        return logits.float()
+    aligned_width = (width + 3) // 4 * 4
+    output = torch.empty(
+        (logits.shape[0], aligned_width), dtype=torch.float32, device=logits.device
+    )[:, :width]
+    return output.copy_(logits)
+
+
 class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
@@ -62,6 +74,8 @@ class DSATopKBackend(Enum):
         topk: int,
         row_starts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if is_sail() and score.dtype == torch.bfloat16 and self.is_sgl_kernel():
+            score = _sail_topk_fp32(score)
         if self.is_sgl_kernel():
             from sgl_kernel import fast_topk_v2
 
@@ -165,6 +179,9 @@ class DSATopKBackend(Enum):
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
+        # MXFP4 always emits BF16; cast losslessly to FP32 for fused/v2 Top-K.
+        if is_sail() and logits.dtype == torch.bfloat16:
+            logits = _sail_topk_fp32(logits)
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
