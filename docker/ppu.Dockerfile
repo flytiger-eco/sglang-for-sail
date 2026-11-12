@@ -4,7 +4,8 @@
 # docker build -f docker/ppu.Dockerfile --target framework -t sglang:ppu-dev .
 #
 # Based on docker/ppu.Dockerfile from v0.5.21, retaining parallel kernel/gateway
-# builds and framework/runtime targets with the current SAIL scripts and native SDK.
+# builds and framework/runtime targets with the current SAIL scripts.
+# Support both CUDA-compatible PPU and native cuda-free SDK images.
 # NVIDIA-only components and kernels-community CUDA cubins are not installed.
 ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
 # pyproject_other.toml no longer provides http2/ray extras; inference dependencies
@@ -23,6 +24,9 @@ ARG MAX_JOBS=16
 ARG SAILIFY_WHEEL_URL=https://download.t-head.cn/artifactory/pypi_tmp/2026-11-03-0938/sailify-1.0.0-py3-none-any.whl
 ARG PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
 ARG SGL_KERNEL_VERSION=0.4.9
+# Pin the same standalone CUDA configuration converter used by the wheel workflow.
+ARG CUDAFY_SCRIPT_URL=https://raw.githubusercontent.com/flytiger-eco/cudafy-for-sail/17fc9b6dd6267000a2fcb58e0177051d3439052b/cudafy_sail_sglang.py
+ARG CUDAFY_SCRIPT_SHA256=0b4ab5ddf536731b855981048d8a568e411d22937d70772035165886b76199c5
 # Keep v0.5.21 PPU local-version pins for dependencies without temporary wheels
 # to prevent CUDA package selection. sailify is required for build-time source
 # conversion in setup_sail.py and for JIT compilation.
@@ -65,9 +69,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PIP_ROOT_USER_ACTION=ignore \
     PPU_SDK=/usr/local/PPU_SDK \
-    PPU_HOME=/usr/local/PPU_SDK \
-    CUDA_HOME=/usr/local/PPU_SDK \
-    CUDA_PATH=/usr/local/PPU_SDK
+    PPU_HOME=/usr/local/PPU_SDK
+# Preserve the base image's CUDA_HOME/CUDA_PATH for its actual compiler mode.
 ENV PATH="${PPU_SDK}/bin:${PATH}" \
     LD_LIBRARY_PATH="${PPU_SDK}/lib:${LD_LIBRARY_PATH}"
 
@@ -130,7 +133,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "setuptools-rust>=1.11" \
         "setuptools-scm>=8" \
         wheel packaging ninja pybind11 cython scikit-build-core \
-    && python3 -c "import platform, sys, torch; assert sys.version_info[:2] == (3, 12); assert platform.machine() == 'x86_64'; assert getattr(torch.version, 'sail', None), 'SAIL torch is required'; print('base torch:', torch.__version__)"
+    && python3 -c "import platform, sys, torch; from torch.utils import cpp_extension; assert sys.version_info[:2] == (3, 12); assert platform.machine() == 'x86_64'; assert torch.version.cuda is not None, 'A GPU-enabled PPU Torch build is required'; print('base torch:', torch.__version__, 'cuda:', torch.version.cuda, 'sail:', getattr(torch.version, 'sail', None), 'native PPU extensions:', getattr(cpp_extension, 'IS_PPU_EXTENSION', False))"
 
 RUN locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8 \
@@ -150,6 +153,8 @@ ARG PPU_PACKAGES
 ARG PPU_TORCH_PACKAGES
 ARG PPU_WHEEL_URLS
 ARG SGL_KERNEL_VERSION
+ARG CUDAFY_SCRIPT_URL
+ARG CUDAFY_SCRIPT_SHA256
 
 WORKDIR /build
 
@@ -170,8 +175,9 @@ RUN source "${PPU_SDK}/envsetup.sh" ppu \
     && ls -l /wheels
 
 # Build AOT kernels from the current branch to avoid stale same-version index
-# packages. setup_sail.py requires sailify and the relative kernels/jit/include
-# directory layout.
+# packages. Native builds require sailify and the relative kernels/jit/include
+# directory layout. CUDA-compatible builds need CUTLASS, NVCC flags, CUDA link
+# libraries, and direct relative sources instead of native sailify staging.
 COPY python/sglang/kernels/aot /build/sglang/kernels/aot
 COPY python/sglang/kernels/jit/include /build/sglang/kernels/jit/include
 RUN source "${PPU_SDK}/envsetup.sh" ppu \
@@ -184,6 +190,17 @@ RUN source "${PPU_SDK}/envsetup.sh" ppu \
     && { grep -qx "version = \"${SGL_KERNEL_VERSION}\"" pyproject_sail.toml \
          || { echo "AOT version does not match SGL_KERNEL_VERSION=${SGL_KERNEL_VERSION}"; exit 1; }; } \
     && cp pyproject_sail.toml pyproject.toml \
+    && if python3 -c "from torch.utils import cpp_extension; import sys; sys.exit(0 if getattr(cpp_extension, 'IS_PPU_EXTENSION', False) else 1)"; then \
+        echo "Building native PPU AOT kernels with hgcc and sailify"; \
+    else \
+        echo "Converting AOT configuration for the CUDA-compatible PPU toolchain" \
+        && curl --fail --location --retry 3 --connect-timeout 30 \
+            "${CUDAFY_SCRIPT_URL}" -o /tmp/cudafy_sail_sglang.py \
+        && echo "${CUDAFY_SCRIPT_SHA256}  /tmp/cudafy_sail_sglang.py" | sha256sum -c - \
+        && python3 /tmp/cudafy_sail_sglang.py --file setup_sail.py --no-backup \
+        && rm -f /tmp/cudafy_sail_sglang.py \
+        || exit 1; \
+    fi \
     && python3 setup_sail.py bdist_wheel --dist-dir /wheels \
     && rm -rf /build/sglang \
     && ls -l /wheels
