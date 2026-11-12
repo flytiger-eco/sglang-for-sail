@@ -180,7 +180,6 @@ if _use_aiter:
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k, get_dcp_lens
 from sglang.srt.layers.linear import ReplicatedLinear

@@ -1,6 +1,5 @@
 """Run with python on eight GPUs; validate peer exchange and graph replay."""
 
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +13,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
 )
 from sglang.srt.layers.dcp import comm
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import published_topology

@@ -176,6 +176,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
+
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 

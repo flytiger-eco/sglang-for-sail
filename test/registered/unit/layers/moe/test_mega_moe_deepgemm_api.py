@@ -1163,7 +1163,8 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             DeepseekV2MoE,
         )
         self.assertTrue(
-            hasattr(DeepseekV2MoE, "forward"), "mega hook lives in DeepseekV2MoE.forward"
+            hasattr(DeepseekV2MoE, "forward"),
+            "mega hook lives in DeepseekV2MoE.forward",
         )
 
     def _fake_hit_moe(self, tag):
@@ -1176,7 +1177,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         return SimpleNamespace(prefix=tag, experts=experts, n_shared_experts=1)
 
     def _reset_hit_marker(self):
-        self.addCleanup(setattr, mega_moe, "_MEGA_HIT_LOGGED", mega_moe._MEGA_HIT_LOGGED)
+        self.addCleanup(
+            setattr, mega_moe, "_MEGA_HIT_LOGGED", mega_moe._MEGA_HIT_LOGGED
+        )
         mega_moe._MEGA_HIT_LOGGED = False
 
     def test_mega_moe_hit_marker_logs_once_for_all_layers(self):

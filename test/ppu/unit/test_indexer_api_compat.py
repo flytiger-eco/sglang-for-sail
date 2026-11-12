@@ -134,13 +134,20 @@ class TestIndexerAPI(unittest.TestCase):
         lens = torch.arange(1, 13, dtype=torch.int64)
         table = torch.arange(24, dtype=torch.int32).reshape(12, 2)
         cache = torch.zeros(24, 64 * 132, dtype=torch.uint8)
-        self.dg.int8_paged_mqa_logits.side_effect = (
-            lambda q, *args, **kwargs: torch.zeros(q.shape[0], 128)
+        self.dg.int8_paged_mqa_logits.side_effect = lambda q, *args, **kwargs: (
+            torch.zeros(q.shape[0], 128)
         )
         for rows in (slice(0, 12), slice(0, 4), slice(4, 8), slice(8, 12)):
             output = paged(
-                q[rows], weights[rows], cache, lens[rows], table[rows],
-                object(), 128, 64, rows_per_request=6,
+                q[rows],
+                weights[rows],
+                cache,
+                lens[rows],
+                table[rows],
+                object(),
+                128,
+                64,
+                rows_per_request=6,
             )
             args, kwargs = self.dg.int8_paged_mqa_logits.call_args
             meta_args, meta_kwargs = self.dg.get_paged_mqa_logits_metadata.call_args

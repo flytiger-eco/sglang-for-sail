@@ -239,7 +239,10 @@ def _wheel_scores(input: torch.Tensor) -> torch.Tensor:
             "produce bf16 index logits or rank fp32 on the top-k v2 kernel"
         )
     run_bytes = _wheel_stride_requirement()[0]
-    if input.stride(-1) == 1 and input.stride(0) * input.element_size() % run_bytes == 0:
+    if (
+        input.stride(-1) == 1
+        and input.stride(0) * input.element_size() % run_bytes == 0
+    ):
         return input
     step = run_bytes // input.element_size()
     width = input.shape[1]
@@ -321,9 +324,9 @@ def _wheel_page_transform(
     valid = raw >= 0
     cols = raw.clamp_min(0).to(torch.int64)
     slots = page_table.gather(1, cols // page_size) * page_size + cols % page_size
-    result = torch.where(
-        valid, slots, torch.full_like(slots, idx_oob_fill_value)
-    ).to(torch.int32)
+    result = torch.where(valid, slots, torch.full_like(slots, idx_oob_fill_value)).to(
+        torch.int32
+    )
     if output_idx is not None:
         output_idx.copy_(result)
         return output_idx
@@ -411,7 +414,6 @@ def warn_no_backend() -> None:
         "DeepSelect has no backend on this device (no wheel and no supported "
         "JIT arch); the top-k ranks exact fp32 values instead."
     )
-
 
 
 class _CachedModuleDispatch:
@@ -575,7 +577,9 @@ def topk_page_transform(
         )
     if not is_deep_select_supported():
         if abort_when_nan_found:
-            raise NotImplementedError("the DeepSelect fp32 fallback cannot abort on NaN")
+            raise NotImplementedError(
+                "the DeepSelect fp32 fallback cannot abort on NaN"
+            )
         return _paged_fp32(
             input,
             topk,
