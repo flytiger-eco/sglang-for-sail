@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import (
+    can_use_mega_mhc_decode,
     can_use_mega_mhc_prefill,
     try_mhc_mega_boundary,
 )
@@ -661,7 +662,10 @@ def _can_use_mega_mhc(cfg: HcConfig, forward_batch: Optional[ForwardBatch]) -> b
         and not cfg.cp_prefill
         and not get_forward().sp_active
         and forward_batch is not None
-        and can_use_mega_mhc_prefill(forward_batch)
+        and (
+            can_use_mega_mhc_prefill(forward_batch)
+            or can_use_mega_mhc_decode(forward_batch)
+        )
     )
 
 

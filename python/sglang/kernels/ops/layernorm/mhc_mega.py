@@ -40,11 +40,24 @@ def _mega_mhc_kernel():
 
 
 def can_use_mega_mhc_prefill(forward_batch) -> bool:
-    if (
-        not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
-        or not ENABLE_JIT_DEEPGEMM
-        or not forward_batch.forward_mode.is_extend_without_speculative()
-    ):
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and _mega_mhc_supported()
+    )
+
+
+def can_use_mega_mhc_decode(forward_batch) -> bool:
+    mode = forward_batch.forward_mode
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.get()
+        and (mode.is_decode() or mode.is_target_verify())
+        and _mega_mhc_supported()
+    )
+
+
+def _mega_mhc_supported() -> bool:
+    if not ENABLE_JIT_DEEPGEMM:
         return False
     sm = get_device_sm()
     if not (sm >= 89 if _is_sail else is_cuda() and 100 <= sm < 110):

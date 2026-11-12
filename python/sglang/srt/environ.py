@@ -1877,6 +1877,8 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     # Auto-enable only on SAIL; still requires SM89+ and a compatible MegaMHC API.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(_default_sail)
+    # Also fuse the MegaMHC boundary in decode and target-verify batches (SAIL default).
+    SGLANG_OPT_DSV41_MEGA_MHC_DECODE = EnvBool(_default_sail)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
