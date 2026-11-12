@@ -5,6 +5,9 @@ name: Release Docker Images Nightly (PPU)
 # with the built-in GITHUB_TOKEN. Runs on a daily schedule and can also be
 # triggered manually. Images are pushed only to ghcr.io.
 on:
+  push:
+    branches:
+      - v0.5.12
   # Debug aid: build on every push to this feature branch. Remove this trigger
   # once the nightly flow is validated on the default branch.
   workflow_dispatch:
