@@ -106,6 +106,11 @@ class FullTopKIndexer:
                     table,
                     plan,
                     metadata.max_compressed_seq_len,
+                    indices=(
+                        metadata.request_indices[rows]
+                        if metadata.request_indices is not None
+                        else None
+                    ),
                 )
                 # TODO(dark): add bf16 topk
                 topk_transform_paged_from_metadata(
@@ -128,6 +133,7 @@ class FullTopKIndexer:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=metadata.request_indices,
         )
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
