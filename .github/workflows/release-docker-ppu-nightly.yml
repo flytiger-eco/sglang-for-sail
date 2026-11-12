@@ -32,10 +32,8 @@ permissions:
 
 jobs:
   build:
-    # GitHub-hosted runner: every address the Dockerfile reaches (PPU base
-    # image, PyPI index, source repo) is a public URL, so no self-hosted
-    # runner is required.
-    runs-on: ubuntu-latest
+    # x86_64 Ubuntu 24.04 runner used for the PPU image build.
+    runs-on: x86-ubuntu2404-8-32
     timeout-minutes: 300
     steps:
       - name: Checkout repository
