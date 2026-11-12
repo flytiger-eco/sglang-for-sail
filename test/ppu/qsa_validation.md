@@ -8,9 +8,9 @@ The optional QSA ports provide two independent switches:
 - `SGLANG_SAIL_QSA_FA3_SPARSE_ATTN=1`: request the separate QSA-enabled FA3
   attention interface when its schema, inputs and cache format are supported.
 
-Both switches default to false. The measurements below enable only the first
-switch. A generic `attention_backend=fa3` setting is separate from the QSA FA3
-switch.
+Both switches default to false. The November 11 measurements enable only the
+first switch; the November 12 validation below enables both. A generic
+`attention_backend=fa3` setting is separate from the QSA FA3 switch.
 
 ## Current DeepGEMM API
 
@@ -33,7 +33,7 @@ unrecognized/legacy library schema retain the original scorer. The public
 `qsa_mqa_prefill` reference/baseline helper keeps its global-column, masked
 output contract.
 
-## Validation environment
+## Validation environment (November 11 indexer-only runs)
 
 Recorded on 2026-11-11 using four PPU-890P devices, 147456 MiB per device, with
 ICN8 links. The tested environment was Python 3.12.3, torch 2.13.0, driver
@@ -49,7 +49,8 @@ here. No MXFP4 conversion or model-precision change was made.
 The hardware-tested source snapshot has digest
 `48a572a22d59d9d6326a4dd3849e2ab2d067e3b9684b3735d0cb56d369abcbd8`.
 The validation note and the legacy reproducer's documentation were added after
-these runs; runtime implementation bytes have not changed.
+those runs. The later FA3 integration fixes and their separately measured
+source snapshot are documented below.
 
 ## Targeted tests and unresolved numerical checks
 
@@ -82,7 +83,8 @@ The skip is SM121-specific. These results are **not an all-green validation**:
   checks also complete successfully. The pointwise assertions execute afterward
   and still fail; they are neither skipped nor reclassified as passed.
 - Tiny native FA3 decode/extend tests pass in this image. Model-level FA3 QSA
-  performance and accuracy were not tested.
+  performance and accuracy were not tested in those November 11 runs; see the
+  separate November 12 results below.
 
 `test_deep_gemm_fp8_mqa_avg_logits_d32.py` is a separate legacy-ABI crash
 reproducer. Its older-library D32 failures are historical evidence, not a claim
@@ -197,3 +199,125 @@ Raw predictions, reviews, benchmark JSONL files, source manifests and status
 records were retained and transferred with per-file hashes. They are not
 included in the source patch; this note records the reproducible configuration,
 observed results and unresolved checks without publishing internal locations.
+
+
+## FA3 graph replay and model validation (November 12)
+
+CUDA-graph metadata deliberately retains a one-column dummy token-slot table.
+Using it for FA3 decode maps valid logical indices to physical slot zero, so
+prefill can match a reference while generation repeats tokens. Graph dispatch
+now gathers physical slots from the persistent request pool using replay-updated
+request IDs, with the original row-length mask. Eager dispatch keeps its real
+per-sequence/per-query table.
+
+Two associated integration fixes resolve wrappers lazily to avoid duplicate
+custom-op registration, and keep cumulative prefill query lengths in int32
+because integer `cumsum` otherwise promotes to int64.
+
+Twelve targeted cases passed with zero failures/skips: wrapper resolution,
+request-pool mapping, H4/H6 native decode and production extend, padded width
+2048, and actual CUDA-graph capture/replay at batches 1 and 3. Replay tests update
+request IDs, lengths and selections twice after capture. Existing tolerances
+remain `rtol=atol=0.02`. The command was:
+
+```bash
+python3 -m pytest test/ppu/unit/test_qsa_ppu_backends.py \
+  -k 'test_fa3_sparse_matches_reference or test_fa3_resolver_does_not_import_second_valid_wrapper or test_fa3_sparse_padded_production_width or test_fa3_graph' \
+  -v -s
+```
+
+The tested source snapshot is
+`ad7c8ae0078660e80609440dc750d6ca8a868226a21fd111d745aeb8c724d6cb`.
+Four PPU-890P devices used the original FP8 checkpoint precision and TP4, Python
+3.12.3, torch 2.13.0, driver 2.4.0-d56262, **SAIL 2.2.0-663c22**, PCCL 2.2.1,
+DeepGEMM dev33 as above, and QSA-enabled `flash-attn-3==3.0.0b1` with the
+`flash-attn==2.8.2` Python interface. This is a different SDK environment from
+the historical SAIL 2.3.0 measurements. Native FA3 execution was observed on all
+four ranks for a real user prefill `[64,6,256]`. `qsa_allow_aiu=False`: arbitrary
+four-token selections do not certify sixteen-token contiguous runs.
+
+### LongBench v2: all 503 samples, maximum output 32K
+
+EvalScope 1.14.1 evaluated both QSA switches enabled with prefix caching disabled.
+The dataset was `zai-org/LongBench-v2`, revision
+`2b48e494f2c7a2f0af81aae178e05c7e1dde0fe9`. Original `data.json` SHA256:
+`15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2`.
+The native adapter used train split, zero-shot step-by-step prompting, all three
+original length subsets and rule-based multiple-choice accuracy.
+
+| Subset | Correct / total | Accuracy |
+| --- | ---: | ---: |
+| short | 129 / 180 | 71.6667% |
+| medium | 141 / 215 | 65.5814% |
+| long | 68 / 108 | 62.9630% |
+| Overall | **338 / 503** | **67.1968%** |
+
+Generation used concurrency 16, temperature 0, top_p 1, n=1, seed 1, streaming
+and **max_tokens=32768**, including reasoning and the final answer. Requests
+were checked against the prepared prompt hash and generation settings. All
+503 predictions and reviews are unique and present: zero API failures, missing
+samples or duplicates. There are 475 normal stops and 28 output-limit endings;
+all 28 remain scored in the 503-sample denominator.
+
+The model context limit is 262144 tokens. Reserving 32768 for output and a
+256-token margin gives a 229120-token chat input budget. The context field of
+113 samples was split into token-balanced head/tail segments; question, choices,
+answer and original length labels were unchanged. Maximum prepared input was
+229058 tokens. All 503 actual server input counts matched the prepared counts.
+Processed JSONL SHA256:
+`dc3d3b29cfcb0ccf1afd03b3314af8f80be32afe2c89be9c05518b214ce71258`.
+
+For reproduction, start the server with the arguments above, both QSA switches
+set to 1 and `--disable-radix-cache`. Use a prepared local dataset **directory**
+containing `default_train.jsonl` with the stated head/tail policy. The EvalScope
+`TaskConfig` settings were:
+
+```python
+eval_type = "openai_api"
+api_url = "http://127.0.0.1:18990/v1"
+datasets = ["longbench_v2"]
+dataset_args = {"longbench_v2": {
+    "local_path": PREPARED_DATA_DIRECTORY,
+    "subset_list": ["short", "medium", "long"],
+    "few_shot_num": 0,
+}}
+eval_batch_size = 16
+generation_config = {
+    "max_tokens": 32768, "temperature": 0.0, "top_p": 1.0,
+    "n": 1, "seed": 1, "stream": True, "timeout": 1800, "retries": 1,
+}
+model_args = {"max_retries": 0}
+seed = 1
+repeats = 1
+limit = None
+```
+
+Independent audits checked original targets, complete IDs, request limits,
+reviews and report rounding. A post-evaluation audit inside the model container
+matched all 10202 source files, Git metadata, both native-library hashes and the
+SDK. Full client evidence was transferred and checked across 8153 files/entries,
+then independently rechecked locally. Original SSH transport errors are retained
+separately from successful remote completion and the fresh managed audit.
+
+This is an absolute score under the stated context/output limits and truncation
+policy. No matching disabled-FA3 LongBench baseline or accuracy threshold was
+supplied. Historical numerical failures above remain unresolved and are not
+reclassified by these results.
+
+### Incremental FA3 serving performance
+
+With the same new FA3 installation in both groups, identical launch arguments
+and prefix caching disabled, C1/I100000/O1/N10, three rounds per group, give:
+
+| Metric | DeepGEMM indexer only | DeepGEMM indexer + FA3 QSA | Change |
+| --- | ---: | ---: | ---: |
+| Mean TTFT | 6998.400 ms | 6666.216 ms | -4.7466% |
+| Input throughput | 14284.853 tokens/s | 14996.166 tokens/s | +4.9795% |
+| Formal successful requests | 30/30 | 30/30 | No API errors |
+
+Actual lengths were 100000/1 with zero cache hits. Both groups derived KV capacity
+7327360 tokens and Mamba capacity 32 slots. The disabled-FA3 baseline predates the
+graph-mapping correction, which is not executed in its CUDA path. Its source and
+post-measurement verification were retained separately; the candidate's
+post-measurement container check also passed. No AB/BA or significance claim is
+made. Gains from different SDK environments must not be added together.

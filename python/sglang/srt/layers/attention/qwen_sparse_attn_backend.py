@@ -58,24 +58,19 @@ def _resolve_ppu_fa3_qsa_with_kvcache():
     flash-attn-3 wheel ships the QSA build either as the top-level
     flash_attn_interface module or packaged under hopper/.
     """
+    import importlib
     import inspect
 
     if not is_ppu():
         return None
-    candidates = []
-    try:
-        import flash_attn_interface
-
-        candidates.append(flash_attn_interface)
-    except ImportError:
-        pass
-    try:
-        from hopper import flash_attn_interface as hopper_flash_attn_interface
-
-        candidates.append(hopper_flash_attn_interface)
-    except ImportError:
-        pass
-    for module in candidates:
+    # Both packages can register the same flash_attn_3_ops custom operators.
+    # Importing the second wrapper before returning the first can invalidate
+    # the first wrapper's OpOverload handles. Load alternatives lazily.
+    for module_name in ("flash_attn_interface", "hopper.flash_attn_interface"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
         fn = getattr(module, "flash_attn_with_kvcache", None)
         if fn is None:
             continue
@@ -1304,9 +1299,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         assert self.forward_metadata is not None
         return self.forward_metadata
 
-    @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        self, logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
     ) -> torch.Tensor:
         sequence_ids = metadata.token_to_batch_idx.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
@@ -1315,10 +1309,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             0, sequence_ids
         )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        if metadata.is_cuda_graph:
+            # Graph metadata keeps only a one-column dummy slot table. The
+            # replay kernels refresh request IDs, so gather from the stable
+            # request pool just like the original decode KV-extraction path.
+            if self.req_to_token is None or metadata.row_req_pool_indices is None:
+                raise RuntimeError("QSA CUDA graph request mapping is incomplete")
+            table = self.req_to_token
+            table_rows = metadata.row_req_pool_indices.long()
+        else:
+            table = metadata.token_slot_table
+            table_rows = sequence_ids
+        safe = logical_indices.clamp(min=0, max=table.shape[1] - 1).long()
+        slots = table[table_rows[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     def _fa3_qsa_supported(self, q, layer, k_buffer, v_buffer) -> bool:
@@ -1392,8 +1395,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if rows == 0:
             return q.new_zeros((0, num_heads * q.shape[-1]))
         # Logical token indices -> physical pool slots, one row per query row.
-        # Current metadata owns the per-sequence/per-query slot table,
-        # including speculative rows and graph padding. Reuse its bounds mask.
+        # Eager metadata owns the slot table; graph replay owns a persistent
+        # request-pool mapping instead. Reuse both paths' row-length mask.
         slots = self._logical_to_physical(topk_indices, metadata).contiguous()
         total_slots, num_kv_heads, head_dim = k_buffer.shape
         output = flash_attn_with_kvcache(
@@ -1465,7 +1468,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
         ]
         cu_seqlens_q = F.pad(
-            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
+            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(
+                0, dtype=torch.int32
+            ),
             (1, 0),
         ).contiguous()
         if envs.SGLANG_SAIL_QSA_FA3_SPARSE_ATTN.get():

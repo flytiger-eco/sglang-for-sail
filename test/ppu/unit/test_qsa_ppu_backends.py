@@ -1,7 +1,10 @@
 """QSA ports of 645eb6b / 5684ecf: dispatch, quantization and sparse layouts."""
 
+import json
 import math
+import os
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -43,6 +46,36 @@ def test_missing_avg_logits_falls_back(monkeypatch):
     monkeypatch.setattr(utils, "get_device_sm", lambda: 89)
     monkeypatch.setitem(sys.modules, "deep_gemm", ModuleType("deep_gemm"))
     assert mqa._resolve_fp8_avg_mqa_logits() is None
+
+
+def test_fa3_resolver_does_not_import_second_valid_wrapper(monkeypatch):
+    """Do not replace custom-op registrations behind a retained first handle."""
+    monkeypatch.setattr(backend_module, "is_ppu", lambda: True)
+
+    def native(*args, qsa_allow_aiu=False, **kwargs):
+        return None
+
+    first = ModuleType("flash_attn_interface")
+    first.flash_attn_with_kvcache = native
+    second = ModuleType("hopper")
+    second.__path__ = []
+
+    def reject_second(name):
+        if name == "flash_attn_interface":
+            raise AssertionError("second wrapper would replace the first custom op")
+        raise AttributeError(name)
+
+    second.__getattr__ = reject_second
+    monkeypatch.setitem(sys.modules, "flash_attn_interface", first)
+    monkeypatch.setitem(sys.modules, "hopper", second)
+    monkeypatch.setattr(
+        torch.ops,
+        "flash_attn_3",
+        SimpleNamespace(
+            fwd=SimpleNamespace(_schemas={"": "fwd(bool qsa_allow_aiu=False)"})
+        ),
+    )
+    assert backend_module._resolve_ppu_fa3_qsa_with_kvcache() is native
 
 
 @pytest.mark.parametrize(
@@ -214,15 +247,106 @@ def test_fa3_quantized_cache_uses_original_backend(monkeypatch):
     )
 
 
+def test_fa3_graph_slot_mapping_uses_request_pool():
+    backend = QwenSparseAttnBackend()
+    backend.req_to_token = torch.tensor(
+        [[0, 0, 0], [7, 2, 5], [1, 8, 6]], dtype=torch.int32
+    )
+    metadata = QwenSparseAttnMetadata(
+        sequence_lengths=torch.tensor([3, 2, 1], dtype=torch.int32),
+        token_to_batch_idx=torch.arange(3, dtype=torch.int32),
+        token_slot_table=torch.zeros(3, 1, dtype=torch.int32),
+        indexer_metadata=None,
+        row_req_pool_indices=torch.tensor([2, 1, 0], dtype=torch.int32),
+        is_cuda_graph=True,
+    )
+    indices = torch.tensor([[2, -1, 3], [1, 0, 2], [0, -1, 1]], dtype=torch.int32)
+    expected = torch.tensor([[6, -1, -1], [2, 7, -1], [0, -1, -1]], dtype=torch.int32)
+    torch.testing.assert_close(
+        backend._logical_to_physical(indices, metadata), expected
+    )
+    metadata.row_req_pool_indices[:2] = torch.tensor([1, 2], dtype=torch.int32)
+    expected[:2] = torch.tensor([[5, -1, -1], [8, 1, -1]], dtype=torch.int32)
+    torch.testing.assert_close(
+        backend._logical_to_physical(indices, metadata), expected
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+def test_fa3_graph_replay_refreshes_physical_slots(batch, monkeypatch):
+    _require_890p()
+    if backend_module._resolve_ppu_fa3_qsa_with_kvcache() is None:
+        pytest.skip("installed FA3 is not built with QSA support")
+    monkeypatch.setenv("SGLANG_SAIL_QSA_FA3_SPARSE_ATTN", "1")
+    torch.manual_seed(45)
+    q = torch.randn(batch, 6, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(32, 1, 256, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    backend = QwenSparseAttnBackend()
+    table = torch.stack(
+        [
+            torch.zeros(8, dtype=torch.int32, device=q.device),
+            torch.arange(1, 9, dtype=torch.int32, device=q.device),
+            torch.arange(12, 20, dtype=torch.int32, device=q.device),
+        ]
+    )
+    backend.req_to_token = table
+    backend.token_to_kv_pool = SimpleNamespace(
+        get_key_buffer=lambda _: k, get_value_buffer=lambda _: v
+    )
+    metadata = QwenSparseAttnMetadata(
+        sequence_lengths=torch.ones(batch, dtype=torch.int32, device=q.device),
+        token_to_batch_idx=torch.arange(batch, dtype=torch.int32, device=q.device),
+        token_slot_table=torch.zeros(batch, 1, dtype=torch.int32, device=q.device),
+        indexer_metadata=None,
+        row_req_pool_indices=torch.zeros(batch, dtype=torch.int32, device=q.device),
+        is_cuda_graph=True,
+        fa2_cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32, device=q.device),
+    )
+    backend.forward_metadata = metadata
+    indices = torch.full((batch, 2051), -1, dtype=torch.int32, device=q.device)
+    indices[:, 0] = 0
+    layer = SimpleNamespace(layer_id=0, tp_q_head_num=6, head_dim=256, scaling=1 / 16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            backend._forward_paged_attention(q, layer, None, indices)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = backend._forward_paged_attention(q, layer, None, indices)
+    for request_ids in ([2, 1, 0], [1, 2, 0]):
+        lengths = [8, 3, 1][:batch]
+        metadata.row_req_pool_indices.copy_(
+            torch.tensor(request_ids[:batch], device=q.device, dtype=torch.int32)
+        )
+        metadata.sequence_lengths.copy_(
+            torch.tensor(lengths, device=q.device, dtype=torch.int32)
+        )
+        indices.fill_(-1)
+        for row, length in enumerate(lengths):
+            indices[row, :length] = torch.arange(length, device=q.device)
+        graph.replay()
+        expected = []
+        for row, length in enumerate(lengths):
+            slots = table[request_ids[row], :length].long()
+            scores = q[row].float() @ k[slots, 0].float().T / 16
+            expected.append(scores.softmax(-1) @ v[slots, 0].float())
+        expected = torch.stack(expected).reshape(batch, -1).to(q.dtype)
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.02)
+
+
 @pytest.mark.parametrize("mode", ["decode", "extend"])
-def test_fa3_sparse_matches_reference(mode):
+@pytest.mark.parametrize("heads", [4, 6])
+def test_fa3_sparse_matches_reference(mode, heads, monkeypatch):
     _require_890p()
     if backend_module._resolve_ppu_fa3_qsa_with_kvcache() is None:
         pytest.skip("installed FA3 is not built with QSA support")
     torch.manual_seed(43)
     device = "cuda"
     rows = 3
-    q = torch.randn(rows, 4, 256, device=device, dtype=torch.bfloat16)
+    q = torch.randn(rows, heads, 256, device=device, dtype=torch.bfloat16)
     k = torch.randn(11, 1, 256, device=device, dtype=q.dtype)
     v = torch.randn_like(k)
     indices = torch.tensor(
@@ -246,16 +370,32 @@ def test_fa3_sparse_matches_reference(mode):
         [0, 3] if extend else [0, 1, 2, 3], device=device, dtype=torch.int32
     )
     scale = 1 / math.sqrt(256)
-    actual = QwenSparseAttnBackend()._forward_fa3_qsa_sparse(
-        q,
-        k,
-        v,
-        SimpleNamespace(scaling=scale),
-        metadata,
-        indices,
-        cu_q,
-        rows if extend else 1,
+    backend = QwenSparseAttnBackend()
+    layer = SimpleNamespace(
+        scaling=scale, tp_q_head_num=heads, head_dim=256, layer_id=0
     )
+    if extend:
+        # Exercise the production cumulative-length construction, not just
+        # the native helper with an already-int32 test tensor. Integer cumsum
+        # otherwise promotes to int64, which FA3 rejects.
+        monkeypatch.setenv("SGLANG_SAIL_QSA_FA3_SPARSE_ATTN", "1")
+        backend.forward_metadata = metadata
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: k, get_value_buffer=lambda _: v
+        )
+        batch = SimpleNamespace(
+            forward_mode=None,
+            extend_seq_lens=torch.tensor([rows], device=device, dtype=torch.int32),
+            extend_seq_lens_cpu=[rows],
+            seq_lens_cpu=[rows],
+        )
+        actual = backend.forward_extend(
+            q, k, v, layer, batch, save_kv_cache=False, topk_indices=indices
+        )
+    else:
+        actual = backend._forward_fa3_qsa_sparse(
+            q, k, v, layer, metadata, indices, cu_q, 1
+        )
     expected = []
     for row in range(rows):
         selected = slots[indices[row][indices[row] >= 0].long()].long()
@@ -264,4 +404,69 @@ def test_fa3_sparse_matches_reference(mode):
         )
         expected.append(torch.softmax(scores, -1) @ v[selected, 0].float())
     expected = torch.stack(expected).reshape(rows, -1).to(q.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("rows", [1, 64, 122, 129])
+def test_fa3_sparse_padded_production_width(rows):
+    """Production GQA6, top-k width 2048 and a short causal valid prefix."""
+    _require_890p()
+    fn = backend_module._resolve_ppu_fa3_qsa_with_kvcache()
+    if fn is None:
+        pytest.skip("installed FA3 is not built with QSA support")
+    torch.manual_seed(44)
+    q = torch.randn(rows, 6, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(rows + 17, 1, 256, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    slots = torch.randperm(k.shape[0], device=q.device)[:rows].to(torch.int32)
+    columns = torch.arange(2048, device=q.device)
+    valid = columns[None, :] <= torch.arange(rows, device=q.device)[:, None]
+    indices = torch.where(valid, columns[None, :], -1).to(torch.int32)
+    metadata = QwenSparseAttnMetadata(
+        sequence_lengths=torch.tensor([rows], device=q.device, dtype=torch.int32),
+        token_to_batch_idx=torch.zeros(rows, device=q.device, dtype=torch.int32),
+        token_slot_table=slots[None, :],
+        indexer_metadata=None,
+    )
+    cu_q = torch.tensor([0, rows], device=q.device, dtype=torch.int32)
+    backend = QwenSparseAttnBackend()
+    actual = backend._forward_fa3_qsa_sparse(
+        q, k, v, SimpleNamespace(scaling=1 / 16), metadata, indices, cu_q, rows
+    )
+    kk, vv = k[slots.long(), 0].float(), v[slots.long(), 0].float()
+    scores = torch.einsum("mhd,nd->mhn", q.float(), kk) / 16
+    causal = (
+        torch.arange(rows, device=q.device)[None, :]
+        <= torch.arange(rows, device=q.device)[:, None]
+    )
+    expected = scores.masked_fill(~causal[:, None, :], -float("inf")).softmax(-1) @ vv
+    expected = expected.reshape(rows, -1).to(q.dtype)
+    diagnostics = {}
+    physical = backend._logical_to_physical(indices, metadata).unsqueeze(1)
+    for splits in (0, 1):
+        direct = fn(
+            q=q,
+            k_cache=k[:, None],
+            v_cache=v[:, None],
+            cache_seqlens=metadata.sequence_lengths,
+            page_table=physical,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=rows,
+            softmax_scale=1 / 16,
+            causal=True,
+            num_splits=splits,
+            pack_gqa=True,
+            qsa_allow_aiu=False,
+        ).reshape_as(actual)
+        diagnostics[str(splits)] = {
+            "finite": bool(torch.isfinite(direct).all()),
+            "max_abs": float((direct.float() - expected.float()).abs().max()),
+            "matches_reference": torch.allclose(direct, expected, rtol=0.02, atol=0.02),
+            "matches_adapter": torch.equal(direct, actual),
+        }
+    print({"rows": rows, "width": 2048, "native": diagnostics})
+    if os.environ.get("PPU_DEV_RUN_DIR"):
+        (Path(os.environ["PPU_DEV_RUN_DIR"]) / f"fa3-padded-{rows}.json").write_text(
+            json.dumps(diagnostics, indent=2)
+        )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.02)
