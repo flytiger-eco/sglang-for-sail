@@ -33,10 +33,14 @@ from sglang.srt.configs.hybrid_arch import (
     linear_attn_model_spec,
     mamba2_config,
 )
-from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    ModelImpl,
+    is_deepseek_dsa,
+)
 from sglang.srt.disaggregation.utils import (
     dsa_cp_prefix_cache_enabled,
     should_bypass_dsa_cp_prefix_cache,
+    supports_dsa_cp_prefix_cache,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -309,15 +313,18 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(
-        server_args, is_dsa=is_dsa
+    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(is_dsa=is_dsa)
+    # Respect an explicit radix disable before validating/logging activation.
+    disable_radix_cache = (
+        get_memory().disable_radix_cache
+        or (model_config.is_multimodal and uses_transformers_backend)
+        or bypass_dsa_cp_prefix_cache
     )
     if (
         is_dsa
+        and not disable_radix_cache
         and dsa_cp_prefix_cache_enabled()
-        and get_disagg().disaggregation_mode == "prefill"
-        and getattr(server_args, "enable_prefill_cp", False)
-        and getattr(server_args, "cp_strategy", None) == "interleave"
+        and supports_dsa_cp_prefix_cache()
     ):
         # Experimental un-bypass for DSA prefill CP: it relies on the CP KV
         # pool keeping a full logical-order copy on every rank, and on the
@@ -332,12 +339,6 @@ def build_kv_cache(
             "DSA prefill CP prefix cache is ENABLED (experimental): the radix "
             "cache stays on for this PD prefill worker."
         )
-    # Also disable the radix cache when PD DSA prefill CP needs CP-aware KV resharding.
-    disable_radix_cache = (
-        get_memory().disable_radix_cache
-        or (model_config.is_multimodal and uses_transformers_backend)
-        or bypass_dsa_cp_prefix_cache
-    )
     if disable_radix_cache and not get_memory().disable_radix_cache:
         if bypass_dsa_cp_prefix_cache:
             logger.warning(
