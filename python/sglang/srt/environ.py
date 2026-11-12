@@ -184,6 +184,12 @@ class _DeprecatedEnvFallback:
                 os.environ[self.name] = fallback
         return super().get()
 
+    def is_set(self) -> bool:
+        # A deprecated alias counts as an explicit setting: callers that
+        # "default unless user-set" (e.g. the PPU platform hook) must not
+        # overwrite a value supplied through the old name.
+        return super().is_set() or os.getenv(self.deprecated_name) is not None
+
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
     pass
@@ -1333,7 +1339,9 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
-    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+    )
     # Experimental: keep the radix (prefix) cache enabled under DSA prefill
     # context parallelism on PD prefill workers instead of bypassing it.
     # Default OFF keeps today's behavior; enabling it is only valid for
