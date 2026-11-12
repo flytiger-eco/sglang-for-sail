@@ -39,7 +39,6 @@ ARG PPU_PACKAGES="\
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
-    pla==1.0.1+v0.1.0.ppu2.2.0 \
     tilelang==0.1.12+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
@@ -277,6 +276,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --no-deps /tmp/wheels/ppu/*.whl /tmp/wheels/gateway/*.whl \
     && rm -rf /tmp/wheels
 
+# Install pla from artifactory/pypi_tmp (not published on the flytiger simple
+# index yet). --no-deps matches the wheel install above; the pla pin is added
+# to ppu_constraints.txt below so the uv resolve keeps this exact wheel.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-deps \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-12-1644/pla-1.0.0-cp312-cp312-linux_x86_64.whl
+
 # Pin torch from the base image and the PPU builds so the dependency solve
 # below can never replace them with CUDA wheels from PyPI.
 RUN python3 -m pip list --format=freeze \
@@ -284,6 +290,7 @@ RUN python3 -m pip list --format=freeze \
     && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES}; do echo "${spec}"; done \
         | sed 's/^mooncake==/mooncake-transfer-engine==/' \
         >> /sgl-workspace/ppu_constraints.txt \
+    && echo "pla==1.0.0" >> /sgl-workspace/ppu_constraints.txt \
     && cat /sgl-workspace/ppu_constraints.txt
 
 # Install sglang dependencies from a stub project built from pyproject_ppu.toml.
