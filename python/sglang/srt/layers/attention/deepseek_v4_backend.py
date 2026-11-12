@@ -1327,6 +1327,12 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise ValueError(f"Unsupported indexer {compress_ratio = }")
+        query_head_dim = self.index_head_dim
+        if not use_dsv41_int8_indexer() and (
+            compress_ratio in (1, 2) or self.enable_deepseek_v4_fp4_indexer
+        ):
+            # The PPU planner takes the stored Q width: two FP4 values per byte.
+            query_head_dim //= 2
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size or self.page_size // compress_ratio,
@@ -1347,7 +1353,7 @@ class DeepseekV4AttnBackend(
                     c_seq_lens.shape[0],
                     1,
                     self.index_n_heads,
-                    self.index_head_dim,
+                    query_head_dim,
                 )
             ),
         )
@@ -1535,7 +1541,8 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
             force_deep_gemm_metadata=is_ppu(),
             q_fp8_shape=torch.Size(
-                (c_seq_lens.shape[0], 1, self.index_n_heads, self.index_head_dim)
+                # The captured low-ratio indexer uses packed FP4 queries.
+                (c_seq_lens.shape[0], 1, self.index_n_heads, self.index_head_dim // 2)
             ),
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
