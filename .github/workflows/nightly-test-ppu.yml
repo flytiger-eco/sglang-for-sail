@@ -31,6 +31,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       matrix: ${{ steps.manifest.outputs.matrix }}
+      resources: ${{ steps.manifest.outputs.resources }}
       sha: ${{ steps.dispatch.outputs.sha }}
     steps:
       - name: Validate dispatch before checkout
@@ -141,6 +142,7 @@ jobs:
           (ROOT / '.ppu-resource/manifest.json').write_text(json.dumps({'tests': TESTS}, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write('matrix=' + json.dumps({'include': TESTS}, separators=(',', ':')) + '\n')
+              stream.write('resources=' + '|'.join(item['resource'] for item in TESTS) + '\n')
           PY
           cat > .ppu-resource/repair_cache.py <<'PY'
           import hashlib
@@ -236,8 +238,18 @@ jobs:
               if not candidates:
                   details = []
                   for resolved, path in sorted(observed.items()):
-                      files = sorted(item.name for item in path.iterdir() if item.is_file())
-                      details.append({'path': resolved, 'files': files[:80]})
+                      entries = []
+                      for item in sorted(path.iterdir(), key=lambda value: value.name):
+                          entry = {
+                              'name': item.name,
+                              'is_dir': item.is_dir(),
+                              'is_file': item.is_file(),
+                              'is_symlink': item.is_symlink(),
+                          }
+                          if item.is_symlink():
+                              entry['target'] = os.readlink(item)
+                          entries.append(entry)
+                      details.append({'path': resolved, 'entries': entries[:100]})
                   raise FileNotFoundError(
                       f'No complete source found for {repo_id} under {root} or {CACHE}; '
                       f'observed={json.dumps(details)}'
@@ -381,8 +393,14 @@ jobs:
                   'resources': report,
               }
               destination.write_text(json.dumps(result, indent=2) + '\n')
-              failed = [item['resource'] for item in report if item['status'] != 'ok']
-              print(f'CACHE_REPAIR_SUMMARY total={len(report)} failed={failed}', flush=True)
+              required = set(filter(None, os.environ.get('REQUIRED_RESOURCES', '').split('|')))
+              if not required:
+                  required = {item['resource'] for item in report}
+              failed = [
+                  item['resource'] for item in report
+                  if item['status'] != 'ok' and item['resource'] in required
+              ]
+              print(f'CACHE_REPAIR_SUMMARY total={len(report)} required_failed={failed}', flush=True)
               if failed:
                   raise SystemExit(1)
 
@@ -625,6 +643,7 @@ jobs:
       PPU_BASE_IMAGE_REF: ${{ needs.image.outputs.image }}
       PPU_BASE_IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
       EVIDENCE_SOURCE: /wl_nas/pr-ci/cache-repair/${{ github.run_id }}/${{ github.run_attempt }}/repair
+      REQUIRED_RESOURCES: ${{ needs.prepare.outputs.resources }}
     steps:
       - name: Set runner-local result directory
         run: printf 'RESULT_DIR=%s/ppu-cache-repair\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
@@ -652,7 +671,7 @@ jobs:
           job_suffix: cache-repair
           command: bash /workspace/source/.ppu-resource/worker.sh
           host_volumes: /wl_nas/pr-ci/cache-repair/${{ github.run_id }}/${{ github.run_attempt }}/repair:/ppu-evidence,/wl_nas/pr-ci/cache-repair-cache/${{ github.run_id }}/${{ github.run_attempt }}:/ppu-resource-cache
-          extra_env: "MODE=repair,PPU_EVIDENCE_DIR=/ppu-evidence,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,HF_DATASETS_OFFLINE=1"
+          extra_env: "MODE=repair,REQUIRED_RESOURCES=${{ needs.prepare.outputs.resources }},PPU_EVIDENCE_DIR=/ppu-evidence,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1,HF_DATASETS_OFFLINE=1"
           container_options: |
             privileged: true
             host_ipc: true
