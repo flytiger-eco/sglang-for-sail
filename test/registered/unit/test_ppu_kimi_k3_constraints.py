@@ -161,19 +161,47 @@ def test_kda_extend_dispatcher_normalizes_kernel_return_contract():
     assert h is None
 
 
-@pytest.mark.parametrize("extend_kwargs", [{}, {"return_intermediate_states": False}])
-def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
+@pytest.mark.parametrize(
+    "extend_kwargs, device_offsets, expected_raw",
+    [
+        ({}, [0, 64], None),
+        ({"return_intermediate_states": False}, [0, 64], None),
+        ({"extend_seq_lens_cpu": [64]}, [0, 64], (0, 64)),
+        ({"extend_seq_lens_cpu": [19]}, [0, 19], (0, 19)),
+        ({"extend_seq_lens_cpu": [19, 45]}, [0, 19, 64], (0, 19, 64)),
+        ({"extend_seq_lens_cpu": (45, 19)}, [0, 45, 64], (0, 45, 64)),
+        ({"extend_seq_lens_cpu": [0, 64]}, [0, 0, 64], (0, 0, 64)),
+        ({"extend_seq_lens_cpu": [64, 0]}, [0, 64], None),
+        ({"extend_seq_lens_cpu": [4096]}, [0, 19], None),
+        ({"extend_seq_lens_cpu": [19]}, [0, 64], None),
+        ({"extend_seq_lens_cpu": []}, [0, 64], None),
+        ({"extend_seq_lens_cpu": [64.0]}, [0, 64], None),
+        ({"extend_seq_lens_cpu": [-1, 65]}, [0, 19, 64], None),
+        ({"extend_seq_lens_cpu": torch.tensor([64])}, [0, 64], None),
+    ],
+)
+@pytest.mark.parametrize("capturing", [False, True])
+def test_ppu_flashkda_dispatches_to_platform_operator(
+    extend_kwargs, device_offsets, expected_raw, capturing
+):
     num_heads = 12
     head_dim = 128
-    packed_tokens = 64
+    packed_tokens = device_offsets[-1]
     q = torch.zeros((1, packed_tokens, num_heads, head_dim), dtype=torch.bfloat16)
     k = torch.zeros_like(q)
     v = torch.zeros_like(q)
     g = torch.zeros_like(q)
     beta = torch.full((1, packed_tokens, num_heads), 0.5, dtype=torch.float32)
-    ssm_states = torch.zeros((2, num_heads, head_dim, head_dim), dtype=torch.float32)
-    cache_indices = torch.tensor([1], dtype=torch.int32)
-    query_start_loc = torch.tensor([0, packed_tokens], dtype=torch.int32)
+    num_sequences = len(device_offsets) - 1
+    ssm_states = torch.zeros(
+        (num_sequences + 1, num_heads, head_dim, head_dim), dtype=torch.float32
+    )
+    cache_indices = torch.arange(1, num_sequences + 1, dtype=torch.int32)
+    device_cu = torch.tensor(device_offsets, dtype=torch.int32)
+    # CPU backing storage, with device metadata/capture flags mocked explicitly.
+    query_start_loc = SimpleNamespace(
+        is_cuda=True, numel=device_cu.numel, to=device_cu.to
+    )
     flashkda_fwd = Mock(
         side_effect=lambda **kwargs: (
             kwargs["out"].fill_(0.25),
@@ -190,6 +218,7 @@ def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
     with (
         patch.object(kda_flashkda, "is_sail", return_value=True),
         patch.object(kda_flashkda, "_load_flash_kda") as load_flash_kda,
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=capturing),
         envs.SGLANG_SAIL_PLA_CUDA.override(True),
         patch.dict(
             sys.modules,
@@ -218,7 +247,7 @@ def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
     assert isinstance(output, torch.Tensor)
     assert output.shape == q.shape
     assert torch.all(output == 0.25)
-    assert torch.all(ssm_states[1] == 1)
+    assert torch.all(ssm_states[1:] == 1)
     assert torch.count_nonzero(ssm_states[0]) == 0
     load_flash_kda.assert_not_called()
     flashkda_fwd.assert_called_once()
@@ -229,6 +258,78 @@ def test_ppu_flashkda_dispatches_to_platform_operator(extend_kwargs):
     assert kwargs["A_log"].shape == (num_heads,)
     assert kwargs["dt_bias"].shape == (num_heads, head_dim)
     assert kwargs["cu_seqlens"].dtype == torch.int64
+    assert kwargs["cu_seqlens"].tolist() == device_offsets
+    assert kwargs["raw_cu_seqlens"] == (None if capturing else expected_raw)
+
+
+@pytest.mark.parametrize(
+    "lengths, num_tokens, expected",
+    [
+        ([8192], 8192, (0, 8192)),
+        ([19, 200], 219, (0, 19, 219)),
+        ([200, 19], 219, (0, 200, 219)),
+        ([0, 19], 19, (0, 0, 19)),
+        ([True, 18], 19, None),
+        ([torch.tensor(19)], 19, None),
+    ],
+)
+def test_pla_host_offsets_never_reads_device_values(lengths, num_tokens, expected):
+    query = SimpleNamespace(
+        is_cuda=True,
+        numel=lambda: len(lengths) + 1,
+        cpu=Mock(side_effect=AssertionError("unexpected D2H")),
+        tolist=Mock(side_effect=AssertionError("unexpected D2H")),
+        item=Mock(side_effect=AssertionError("unexpected D2H")),
+    )
+    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+        assert kda_flashkda._pla_host_offsets(lengths, query, num_tokens) == expected
+    query.cpu.assert_not_called()
+    query.tolist.assert_not_called()
+    query.item.assert_not_called()
+
+
+def test_pla_host_offsets_keeps_capture_device_driven_but_allows_eager_breaks():
+    query = SimpleNamespace(is_cuda=True, numel=lambda: 3)
+    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+        assert kda_flashkda._pla_host_offsets([19, 45], query, 64) is None
+    # Breakable attention executes eagerly on replay: recompute from this call's
+    # lengths rather than retaining the tuple used during graph warmup.
+    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=False):
+        lengths = [19, 45]
+        assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 19, 64)
+        lengths[:] = [45, 19]
+        assert kda_flashkda._pla_host_offsets(lengths, query, 64) == (0, 45, 64)
+
+
+def test_cuda_flashkda_does_not_receive_pla_host_offsets():
+    kernel = kda_flashkda.FlashKDAKernel()
+    q = torch.zeros((1, 64, 4, 128), dtype=torch.bfloat16)
+    beta = torch.zeros((1, 64, 4), dtype=torch.bfloat16)
+    states = torch.zeros((1, 4, 128, 128), dtype=torch.float32)
+    external = SimpleNamespace(fwd=Mock())
+    with (
+        patch.object(kda_flashkda, "is_ppu", return_value=False),
+        patch.object(kda_flashkda, "_load_flash_kda", return_value=external),
+        patch.object(kda_flashkda, "_pla_host_offsets") as host_offsets,
+    ):
+        kernel._flashkda_extend(
+            q,
+            q.clone(),
+            q.clone(),
+            q.clone(),
+            beta,
+            ssm_states=states,
+            cache_indices=torch.tensor([0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 64], dtype=torch.int32),
+            A_log=torch.zeros(4),
+            dt_bias=torch.zeros(4 * 128),
+            lower_bound=-5.0,
+            beta_is_raw=True,
+            extend_seq_lens_cpu=[64],
+        )
+    host_offsets.assert_not_called()
+    external.fwd.assert_called_once()
+    assert "raw_cu_seqlens" not in external.fwd.call_args.kwargs
 
 
 @pytest.mark.parametrize(

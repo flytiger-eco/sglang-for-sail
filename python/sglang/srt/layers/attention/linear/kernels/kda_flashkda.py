@@ -1,3 +1,4 @@
+from numbers import Integral
 from typing import Optional
 
 import torch
@@ -27,6 +28,35 @@ def ppu_pla_prefill_gate_open() -> bool:
     if not is_sail():
         return False
     return envs.SGLANG_SAIL_PLA_CUDA.get()
+
+
+def _pla_host_offsets(
+    seq_lens_cpu: Optional[list],
+    query_start_loc: torch.Tensor,
+    num_tokens: int,
+) -> Optional[tuple[int, ...]]:
+    """Build trusted offsets only from the current packed batch's CPU lengths."""
+    # Captured graphs replay changing device offsets without re-running Python.
+    # Keep their metadata device-driven; eager graph breaks can rebuild this
+    # tuple on every call because their stream is not capturing.
+    if query_start_loc.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    if not isinstance(seq_lens_cpu, (list, tuple)) or not seq_lens_cpu:
+        return None
+    if len(seq_lens_cpu) + 1 != query_start_loc.numel():
+        return None
+
+    offsets = [0]
+    for length in seq_lens_cpu:
+        # Do not coerce tensor scalars (possibly on device) or fractional values.
+        if not isinstance(length, Integral) or isinstance(length, bool) or length < 0:
+            return None
+        offsets.append(offsets[-1] + int(length))
+    # KDAAttnBackend trims physical padding before calling this adapter. If CPU
+    # metadata describes another slice/batch, retain the device-only path.
+    if offsets[-1] != num_tokens:
+        return None
+    return tuple(offsets)
 
 
 def _load_flash_kda():
@@ -195,6 +225,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             beta_is_raw=beta_is_raw,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
 
     def _fallback_reason(
@@ -276,6 +307,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
+        extend_seq_lens_cpu: Optional[list] = None,
     ) -> torch.Tensor:
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
@@ -336,6 +368,9 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 initial_state=initial_state,
                 final_state=final_state,
                 cu_seqlens=cu_seqlens,
+                raw_cu_seqlens=_pla_host_offsets(
+                    extend_seq_lens_cpu, query_start_loc, batch_size * seq_len
+                ),
             )
         else:
             flash_kda = _load_flash_kda()
