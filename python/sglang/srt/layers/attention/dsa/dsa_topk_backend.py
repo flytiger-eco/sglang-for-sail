@@ -289,8 +289,16 @@ class DSATopKBackend(Enum):
                         "RAGGED topk_transform requires topk_indices_offset; "
                         "expected extend-without-speculative metadata."
                     )
+                # fast_topk_transform_ragged_fused requires fp32 scores. An fp8 KV
+                # store makes the indexer emit bf16 logits (it previously saw fp32
+                # from the bf16 KV path), which fails inside sgl_kernel with
+                # "expected scalar type Float but found BFloat16".
+                # bf16 -> fp32 is value preserving, so the selected indices are
+                # unchanged; this restores the pre-fp8 dtype instead of changing
+                # the selection semantics.
+                score = logits if logits.dtype == torch.float32 else logits.float()
                 return fast_topk_transform_ragged_fused(
-                    score=logits,
+                    score=score,
                     lengths=lengths,
                     topk_indices_offset=topk_indices_offset,
                     topk=topk,

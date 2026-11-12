@@ -195,6 +195,12 @@ class _DeprecatedEnvFallback:
                 os.environ[self.name] = fallback
         return super().get()
 
+    def is_set(self) -> bool:
+        # A deprecated alias counts as an explicit setting: callers that
+        # "default unless user-set" (e.g. the PPU platform hook) must not
+        # overwrite a value supplied through the old name.
+        return super().is_set() or os.getenv(self.deprecated_name) is not None
+
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
     pass
@@ -2295,7 +2301,9 @@ class Envs:
     # on 810E this falls back to the TileLang/torch path with a warning.
     SGLANG_SAIL_QSA_INDEXER_FP8_AVG_LOGITS = EnvBool(False)
     SGLANG_OPT_USE_FP4_INDEXER_CACHE = EnvBool(True)
-    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBool(True)
+    SGLANG_DSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8"
+    )
     # SAIL PLA CUDA: master switch for every SAIL PLA kernel on PPU -- the KDA
     # decode / MTP fast paths and, since the KDA prefill integration, the KDA
     # prefill/extend path (kda_flashkda.FlashKDAKernel ->
