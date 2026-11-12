@@ -1418,25 +1418,21 @@ def _ppu_fa3_flashmla_qv_fallback(view: Any) -> dict:
 
 @register_post_process
 def _ppu_flashmla_fp8_kv_cache_fallback(view: Any) -> dict:
-    # [fp8-kv-cache fallback] On PPU, flashmla/flashmla_sparse do not support
-    # fp8_e4m3 kv-cache; disable fp8 kv-cache and keep backend unchanged.
+    # [fp8-kv-cache fallback] On PPU only the dense FlashMLA path lacks an
+    # fp8_e4m3 kv-cache kernel; keep the fallback for it and leave every other
+    # backend untouched. In particular --dsa-prefill-backend flashmla_sparse is
+    # supported: the pool stores fp8 (quantize_k_cache on write) and the
+    # framework dequantizes the prefix KV (dequantize_k_cache_paged) before the
+    # bf16 sparse kernel, so forcing bf16 here would only lose the memory win.
     from sglang.srt.utils.common import is_sail
 
     if not (is_sail() and view.kv_cache_dtype == "fp8_e4m3"):
         return {}
-    if not (
-        view.decode_attention_backend == "flashmla"
-        or view.dsa_prefill_backend == "flashmla_sparse"
-    ):
+    if view.decode_attention_backend != "flashmla":
         return {}
 
-    incompatible = []
-    if view.decode_attention_backend == "flashmla":
-        incompatible.append("--decode-attention-backend flashmla")
-    if view.dsa_prefill_backend == "flashmla_sparse":
-        incompatible.append("--dsa-prefill-backend flashmla_sparse")
     logger.warning(
-        f"On PPU, {' and '.join(incompatible)} does not support "
+        "On PPU, --decode-attention-backend flashmla does not support "
         "--kv-cache-dtype fp8_e4m3. Disabling FP8 KV cache "
         "(falling back to --kv-cache-dtype auto)."
     )
