@@ -578,6 +578,7 @@ jobs:
         with:
           name: ppu-cache-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ppu-resource/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 30
 
