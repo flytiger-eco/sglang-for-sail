@@ -302,9 +302,10 @@ def _publish_tile_blocks(
 ) -> None:
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
-        scores = logits[rows, :lc]
+        aligned_lc = -(-lc // block_size) * block_size
+        scores = logits[rows, :aligned_lc]
         scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
+            torch.arange(aligned_lc, device=logits.device)[None, :] >= lens[rows, None],
             -torch.inf,
         )
         ids = select_candidate_block_ids(
