@@ -202,16 +202,21 @@ def select_candidate_block_ids(
     """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
     block of position ``compress_lens - 1`` always kept: int32
     ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
-    ``logits`` must be ``-inf`` past each row's causal length."""
+    ``compress_lens`` is a nonnegative int or a ``[rows, 1]`` tensor. Logits past each
+    row's causal length may be uninitialized; the input is not modified."""
     width = logits.size(-1)
     padding = -width % block_size
     scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
     last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(num_blocks, device=logits.device) == last, torch.inf
-    )
+    block_ids = torch.arange(num_blocks, device=logits.device)
+    # Earlier blocks are wholly valid. The newest (possibly partial) block is
+    # forced to +inf, so its invalid tail cannot affect selection. Drop later
+    # blocks after reduction, avoiding a full [rows, width] causal mask. This
+    # also overwrites NaNs from uninitialized tails; length zero has last=-1.
+    scores.masked_fill_(block_ids > last, -torch.inf)
+    scores.masked_fill_(block_ids == last, torch.inf)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 
