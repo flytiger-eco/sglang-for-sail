@@ -33,6 +33,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import (
     should_bypass_dsa_cp_prefix_cache,
     supports_dsa_cp_prefix_cache,
+    validate_dsa_cp_prefix_cache_geometry,
 )
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -473,6 +474,28 @@ class TestBypassPredicates(CustomTestCase):
     def test_non_dsa_never_bypasses(self):
         with _pd_args():
             self.assertFalse(should_bypass_dsa_cp_prefix_cache(is_dsa=False))
+
+    def test_pooled_indexer_is_rejected_before_cache_construction(self):
+        with self.assertRaisesRegex(ValueError, "index_kpool == 1"):
+            validate_dsa_cp_prefix_cache_geometry(
+                page_size=64, index_kpool=4, cache_layer_split=False
+            )
+
+    def test_unpooled_full_replica_geometry_is_supported(self):
+        validate_dsa_cp_prefix_cache_geometry(
+            page_size=64, index_kpool=1, cache_layer_split=False
+        )
+
+    def test_layer_split_hicache_layout(self):
+        validate_dsa_cp_prefix_cache_geometry(
+            page_size=64, index_kpool=1, cache_layer_split=True,
+            hicache_layout="layer_first", hicache_io_backend="kernel",
+        )
+        with self.assertRaisesRegex(ValueError, "layer_first"):
+            validate_dsa_cp_prefix_cache_geometry(
+                page_size=64, index_kpool=1, cache_layer_split=True,
+                hicache_layout="page_first", hicache_io_backend="kernel",
+            )
 
 
 class TestWrapperCowMambaGate(CustomTestCase):

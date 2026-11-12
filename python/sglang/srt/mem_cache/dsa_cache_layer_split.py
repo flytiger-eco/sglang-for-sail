@@ -457,6 +457,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
         self.pending_remote_kv_layer_id = None
 
+    def invalidate_kv_buffer_for_layer(self, layer_id: int) -> None:
+        if self.pending_remote_kv_layer_id == layer_id:
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if self.remote_kv_layer_id == layer_id:
+            self.remote_kv_layer_id = None
+
     def prefetch_kv_buffer(
         self,
         layer_id: int,
@@ -480,7 +486,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        if layer_transfer_counter is None:
+            layer_transfer_counter = self.layer_transfer_counter
+        if layer_transfer_idx is None:
+            layer_transfer_idx = self._local_layer_idx(layer_id)
         if self.layer_broadcast_comm is None:
+            if layer_transfer_counter is not None:
+                layer_transfer_counter.wait_until(layer_transfer_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,
