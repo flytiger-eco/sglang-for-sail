@@ -2282,7 +2282,7 @@ class Envs:
     SGLANG_TEST_PPU_W4A8_HIDDEN = EnvInt(256)
     SGLANG_TEST_PPU_W4A8_INTERMEDIATE = EnvInt(128)
     SGLANG_TEST_PPU_W4A8_TOPK = EnvInt(2)
-    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(True)
     # Fused SiLU+Mul + per-token fp8 quant JIT kernel in the channel-wise
     # masked DeepGEMM path. Set =0 to fall back to the Triton implementation.
     SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
