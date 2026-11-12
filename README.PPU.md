@@ -30,7 +30,7 @@ Before installing SGLang-for-SAIL v0.5.21, make sure the SAIL SDK and required r
 - SAIL SDK v2.2.0 or later
 - Python 3.12
 - PyTorch-for-SAIL 2.13.0 or later
-- FlashInfer-for-SAIL 0.6.17 or later
+- FlashInfer-for-SAIL 0.6.18 or later
 
 ## Quick Start
 
