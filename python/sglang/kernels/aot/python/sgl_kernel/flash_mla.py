@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx, in_sparse_range
 
 try:
     from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
@@ -105,6 +106,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -187,7 +189,7 @@ def flash_mla_with_kvcache(
         "descale_q and descale_k should be both None or both not None"
     )
 
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         batch_size = q.shape[0]
         max_seqlen_q = q.shape[-3] if q.dim() == 4 else 1
         if torch.cuda.is_current_stream_capturing():
@@ -223,7 +225,7 @@ def flash_mla_with_kvcache(
             softmax_scale,
             kv_format,
         )
-        if SGLANG_PROFILE_NVTX:
+        if SGLANG_PROFILE_NVTX and not in_sparse_range():
             th_nvtx_range_pop()
         return out, softmax_lse
 
@@ -261,7 +263,7 @@ def flash_mla_with_kvcache(
             topk_length,
             extra_topk_length,
         )
-    if SGLANG_PROFILE_NVTX:
+    if SGLANG_PROFILE_NVTX and not in_sparse_range():
         th_nvtx_range_pop()
     return out, softmax_lse
 

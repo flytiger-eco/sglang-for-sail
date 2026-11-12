@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_nvtx import flashmla_kv_leaf_nvtx, in_sparse_range
 
 try:
     import flash_mla as _flashmla
@@ -89,6 +90,7 @@ def get_mla_metadata(
     )
 
 
+@flashmla_kv_leaf_nvtx
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -135,7 +137,9 @@ def flash_mla_with_kvcache(
             "FlashMLA dense FP8 with kvcache is not supported on PPU."
         )
 
-    nvtx_pushed = SGLANG_PROFILE_NVTX and num_splits is not None
+    nvtx_pushed = (
+        SGLANG_PROFILE_NVTX and num_splits is not None and not in_sparse_range()
+    )
     if nvtx_pushed:
         batch_size = len(num_splits) - 1
         if q.dim() == 4:
