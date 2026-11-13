@@ -118,60 +118,23 @@ jobs:
           printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
 
       # Settle "which image is under test" once, in prepare, so all four test jobs
-      # work from the same answer. The tag rule has to match Compute image metadata
-      # in release-docker-ppu-nightly.yml character for character: lowercased owner,
-      # / turned into - in the branch, UTC date, first 7 of the sha. Several
-      # candidates are produced because the date is the one part that can differ.
+      # work from the same answer. The tag rule lives in
+      # scripts/ci/ppu/derive_test_image.sh -- it has to match Compute image
+      # metadata in release-docker-ppu-nightly.yml character for character, and the
+      # rehearsal workflow exercises the same file rather than a copy of it.
       - name: Derive the image under test
         id: image
         env:
-          REQUESTED_IMAGE: ${{ inputs.test_image }}
-          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
-          BUILD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PPU_DERIVE_TAG_INPUT: ${{ inputs.test_image }}
+          PPU_DERIVE_SHA: ${{ github.event.workflow_run.head_sha }}
+          PPU_DERIVE_BRANCH: ${{ github.event.workflow_run.head_branch }}
           # The build stamps its tag with `date -u +%Y%m%d` when it executes, not
           # when the run was created, and a re-run keeps created_at. Reading the
           # date off created_at would name a tag that the re-run never pushed.
-          BUILD_STARTED: ${{ github.event.workflow_run.run_started_at || github.event.workflow_run.created_at }}
-          BUILD_CREATED: ${{ github.event.workflow_run.created_at }}
-        run: |
-          set -euo pipefail
-          if [ -n "$REQUESTED_IMAGE" ]; then
-            printf 'tag=%s\n' "$REQUESTED_IMAGE" >> "$GITHUB_OUTPUT"
-            printf 'candidates=%s\n' "$REQUESTED_IMAGE" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -z "$BUILD_SHA" ]; then
-            # Manual dispatch with no test_image: keep the fixed base image and
-            # the source install.
-            echo 'no build run behind this dispatch and no test_image given; keeping the source path'
-            printf 'tag=\n' >> "$GITHUB_OUTPUT"
-            printf 'candidates=\n' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          owner_lc=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          branch=$(printf '%s' "$BUILD_BRANCH" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
-          short_sha="${BUILD_SHA:0:7}"
-          day_of() { printf '%s' "$1" | cut -c1-10 | tr -d '-'; }
-          started_day="$(day_of "$BUILD_STARTED")"
-          created_day="$(day_of "$BUILD_CREATED")"
-          # A re-run that lands after 00:00 UTC on the following day stamps that
-          # later date, which neither of the two above can guess.
-          next_day="$(date -u -d "${created_day} + 1 day" +%Y%m%d 2>/dev/null || echo '')"
-          # Tried in this order: the default branch can stand still for several
-          # nights, so the same commit gets rebuilt under more than one date tag and
-          # only the first candidate belongs to this build.
-          candidates=''
-          for day in "$started_day" "$created_day" "$next_day"; do
-            [ -n "$day" ] || continue
-            candidate="ghcr.io/${owner_lc}/sglang-ppu-nightly:${branch}-${day}-cuda13.0.0-sdk2.2.0-${short_sha}"
-            case " $candidates " in
-              *" $candidate "*) continue ;;
-            esac
-            candidates="${candidates:+$candidates }$candidate"
-          done
-          echo "candidate images under test: ${candidates}"
-          printf 'tag=%s\n' "${candidates%% *}" >> "$GITHUB_OUTPUT"
-          printf 'candidates=%s\n' "$candidates" >> "$GITHUB_OUTPUT"
+          PPU_DERIVE_STARTED: ${{ github.event.workflow_run.run_started_at || github.event.workflow_run.created_at }}
+          PPU_DERIVE_CREATED: ${{ github.event.workflow_run.created_at }}
+          PPU_DERIVE_OWNER: ${{ github.repository_owner }}
+        run: bash scripts/ci/ppu/derive_test_image.sh
 
       # Pin the artifact here, once, rather than in each worker: four workers
       # asking the registry about the same tag can land on two different images

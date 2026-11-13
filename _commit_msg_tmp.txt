@@ -1,0 +1,19 @@
+ci(ppu): add a rehearsal that drives the build -> test link by hand
+
+workflow_run only fires for workflow files that exist on the default branch, so
+the automatic link in nightly-test-ppu.yml and the issue tracker cannot be
+exercised on a feature branch. Everything else can. The rehearsal dispatches the
+nightly build, waits for it, names the tag off the build run the same way prepare
+does, asserts the first date candidate resolves, and hands the digest-pinned
+reference to nightly-test-ppu.yml for all four partitions.
+
+The tag derivation moves out of prepare into scripts/ci/ppu/derive_test_image.sh
+so the rehearsal runs the same file the nightly runs rather than a copy that
+drifts. prepare's behaviour is unchanged.
+
+The assertions that need no pod live in scripts/ci/ppu/rehearsal_preflight.sh:
+syntax of every workflow and script, the date candidates across a same-day
+build, a re-run that crossed midnight, a calendar rollover, a branch with a
+slash, a caller-given image, no build at all, an unset run_started_at and a sha
+with no readable date; four digest resolution cases; the health check in source
+mode; and the three shapes the finish-job lookup returns.

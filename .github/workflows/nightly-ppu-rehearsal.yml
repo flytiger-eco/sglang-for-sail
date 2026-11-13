@@ -1,0 +1,316 @@
+name: Nightly PPU Rehearsal (disposable)
+
+# Exercise the build -> test link by hand, on a branch, at any hour.
+#
+# What this cannot do, and why: workflow_run only fires for workflow files that
+# exist on the default branch, so the automatic link in nightly-test-ppu.yml and
+# the issue tracker stay dormant on a feature branch. Those two are verified after
+# merge, against a real failed build. Everything else -- naming the image the build
+# pushed, pinning it to a digest once, and the image health check running inside a
+# pod -- is reachable from workflow_dispatch, which is what this file drives.
+#
+# Modes:
+#   static     no pods, no build. Runs scripts/ci/ppu/rehearsal_preflight.sh, which
+#              is the same file a contributor can run on a laptop.
+#   full       dispatch release-docker-ppu-nightly.yml with push=true, wait for it,
+#              derive the tag from the build run the way prepare does, assert the
+#              first date candidate resolves, then hand that digest-pinned
+#              reference to nightly-test-ppu.yml (all four partitions).
+#   test-only  skip the build. Test an image that already exists.
+#
+# Nothing here runs on a schedule, and nothing here opens or closes an issue.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'static = assertions only; full = build then test; test-only = test an existing image'
+        required: true
+        type: choice
+        options: [static, full, test-only]
+        default: static
+      ref:
+        description: 'Commit or branch to check out for the test. Empty uses the branch this was dispatched on.'
+        required: false
+        type: string
+        default: ''
+      test_image:
+        description: 'test-only: the image to test. Empty falls back to the rolling nightly tag.'
+        required: false
+        type: string
+        default: ''
+      confirm_pods:
+        description: 'full and test-only submit real pods (8 PPU cards at peak). Type yes to allow it.'
+        required: false
+        type: string
+        default: ''
+
+# Its own group: a rehearsal must never preempt, or be preempted by, the nightly
+# that is already running on the default branch.
+concurrency:
+  group: nightly-ppu-rehearsal-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Dispatch the build, then read its status. No issues permission on purpose:
+  # this workflow is not allowed to open or close anything.
+  actions: write
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      ref: ${{ steps.defaults.outputs.ref }}
+      default_image: ${{ steps.defaults.outputs.default_image }}
+    steps:
+      # inputs.ref reaches actions/checkout, so it is held to the same shape prepare
+      # accepts: a full commit sha, or a ref git itself would accept.
+      - name: Validate the requested ref
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$REQUESTED_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            :
+          elif [[ "$REQUESTED_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+            git check-ref-format --allow-onelevel "$REQUESTED_REF" >/dev/null; then
+            :
+          else
+            echo '::error::ref must be a full commit SHA or a valid branch/tag ref' >&2
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Work out the defaults
+        id: defaults
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REQUESTED_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          set -euo pipefail
+          owner_lc=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          printf 'default_image=%s\n' "ghcr.io/${owner_lc}/sglang-ppu-nightly:nightly" >> "$GITHUB_OUTPUT"
+
+      - name: Run the assertions that need no pod
+        run: bash scripts/ci/ppu/rehearsal_preflight.sh
+
+  # Builds from the branch this run was dispatched on, never from inputs.ref: the
+  # build stamps its tag with github.ref_name and github.sha, and the test has to
+  # be pointed at exactly the commit the image carries.
+  build:
+    needs: [preflight]
+    if: ${{ inputs.mode == 'full' && inputs.confirm_pods == 'yes' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    outputs:
+      head_sha: ${{ steps.wait.outputs.head_sha }}
+      run_id: ${{ steps.wait.outputs.run_id }}
+      candidates: ${{ steps.derive.outputs.candidates }}
+      image_ref: ${{ steps.pin.outputs.ref }}
+      image_digest: ${{ steps.pin.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Dispatch the nightly build
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf 'started=%s\n' "$started" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$BUILD_REF" >> "$GITHUB_OUTPUT"
+          # -F, not -f: push is declared boolean, and the API rejects a string there.
+          gh workflow run release-docker-ppu-nightly.yml --ref "$BUILD_REF" -F push=true
+
+      - name: Wait for it to finish
+        id: wait
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_REF: ${{ steps.dispatch.outputs.ref }}
+          STARTED: ${{ steps.dispatch.outputs.started }}
+        run: |
+          set -euo pipefail
+          run_id=''
+          deadline=$(( $(date -u +%s) + 330 * 60 ))
+          while :; do
+            # A dispatch can take a few seconds to appear, so the lookup is retried
+            # rather than assumed to return something on the first pass.
+            run_id="$(gh run list --workflow=release-docker-ppu-nightly.yml \
+              --branch="$BUILD_REF" --limit 20 \
+              --json databaseId,createdAt,event \
+              --jq '.[] | select(.event == "workflow_dispatch" and .createdAt >= "'"$STARTED"'") | .databaseId' \
+              2>/dev/null | sort -n | tail -1)"
+            [ -n "$run_id" ] && break
+            [ "$(date -u +%s)" -ge "$deadline" ] && { echo '::error::the dispatched build never appeared'; exit 1; }
+            echo 'waiting for the build run to appear'
+            sleep 20
+          done
+          echo "build run: ${run_id}"
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+
+          while :; do
+            json="$(gh run view "$run_id" --json status,conclusion,headSha,headBranch,createdAt,runStartedAt 2>/dev/null || echo '{}')"
+            status="$(printf '%s' "$json" | jq -r '.status // ""')"
+            echo "build ${run_id}: ${status:-unknown}"
+            case "$status" in
+              completed)
+                conclusion="$(printf '%s' "$json" | jq -r '.conclusion // ""')"
+                printf '%s' "$json" | jq -r '"head_sha=\(.headSha)\nhead_branch=\(.headBranch)\ncreated_at=\(.createdAt)\nrun_started_at=\(.runStartedAt)"' >> "$GITHUB_OUTPUT"
+                if [ "$conclusion" != success ]; then
+                  echo "::error::the build concluded ${conclusion}"
+                  exit 1
+                fi
+                break
+                ;;
+            esac
+            if [ "$(date -u +%s)" -ge "$deadline" ]; then
+              echo '::error::the build did not finish in 5.5h'
+              exit 1
+            fi
+            sleep 60
+          done
+
+      # Same file prepare runs, fed the build run's own timestamps. A rehearsal is
+      # worth nothing if it exercises a copy of the logic that names the tag.
+      - name: Name the image the build pushed
+        id: derive
+        env:
+          PPU_DERIVE_SHA: ${{ steps.wait.outputs.head_sha }}
+          PPU_DERIVE_BRANCH: ${{ steps.wait.outputs.head_branch }}
+          PPU_DERIVE_STARTED: ${{ steps.wait.outputs.run_started_at }}
+          PPU_DERIVE_CREATED: ${{ steps.wait.outputs.created_at }}
+          PPU_DERIVE_OWNER: ${{ github.repository_owner }}
+        run: bash scripts/ci/ppu/derive_test_image.sh
+
+      # The first candidate is the one prepare would try first. If it is not in the
+      # registry, the tag rule and the build have drifted apart, which is the whole
+      # failure this line exists to catch.
+      - name: Pin the first candidate
+        id: pin
+        env:
+          CANDIDATES: ${{ steps.derive.outputs.candidates }}
+        run: |
+          set -uo pipefail
+          first="${CANDIDATES%% *}"
+          if [ -z "$first" ]; then
+            echo '::error::no candidate was derived from the build run'
+            exit 1
+          fi
+          if ! PPU_RESOLVE_INPUT="$first" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
+            PPU_RESOLVE_STRICT=1 bash scripts/ci/ppu/resolve_image_digest.sh; then
+            echo "::error::${first} does not resolve; the derived tag and the build have drifted apart"
+            exit 1
+          fi
+          set -a
+          # shellcheck disable=SC1090
+          . "$GITHUB_ENV"
+          set +a
+          printf 'ref=%s\n' "$PPU_TEST_IMAGE_REF" >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$PPU_TEST_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image under test: ${PPU_TEST_IMAGE_REF}"
+
+  test:
+    needs: [preflight, build]
+    if: >-
+      always() && !cancelled() && inputs.confirm_pods == 'yes' &&
+      (inputs.mode == 'test-only' ||
+      (inputs.mode == 'full' && needs.build.result == 'success'))
+    # The digest-pinned reference goes in, not the tag: this also exercises the
+    # digest passthrough in resolve_image_digest.sh, which is what prepare will see
+    # once this branch is merged and a build finishes at 01:00.
+    uses: ./.github/workflows/nightly-test-ppu.yml
+    with:
+      ref: ${{ inputs.mode == 'full' && needs.build.outputs.head_sha || needs.preflight.outputs.ref }}
+      test_image: ${{ inputs.mode == 'full' && needs.build.outputs.image_ref || (inputs.test_image || needs.preflight.outputs.default_image) }}
+    secrets: inherit
+
+  verify:
+    needs: [preflight, build, test]
+    if: ${{ always() && needs.test.result != 'skipped' && inputs.confirm_pods == 'yes' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # The evidence the pods exported, from the same run: a called workflow's
+      # artifacts belong to the caller, so no cross-run lookup is needed.
+      - name: Collect the evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-nightly-evidence-*
+          path: evidence
+          merge-multiple: false
+
+      # A green suite on the wrong object is the failure this whole change is
+      # about, so the verdict is read off the health check rather than off the
+      # case results: the cases are allowed to find regressions, the artifact is
+      # not allowed to be the wrong one.
+      - name: Read the verdict off the health check
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import sys
+
+          reports = sorted(glob.glob("evidence/**/image_healthcheck.json", recursive=True))
+          if not reports:
+              print("::error::no image_healthcheck.json in the evidence; the health check did not run")
+              sys.exit(1)
+
+          required = ["image-commit", "import", "module-provenance", "version", "sgl-kernel", "launch-server", "serve"]
+          problems = []
+          for path in reports:
+              with open(path, encoding="utf-8") as handle:
+                  report = json.load(handle)
+              checks = {item["check"]: item for item in report.get("checks", [])}
+              statuses = ", ".join(f"{name}={checks[name]['status']}" for name in checks)
+              print(f"{path}: mode={report.get('mode')} failures={report.get('failures')} [{statuses}]")
+              if report.get("mode") != "image":
+                  problems.append(f"{path}: mode is {report.get('mode')}, not image")
+              if report.get("failures"):
+                  problems.append(f"{path}: {report['failures']} check(s) failed")
+              for name in required:
+                  entry = checks.get(name)
+                  if entry is None:
+                      problems.append(f"{path}: the {name} check is missing")
+                  elif entry["status"] == "fail":
+                      problems.append(f"{path}: {name} failed: {entry['detail']}")
+
+          if problems:
+              for problem in problems:
+                  print(f"::error::{problem}")
+              sys.exit(1)
+          print(f"all {len(reports)} health report(s) read back clean")
+          PY
+
+      - name: Summarise
+        if: always()
+        env:
+          MODE: ${{ inputs.mode }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          IMAGE: ${{ needs.build.outputs.image_ref }}
+          DIGEST: ${{ needs.build.outputs.image_digest }}
+        run: |
+          {
+            printf '## Nightly PPU rehearsal\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| mode | %s |\n' "$MODE"
+            printf '| build | %s |\n' "$BUILD_RESULT"
+            printf '| test | %s |\n' "$TEST_RESULT"
+            printf '| image | %s |\n' "${IMAGE:-<not built here>}"
+            printf '| digest | %s |\n' "${DIGEST:-<not resolved>}"
+            printf '\nA test result of `failure` can be a real regression in the cases.\n'
+            printf 'Read the health check row above before reading it that way.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
