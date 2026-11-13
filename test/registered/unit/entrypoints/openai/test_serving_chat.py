@@ -227,6 +227,58 @@ class TestChatTemplateCache(CustomTestCase):
         kwargs.update(overrides)
         return self.chat._render_and_encode_chat_template(**kwargs)
 
+    def test_render_only_skips_encode_and_decode(self):
+        self.chat._prefill_text_normalizer = None
+        self.assertEqual(self._render(render_only=True), ([], "rendered"))
+        self.assertEqual(self._render(render_only=True), ([], "rendered"))
+        self.tokenizer_manager.tokenizer.apply_chat_template.assert_called_once()
+        self.tokenizer_manager.tokenizer.encode.assert_not_called()
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def test_render_only_and_id_caches_do_not_alias(self):
+        self.chat._prefill_text_normalizer = None
+        self.assertEqual(self._render(), ([11, 12], "decoded"))
+        self.assertEqual(self._render(render_only=True), ([], "rendered"))
+        self.assertEqual(self._render(), ([11, 12], "decoded"))
+        self.assertEqual(self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2)
+
+    def test_render_only_keeps_round_trip_when_normalization_changes_text(self):
+        from types import SimpleNamespace
+        import unicodedata
+        self.chat._prefill_text_normalizer = SimpleNamespace(
+            normalize_str=lambda text: unicodedata.normalize("NFC", text)
+        )
+        self.tokenizer_manager.tokenizer.apply_chat_template.return_value = "x\u2000"
+        self.assertEqual(self._render(render_only=True), ([11, 12], "decoded"))
+        self.tokenizer_manager.tokenizer.encode.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_called_once()
+
+    def test_expanded_prefill_renders_raw_prompt_only_for_eligible_processors(self):
+        from types import SimpleNamespace
+        self.chat._prefill_text_normalizer = None
+        self.chat._can_render_prefill_text = True
+        self.chat._tokenizer_auto_adds_specials = False
+        self.chat._prompt_text_round_trip_is_lossy = False
+        for mode, expanded, raw_processor, expected_ids in [
+            ("prefill", True, True, []),
+            ("prefill", False, True, [11, 12]),
+            ("prefill", True, False, [11, 12]),
+            ("decode", True, True, [11, 12]),
+        ]:
+            with self.subTest(mode=mode, expanded=expanded, raw=raw_processor):
+                self.tokenizer_manager.mm_processor = SimpleNamespace(
+                    generates_input_ids_from_raw_prompt=raw_processor
+                )
+                request = ChatCompletionRequest(
+                    model="test", messages=[{"role": "user", "content": "hello"}]
+                )
+                with (
+                    get_context().override_server_args(disaggregation_mode=mode),
+                    envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(expanded),
+                ):
+                    processed = self.chat._apply_jinja_template(request, None, True)
+                self.assertEqual(processed.prompt_ids, expected_ids)
+
     def test_cache_hit_reuses_render_encode_and_returns_an_owned_id_list(self):
         first = self._render()
         first[0].append(99)
@@ -270,6 +322,90 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def test_expanded_decode_keeps_cached_ids_without_decoding_to_text(self):
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode", language_only=True
+            ),
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(True),
+        ):
+            self.assertEqual(self._render(), ([11, 12], None))
+            self.assertEqual(self._render(), ([11, 12], None))
+        self.tokenizer_manager.tokenizer.encode.assert_called_once()
+        self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+    def test_expanded_decode_reuses_media_prompt_ids_but_prefill_keeps_text(self):
+        processed = MessageProcessingResult(
+            prompt="rendered image placeholder",
+            prompt_ids=[11, 12],
+            image_data=["image.png"],
+            audio_data=None,
+            video_data=None,
+            modalities=["image"],
+            stop=[],
+        )
+        for mode, language_only, expanded, expected in [
+            ("decode", True, True, ("input_ids", [11, 12])),
+            ("decode", False, True, ("text", processed.prompt)),
+            ("decode", True, False, ("text", processed.prompt)),
+            ("prefill", True, True, ("text", processed.prompt)),
+        ]:
+            with (
+                self.subTest(mode=mode, language_only=language_only, expanded=expanded),
+                get_context().override_server_args(
+                    disaggregation_mode=mode, language_only=language_only
+                ),
+                envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(expanded),
+            ):
+                self.assertEqual(self.chat._engine_prompt(processed, True), expected)
+
+    def test_schema_cache_validates_mutations_and_never_caches_failures(self):
+        from jsonschema import Draft202012Validator, SchemaError
+
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.Draft202012Validator.check_schema",
+            wraps=Draft202012Validator.check_schema,
+        ) as check:
+            self.chat._validate_tool_schema(schema)
+            self.chat._validate_tool_schema(json.loads(json.dumps(schema)))
+            self.assertEqual(check.call_count, 1)
+            schema["properties"]["x"]["type"] = "invalid"
+            for _ in range(2):
+                with self.assertRaises(SchemaError):
+                    self.chat._validate_tool_schema(schema)
+            self.assertEqual(check.call_count, 3)
+
+    def test_expanded_decode_keeps_text_when_conversation_template_has_no_ids(self):
+        processed = MessageProcessingResult(
+            prompt="conversation prompt",
+            prompt_ids=[],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode", language_only=True
+            ),
+            envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.override(True),
+        ):
+            self.assertEqual(
+                self.chat._engine_prompt(processed, True), ("text", processed.prompt)
+            )
+
+    def test_schema_cache_does_not_alias_non_json_values(self):
+        from jsonschema import SchemaError
+
+        self.chat._validate_tool_schema({"maximum": float("nan")})
+        with self.assertRaises(SchemaError):
+            self.chat._validate_tool_schema({"maximum": None})
+        self.chat._validate_tool_schema({"required": ["x"]})
+        with self.assertRaises(SchemaError):
+            self.chat._validate_tool_schema({"required": ("x",)})
 
 
 class ServingChatTestCase(CustomTestCase):

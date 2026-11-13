@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -125,6 +126,22 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+_TOOL_SCHEMA_CACHE_MAX_SIZE = 256
+
+
+def _schema_is_json_value(value) -> bool:
+    # orjson maps NaN/Inf to null and tuples to arrays. Do not let those
+    # programmatic inputs share a cache entry with a different JSON schema.
+    if type(value) is dict:
+        return all(
+            type(key) is str and _schema_is_json_value(item)
+            for key, item in value.items()
+        )
+    if type(value) is list:
+        return all(_schema_is_json_value(item) for item in value)
+    if type(value) is float:
+        return math.isfinite(value)
+    return type(value) in (str, int, bool, type(None))
 
 
 def normalize_tool_content(role: str, content):
@@ -372,9 +389,25 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
-        self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
-            OrderedDict()
+        tokenizer = self.tokenizer_manager.tokenizer
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        self._prefill_text_normalizer = getattr(backend, "normalizer", None)
+        self._can_render_prefill_text = (
+            type(getattr(backend, "decoder", None)).__name__ == "ByteLevel"
+            and (
+                self._prefill_text_normalizer is None
+                or type(self._prefill_text_normalizer).__name__ == "NFC"
+            )
+            and not tokenizer.clean_up_tokenization_spaces
+            and all(
+                not token.lstrip and not token.rstrip
+                for token in tokenizer.added_tokens_decoder.values()
+            )
         )
+        self._validated_tool_schemas: OrderedDict[bytes, None] = OrderedDict()
+        self._chat_template_cache: OrderedDict[
+            bytes, tuple[tuple[int, ...], Optional[str]]
+        ] = OrderedDict()
 
     def _probe_prompt_text_round_trip(self) -> bool:
         """Does rendering the chat template to text and re-encoding lose anything?
@@ -1074,7 +1107,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                self._validate_tool_schema(tool.function.parameters)
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1101,6 +1134,39 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    def _validate_tool_schema(self, schema: dict) -> None:
+        # Cache only successful validation, keyed by content rather than object
+        # identity: callers can reuse and mutate a tool definition between calls.
+        try:
+            if not _schema_is_json_value(schema):
+                Draft202012Validator.check_schema(schema)
+                return
+            key = hashlib.sha256(
+                orjson.dumps(schema, option=orjson.OPT_SORT_KEYS)
+            ).digest()
+        except (TypeError, RecursionError):
+            Draft202012Validator.check_schema(schema)
+            return
+        if key in self._validated_tool_schemas:
+            self._validated_tool_schemas.move_to_end(key)
+            return
+        Draft202012Validator.check_schema(schema)
+        self._validated_tool_schemas[key] = None
+        if len(self._validated_tool_schemas) > _TOOL_SCHEMA_CACHE_MAX_SIZE:
+            self._validated_tool_schemas.popitem(last=False)
+
+    @staticmethod
+    def _decode_reuses_prompt_ids() -> bool:
+        # Expanded-input Prefill owns media expansion and MRoPE metadata. Decode
+        # does not run a media processor, so it can keep the ids already produced
+        # by the chat renderer instead of decoding and tokenizing them again.
+        disagg = get_disagg()
+        return (
+            disagg.disaggregation_mode == "decode"
+            and disagg.language_only
+            and envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+        )
 
     def _validate_media_content(self, request: ChatCompletionRequest) -> str | None:
         is_expanded_len_decode = get_disagg().disaggregation_mode == "decode" and (
@@ -1135,6 +1201,12 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
+        if (
+            self._decode_reuses_prompt_ids()
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+        ):
+            return "input_ids", processed_messages.prompt_ids
         # A lossy text round-trip makes the rendered prompt unusable, so send the
         # ids instead. Only when nothing needs placeholder expansion: with media
         # attached the MM processor still has to tokenize the text itself.
@@ -1684,6 +1756,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials
                 else {}
             )
+            # Expanded-input Prefill's MM processor builds the final ids from
+            # this text. Avoid encoding and decoding a placeholder-only prompt
+            # that it will immediately tokenize again. Token-first/lossy and
+            # assistant-continuation paths retain their existing semantics.
+            render_only = (
+                is_multimodal
+                and get_disagg().disaggregation_mode == "prefill"
+                and envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+                and not self._prompt_text_round_trip_is_lossy
+                and not self._tokenizer_auto_adds_specials
+                and self._can_render_prefill_text
+                and not assistant_prefix
+                and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
+                and getattr(
+                    self.tokenizer_manager.mm_processor,
+                    "generates_input_ids_from_raw_prompt",
+                    False,
+                )
+            )
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
@@ -1691,6 +1782,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
+                    render_only=render_only,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1707,6 +1799,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
+                        render_only=render_only,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1722,7 +1815,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
 
-            if is_multimodal:
+            if is_multimodal and not self._decode_reuses_prompt_ids():
                 prompt = (
                     decoded_prompt
                     if decoded_prompt is not None
@@ -1752,6 +1845,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        render_only: bool = False,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
@@ -1768,6 +1862,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools,
                         template_kwargs,
                         encode_kwargs,
+                        render_only,
                     ),
                 )
             except TypeError:
@@ -1799,14 +1894,27 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                rendered_prompt, **encode_kwargs
+            if render_only and self._prefill_text_normalizer is not None:
+                # Keep the old round-trip for text that the tokenizer normalizes.
+                render_only = (
+                    self._prefill_text_normalizer.normalize_str(rendered_prompt)
+                    == rendered_prompt
+                )
+            prompt_ids = (
+                []
+                if render_only
+                else self.tokenizer_manager.tokenizer.encode(
+                    rendered_prompt, **encode_kwargs
+                )
             )
-        decoded_prompt = (
-            self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
-            else None
-        )
+        if render_only:
+            decoded_prompt = rendered_prompt
+        else:
+            decoded_prompt = (
+                self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                if cache_key is not None and not self._decode_reuses_prompt_ids()
+                else None
+            )
 
         if cache_key is not None:
             self._chat_template_cache[cache_key] = (tuple(prompt_ids), decoded_prompt)
