@@ -36,9 +36,12 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "--enable-single-batch-overlap."
         )
     platform = get_platform()
+    if platform.is_ppu and platform.device_sm < 89:
+        raise ValueError("--moe-a2a-backend megamoe on PPU requires SM89 or newer.")
     if not (
         (platform.is_cuda and (platform.is_sm90 or platform.is_sm100))
         or platform.is_hip
+        or platform.is_ppu
     ):
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
@@ -52,6 +55,8 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
         "Qwen2MoeForCausalLM",

@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -56,12 +57,16 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts=None) -> str:
     if experts is not None and experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
+    if _is_ppu and experts is not None:
+        mma_type = getattr(experts, "_mega_moe_mma_type", None)
+        if mma_type is not None:
+            return mma_type
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
+    if not _is_ppu and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
         return None
@@ -118,6 +123,7 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     mma_type: Optional[str] = None,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -132,6 +138,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            activation,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
@@ -144,7 +151,7 @@ def _get_mega_moe_symm_buffer(
                 hidden,
                 intermediate_hidden,
                 mma_type=mma_type,
-                activation="swiglu",
+                activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
@@ -153,11 +160,20 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_ppu:
+        return _device_sm >= 89
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 
+
+_MEGA_HIT_LOGGED=set()
+def _log_mega_moe_hit(moe):
+    import logging
+    if id(moe) in _MEGA_HIT_LOGGED: return
+    _MEGA_HIT_LOGGED.add(id(moe))
+    logging.getLogger("mega_moe").warning("MEGA_MOE_HIT layer=%s experts=%s mma=%s", getattr(moe,"prefix","?"), moe.experts.num_experts, _mega_moe_mma_type(moe.experts))
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if _use_amd_flydsl_mega_moe():
@@ -180,7 +196,10 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    ret = max_tokens_per_rank <= cap
+    if ret:
+        _log_mega_moe_hit(moe)
+    return ret
 
 
 def forward_mega_moe(
@@ -399,7 +418,12 @@ def run_mega_routed_experts(
         device=hidden_states.device,
     )
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+        mega_moe_kernel = (
+            deep_gemm.fp4_fp4_mega_moe
+            if _is_ppu and mma_type == "mxf4xmxf4"
+            else deep_gemm.fp8_fp4_mega_moe
+        )
+        mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,
