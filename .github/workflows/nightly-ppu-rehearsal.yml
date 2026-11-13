@@ -21,6 +21,20 @@ name: Nightly PPU Rehearsal (disposable)
 # Nothing here runs on a schedule, and nothing here opens or closes an issue.
 
 on:
+  # workflow_dispatch only registers a file that already exists on the default
+  # branch, so while this file lives only on a feature branch there is no way to
+  # dispatch it -- and therefore no way to learn whether GitHub accepts it at all.
+  # A push to the rehearsal branch runs the static half, which is enough to prove
+  # the file parses, every job resolves and the reusable call is well formed.
+  # Drop this trigger together with the branch.
+  push:
+    branches:
+      - ci/ppu-nightly-rehearsal
+    paths:
+      - '.github/workflows/nightly-ppu-rehearsal.yml'
+      - '.github/workflows/nightly-test-ppu.yml'
+      - '.github/workflows/release-docker-ppu-nightly.yml'
+      - 'scripts/ci/ppu/**'
   workflow_dispatch:
     inputs:
       mode:
