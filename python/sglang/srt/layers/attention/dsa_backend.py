@@ -800,10 +800,15 @@ class DeepseekSparseAttnBackend(
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
     def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+        query_head_dim = self.indexer_head_dim
+        if getattr(self.token_to_kv_pool, "use_fp4_indexer", False):
+            # Use the actual pool layout: KPool can disable FP4 despite the flag.
+            # The PPU planner expects two FP4 values packed into each byte.
+            query_head_dim //= 2
         return (
             1,  # next_n
             self.num_q_heads,  # num_heads
-            self.indexer_head_dim,  # head_dim
+            query_head_dim,  # head_dim (packed for FP4)
             (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
         )
 
