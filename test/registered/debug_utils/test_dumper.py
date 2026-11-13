@@ -1653,6 +1653,16 @@ def _run_dumper_instance(http_port: int, stop_event, error_queue):
         error_queue.put((http_port, f"{type(exc).__name__}: {exc}"))
 
 
+def _collect_attempt_errors(initial_error, error_queue):
+    errors = [] if initial_error is None else [initial_error]
+    while True:
+        try:
+            port, error = error_queue.get_nowait()
+        except queue.Empty:
+            return errors
+        errors.append(RuntimeError(f"Dumper startup failed on port {port}: {error}"))
+
+
 def _wait_for_dumper_http(url: str, timeout: float = 30, error_queue=None) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1697,6 +1707,7 @@ class TestZmqPortIsolation:
                 thread.start()
                 threads.append(thread)
 
+            attempt_error = None
             try:
                 for port in ports:
                     _wait_for_dumper_http(
@@ -1712,15 +1723,28 @@ class TestZmqPortIsolation:
                     assert (
                         len(states) == 2
                     ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
-                return
             except RuntimeError as exc:
-                if not _is_http_port_collision(exc) or attempt == 2:
-                    raise
+                attempt_error = exc
             finally:
                 for event in stop_events:
                     event.set()
                 for thread in threads:
                     thread.join(timeout=10)
+
+            attempt_errors = _collect_attempt_errors(attempt_error, errors)
+            if any(thread.is_alive() for thread in threads):
+                attempt_errors.append(
+                    RuntimeError("Dumper instances did not stop after cleanup")
+                )
+            if not attempt_errors:
+                return
+            if attempt == 2 or not all(
+                _is_http_port_collision(error) for error in attempt_errors
+            ):
+                raise RuntimeError(
+                    "Dumper startup errors:\n"
+                    + "\n".join(str(error) for error in attempt_errors)
+                )
 
     def test_wait_surfaces_startup_error_before_timeout(self):
         errors = queue.Queue()
@@ -1743,6 +1767,14 @@ class TestZmqPortIsolation:
         assert not _is_http_port_collision(
             RuntimeError("Rank 0: [ZmqRpc] [Errno 98] Address already in use")
         )
+
+    def test_mixed_http_and_zmq_errors_are_not_retryable(self):
+        initial = RuntimeError("_DumperHttpPortCollision: HTTP port 41554")
+        errors = queue.Queue()
+        errors.put((42362, "[ZmqRpc] [Errno 98] Address already in use"))
+        attempt_errors = _collect_attempt_errors(initial, errors)
+        assert len(attempt_errors) == 2
+        assert not all(_is_http_port_collision(error) for error in attempt_errors)
 
 
 class TestDumperHttp:
