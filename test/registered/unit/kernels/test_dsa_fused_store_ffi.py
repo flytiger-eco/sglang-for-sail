@@ -2,6 +2,8 @@
 
 import ast
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -86,6 +88,32 @@ class TestDsaFusedStoreFfi(CustomTestCase):
 
 
 class TestTopkCandidateFfi(CustomTestCase):
+    def test_ragged_parameter_types_compile_without_redefinitions(self):
+        compiler = shutil.which("clang++") or shutil.which("c++")
+        if compiler is None:
+            self.skipTest("A host C++ compiler is required for the header syntax check")
+        header = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/kernels/jit/csrc/deepseek_v4/topk_v2.cuh"
+        ).read_text()
+        declarations = re.findall(
+            r"^struct (?:PageTransform|TopKRaggedKpoolParams) \{.*?^\};",
+            header,
+            re.MULTILINE | re.DOTALL,
+        )
+        source = (
+            "#include <cstdint>\n#define SGL_DEVICE\n"
+            + "\n".join(declarations)
+            + "\nstatic_assert(sizeof(TopKRaggedKpoolParams) > 0);\n"
+        )
+        result = subprocess.run(
+            [compiler, "-std=c++20", "-fsyntax-only", "-x", "c++", "-"],
+            input=source,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_block_and_dcp_candidates_keep_distinct_bindings(self):
         """Candidate blocks return indices; DCP returns score/index pairs."""
         kernels = Path(__file__).resolve().parents[4] / "python/sglang/kernels"
