@@ -7,7 +7,9 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.attention.qsa.kernel import (
+    QSAPrefillPhysicalSelection,
     average_pool_qsa_keys,
+    expand_map_qsa_physical_slots,
     expand_qsa_block_indices,
     qsa_fast_topk,
 )
@@ -16,7 +18,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    qsa_mqa_decode,
+    qsa_mqa_padded_heads,
+    qsa_mqa_prefill,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -158,6 +164,7 @@ class QSAIndexer(MultiPlatformOp):
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
         rope_max_position: int | None = None,
+        ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -173,11 +180,12 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
+            if (
+                ensure_cos_sin_cache
+                and not get_is_capture_mode()
+                and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
             ):
-                # The backend resolves the bound once per forward; reading it
-                # off the device here would sync every QSA layer.
+                # Retain the current branch's once-per-forward host bound.
                 if rope_max_position is None:
                     rope_max_position = int(positions.max().item())
                 self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
@@ -196,13 +204,21 @@ class QSAIndexer(MultiPlatformOp):
                 self.q_layernorm.variance_epsilon,
                 self.rotary_emb.is_neox_style,
                 q_heads_padded=q_heads_padded,
+                out_dtype=pool.get_qsa_compressed_k_buffer(self.layer_id).dtype,
             )
             return q, token_k, True
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q)
+        q = self.apply_rope(
+            positions,
+            q,
+            ensure_cos_sin_cache=ensure_cos_sin_cache,
+            rope_max_position=rope_max_position,
+        )
+        if pool is not None:
+            q = q.to(pool.get_qsa_compressed_k_buffer(self.layer_id).dtype)
         return q, token_k, False
 
     def normalize_compressed_keys(
@@ -397,7 +413,13 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+        ensure_cos_sin_cache: bool = True,
+        rope_max_position: int | None = None,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
@@ -406,10 +428,14 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(
-            self.rotary_emb, "_ensure_cos_sin_cache_length"
+        if (
+            ensure_cos_sin_cache
+            and not get_is_capture_mode()
+            and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            if rope_max_position is None:
+                rope_max_position = int(positions.max().item())
+            self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
@@ -438,15 +464,20 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
-    ) -> torch.Tensor:
+        token_to_batch_idx: torch.Tensor | None = None,
+        token_slot_table: torch.Tensor | None = None,
+    ) -> torch.Tensor | QSAPrefillPhysicalSelection:
         rows = q.shape[0]
+        physical = token_slot_table is not None
+        if physical != (token_to_batch_idx is not None):
+            raise ValueError("QSA physical mapping requires both metadata tensors")
         output = torch.empty(
             (rows, self.token_topk + self.compress_ratio - 1),
             dtype=torch.int32,
             device=q.device,
         )
         if rows == 0:
-            return output
+            return QSAPrefillPhysicalSelection(output) if physical else output
 
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows, compressed_keys.shape[0], q.shape[1]
@@ -463,15 +494,11 @@ class QSAIndexer(MultiPlatformOp):
                 )
                 logits = None
             else:
-                # Only the selected block ids leave this loop, and the top-k
-                # reads each row's [start, end) span alone, so the scorer can
-                # skip its fill/scale/mask passes over the FP32 logits.
                 logits = qsa_mqa_prefill(
                     q[chunk_slice],
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
-                    rank_only=True,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -479,16 +506,27 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
-            selected = expand_qsa_block_indices(
-                block_indices,
-                query_positions[chunk_slice],
-                sequence_lengths_for_rows[chunk_slice],
-                compress_ratio=self.compress_ratio,
-                token_topk=self.token_topk,
-            )
+            if physical:
+                selected = expand_map_qsa_physical_slots(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    token_to_batch_idx[chunk_slice],
+                    token_slot_table,
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
+            else:
+                selected = expand_qsa_block_indices(
+                    block_indices,
+                    query_positions[chunk_slice],
+                    sequence_lengths_for_rows[chunk_slice],
+                    compress_ratio=self.compress_ratio,
+                    token_topk=self.token_topk,
+                )
             output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
-        return output
+        return QSAPrefillPhysicalSelection(output) if physical else output
 
     def select_decode_tokens(
         self,
@@ -600,7 +638,7 @@ class QSAIndexer(MultiPlatformOp):
             cache_loc=state_slots,
             q_heads_padded=(
                 # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
+                qsa_mqa_padded_heads(self.index_n_heads)
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),

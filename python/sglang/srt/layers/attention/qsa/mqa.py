@@ -2,11 +2,13 @@
 the torch implementations are the fallback and the reference."""
 
 import math
+from functools import lru_cache
 from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_ppu
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -108,6 +110,25 @@ def torch_qsa_mqa_decode(
     return logits
 
 
+# TileLang dtype names of the scoring-kernel operands. The logits stay fp32.
+_TILELANG_DTYPES = {
+    torch.bfloat16: "bfloat16",
+    torch.float8_e4m3fn: "float8_e4m3fn",
+}
+
+
+def _scoring_dtype(q: torch.Tensor, k: torch.Tensor) -> torch.dtype:
+    """The dtype both GEMM operands run in: fp8 only when Q and K already are."""
+    if q.dtype == torch.float8_e4m3fn or k.dtype == torch.float8_e4m3fn:
+        if q.dtype != k.dtype:
+            raise ValueError(
+                "QSA fp8 scoring needs Q and the compressed K in the same dtype, "
+                f"got q={q.dtype} k={k.dtype}"
+            )
+        return torch.float8_e4m3fn
+    return torch.bfloat16
+
+
 if HAS_TILELANG:
 
     @tilelang.jit(
@@ -124,21 +145,25 @@ if HAS_TILELANG:
         block_q: int = 32,
         num_stages: int = 3,
         threads: int = 512,
+        dtype: str = "bfloat16",
+        output_bf16: bool = False,
     ):
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
+        logits_dtype = T.bfloat16 if output_bf16 else T.float32
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([rows * heads, head_dim], T.bfloat16),  # type: ignore
-            K: T.Tensor([keys, head_dim], T.bfloat16),  # type: ignore
-            Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
+            Q: T.Tensor([rows * heads, head_dim], dtype),  # type: ignore
+            K: T.Tensor([keys, head_dim], dtype),  # type: ignore
+            Logits: T.Tensor([rows, keys], logits_dtype),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            Scale: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
-                q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
-                k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
+                q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
+                k_shared = T.alloc_shared([block_n, head_dim], dtype)
                 scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
                 scores_3d = T.reshape(scores, (block_n, block_q, heads))
                 reduced = T.alloc_fragment([block_n, block_q], T.float32)
@@ -168,20 +193,28 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
+                        if output_bf16:
+                            Logits[row_base + qi, start_min + ni * block_n + n] = (
+                                reduced[n, qi] / Scale
+                            )
+                        else:
+                            Logits[row_base + qi, start_min + ni * block_n + n] = (
+                                reduced[n, qi]
+                            )
 
         return kernel
 
     @tilelang.jit
-    def _tilelang_qsa_mqa_mask_kernel(threads: int = 512, block_k: int = 4096):
+    def _tilelang_qsa_mqa_mask_kernel(
+        threads: int = 512, block_k: int = 4096, output_bf16: bool = False
+    ):
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
+        logits_dtype = T.bfloat16 if output_bf16 else T.float32
 
         @T.prim_func
         def kernel(
-            Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
+            Logits: T.Tensor([rows, keys], logits_dtype),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
         ):
@@ -191,7 +224,7 @@ if HAS_TILELANG:
                     for item in T.serial(block_k // threads):
                         column = block * block_k + item * threads + tx
                         if column < Starts[bx] or column >= Ends[bx]:
-                            Logits[bx, column] = -T.infinity(T.float32)
+                            Logits[bx, column] = -T.infinity(logits_dtype)
 
         return kernel
 
@@ -208,6 +241,7 @@ if HAS_TILELANG:
         groups_per_cta: int = 1,
         num_stages: int = 3,
         threads: int = 128,
+        dtype: str = "bfloat16",
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -221,8 +255,8 @@ if HAS_TILELANG:
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([batch, 1, heads, head_dim], T.bfloat16),  # type: ignore
-            KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
             ContextLens: T.Tensor([batch], T.int32),  # type: ignore
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
@@ -233,8 +267,8 @@ if HAS_TILELANG:
                 T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta),
                 threads=threads,
             ) as (bx, group_block):
-                q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)
-                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
+                q_shared = T.alloc_shared([heads, head_dim], dtype)
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
                 reduced = T.alloc_fragment([GROUP], T.float32)
                 T.copy(Q[bx, 0, :, :], q_shared)
@@ -274,6 +308,99 @@ if HAS_TILELANG:
 
         return kernel
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_kernel_ppu(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        group_ctas: int = 16,
+        threads: int = 128,
+    ):
+        # The validated MMA layout wants 64 GEMM rows; pages narrower than
+        # that are packed in sub-page quadrants of one 64-row tile.
+        GROUP = 64
+        assert GROUP % page_size == 0, page_size
+        sub_pages = GROUP // page_size
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], T.bfloat16),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            # Keep the grid static for CUDA graph replay and let each CTA
+            # grid-stride over the groups in the row's device-side length.
+            with T.Kernel(batch, group_ctas, threads=threads) as (bx, gx):
+                q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)
+                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
+                scores = T.alloc_fragment([GROUP, heads], T.float32)
+                reduced = T.alloc_fragment([GROUP], T.float32)
+                T.copy(Q[bx, 0, :, :], q_shared)
+                context_len = ContextLens[bx]
+                num_groups = T.ceildiv(context_len, GROUP)
+
+                # T.Pipelined races the conditional sub-page copies with the
+                # GEMM on PPU. A serial grid-stride loop is deterministic.
+                for gi in T.serial(T.ceildiv(T.max(num_groups - gx, 0), group_ctas)):
+                    group = gx + gi * group_ctas
+                    if group * GROUP < context_len:
+                        # TileLang rejects dynamic loops around shared-memory
+                        # copies, so unroll the compile-time sub-page count.
+                        for sp in range(sub_pages):
+                            if (group * sub_pages + sp) * page_size < context_len:
+                                T.copy(
+                                    KCache[
+                                        PageTable[bx, group * sub_pages + sp],
+                                        :,
+                                        0,
+                                        :,
+                                    ],
+                                    k_shared[sp * page_size : (sp + 1) * page_size, :],
+                                )
+                        T.gemm(
+                            k_shared,
+                            q_shared,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, head in T.Parallel(GROUP, heads):
+                            scores[token, head] = T.max(scores[token, head], 0.0)
+                        T.reduce_sum(scores, reduced, dim=1, clear=True)
+                        for token in T.Parallel(GROUP):
+                            position = group * GROUP + token
+                            if position < context_len:
+                                Logits[bx, position] = reduced[token] / Scale
+
+        return kernel
+
+
+def _prefill_mqa_block_n(keys: int, heads: int, head_dim: int) -> int:
+    """按真实 K 长度选择 prefill tile，不改变 logits 的计算语义。"""
+    from sglang.srt.utils import is_ppu
+
+    override = envs.SGLANG_QSA_PREFILL_BLOCK_N.get()
+    if override:
+        if override not in (64, 128, 256):
+            raise ValueError("SGLANG_QSA_PREFILL_BLOCK_N must be 0/64/128/256")
+        return override
+    if is_ppu() and heads == 8 and head_dim == 128:
+        return 64 if keys <= 4096 else 256
+    return 64
+
 
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
@@ -281,25 +408,18 @@ def tilelang_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
-    rank_only: bool = False,
 ) -> torch.Tensor:
-    """Validated TileLang packed prefill kernel with weights removed.
-
-    ``rank_only`` returns logits that are only meaningful for ranking inside
-    each row's ``[start, end)`` span: they are unscaled (a positive scale does
-    not change the order) and the rest of the row is left undefined. This
-    skips the zero-fill, the in-place scale and the mask passes, each a full
-    read/write of the ``[rows, keys]`` FP32 matrix. Ranges-aware top-k
-    consumers such as ``fast_topk`` read only that span.
-    """
+    """Validated TileLang packed prefill kernel with weights removed."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
     _validate_q(q)
     _validate_k(k)
     rows, keys = q.shape[0], k.shape[0]
+    output_bf16 = envs.SGLANG_QSA_PREFILL_BF16_LOGITS.get()
+    logits_dtype = torch.bfloat16 if output_bf16 else torch.float32
     if not rows or not keys:
-        logits = torch.zeros((rows, keys), dtype=torch.float32, device=q.device)
+        logits = torch.zeros((rows, keys), dtype=logits_dtype, device=q.device)
         return logits.masked_fill_(
             torch.ones_like(logits, dtype=torch.bool), -float("inf")
         )
@@ -309,11 +429,9 @@ def tilelang_qsa_mqa_prefill(
     padded_rows = rows + padding
     # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
     # doubling the dominant prefill buffer; allocate pre-padded instead.
-    # The kernel writes every column inside each row's [start, end) span, so
-    # rank-only callers need no fill.
-    alloc = torch.empty if rank_only else torch.zeros
-    logits = alloc((padded_rows, keys), dtype=torch.float32, device=q.device)
-    q_padded = q.to(torch.bfloat16).contiguous()
+    logits = torch.zeros((padded_rows, keys), dtype=logits_dtype, device=q.device)
+    scoring_dtype = _scoring_dtype(q, k)
+    q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
     if padding:
@@ -321,21 +439,48 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
+        block_n=_prefill_mqa_block_n(keys, heads, head_dim),
+        output_bf16=output_bf16,
+    )(
         q_padded.reshape(-1, head_dim),
-        k[:, 0].to(torch.bfloat16).contiguous(),
+        k[:, 0].to(scoring_dtype).contiguous(),
         logits,
         starts,
         ends,
+        float(score_scale or math.sqrt(head_dim)),
     )
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
-    if rank_only:
-        return logits
-    logits.div_(score_scale or math.sqrt(head_dim))
-    _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
+    if not output_bf16:
+        logits.div_(score_scale or math.sqrt(head_dim))
+    _tilelang_qsa_mqa_mask_kernel(output_bf16=output_bf16)(
+        logits, starts[:rows], ends[:rows]
+    )
     return logits
+
+
+@lru_cache(maxsize=1)
+def _decode_head_granularity() -> int:
+    """Q-head multiple required by the decode MQA GEMM's N dimension."""
+
+    from sglang.srt.utils import is_hip, is_ppu
+
+    return 16 if is_ppu() or is_hip() else 8
+
+
+def qsa_mqa_padded_heads(query_heads: int) -> int:
+    """Round query heads up to the active decode kernel's N granularity."""
+
+    granularity = _decode_head_granularity()
+    return max(
+        granularity, ((query_heads + granularity - 1) // granularity) * granularity
+    )
 
 
 def tilelang_qsa_mqa_decode(
@@ -365,15 +510,13 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # Retain the validated CUDA/ROCm paths; PPU uses a persistent serial
+    # sub-page kernel to keep graph replay and shared-memory copies safe.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
-    )
-    q_kernel = q.to(torch.bfloat16)
+    kernel_heads = qsa_mqa_padded_heads(query_heads)
+    ppu_kernel = is_ppu()
+    scoring_dtype = torch.bfloat16 if ppu_kernel else _scoring_dtype(q, k_cache)
+    q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
             [
@@ -382,11 +525,17 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    _tilelang_qsa_mqa_decode_kernel(
-        heads=kernel_heads, head_dim=head_dim, page_size=page_size
-    )(
+    factory = (
+        _tilelang_qsa_mqa_decode_kernel_ppu
+        if ppu_kernel
+        else _tilelang_qsa_mqa_decode_kernel
+    )
+    kernel_kwargs = dict(heads=kernel_heads, head_dim=head_dim, page_size=page_size)
+    if not ppu_kernel:
+        kernel_kwargs["dtype"] = _TILELANG_DTYPES[scoring_dtype]
+    factory(**kernel_kwargs)(
         q_kernel.unsqueeze(1).contiguous(),
-        k_cache.to(torch.bfloat16).contiguous(),
+        k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),
         context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
         logits,
@@ -401,13 +550,9 @@ def qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
-    rank_only: bool = False,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(
-            q, k, row_starts, row_ends, score_scale, rank_only=rank_only
-        )
-    # The reference's scaled, masked logits already satisfy the rank-only contract.
+        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 

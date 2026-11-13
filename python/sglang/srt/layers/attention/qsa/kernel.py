@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+
+@dataclass(frozen=True)
+class QSAPrefillPhysicalSelection:
+    """已映射的物理 KV slots，防止后端将其误当作逻辑 token 索引。"""
+
+    slots: torch.Tensor
+
+    @property
+    def shape(self):
+        return self.slots.shape
+
+    def __getitem__(self, rows):
+        return QSAPrefillPhysicalSelection(self.slots[rows])
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        self.slots.record_stream(stream)
 
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
@@ -20,37 +39,59 @@ def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     return key_groups.float().mean(dim=1).to(key_groups.dtype)
 
 
+@lru_cache(maxsize=32)
+def _qsa_prefill_topk_metadata(device: torch.device, rows: int):
+    """缓存 identity page mapping，避免逐层分配常量张量。"""
+    return (
+        torch.zeros((1, 1), dtype=torch.int32, device=device),
+        torch.zeros((rows,), dtype=torch.int32, device=device),
+    )
+
+
+def _qsa_prefill_bf16_topk(logits, row_starts, row_ends, topk):
+    """直接选择 BF16 分数，输出各 packed request 的相对 block 索引。"""
+    from sglang.kernels.ops.attention.dsv4 import top_k_per_row_prefill_bf16
+
+    rows, columns = logits.shape
+    output = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+    if rows == 0:
+        return output
+    page_table, row_to_page = _qsa_prefill_topk_metadata(logits.device, rows)
+    page_size = 1 << max(columns - 1, 0).bit_length()
+    top_k_per_row_prefill_bf16(
+        logits,
+        row_starts.contiguous(),
+        row_ends.to(device=logits.device, dtype=torch.int32).contiguous(),
+        page_table,
+        output,
+        page_size,
+        row_to_page=row_to_page,
+    )
+    return output
+
+
 def qsa_fast_topk(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks with fixed-width, row-relative output."""
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
     if logits.is_cuda:
-        if topk == 512:
-            # Prefer the JIT kernel: it ships with the sglang python package,
-            # so top-k 512 works regardless of the installed sgl_kernel version.
+        from sglang.srt.utils import is_ppu
+
+        if logits.dtype == torch.bfloat16 and is_ppu() and topk in (512, 2048):
+            return _qsa_prefill_bf16_topk(logits, starts, row_ends, topk)
+        if is_ppu():
+            from sglang.kernels.ops.attention.qsa_fast_topk import fast_topk
+        else:
             from sglang.kernels.ops.attention.fast_topk import fast_topk
 
-            return fast_topk(logits, lengths, topk=512, row_starts=starts)
+        return fast_topk(logits, lengths, topk=topk, row_starts=starts)
 
-        from sgl_kernel import top_k as top_k_module
-
-        supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
-        if topk in supported_topk:
-            return top_k_module.fast_topk_v2(
-                logits, lengths, topk=topk, row_starts=starts
-            )
-        raise ValueError(
-            f"QSA top-k {topk} is unsupported by sgl_kernel; "
-            f"supported values are {supported_topk}"
-        )
-
-    # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
     output = torch.full(
         (logits.shape[0], topk),
         -1,
@@ -131,8 +172,13 @@ def _expand_qsa_block_indices_kernel(
     query_positions,
     sequence_lengths,
     output,
+    token_to_batch_idx,
+    token_slot_table,
     block_stride: tl.constexpr,
     output_stride: tl.constexpr,
+    token_stride: tl.constexpr,
+    token_width: tl.constexpr,
+    PHYSICAL_SLOTS: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     TOKEN_TOPK: tl.constexpr,
@@ -192,6 +238,16 @@ def _expand_qsa_block_indices_kernel(
         expanded,
         tl.where(tail_valid, tail, -1),
     )
+    if PHYSICAL_SLOTS:
+        sequence_id = tl.load(token_to_batch_idx + row).to(tl.int64)
+        valid = (cols < FINAL_TOPK) & (result >= 0) & (result < token_width)
+        result = tl.load(
+            token_slot_table
+            + sequence_id * token_stride
+            + tl.where(valid, result, 0).to(tl.int64),
+            mask=valid,
+            other=-1,
+        )
     tl.store(
         output + row * output_stride + cols,
         result,
@@ -219,8 +275,13 @@ def triton_expand_qsa_block_indices(
         query_positions,
         sequence_lengths,
         output,
+        block_indices,
+        block_indices,
         block_indices.stride(0),
         output.stride(0),
+        token_stride=0,
+        token_width=0,
+        PHYSICAL_SLOTS=False,
         BLOCK_TOPK=block_topk,
         COMPRESS_RATIO=compress_ratio,
         TOKEN_TOPK=token_topk,
@@ -266,6 +327,67 @@ def expand_qsa_block_indices(
         compress_ratio,
         token_topk,
     )
+
+
+def expand_map_qsa_physical_slots(
+    block_indices: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    token_to_batch_idx: torch.Tensor,
+    token_slot_table: torch.Tensor,
+    *,
+    compress_ratio: int,
+    token_topk: int,
+) -> torch.Tensor:
+    """逐 query 融合 block 展开与 KV 映射，不共享其他 query 的 selection。"""
+    rows = block_indices.shape[0]
+    if (
+        block_indices.ndim != 2
+        or block_indices.shape[1] != token_topk // compress_ratio
+    ):
+        raise ValueError("QSA block indices do not match the configured budget")
+    if any(
+        t.numel() != rows
+        for t in (query_positions, sequence_lengths, token_to_batch_idx)
+    ):
+        raise ValueError("QSA mapping metadata must have one entry per query")
+    if token_slot_table.ndim != 2 or token_slot_table.stride(-1) != 1:
+        raise ValueError("QSA token slot table must have a contiguous last dimension")
+    if not block_indices.is_cuda:
+        logical = expand_qsa_block_indices(
+            block_indices, query_positions, sequence_lengths, compress_ratio, token_topk
+        )
+        valid = (logical >= 0) & (logical < token_slot_table.shape[1])
+        slots = token_slot_table[
+            token_to_batch_idx.long()[:, None],
+            logical.clamp(0, token_slot_table.shape[1] - 1).long(),
+        ]
+        return torch.where(valid, slots, -1).to(torch.int32)
+    final_topk = token_topk + compress_ratio - 1
+    slots = torch.empty(
+        (rows, final_topk), dtype=torch.int32, device=block_indices.device
+    )
+    if rows:
+        _expand_qsa_block_indices_kernel[(rows,)](
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            slots,
+            token_to_batch_idx,
+            token_slot_table,
+            block_indices.stride(0),
+            slots.stride(0),
+            token_stride=token_slot_table.stride(0),
+            token_width=token_slot_table.shape[1],
+            PHYSICAL_SLOTS=True,
+            BLOCK_TOPK=block_indices.shape[1],
+            COMPRESS_RATIO=compress_ratio,
+            TOKEN_TOPK=token_topk,
+            FINAL_TOPK=final_topk,
+            OUTPUT_BLOCK_SIZE=triton.next_power_of_2(final_topk),
+            num_warps=8,
+        )
+    return slots
 
 
 def qsa_sparse_attention(
