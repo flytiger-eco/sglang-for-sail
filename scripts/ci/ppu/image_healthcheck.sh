@@ -15,7 +15,10 @@
 #   SGLANG_BUILD_COMMIT          baked into the image, the Dockerfile records the built commit
 #   PPU_EXPECTED_COMMIT          head_sha of the build event; only compared when it is a full 40-char sha
 #   PPU_EXPECTED_SGLANG_PREFIX   where sglang should load from, defaults to /sgl-workspace
-#   PPU_MIN_KERNEL_OPS           lower bound on the sgl-kernel op surface, defaults to 20
+#   PPU_MIN_KERNEL_OPS           lower bound on the number of sgl_kernel:: ops the
+#                                dispatcher registered, defaults to 20. A healthy build
+#                                registers far more, so this only catches a namespace
+#                                that came up empty.
 #   PPU_HEALTHCHECK_STRICT_PIP   1 makes a failing pip check red, defaults to a warning
 #   PPU_HEALTHCHECK_SERVE        0 skips the server step
 #   PPU_HEALTHCHECK_MODEL        model for the server step, defaults to the small one the 1-GPU job already warms
@@ -45,9 +48,21 @@ port="${PPU_HEALTHCHECK_PORT:-39876}"
 results=()
 failures=0
 
+# Rows are kept as tab-separated fields and written out by python at the end.
+# Escaping quotes by hand was not enough: a traceback carries newlines and
+# backslashes, and either one turns the whole file into invalid JSON exactly when
+# the evidence matters most.
+record() {
+  local status="$1" check="$2" detail="$3"
+  detail="${detail//$'\r'/ }"
+  detail="${detail//$'\n'/ }"
+  detail="${detail//$'\t'/ }"
+  results+=("${status}"$'\t'"${check}"$'\t'"${detail}")
+}
+
 pass() {
   echo "[image-health] ok   $1: $2"
-  results+=("{\"check\":\"$1\",\"status\":\"pass\",\"detail\":\"${2//\"/\\\"}\"}")
+  record pass "$1" "$2"
 }
 
 # An image that was not built from this commit, or an sglang that never loaded
@@ -55,13 +70,13 @@ pass() {
 # single failing case, so both are red here.
 fail() {
   echo "::error::[image-health] $1: $2"
-  results+=("{\"check\":\"$1\",\"status\":\"fail\",\"detail\":\"${2//\"/\\\"}\"}")
+  record fail "$1" "$2"
   failures=$((failures + 1))
 }
 
 warn() {
   echo "::warning::[image-health] $1: $2"
-  results+=("{\"check\":\"$1\",\"status\":\"warn\",\"detail\":\"${2//\"/\\\"}\"}")
+  record warn "$1" "$2"
 }
 
 # ---------- 1. Does the image carry the commit we mean to test ---------- #
@@ -75,24 +90,30 @@ else
 fi
 
 # ---------- 2. Does it import ---------- #
-if out="$(python3 -c 'import sglang, torch; print("sglang", sglang.__version__, "torch", torch.__version__)' 2>&1)"; then
+# stderr is kept out of `out` throughout: a single warning printed there would be
+# prepended to the value the checks below compare against.
+import_err="$(mktemp -t ppu-healthcheck-import.XXXXXX)"
+if out="$(python3 -c 'import sglang, torch; print("sglang", sglang.__version__, "torch", torch.__version__)' 2>"${import_err}")"; then
   pass "import" "${out}"
 else
-  fail "import" "$(printf '%s' "${out}" | tail -3 | tr '\n' ' ')"
+  fail "import" "$(tail -3 "${import_err}" | tr '\n' ' ')"
 fi
+rm -f "${import_err}"
 
 # ---------- 3. Does the code under test really come from the image ---------- #
 # This is what the whole change rests on: pytest runs from /workspace/source, and
 # the moment that checkout wins a place on sys.path the image is only a bystander
 # while the report still looks green.
-if out="$(python3 -c 'import os, sglang; print(os.path.realpath(sglang.__file__))' 2>&1)"; then
+provenance_err="$(mktemp -t ppu-healthcheck-provenance.XXXXXX)"
+if out="$(python3 -c 'import os, sglang; print(os.path.realpath(sglang.__file__))' 2>"${provenance_err}")"; then
   case "${out}" in
     "${expected_prefix}"/*) pass "module-provenance" "${out}" ;;
     *) fail "module-provenance" "sglang loaded from ${out}, which is not under the image's ${expected_prefix}" ;;
   esac
 else
-  fail "module-provenance" "$(printf '%s' "${out}" | tail -1)"
+  fail "module-provenance" "$(tail -1 "${provenance_err}")"
 fi
+rm -f "${provenance_err}"
 
 # ---------- 4. The version is not a placeholder ---------- #
 version="$(python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null || true)"
@@ -107,21 +128,37 @@ case "${version}" in
 esac
 
 # ---------- 5. The sgl-kernel op surface ---------- #
-kernel_out="$(python3 - <<'PY' 2>&1
+# The probe is written to a file instead of fed through $(...) with a here-doc:
+# bash 3.2 (the macOS default, which is what a contributor runs locally) scans a
+# here-doc body inside command substitution for quotes, so a single apostrophe in
+# a comment there reads as an unterminated string.
+kernel_err="$(mktemp -t ppu-healthcheck-kernel.XXXXXX)"
+kernel_py="$(mktemp -t ppu-healthcheck-kernel.XXXXXX.py)"
+cat >"${kernel_py}" <<'PY'
 import sys
+
 try:
     import torch, sgl_kernel
 except Exception as exc:  # noqa: BLE001 - the point is to turn this into a readable failure
     print("import-error", exc)
     sys.exit(3)
-registered = getattr(torch.ops, "sgl_kernel", None)
-if registered is None:
+
+# The dispatcher registry, not dir() on the namespace object: torch.ops.X is
+# lazily populated, so its __dict__ holds only the names already touched and
+# dir() reports a couple of module attributes whatever the native library
+# registered. A healthy image used to read as an empty kernel that way.
+names = [
+    name
+    for name in torch._C._dispatch_get_all_op_names()
+    if name.startswith("sgl_kernel::")
+]
+if not names:
     print("no-sgl-kernel-namespace")
     sys.exit(4)
-names = [n for n in dir(registered) if not n.startswith("_")]
 print("ops", len(names), "version", getattr(sgl_kernel, "__version__", "?"))
 PY
-)"
+kernel_out="$(python3 "${kernel_py}" 2>"${kernel_err}")"
+rm -f "${kernel_py}"
 case "${kernel_out}" in
   ops*)
     op_count="$(printf '%s' "${kernel_out}" | awk '{print $2}')"
@@ -132,8 +169,11 @@ case "${kernel_out}" in
       pass "sgl-kernel" "${kernel_out}"
     fi
     ;;
-  *) fail "sgl-kernel" "${kernel_out}" ;;
+  *)
+    fail "sgl-kernel" "$(printf '%s %s' "${kernel_out}" "$(tail -3 "${kernel_err}" | tr '\n' ' ')")"
+    ;;
 esac
+rm -f "${kernel_err}"
 
 # ---------- 6. Does the entry point still come up ---------- #
 if python3 -m sglang.launch_server --help >/dev/null 2>&1; then
@@ -201,17 +241,37 @@ fi
 
 # ---------- Summary ---------- #
 if [ -n "${evidence_dir}" ] && [ -d "${evidence_dir}" ]; then
-  {
-    printf '{"mode":"image","expected_commit":"%s","failures":%s,"checks":[' \
-      "${expected_commit}" "${failures}"
-    first=1
-    for row in "${results[@]}"; do
-      [ "${first}" = "1" ] || printf ','
-      printf '%s' "${row}"
-      first=0
-    done
-    printf ']}\n'
-  } >"${evidence_dir}/image_healthcheck.json"
+  health_rows="$(mktemp -t ppu-healthcheck-rows.XXXXXX)"
+  if [ "${#results[@]}" -gt 0 ]; then
+    printf '%s\n' "${results[@]}" >"${health_rows}"
+  fi
+  python3 - "${health_rows}" "${evidence_dir}/image_healthcheck.json" \
+    "${failures}" "${expected_commit}" <<'PY'
+import json
+import sys
+
+rows_path, out_path, failures, expected_commit = sys.argv[1:5]
+checks = []
+with open(rows_path, encoding="utf-8") as handle:
+    for line in handle.read().splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) == 3:
+            checks.append(
+                {"check": fields[1], "status": fields[0], "detail": fields[2]}
+            )
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "mode": "image",
+            "expected_commit": expected_commit,
+            "failures": int(failures),
+            "checks": checks,
+        },
+        handle,
+    )
+    handle.write("\n")
+PY
+  rm -f "${health_rows}"
 fi
 
 if [ "${failures}" -gt 0 ]; then
