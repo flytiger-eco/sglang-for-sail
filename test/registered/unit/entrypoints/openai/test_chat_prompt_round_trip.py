@@ -93,7 +93,8 @@ class TestRenderAndEncode(unittest.TestCase):
 class TestEnginePrompt(unittest.TestCase):
     def _server(self, lossy):
         return SimpleNamespace(
-            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None
+            _prompt_text_round_trip_is_lossy=lossy, chat_encoding_spec=None,
+            _decode_reuses_prompt_ids=lambda: False
         )
 
     def test_lossy_text_only_sends_ids(self):
