@@ -21,6 +21,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.qsa.cp import (
+    QSAOnlyCPContext,
+    qsa_only_cp_from_interleaved,
+    qsa_only_cp_to_interleaved,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -40,7 +45,11 @@ from sglang.srt.layers.hyperconnection import (
     HyperConnectionConfig,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -49,6 +58,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.hc_seq_parallel import (
     hc_sp_pack_interleaved,
@@ -1518,7 +1528,7 @@ class Qwen4ExpLayerExtensionMixin:
         hidden_states, residual = self.attn_hyper_connection.mix(
             hidden_states, pre_normed=pre_normed
         )
-        if hc_sp is not None:
+        if hc_sp is not None and not getattr(self, "qsa_only_cp", False):
             hidden_states = hc_sp.gather(hidden_states)
         return hidden_states, residual
 
@@ -1528,8 +1538,12 @@ class Qwen4ExpLayerExtensionMixin:
         residual: _HCResiduals,
         forward_batch: ForwardBatch,
         hc_sp: Optional[_HCSeqParallel] = None,
+        *,
+        skip_attn_tp_reduce: bool = False,
     ) -> Tuple[torch.Tensor, _HCResiduals]:
-        if hc_sp is not None:
+        if skip_attn_tp_reduce:
+            pass  # replicated projection 已生成完整的本地输出，无需跨 rank 求和。
+        elif hc_sp is not None:
             hidden_states = hc_sp.reduce_scatter(hidden_states)
         elif not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
@@ -1693,10 +1707,13 @@ class Qwen4ExpAttentionDecoderLayer(
     ) -> None:
         config.attn_output_gate = True
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa, use_qsa_only_cp
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
+        self.qsa_only_cp = not is_nextn and use_qsa_only_cp(config)
+        if self.qsa_only_cp:
+            self._replicate_qsa_projections(config, quant_config, prefix)
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
@@ -1707,11 +1724,67 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
+    def _replicate_qsa_projections(self, config, quant_config, prefix) -> None:
+        """仅将 QSA 的 head-parallel projection 替换为完整权重副本。"""
+        self.attn_tp_rank = self.kv_tp_rank = 0
+        self.attn_tp_size = self.kv_tp_size = 1
+        self.num_heads = self.total_num_heads
+        self.num_kv_heads = self.total_num_kv_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.total_num_heads * (1 + self.attn_output_gate),
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            tp_rank=0,
+            tp_size=1,
+            kv_tp_rank=0,
+            kv_tp_size=1,
+            prefix=f"{prefix}.qkv_proj" if prefix else "qkv_proj",
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            tp_rank=0,
+            tp_size=1,
+            prefix=f"{prefix}.o_proj" if prefix else "o_proj",
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=self.layer_id,
+            prefix=f"{prefix}.attn",
+            quant_config=quant_config,
+        )
+
+    def _qsa_only_cp_context(self, hc_sp, forward_batch):
+        if not self.qsa_only_cp or hc_sp is None:
+            return None
+        lengths = forward_batch.extend_seq_lens_cpu
+        rows = sum(lengths) if lengths is not None else hc_sp.num_tokens
+        return QSAOnlyCPContext(
+            total_rows=int(rows),
+            local_capacity=hc_sp.local_tokens,
+            rank=hc_sp.rank,
+            world_size=hc_sp.world_size,
+            hc_interleaved=hc_sp.interleaved,
+        )
+
     def _compute_qsa_topk_indices(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        qsa_cp_context: Optional[QSAOnlyCPContext] = None,
+        on_index_keys_gathered=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
@@ -1730,12 +1803,19 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
-        topk_indices = self.indexer(
-            hidden_states,
-            positions,
-            forward_batch,
-            indexer_metadata,
-        )
+        if qsa_cp_context is None:
+            topk_indices = self.indexer(
+                hidden_states, positions, forward_batch, indexer_metadata
+            )
+        else:
+            topk_indices = self.indexer.forward_cuda(
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                qsa_cp_context=qsa_cp_context,
+                on_index_keys_gathered=on_index_keys_gathered,
+            )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
         )
@@ -1750,6 +1830,7 @@ class Qwen4ExpAttentionDecoderLayer(
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        qsa_cp_context: Optional[QSAOnlyCPContext] = None,
     ) -> torch.Tensor:
         overlap_indexer = (
             self.is_qsa
@@ -1781,10 +1862,30 @@ class Qwen4ExpAttentionDecoderLayer(
             topk_indices.record_stream(current_stream)
             attention_kwargs["topk_indices"] = topk_indices
         elif self.is_qsa:
+            on_index_keys_gathered = None
+            if (
+                qsa_cp_context is not None
+                and envs.SGLANG_QSA_ONLY_CP_PREFETCH_KV.get()
+                and not get_is_capture_mode()
+            ):
+                from sglang.srt.layers.attention.qsa.glue import (
+                    resolve_qsa_sparse_backend,
+                )
+
+                sparse_backend = resolve_qsa_sparse_backend(get_attn_backend())
+                on_index_keys_gathered = lambda: sparse_backend.prefetch_qsa_only_cp_kv(
+                    self.attn, k, v, forward_batch, qsa_cp_context
+                )
             attention_kwargs["topk_indices"] = self._compute_qsa_topk_indices(
-                hidden_states, positions, forward_batch
+                hidden_states,
+                positions,
+                forward_batch,
+                qsa_cp_context=qsa_cp_context,
+                on_index_keys_gathered=on_index_keys_gathered,
             )
 
+        if qsa_cp_context is not None:
+            attention_kwargs["qsa_cp_context"] = qsa_cp_context
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
             if attn_output.is_cuda:
@@ -1815,17 +1916,38 @@ class Qwen4ExpAttentionDecoderLayer(
         )
 
         if not forward_batch.forward_mode.is_idle():
+            context = self._qsa_only_cp_context(hc_sp, forward_batch)
+            attention_input, attention_positions = hidden_states, positions
+            if context is not None:
+                attention_input = qsa_only_cp_to_interleaved(hidden_states, context)[
+                    : context.local_rows
+                ]
+                attention_positions = (
+                    context.shard(positions.transpose(0, 1))
+                    .transpose(0, 1)
+                    .contiguous()
+                    if positions.ndim == 2
+                    else context.shard(positions)
+                )
             hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
+                positions=attention_positions,
+                hidden_states=attention_input,
                 forward_batch=forward_batch,
+                qsa_cp_context=context,
             )
+            if context is not None:
+                padded = hidden_states.new_zeros(
+                    (context.local_capacity, hidden_states.shape[-1])
+                )
+                padded[: context.local_rows].copy_(hidden_states)
+                hidden_states = qsa_only_cp_from_interleaved(padded, context)
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
             hidden_states,
             residual,
             forward_batch,
             hc_sp,
+            skip_attn_tp_reduce=self.qsa_only_cp,
         )
         hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch, hc_sp)
         return self._postprocess_qwen4_exp_layer(

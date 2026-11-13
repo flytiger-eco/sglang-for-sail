@@ -1930,12 +1930,14 @@ class KVCacheConfigurator:
         )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
+            use_qsa_only_cp,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
         )
 
-        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+        qsa_config = self.model_config.hf_config
+        qsa_profile = parse_qsa_profile(qsa_config)
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
@@ -1948,13 +1950,17 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+        replicated_kv = not self.is_draft_worker and use_qsa_only_cp(qsa_config)
+        parallel = get_parallel()
+        head_num = self.model_config.get_num_kv_heads(
+            1 if replicated_kv else parallel.attn_tp_size,
+            1 if replicated_kv else parallel.attn_dcp_size,
+        )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
+            head_num=head_num,
             head_dim=self.model_config.head_dim,
             # if draft worker, we only need 1 attention layer's kv pool
             full_attention_layer_ids=full_attention_layer_ids,

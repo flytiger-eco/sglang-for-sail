@@ -1559,10 +1559,39 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if total_kv_heads <= 0:
             total_kv_heads = self.kv_args.kv_head_num * self.attn_tp_size
 
+        if page_size <= 0:
+            raise RuntimeError("KV slice transfer requires a positive page size")
+        src_heads_per_rank = max(1, total_kv_heads // self.attn_tp_size)
         dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
-        bytes_per_head_slice_to_send = (
-            dst_kv_item_len // page_size // dst_heads_per_rank
+        src_storage_heads = int(
+            getattr(self.kv_args, "kv_head_num", 0) or src_heads_per_rank
         )
+        dcp_size = int(getattr(self, "dcp_size", 1))
+        if dcp_size < 1 or self.attn_tp_size % dcp_size or dst_attn_tp_size % dcp_size:
+            raise RuntimeError("Invalid equal-DCP KV head-slice topology")
+        src_dcp_heads = max(1, total_kv_heads // (self.attn_tp_size // dcp_size))
+        if src_storage_heads not in (src_dcp_heads, total_kv_heads):
+            raise RuntimeError("Unsupported source KV head layout")
+        source_is_replicated = (
+            src_storage_heads == total_kv_heads and src_storage_heads != src_dcp_heads
+        )
+        if source_is_replicated and dcp_size != 1:
+            raise RuntimeError(
+                "Replicated source KV with DCP slice transfer is unsupported"
+            )
+        # Equal-DCP retains logical slice units, as in the original transfer path.
+        src_head_units = (
+            src_storage_heads if source_is_replicated else src_heads_per_rank
+        )
+        src_denominator = page_size * src_head_units
+        dst_denominator = page_size * dst_heads_per_rank
+        if src_kv_item_len % src_denominator or dst_kv_item_len % dst_denominator:
+            raise RuntimeError(
+                "KV item length is not divisible by page and local heads"
+            )
+        bytes_per_head_slice_to_send = dst_kv_item_len // dst_denominator
+        if src_kv_item_len // src_denominator != bytes_per_head_slice_to_send:
+            raise RuntimeError("PD peers disagree on target KV bytes per head")
 
         (
             src_head_start_offset,
@@ -1576,6 +1605,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_tp_rank,
             total_kv_heads,
         )
+        if source_is_replicated:
+            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+            dst_global_start = (
+                (dst_tp_rank % dst_attn_tp_size) // dst_replication
+            ) * dst_heads_per_rank
+            src_head_start_offset = dst_global_start + dst_head_start_offset
+        if (
+            src_head_start_offset + num_heads_to_send > src_head_units
+            or dst_head_start_offset + num_heads_to_send > dst_heads_per_rank
+        ):
+            raise RuntimeError(
+                "Target KV head slice exceeds source or destination cache"
+            )
 
         src_data_ptrs = self.kv_args.kv_data_ptrs
         src_layer_ids = self.kv_args.kv_layer_ids
