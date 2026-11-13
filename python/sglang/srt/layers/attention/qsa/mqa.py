@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.common import is_hip, is_ppu
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -22,6 +22,15 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+
+def _qsa_decode_padded_heads(query_heads: int) -> int:
+    # PPU actlize MMA and ROCm MFMA require n16; ordinary CUDA accepts n8.
+    head_alignment = 16 if is_hip() or is_ppu() else 8
+    return max(
+        head_alignment,
+        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
+    )
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -351,14 +360,10 @@ def tilelang_qsa_mqa_decode(
     )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # Share the fused-prep alignment so already-padded queries need no copy.
+    # Zero heads preserve the weight-free ReLU head sum.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
-    )
+    kernel_heads = _qsa_decode_padded_heads(query_heads)
     q_kernel = q.to(torch.bfloat16)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
