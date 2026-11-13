@@ -16,7 +16,11 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    _qsa_decode_padded_heads,
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -587,8 +591,7 @@ class QSAIndexer(MultiPlatformOp):
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
-                ((self.index_n_heads + 7) // 8) * 8
+                _qsa_decode_padded_heads(self.index_n_heads)
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
