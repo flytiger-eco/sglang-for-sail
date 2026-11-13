@@ -307,6 +307,12 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    SGLANG_QWEN4_HC_SEQ_PARALLEL = EnvBool(False)
+    SGLANG_QWEN4_HC_SEQ_PARALLEL_INTERLEAVED = EnvBool(False)
+    SGLANG_QWEN4_HC_SEQ_PARALLEL_MIN_TOKENS = EnvInt(1024)
+    SGLANG_HC_MIX_UP_FUSED = EnvBool(True)
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)

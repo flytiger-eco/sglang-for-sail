@@ -24,7 +24,9 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
+    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
+    attn_tp_reduce_scatter_tensor,
     dp_gather_replicate,
     dp_scatter,
     get_dp_global_num_tokens,
@@ -48,6 +50,11 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.hc_seq_parallel import (
+    hc_sp_pack_interleaved,
+    hc_sp_scatter_interleaved,
+    hc_sp_unpack_interleaved,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -59,6 +66,9 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -390,6 +400,108 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     out = x.new_zeros((total_tokens, *x.shape[1:]))
     out[: x.shape[0]] = x
     return out
+
+
+class _HCPreNormed(msgspec.Struct, frozen=True):
+    """Carries a fused combine output's precomputed norm across layer boundaries."""
+
+    normed: torch.Tensor
+
+
+_HCInterLayerState = Optional[Union[torch.Tensor, _HCPreNormed]]
+_HCResiduals = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+
+
+class _HCSeqParallel(msgspec.Struct, frozen=True):
+    """Token split of the HC residual stream across the attention-TP group.
+
+    Each rank owns ``local_tokens`` padded rows, either consecutive or
+    interleaved by rank. Pad rows stay exactly zero through HC mix/combine
+    and the MoE, and are dropped on every gather.
+    """
+
+    num_tokens: int
+    padded_tokens: int
+    local_tokens: int
+    rank: int
+    world_size: int = 1
+    interleaved: bool = False
+
+    def scatter(self, x: torch.Tensor) -> torch.Tensor:
+        """Keep this rank's rows of a replicated ``[num_tokens, *]`` tensor."""
+        if self.interleaved:
+            return hc_sp_scatter_interleaved(
+                x,
+                num_tokens=self.num_tokens,
+                local_tokens=self.local_tokens,
+                world_size=self.world_size,
+                rank=self.rank,
+            )
+        x = _pad_token_rows(x, self.padded_tokens)
+        start = self.rank * self.local_tokens
+        return x[start : start + self.local_tokens]
+
+    def gather(self, x: torch.Tensor) -> torch.Tensor:
+        """All-gather the local rows back into ``[num_tokens, *]``."""
+        out = x.new_empty((self.padded_tokens, *x.shape[1:]))
+        attn_tp_all_gather_into_tensor(out, x.contiguous())
+        if self.interleaved:
+            return hc_sp_unpack_interleaved(
+                out,
+                num_tokens=self.num_tokens,
+                local_tokens=self.local_tokens,
+                world_size=self.world_size,
+            )
+        return out[: self.num_tokens]
+
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the attn-TP partials of ``[num_tokens, *]``, keep the local rows."""
+        if self.interleaved:
+            x = hc_sp_pack_interleaved(
+                x,
+                num_tokens=self.num_tokens,
+                local_tokens=self.local_tokens,
+                world_size=self.world_size,
+            )
+        else:
+            x = _pad_token_rows(x, self.padded_tokens)
+        out = x.new_empty((self.local_tokens, *x.shape[1:]))
+        attn_tp_reduce_scatter_tensor(out, x.contiguous())
+        return out
+
+
+def _init_hc_seq_parallel(
+    forward_batch: ForwardBatch, num_tokens: int
+) -> Optional[_HCSeqParallel]:
+    """Decide once per forward; the inputs are identical on all attn-TP ranks."""
+    mode = forward_batch.forward_mode
+    if not (mode == ForwardMode.EXTEND or mode.is_mixed()):
+        return None
+    if num_tokens < envs.SGLANG_QWEN4_HC_SEQ_PARALLEL_MIN_TOKENS.get():
+        return None
+    parallel = get_parallel()
+    attn_tp_size = parallel.attn_tp_size
+    if (
+        attn_tp_size <= 1
+        or parallel.attn_cp_size > 1
+        or parallel.pp_size > 1
+        or get_parallel().attn_dp_size > 1
+        # The MoE must take per-rank tokens (a2a dispatch), not replicated ones.
+        or get_moe_a2a_backend().is_none()
+        or forward_batch.tbo_parent_token_range is not None
+        or get_is_capture_mode()
+        or is_in_tc_piecewise_cuda_graph()
+    ):
+        return None
+    local_tokens = -(-num_tokens // attn_tp_size)
+    return _HCSeqParallel(
+        num_tokens=num_tokens,
+        padded_tokens=local_tokens * attn_tp_size,
+        local_tokens=local_tokens,
+        rank=parallel.attn_tp_rank,
+        world_size=attn_tp_size,
+        interleaved=envs.SGLANG_QWEN4_HC_SEQ_PARALLEL_INTERLEAVED.get(),
+    )
 
 
 def _use_attn_tp_ngram() -> bool:
@@ -1364,11 +1476,17 @@ class Qwen4ExpLayerExtensionMixin:
     def _prepare_qwen4_exp_attn(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: _HCInterLayerState,
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
-    ):
+        hc_sp: Optional[_HCSeqParallel] = None,
+    ) -> Tuple[torch.Tensor, _HCResiduals]:
+        pre_normed = None
+        if isinstance(residual, _HCPreNormed):
+            pre_normed = residual.normed
+            residual = None
+
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
@@ -1387,23 +1505,43 @@ class Qwen4ExpLayerExtensionMixin:
                 ple_query = (
                     hidden_states if residual is None else hidden_states + residual
                 )
-                hidden_states = hidden_states + self.ple(
-                    ple_query, forward_batch, ple_batch
-                )
+                if hc_sp is not None:
+                    # The short conv mixes neighbouring tokens: run PLE on the
+                    # full stream and keep only this rank's rows of its output.
+                    ple_output = hc_sp.scatter(
+                        self.ple(hc_sp.gather(ple_query), forward_batch, ple_batch)
+                    )
+                else:
+                    ple_output = self.ple(ple_query, forward_batch, ple_batch)
+                hidden_states = hidden_states + ple_output
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, pre_normed=pre_normed
+        )
+        if hc_sp is not None:
+            hidden_states = hc_sp.gather(hidden_states)
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: _HCResiduals,
         forward_batch: ForwardBatch,
-    ):
-        if not forward_batch.forward_mode.is_idle():
+        hc_sp: Optional[_HCSeqParallel] = None,
+    ) -> Tuple[torch.Tensor, _HCResiduals]:
+        if hc_sp is not None:
+            hidden_states = hc_sp.reduce_scatter(hidden_states)
+        elif not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
-        hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, pre_normed = self.attn_hyper_connection.combine_and_norm(
+            hidden_states,
+            residual,
+            self.mlp_hyper_connection.hc_norm.weight,
+            self.mlp_hyper_connection.config.rms_norm_eps,
+        )
+        hidden_states, residual = self.mlp_hyper_connection.mix(
+            hidden_states, pre_normed=pre_normed
+        )
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1416,9 +1554,12 @@ class Qwen4ExpLayerExtensionMixin:
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        hc_sp: Optional[_HCSeqParallel] = None,
     ) -> torch.Tensor:
         if not self.config.num_experts:
             return self.mlp(hidden_states)
+        if hc_sp is not None:
+            return self.mlp(hidden_states, forward_batch)
 
         use_dp_moe_gather = self._qwen4_exp_use_dp_moe_gather()
         use_attn_tp_a2a_scatter = self._qwen4_exp_use_attn_tp_a2a_scatter()
@@ -1468,11 +1609,26 @@ class Qwen4ExpLayerExtensionMixin:
     def _postprocess_qwen4_exp_layer(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: _HCResiduals,
         forward_batch: ForwardBatch,
-    ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
-        return hidden_states, None
+        *,
+        next_hc_norm_weight: Optional[torch.Tensor] = None,
+        next_hc_norm_eps: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Optional[_HCPreNormed]]:
+        if next_hc_norm_weight is None or next_hc_norm_eps is None:
+            hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+            return hidden_states, None
+
+        hidden_states, pre_normed = self.mlp_hyper_connection.combine_and_norm(
+            hidden_states,
+            residual,
+            next_hc_norm_weight,
+            next_hc_norm_eps,
+        )
+        return (
+            hidden_states,
+            _HCPreNormed(pre_normed) if pre_normed is not None else None,
+        )
 
 
 class Qwen4ExpLinearDecoderLayer(
@@ -1493,26 +1649,34 @@ class Qwen4ExpLinearDecoderLayer(
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: _HCInterLayerState,
         **kwargs,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[_HCPreNormed]]:
         forward_batch = kwargs.get("forward_batch", None)
+        hc_sp = kwargs.get("hc_sp")
 
         hidden_states, residual = self._prepare_qwen4_exp_attn(
             hidden_states,
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            hc_sp=hc_sp,
         )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, hc_sp
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch, hc_sp)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states,
+            residual,
+            forward_batch,
+            next_hc_norm_weight=kwargs.get("next_hc_norm_weight"),
+            next_hc_norm_eps=kwargs.get("next_hc_norm_eps"),
+        )
 
 
 class Qwen4ExpAttentionDecoderLayer(
@@ -1642,15 +1806,17 @@ class Qwen4ExpAttentionDecoderLayer(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: _HCInterLayerState,
         forward_batch: ForwardBatch,
         **kwargs: Any,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[_HCPreNormed]]:
+        hc_sp = kwargs.get("hc_sp")
         hidden_states, residual = self._prepare_qwen4_exp_attn(
             hidden_states,
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            hc_sp=hc_sp,
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -1661,10 +1827,19 @@ class Qwen4ExpAttentionDecoderLayer(
             )
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            hc_sp,
         )
-        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch)
-        return self._postprocess_qwen4_exp_layer(hidden_states, residual, forward_batch)
+        hidden_states = self._run_qwen4_exp_mlp(hidden_states, forward_batch, hc_sp)
+        return self._postprocess_qwen4_exp_layer(
+            hidden_states,
+            residual,
+            forward_batch,
+            next_hc_norm_weight=kwargs.get("next_hc_norm_weight"),
+            next_hc_norm_eps=kwargs.get("next_hc_norm_eps"),
+        )
 
 
 ALL_DECODER_LAYER_TYPES = {
@@ -1720,6 +1895,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+        self.enable_hc_seq_parallel = (
+            envs.SGLANG_QWEN4_HC_SEQ_PARALLEL.get()
+            and not is_nextn
+            and bool(config.num_experts)
+        )
 
     def forward(
         self,
@@ -1757,13 +1937,31 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.has_ple
             else None
         )
+        hc_sp = (
+            _init_hc_seq_parallel(forward_batch, hidden_states.shape[0])
+            if self.enable_hc_seq_parallel
+            else None
+        )
+        if hc_sp is not None:
+            hidden_states = hc_sp.scatter(hidden_states)
         aux_hidden_states = AuxHiddenStateList()
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            if i + 1 < self.end_layer:
-                next_ple = self.layers[i + 1].ple
-                if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
+            next_layer = self.layers[i + 1] if i + 1 < self.end_layer else None
+            next_ple = getattr(next_layer, "ple", None)
+            if next_ple is not None:
+                next_ple.start_prefetch(ple_batch, forward_batch)
+            next_hc = (
+                None
+                if next_ple is not None
+                else (
+                    next_layer.attn_hyper_connection
+                    if next_layer is not None
+                    else self.hyper_connection_mixer
+                    if self.pp_group.is_last_rank
+                    else None
+                )
+            )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -1771,6 +1969,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     residual=residual,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
+                    hc_sp=hc_sp,
+                    next_hc_norm_weight=next_hc.hc_norm.weight
+                    if next_hc is not None
+                    else None,
+                    next_hc_norm_eps=next_hc.config.rms_norm_eps
+                    if next_hc is not None
+                    else None,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
@@ -1787,7 +1992,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             return PPProxyTensors(proxy_tensors)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(
+            hidden_states,
+            pre_normed=residual.normed if isinstance(residual, _HCPreNormed) else None,
+        )
+        if hc_sp is not None:
+            hidden_states = hc_sp.gather(hidden_states)
+            hc_hidden_states = hc_sp.gather(hc_hidden_states)
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 
