@@ -12,7 +12,7 @@ on:
       scope:
         description: 'CUDA scope including kernel unit/benchmark (weekly/stress/native workflows excluded)'
         type: choice
-        options: [base, extra, nightly, cache-audit]
+        options: [base, extra, nightly]
         default: base
       suites:
         description: 'Optional comma-separated exact CUDA suites within the selected scope'
@@ -44,58 +44,7 @@ env:
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
-  cache-audit:
-    if: ${{ inputs.scope == 'cache-audit' }}
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 30
-    env:
-      AUDIT_SOURCE: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/cache-audit
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Prepare isolated audit directory
-        run: |
-          test ! -e "$AUDIT_SOURCE"
-          mkdir -p "$AUDIT_SOURCE"
-      - name: Audit missing models and datasets on NAS
-        id: audit
-        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
-        with:
-          image: ${{ env.PPU_BASE_IMAGE }}
-          nnodes: 0
-          nproc_per_node: 1
-          node_selector: board-type=ZW-M890P
-          namespace: ppu-sched
-          job_suffix: cache-audit
-          command: python3 /workspace/source/scripts/ci/ppu/audit_missing_resources.py --output /ppu-cache-audit
-          host_volumes: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/cache-audit:/ppu-cache-audit
-          extra_env: "HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub"
-          container_options: |
-            privileged: true
-            cpus: '2'
-            memory: 8Gi
-            shm_size: 64Mi
-          timeout_minutes: 20
-          cleanup_policy: always
-      - name: Publish audit summary
-        if: always()
-        run: |
-          test -f "$AUDIT_SOURCE/cache_audit.md"
-          cat "$AUDIT_SOURCE/cache_audit.md" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ppu-cache-audit-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.AUDIT_SOURCE }}/
-          if-no-files-found: error
-          retention-days: 30
-
   sweep-prepare:
-    if: ${{ inputs.scope != 'cache-audit' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -1023,11 +972,11 @@ jobs:
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
                       self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
-                      self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly', 'cache-audit'])
+                      self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
                       self.assertNotIn('if', jobs['sweep-execute'])
-                      self.assertEqual(jobs['sweep-summarize']['if'], '${' + '{ always() && inputs.scope != \'cache-audit\' }}')
+                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1549,7 +1498,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: ${{ always() && inputs.scope != 'cache-audit' }}
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
