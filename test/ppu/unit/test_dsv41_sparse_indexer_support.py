@@ -186,6 +186,53 @@ class TestDSV41SparseIndexerSupport(unittest.TestCase):
         self.assertEqual(result, (dense.return_value, dense.return_value))
         sparse.assert_not_called()
 
+    def test_int8_torch_prefill_accepts_the_gathered_k_tuple(self):
+        """gather_int8_index_k returns (k, scales); the row-chunk budget must not
+        read .shape from that tuple."""
+        scoring_path = LAYERS / "attention/dsv4/v41_indexer/scoring.py"
+        tensor = MagicMock()
+        int8_module = ModuleType("sglang.kernels.ops.attention.dsv4.int8_indexer")
+        int8_module.int8_index_logits = Mock(return_value=tensor)
+        int8_module.int8_logits_rows_per_chunk = Mock(return_value=2)
+        environ = ModuleType("sglang.srt.environ")
+        environ.envs = SimpleNamespace(
+            SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB=SimpleNamespace(get=lambda: 1)
+        )
+        tok = MagicMock()
+        tok.numel.return_value = 3
+
+        class Broadcastable:
+            def __getitem__(self, key):
+                return self
+
+            def __ge__(self, other):
+                return self
+
+        request = SimpleNamespace(
+            lc=5, k=2, columns=Broadcastable(), tok=tok, lens=tensor
+        )
+        namespace = {
+            "_TORCH_SCORE_BUDGET_BYTES": 1 << 30,
+            "ChunkScores": SimpleNamespace,
+            "torch": SimpleNamespace(inf=float("inf")),
+        }
+        score_chunks = load_function(scoring_path, "_score_chunks", namespace)
+        with patch.dict(
+            sys.modules,
+            {int8_module.__name__: int8_module, environ.__name__: environ},
+        ):
+            chunks = list(
+                score_chunks(
+                    indexer=SimpleNamespace(use_int8=True),
+                    q=tensor,
+                    weights=tensor,
+                    index_k=(tensor, tensor),
+                    request=request,
+                )
+            )
+        int8_module.int8_logits_rows_per_chunk.assert_called_once_with(5, 1 << 20)
+        self.assertEqual(len(chunks), 2)
+
     def test_sm90_decode_respects_platform_and_cache_format(self):
         """SAIL SM90 must use its INT8/DeepGEMM scorer, not Hopper's FP4 scorer."""
         scoring_path = LAYERS / "attention/dsv4/v41_indexer/scoring.py"

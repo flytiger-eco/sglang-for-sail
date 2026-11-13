@@ -5,7 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -482,14 +482,10 @@ def _score_chunks(
     indexer: DeepseekV41Indexer,
     q: torch.Tensor,
     weights: torch.Tensor,
-    index_k: torch.Tensor,
+    index_k: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     request: RequestScores,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(
-        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
-    )
     if indexer.use_int8:
         from sglang.kernels.ops.attention.dsv4.int8_indexer import (
             int8_index_logits,
@@ -505,6 +501,11 @@ def _score_chunks(
         # the out-of-place mask can hold ~3x this budget at once. INT8 sparse
         # indexer support removes it only for candidate layers; full-top-k and
         # the torch fallback still need mask-in-place + release-before-next.
+    else:
+        # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
+        rows_per_chunk = max(
+            1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+        )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
