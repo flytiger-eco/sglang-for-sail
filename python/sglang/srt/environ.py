@@ -307,6 +307,7 @@ class Envs:
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # PPU HC and QSA query-only context parallel controls.
     SGLANG_QWEN4_HC_SEQ_PARALLEL = EnvBool(False)
     SGLANG_QWEN4_HC_SEQ_PARALLEL_INTERLEAVED = EnvBool(False)
     SGLANG_QWEN4_HC_SEQ_PARALLEL_MIN_TOKENS = EnvInt(1024)
@@ -318,6 +319,10 @@ class Envs:
     SGLANG_QSA_PREFILL_BF16_LOGITS = EnvBool(False)
     SGLANG_QSA_PREFILL_BLOCK_N = EnvInt(0)
     SGLANG_QSA_FUSED_PREFILL_PHYSICAL_SLOTS = EnvBool(False)
+    SGLANG_QSA_ONLY_CP_REPLICATE = EnvBool(False)
+    # Query-only prompt prefill; decode and MTP keep their current paths.
+    SGLANG_QSA_ONLY_CP_NO_HOST_SYNC = EnvBool(True)
+    SGLANG_QSA_ONLY_CP_PREFETCH_KV = EnvBool(True)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)

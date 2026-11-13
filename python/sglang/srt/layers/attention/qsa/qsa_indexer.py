@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Callable, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa import qsa_tilelang
+from sglang.srt.layers.attention.qsa.cp import QSAOnlyCPContext, qsa_only_cp_gather_rows
 from sglang.srt.layers.attention.qsa.kernel import (
     QSAPrefillPhysicalSelection,
     average_pool_qsa_keys,
@@ -367,10 +370,6 @@ class QSAIndexer(MultiPlatformOp):
                 source_rope=source_rope,
             )
             return
-        # Padded groups target the reserved dump slot, but their expanded
-        # source indices can exceed a short extend. Keep the fixed shape
-        # while gathering a safe row for every member of an inactive group.
-        group_locs = torch.where(compressed_locs[:, None] != 0, group_locs, 0)
         key_groups = source_keys[group_locs]
         pooled = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
@@ -393,7 +392,6 @@ class QSAIndexer(MultiPlatformOp):
                 metadata.graph_write_locs,
             )
             return
-        group_locs = torch.where(metadata.graph_write_locs[:, None] != 0, group_locs, 0)
         key_groups = pool.get_qsa_key_state_buffer(self.layer_id)[group_locs]
         compressed = average_pool_qsa_keys(key_groups)
         compressed_rope_positions = self._rope_from_matrix(
@@ -569,16 +567,15 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
-    def _forward_impl(
+    def forward_cuda(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
-    ) -> torch.Tensor:
-        """Portable orchestration shared by different platforms.
-        Fast paths are gated per platforms inside kernel calls.
-        """
+        qsa_cp_context: QSAOnlyCPContext | None = None,
+        on_index_keys_gathered: Callable[[], None] | None = None,
+    ) -> torch.Tensor | QSAPrefillPhysicalSelection:
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
@@ -597,7 +594,24 @@ class QSAIndexer(MultiPlatformOp):
             logical_positions = logical_positions.flatten()
         # DP MAX_LEN padding adds token rows without assigning them to a
         # request. token_to_batch_idx is the source of truth for semantic rows.
-        num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
+        full_sequence_ids = indexer_metadata.get_token_to_batch_idx()
+        num_global_tokens = full_sequence_ids.numel()
+        full_logical_positions = logical_positions[:num_global_tokens]
+        # Image MRoPE coordinates differ from the logical paged-KV positions.
+        # CP compression consumes gathered keys, so it needs the full three-axis
+        # coordinates rather than the local query shard or 1D cache positions.
+        full_rope_positions = (
+            forward_batch.mrope_positions
+            if positions.ndim == 2
+            else getattr(forward_batch, "positions", positions)
+        )
+        if qsa_cp_context is not None:
+            if forward_mode.is_decode() or is_target_verify or is_draft_extend:
+                raise ValueError("QSA-only CP context is only valid for prompt prefill")
+            logical_positions = qsa_cp_context.shard(full_logical_positions)
+            num_valid_tokens = qsa_cp_context.local_rows
+        else:
+            num_valid_tokens = num_global_tokens
         if logical_positions.numel() < num_valid_tokens:
             raise ValueError(
                 "QSA logical positions are shorter than the request mapping: "
@@ -625,7 +639,9 @@ class QSAIndexer(MultiPlatformOp):
             else positions[:num_valid_tokens]
         )
         state_slots = indexer_metadata.pending_ring_slots
-        if state_slots is None:
+        if qsa_cp_context is not None:
+            state_slots = None
+        elif state_slots is None:
             state_slots = self._pending_ring_slots(
                 indexer_metadata,
                 logical_positions,
@@ -634,20 +650,42 @@ class QSAIndexer(MultiPlatformOp):
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
-            pool=indexer_metadata.token_to_kv_pool,
+            pool=indexer_metadata.token_to_kv_pool if qsa_cp_context is None else None,
             cache_loc=state_slots,
+            rope_max_position=getattr(indexer_metadata, "rope_max_position", None),
+            ensure_cos_sin_cache=not (
+                qsa_cp_context is not None
+                and envs.SGLANG_QSA_ONLY_CP_NO_HOST_SYNC.get()
+            ),
             q_heads_padded=(
-                # The tilelang decode MQA kernel needs query heads in multiples of 8.
+                # The fused prep writes the platform-specific zero padding
+                # directly, avoiding a second allocation in decode MQA.
                 qsa_mqa_padded_heads(self.index_n_heads)
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),
-            rope_max_position=getattr(indexer_metadata, "rope_max_position", None),
         )
+        update_positions, update_rope = logical_positions, positions
+        if qsa_cp_context is not None:
+            token_k = qsa_only_cp_gather_rows(token_k, qsa_cp_context)
+            if on_index_keys_gathered is not None:
+                on_index_keys_gathered()
+            q = q.to(
+                indexer_metadata.token_to_kv_pool.get_qsa_compressed_k_buffer(
+                    self.layer_id
+                ).dtype
+            )
+            update_positions = full_logical_positions
+            update_rope = (
+                full_rope_positions[:, :num_global_tokens]
+                if full_rope_positions.ndim == 2
+                else full_rope_positions[:num_global_tokens]
+            )
+            state_slots = indexer_metadata.pending_ring_slots
         self.update_key_state_and_compress(
             token_k,
-            logical_positions,
-            positions,
+            update_positions,
+            update_rope,
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
@@ -667,8 +705,29 @@ class QSAIndexer(MultiPlatformOp):
             )
 
         compressed_keys, row_starts, row_ends, row_sequence_lengths = (
-            indexer_metadata.get_prefill_mqa_inputs(self.layer_id, logical_positions)
+            indexer_metadata.get_prefill_mqa_inputs(
+                self.layer_id, full_logical_positions
+            )
         )
+        query_sequence_ids = full_sequence_ids
+        if qsa_cp_context is not None:
+            query_sequence_ids = qsa_cp_context.shard(full_sequence_ids)
+            # The prefill plan already has one entry per global query row.
+            # Keep its ranges and lengths aligned with the local query shard.
+            row_starts = qsa_cp_context.shard(row_starts)
+            row_ends = qsa_cp_context.shard(row_ends)
+            row_sequence_lengths = qsa_cp_context.shard(row_sequence_lengths)
+        physical = (
+            envs.SGLANG_QSA_FUSED_PREFILL_PHYSICAL_SLOTS.get()
+            and qsa_tilelang.is_available()
+            and not indexer_metadata.is_cuda_graph
+        )
+        mapping_kwargs = {}
+        if physical:
+            mapping_kwargs = {
+                "token_to_batch_idx": query_sequence_ids,
+                "token_slot_table": indexer_metadata.get_token_slot_table(),
+            }
         return self.select_prefill_tokens(
             q,
             compressed_keys,
@@ -676,28 +735,7 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
-        )
-
-    def forward_cuda(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch,
-        indexer_metadata,
-    ) -> torch.Tensor:
-        return self._forward_impl(
-            hidden_states, positions, forward_batch, indexer_metadata
-        )
-
-    def forward_xpu(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch,
-        indexer_metadata,
-    ) -> torch.Tensor:
-        return self._forward_impl(
-            hidden_states, positions, forward_batch, indexer_metadata
+            **mapping_kwargs,
         )
 
 
