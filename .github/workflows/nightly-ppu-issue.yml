@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
   issues: write
+  # Read only, to ask whether the test run's finish job actually executed: an
+  # all-skipped run still reports success.
+  actions: read
 
 # One event at a time per workflow, so two completions in flight cannot both miss
 # the existing issue and each open one.
@@ -39,6 +42,7 @@ jobs:
       RUN_URL: ${{ github.event.workflow_run.html_url }}
       RUN_SHA: ${{ github.event.workflow_run.head_sha }}
       RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
     steps:
       - name: Ensure the label exists
         run: |
@@ -56,6 +60,21 @@ jobs:
             cancelled|skipped) echo "conclusion=${WF_CONCLUSION}, not tracked"; exit 0 ;;
             *) outcome=red ;;
           esac
+
+          # A test run whose every job was skipped can still conclude success:
+          # prepare is skipped when the build failed or was not scheduled, every
+          # job depends on it, and nothing runs. Reading that as recovery would
+          # close an open test-failure issue on a run that executed no test at all,
+          # so check that the finish job really ran before calling a test run green.
+          if [ "$outcome" = green ] && [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+            finish="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "nightly-test-ppu-finish")]
+                    | if length == 0 then "absent" else (.[0].conclusion // "null") end')"
+            if [ "$finish" != "success" ]; then
+              echo "run concluded ${WF_CONCLUSION} but nightly-test-ppu-finish is '${finish}'; no test ran, not tracking"
+              exit 0
+            fi
+          fi
 
           # Claim the issue by a marker in the body rather than by title: the title
           # may change later while the marker stays put, and a title change would

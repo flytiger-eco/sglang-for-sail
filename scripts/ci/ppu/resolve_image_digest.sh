@@ -23,7 +23,7 @@
 # existed; a nightly must not go red over provenance it cannot look up.
 #
 # Reads:
-#   PPU_BASE_IMAGE      the image, in tag form
+#   PPU_BASE_IMAGE      the image, in tag form or as image@sha256:...
 #   GITHUB_ENV          appended to, for the steps that follow
 #
 # Optional, so that one script serves both images a nightly run touches -- the
@@ -69,6 +69,26 @@ give_up() {
   } >> "${GITHUB_ENV}"
   exit 0
 }
+
+# A digest-pinned reference is already the answer: there is nothing to ask the
+# registry, and the digest the caller supplied must not be thrown away. Without
+# this the tag split below reads "@sha256" as part of the repository and the hash
+# as a tag, which fails a lookup and -- in non-strict mode -- replaces a known
+# digest with nothing.
+case "${image}" in
+  *@sha256:*)
+    pinned="${image#*@}"
+    if [[ ! "${pinned}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      give_up "malformed digest in ${image}"
+    fi
+    echo "${image} is already digest-pinned; nothing to resolve"
+    {
+      echo "${prefix}_DIGEST=${pinned}"
+      echo "${prefix}_REF=${image}"
+    } >> "${GITHUB_ENV}"
+    exit 0
+    ;;
+esac
 
 # Split host from repository path and tag. The tag is what follows the last colon,
 # but only when that piece is not a port number preceding a path.
