@@ -15,6 +15,8 @@ ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-u
 ARG BUILD_TYPE=runtime_common,tracing
 ARG SGLANG_WHEEL_URL=https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-12-2115/sglang-0.5.23-cp312-cp312-linux_x86_64.whl
 ARG SGL_KERNEL_WHEEL_URL=https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-12-2115/sglang_kernel-0.4.10-cp310-abi3-linux_x86_64.whl
+# Use the original gateway source revision without requiring a local source tree.
+ARG GATEWAY_SOURCE_COMMIT=297e54fd105e974cdf401e5b4d20253a22c16f90
 # Match the community v0.5.23 Python dependency pins.
 ARG TRANSFORMERS_VERSION=5.19.0
 ARG DEEPSEEK_RECIPE_VERSION=0.2.0
@@ -183,8 +185,14 @@ RUN python3 -c 'import glob, os, zipfile; \
 ########################################################
 FROM base AS gateway_builder
 
+ARG GATEWAY_SOURCE_COMMIT
+
 WORKDIR /build
-COPY sgl-model-gateway /build/sgl-model-gateway
+# Extract only the gateway directory from the pinned community source archive.
+RUN curl --fail --location --retry 3 --connect-timeout 30 \
+        "https://github.com/sgl-project/sglang/archive/${GATEWAY_SOURCE_COMMIT}.tar.gz" \
+        | tar -xz --strip-components=1 -C /build \
+            "sglang-${GATEWAY_SOURCE_COMMIT}/sgl-model-gateway"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
