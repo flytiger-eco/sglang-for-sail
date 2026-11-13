@@ -1126,6 +1126,39 @@ class DeepseekSparseAttnBackend(
                 else None
             )
             if strategy is not None:
+                if use_kpool and envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+                    # A reused prefix must end on a kpool boundary. The compress
+                    # tail buffer is per-request, so a partial pool belonging to
+                    # the shared prefix is invisible to this request's pooled
+                    # top-k read: the indexer would silently drop candidates.
+                    # The admission gate enforces this; this is the last line of
+                    # defence before the reads below.
+                    kpool = max(1, int(self.dsa_index_kpool))
+                    for seq_len_i, ext_i in zip(
+                        indexer_seq_lens_cpu, extend_seq_lens_cpu, strict=True
+                    ):
+                        prefix_len = int(seq_len_i) - int(ext_i)
+                        assert prefix_len >= 0 and prefix_len % kpool == 0, (
+                            "DSA prefill CP prefix reuse is not kpool-aligned: "
+                            f"indexer_seq_len={int(seq_len_i)} "
+                            f"extend_len={int(ext_i)} prefix_len={prefix_len} "
+                            f"index_kpool={kpool}"
+                        )
+                    # Writes must cover only the new tokens: shared prefix
+                    # pages are read-only for this request (no cross-request
+                    # corruption through the CP full-copy pools). TBO pads
+                    # out_cache_loc up to the attn-tp multiple, so compare
+                    # against the unpadded token count and allow the pad slack.
+                    out_cache_loc = forward_batch.out_cache_loc
+                    if out_cache_loc is not None:
+                        # Host-side token count only: num_token_non_padded is a
+                        # GPU scalar and reading it would sync every layer. The
+                        # >= check tolerates the TBO pad-up to attn-tp multiple.
+                        expected = sum(int(x) for x in extend_seq_lens_cpu)
+                        assert out_cache_loc.shape[0] >= expected, (
+                            "out_cache_loc shorter than the new tokens "
+                            f"({out_cache_loc.shape[0]} < {expected})"
+                        )
                 seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
                 extend_seq_lens_cpu, extend_seq_lens, bs_idx_cpu, bs_idx = (
                     strategy.shard_per_request(extend_seq_lens_cpu, extend_seq_lens)
@@ -1133,6 +1166,21 @@ class DeepseekSparseAttnBackend(
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
+                # Prefix accounting under CP: the indexer reads the full
+                # sequence (prefix + this rank's extend rows) from the pool, so
+                # the per-request sequence length must never be shorter than
+                # the rank-local extend length it has to cover.
+                if len(indexer_seq_lens_cpu) != 0:
+                    _seq_lens_per_req = indexer_seq_lens_cpu.tolist()
+                    assert all(
+                        int(total) >= int(local_extend)
+                        for total, local_extend in zip(
+                            _seq_lens_per_req, extend_seq_lens_cpu
+                        )
+                    ), (
+                        "DSA prefill CP: seq_lens must be >= local extend lens "
+                        f"({_seq_lens_per_req} vs {list(extend_seq_lens_cpu)})"
+                    )
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
                     int(indexer_seq_lens_cpu.max().item() + draft_token_num)
