@@ -942,6 +942,11 @@ class DeepseekSparseAttnBackend(
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -965,6 +970,21 @@ class DeepseekSparseAttnBackend(
         page_table = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
         ]
+
+        # Build the union before InterleaveCPStrategy discards requests with
+        # no local query rows. Draft/verify, pooled-indexer and graph paths
+        # retain the original full transport until separately validated.
+        begin_page_broadcast = getattr(
+            self.token_to_kv_pool, "begin_batch_page_broadcast", None
+        )
+        if (
+            begin_page_broadcast is not None
+            and forward_batch.forward_mode.is_extend()
+            and can_dsa_prefill_cp_interleave(forward_batch)
+            and self.real_page_size == 64
+            and self.dsa_index_kpool == 1
+        ):
+            begin_page_broadcast(page_table, cache_seqlens_int32)
 
         page_table_1_flattened = None
         topk_indices_offset = None
@@ -1724,6 +1744,11 @@ class DeepseekSparseAttnBackend(
         also call this directly via _apply_cuda_graph_metadata when they
         need to pass out_cache_loc / actual_forward_mode explicitly.
         """
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         if bs not in self.decode_cuda_graph_metadata:
             self._build_forward_metadata_cuda_graph(
                 bs,
@@ -2044,6 +2069,11 @@ class DeepseekSparseAttnBackend(
             precomputed: Precomputed metadata to copy from
             forward_mode: Forward mode
         """
+        reset_page_broadcast = getattr(
+            self.token_to_kv_pool, "reset_batch_page_broadcast", None
+        )
+        if reset_page_broadcast is not None:
+            reset_page_broadcast()
         self.set_dsa_prefill_impl(forward_batch=None)
 
         metadata = self.decode_cuda_graph_metadata[bs]

@@ -38,7 +38,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -5176,10 +5175,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
                  FP4: k_buf  (seq_len, head_dim/2) uint8 (packed E2M1),
                       k_scale_buf (seq_len, head_dim/32) uint8 (ue8m0)
         """
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if self.use_fp4_indexer:
+            buf = self.index_key_cache.get_buffer(layer_id)
             # FP4 layout: per-token K bytes = head_dim/2; scale bytes = head_dim/32.
             # The triton accessor is byte-stride agnostic; pass packed K width as
             # the "head_dim" to gather K bytes, and gather scales separately.
@@ -5196,13 +5193,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 page_size=self.page_size,
                 index_head_dim=self.packed_bytes_per_token,
             )
-        return index_buf_accessor.GetKAndS.execute(
-            self,
-            buf,
-            page_indices=page_indices,
-            seq_len_tensor=seq_len_tensor,
-            seq_len_sum=seq_len_sum,
-            max_seq_len=max_seq_len,
+        return self.index_key_cache.get_k_and_scale(
+            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
         )
 
     def set_index_k_scale_buffer(
@@ -5217,10 +5209,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             "the fused store kernel (fused_store_index_k_mxfp4_cache); the "
             "scalar (k_fp8, k_scale) tensors here have no FP4 analog."
         )
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
-            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
-        )
+        self.index_key_cache.store_quantized(layer_id, loc, index_k, index_k_scale)
 
     def _get_compress_tail_cpu_copy(self, req_pool_index):
         if not self.kpool_use_compress or req_pool_index is None:

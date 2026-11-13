@@ -30,6 +30,7 @@ PD prefill workers under prefill-CP (see
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -208,6 +209,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        # Supported paths use batch pages; retain the original full-pool fallback.
+        self.batch_page_broadcast_enabled = (
+            os.environ.get("SGLANG_DSA_LAYER_SPLIT_BATCH_PAGES", "1") == "1"
+        )
+        self.batch_page_broadcast_plan = None
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
@@ -250,6 +256,38 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- broadcast plumbing -----------------------------------------------
 
+    def reset_batch_page_broadcast(self) -> None:
+        if not self.batch_page_broadcast_enabled:
+            return
+        # Join the old stream before dropping its plan/workspaces. A scratch
+        # cache valid for one batch is not valid for a different page union.
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
+        self.pending_remote_kv_layer_id = None
+        self.index_key_cache.remote_layer_id = None
+        self.batch_page_broadcast_plan = None
+
+    def begin_batch_page_broadcast(self, token_table, seq_lens) -> None:
+        if not self.batch_page_broadcast_enabled:
+            return
+        from sglang.srt.mem_cache.layer_split_batch_pages import (
+            BatchPageBroadcastPlan,
+            build_batch_page_ids,
+        )
+
+        pages = build_batch_page_ids(
+            token_table,
+            seq_lens,
+            self.page_size,
+            self.remote_kv_buffer.shape[0] // self.page_size,
+            group=get_parallel().attn_cp_group.device_group,
+        )
+        # Dense batches can cost more to pack/scatter than full broadcast.
+        # This initial conservative threshold needs calibration on real PPU.
+        if pages.numel() * 5 >= (self.remote_kv_buffer.shape[0] // self.page_size) * 3:
+            return
+        self.batch_page_broadcast_plan = BatchPageBroadcastPlan(pages)
+
     def _init_layer_broadcast_comm(self) -> None:
         cp_group = get_parallel().attn_cp_group
         if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
@@ -269,6 +307,40 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def _broadcast_tensor_from_owner(
+        self,
+        tensor: torch.Tensor,
+        layer_id: int,
+        src_tensor: Optional[torch.Tensor] = None,
+        use_layer_broadcast_comm: bool = False,
+    ) -> torch.Tensor:
+        plan = self.batch_page_broadcast_plan
+        if plan is None:
+            return self._broadcast_full_tensor_from_owner(
+                tensor, layer_id, src_tensor, use_layer_broadcast_comm
+            )
+        if tensor is self.remote_kv_buffer:
+            shape = (-1, self.page_size) + tuple(tensor.shape[1:])
+            destination_pages = tensor.view(shape)
+            source_pages = src_tensor.view(shape) if src_tensor is not None else None
+        elif tensor is self.index_key_cache.remote_buffer:
+            # Indexer K and scale already share a page-major packed row.
+            destination_pages = tensor
+            source_pages = src_tensor
+        else:
+            raise RuntimeError("Unrecognized LayerSplit broadcast buffer")
+
+        def collective(packed):
+            self._broadcast_full_tensor_from_owner(
+                packed,
+                layer_id,
+                src_tensor=packed if src_tensor is not None else None,
+                use_layer_broadcast_comm=use_layer_broadcast_comm,
+            )
+
+        plan.broadcast(destination_pages, source_pages, collective)
+        return tensor
+
+    def _broadcast_full_tensor_from_owner(
         self,
         tensor: torch.Tensor,
         layer_id: int,
@@ -457,6 +529,12 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_id = self.pending_remote_kv_layer_id
         self.pending_remote_kv_layer_id = None
 
+    def invalidate_kv_buffer_for_layer(self, layer_id: int) -> None:
+        if self.pending_remote_kv_layer_id == layer_id:
+            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        if self.remote_kv_layer_id == layer_id:
+            self.remote_kv_layer_id = None
+
     def prefetch_kv_buffer(
         self,
         layer_id: int,
@@ -480,7 +558,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         src_tensor = (
             self.kv_buffer[local_idx] if self._is_layer_owned(layer_id) else None
         )
+        if layer_transfer_counter is None:
+            layer_transfer_counter = self.layer_transfer_counter
+        if layer_transfer_idx is None:
+            layer_transfer_idx = self._local_layer_idx(layer_id)
         if self.layer_broadcast_comm is None:
+            if layer_transfer_counter is not None:
+                layer_transfer_counter.wait_until(layer_transfer_idx)
             self._broadcast_tensor_from_owner(
                 self.remote_kv_buffer,
                 layer_id,

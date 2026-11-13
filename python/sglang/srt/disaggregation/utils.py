@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_spec,
 )
 from sglang.srt.utils import is_npu
@@ -113,42 +114,70 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-# PD DSA prefill CP KV resharding is incompatible with the radix prefix cache.
 def dsa_cp_prefix_cache_enabled() -> bool:
     """Experimental switch: keep the radix cache on under PD DSA prefill CP."""
     return envs.SGLANG_DSA_CP_PREFIX_CACHE.get()
 
 
-def supports_dsa_cp_prefix_cache(server_args: ServerArgs) -> bool:
+def supports_dsa_cp_prefix_cache() -> bool:
     """Whether the deployment is the supported DSA prefill-CP scenario.
 
-    Only interleave CP is supported: the CP KV/indexer pools then hold a full
-    logical-order copy on every rank, so prefix pages are readable by the
-    existing DSA indexer/attention paths and no CP-aware resharding is needed.
+    With interleave CP all ranks share logical token indices. Replicated
+    pools read their local layers; split pools read an owner broadcast.
     """
     return (
-        getattr(server_args, "disaggregation_mode", "null") != "null"
-        and getattr(server_args, "enable_prefill_cp", False)
-        and getattr(server_args, "cp_strategy", None) == "interleave"
+        get_disagg().disaggregation_mode == "prefill"
+        and get_parallel().enable_prefill_cp
+        and get_parallel().cp_strategy == "interleave"
     )
 
 
 def should_bypass_dsa_cp_prefix_cache(
-    server_args: ServerArgs, *, is_dsa: bool = True
+    *, is_dsa: bool = True
 ) -> bool:
     """Whether PD DSA prefill CP must bypass the legacy radix cache."""
     if not is_dsa:
         return False
-    if getattr(server_args, "disaggregation_mode", "null") == "null" or not getattr(
-        server_args, "enable_prefill_cp", False
+    if (
+        get_disagg().disaggregation_mode == "null"
+        or not get_parallel().enable_prefill_cp
     ):
         # Not the PD prefill-CP scenario at all: today's behavior (no bypass).
         return False
-    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache(server_args):
+    if dsa_cp_prefix_cache_enabled() and supports_dsa_cp_prefix_cache():
         # Experimental un-bypass. Everything else (e.g. a non-interleave
         # strategy) keeps bypassing the radix cache.
         return False
     return True
+
+
+def validate_dsa_cp_prefix_cache_geometry(
+    *,
+    page_size: int,
+    index_kpool: int,
+    cache_layer_split: bool,
+    hicache_layout: Optional[str] = None,
+    hicache_io_backend: Optional[str] = None,
+) -> None:
+    """Fail before constructing a cache whose page ownership is unsupported.
+
+    A pooled indexer page can contain slots from multiple ordinary KV pages.
+    Reusing one such KV page while extending a divergent suffix can overwrite
+    the shared indexer page. The unpooled layout retains page ownership across
+    divergent suffixes.
+    """
+    if page_size != 64 or index_kpool != 1:
+        raise ValueError(
+            "SGLANG_DSA_CP_PREFIX_CACHE=1 requires page_size == 64, "
+            "index_kpool == 1; "
+            f"got {page_size=}, {index_kpool=}, {cache_layer_split=}."
+        )
+    if cache_layer_split and hicache_layout is not None and (
+        hicache_layout != "layer_first" or hicache_io_backend != "kernel"
+    ):
+        raise ValueError(
+            "DSA LayerSplit with HiCache requires layer_first layout and kernel I/O."
+        )
 
 
 class DisaggregationMode(Enum):
