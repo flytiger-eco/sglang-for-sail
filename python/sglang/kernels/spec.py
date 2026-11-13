@@ -76,6 +76,7 @@ class PlatformInfo(msgspec.Struct, frozen=True):
     device_type: str = "cpu"  # "cuda", "hip", "cpu", ...
     cuda_arch_major: Optional[int] = None
     cuda_arch_minor: Optional[int] = None
+    cuda_device_name: Optional[str] = None
 
     @property
     def device(self) -> DeviceType:
@@ -117,6 +118,7 @@ class PlatformInfo(msgspec.Struct, frozen=True):
                     device_type="cuda",
                     cuda_arch_major=major,
                     cuda_arch_minor=minor,
+                    cuda_device_name=torch.cuda.get_device_name(),
                 )
         except Exception:
             pass
@@ -145,6 +147,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     device: DeviceType
     min_cuda_arch: Optional[Tuple[int, int]] = None
     max_cuda_arch: Optional[Tuple[int, int]] = None
+    cuda_name_contains: Optional[str] = None
 
     # Common device-only shortcuts, assigned after the class body (they are
     # instances of the class itself). ClassVar keeps them out of msgspec fields.
@@ -158,12 +161,22 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
         cls,
         min_sm: Optional[Tuple[int, int]] = None,
         max_sm: Optional[Tuple[int, int]] = None,
+        name_contains: Optional[str] = None,
     ) -> CapabilityRequirement:
         """A CUDA requirement bounded to an SM-arch window (inclusive)."""
-        return cls(device=DeviceType.CUDA, min_cuda_arch=min_sm, max_cuda_arch=max_sm)
+        return cls(
+            device=DeviceType.CUDA,
+            min_cuda_arch=min_sm,
+            max_cuda_arch=max_sm,
+            cuda_name_contains=name_contains,
+        )
 
     def is_satisfied_by(self, platform: PlatformInfo) -> bool:
         if self.device != platform.device:
+            return False
+        if self.cuda_name_contains and self.cuda_name_contains not in (
+            platform.cuda_device_name or ""
+        ):
             return False
         if self.device == DeviceType.CUDA and platform.cuda_arch_major is not None:
             arch = (platform.cuda_arch_major, platform.cuda_arch_minor or 0)

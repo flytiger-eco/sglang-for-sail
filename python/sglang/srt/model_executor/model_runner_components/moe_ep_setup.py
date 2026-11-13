@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.topk import (
     fused_shared_expert_weight,
     is_routed_scaling_factor_fused_in_topk,
 )
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
@@ -29,6 +30,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
 def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
+    if (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+        and model_config.hf_text_config.model_type == "glm_moe_dsa"
+        and get_moe_a2a_backend().is_deepep()
+    ):
+        from sglang.srt.layers.moe.glm53_sail_gate import validate_loaded_model
+
+        validate_loaded_model(model)
+
     parallel = get_parallel()
     balancer_cls = None
     num_prepared = 0
@@ -85,7 +95,6 @@ def prebuild_deepep_v2_buffer(*, model) -> None:
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
-    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if not get_moe_a2a_backend().is_deepep_v2():
         return

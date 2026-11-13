@@ -142,6 +142,7 @@ PER_COMMIT_SUITES = {
     ],
     HWBackend.PPU: [
         "stage-a-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu-m890",
     ],
 }
 

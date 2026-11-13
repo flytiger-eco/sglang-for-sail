@@ -73,6 +73,11 @@ PY
         --wheel-dir "$wheel_dir/runtime-deps" \
         git+https://github.com/t-head/sailify.git@f401ecae76d7b4991d44920bde9edaac7e655fd8
     python3 -m pip install --no-deps --force-reinstall "$wheel_dir/runtime-deps/"*.whl
+    if [[ ${PPU_CI_MEGA_GATE:-false} == true ]]; then
+        PYTORCH_SAIL_ARCH=ppu_15 python3 -m pip wheel --no-deps --no-build-isolation \
+            --wheel-dir "$wheel_dir/runtime-deps" \
+            "git+https://github.com/t-head/DeepGEMM-for-sail.git@78083017d7eef4f8d6ae453de79105bfdf59d639"
+    fi
     requirements=$(python3 "$checker" requirements)
     mapfile -t eval_requirements <<< "$requirements"
     python3 -m pip wheel --index-url https://pypi.org/simple --no-deps --no-build-isolation \
@@ -160,3 +165,11 @@ python3 "$repo/test/run_suite.py" --hw ppu --suite stage-a-test-1-gpu-ppu --time
     2>&1 | tee "$artifacts/sanity.log"
 # Require both sanity files; update this count when extending the suite.
 grep -Fxq 'Test Summary: 2/2 passed' "$artifacts/sanity.log"
+
+if [[ ${PPU_CI_MEGA_GATE:-false} == true ]]; then
+    gate_deps=$(mktemp -d)
+    python3 -m pip install --no-index --no-deps --target "$gate_deps" "$wheel_dir"/runtime-deps/deep_gemm-*.whl
+    PYTHONPATH="$gate_deps" python3 "$repo/test/run_suite.py" --hw ppu --suite stage-b-test-1-gpu-ppu-m890 \
+        --timeout-per-file 300 2>&1 | tee "$artifacts/mega-gate.log"
+    grep -Fxq 'Test Summary: 1/1 passed' "$artifacts/mega-gate.log"
+fi

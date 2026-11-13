@@ -120,7 +120,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 topk_indices, (0, self.num_fused_shared_experts), value=-1
             )
         if _is_scattered_a2a_backend():
-            local_topk = topk_indices
+            local_topk = topk_indices.to(self.gather_buffer.dtype)
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]

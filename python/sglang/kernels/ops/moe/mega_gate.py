@@ -12,6 +12,7 @@ def bf16_mega_gate(
     *,
     routed_scaling_factor: float,
     ep_rank: int,
+    scoring_func: str = "sqrtsoftplus",
     bias: Optional[torch.Tensor] = None,
     image_bias: Optional[torch.Tensor] = None,
     image_token_mask: Optional[torch.Tensor] = None,
@@ -21,6 +22,11 @@ def bf16_mega_gate(
     logical_count: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (weights, ids). Supply out in the same order to reuse both tensors.
+
+    `hash_topk_ids` is a writable per-call buffer. Masked rows are overwritten
+    with -1, so refill them with valid expert IDs before reusing them as active rows.
+    """
     import deep_gemm
 
     if out is None:
@@ -31,7 +37,7 @@ def bf16_mega_gate(
         )
         weights = torch.empty_like(ids, dtype=torch.float32)
     else:
-        ids, weights = out
+        weights, ids = out
     deep_gemm.bf16_mega_gate(
         hidden_states,
         weight,
@@ -40,7 +46,7 @@ def bf16_mega_gate(
         num_shared_experts=0,
         routed_scaling_factor=routed_scaling_factor,
         ep_rank=ep_rank,
-        scoring_func="sqrtsoftplus",
+        scoring_func=scoring_func,
         mask=valid_token_mask,
         bias=bias,
         image_bias=image_bias,

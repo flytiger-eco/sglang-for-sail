@@ -231,6 +231,7 @@ docker create --name "$container" --runtime=runc --shm-size=16g \
     --mount "type=bind,source=${inputs[5]},target=/eval-cache,readonly" \
     --mount "type=bind,source=$private,target=/artifacts" \
     --env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES=0 \
+    --env PPU_CI_MEGA_GATE="${PPU_CI_MEGA_GATE:-false}" \
     --env PPU_CI_SOURCE_SHA="$PPU_CI_SOURCE_SHA" \
     --env PPU_CI_WHEEL_DIR=/wheels --env PPU_CI_ARTIFACT_DIR=/artifacts \
     --env PPU_CI_TARGET_MODEL_PATH=/models/target \

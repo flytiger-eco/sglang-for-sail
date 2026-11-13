@@ -106,6 +106,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    glm53_sail_gate,
     post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -1538,7 +1539,19 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            use_glm_gate = False
+            if (
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+                and get_moe_a2a_backend().is_deepep()
+                and self.config.model_type == "glm_moe_dsa"
+                and not self.is_hash
+            ):
+                bound, dispatch_info = self.topk.routing_inputs()
+                use_glm_gate = glm53_sail_gate.can_route(
+                    self, hidden_states, dispatch_info
+                )
+            if not use_glm_gate:
+                router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1555,16 +1568,21 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                **topk_kwargs,
-            )
+            if use_glm_gate:
+                topk_output = glm53_sail_gate.route(
+                    self, hidden_states, bound, dispatch_info
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    **topk_kwargs,
+                )
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device,

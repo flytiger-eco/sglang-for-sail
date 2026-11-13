@@ -16,6 +16,32 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestScatteredCapture(CustomTestCase):
+    def test_all_gather_uses_capture_dtype(self):
+        cap = object.__new__(re_mod.RoutedExpertsCapturer)
+        cap.gather_buffer = torch.empty((4, 2), dtype=torch.int32)
+        cap.device_cache = mock.Mock(buffer=torch.empty(4, 1, 2, dtype=torch.int32))
+        for dtype in (torch.int32, torch.int64):
+            ids = torch.tensor([[2, 255], [-1, -1]], dtype=dtype)
+            with (
+                self.subTest(dtype=dtype),
+                mock.patch.object(
+                    re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend.DEEPEP
+                ),
+                mock.patch.object(
+                    re_mod, "get_parallel", return_value=SimpleNamespace(attn_tp_size=2)
+                ),
+                mock.patch.object(re_mod, "attn_tp_all_gather_into_tensor") as gather,
+            ):
+                cap.capture(0, ids)
+                output, local = gather.call_args.args
+                self.assertEqual(output.shape, (4, 2))
+                self.assertEqual(local.dtype, output.dtype)
+                torch.testing.assert_close(local, ids.to(torch.int32))
+                if dtype == torch.int32:
+                    self.assertIs(local, ids)
+
+
 class TestGetLocalSliceBackendBranch(CustomTestCase):
     T, L, K = 16, 3, 4
 

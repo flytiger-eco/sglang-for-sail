@@ -228,7 +228,7 @@ def run_mega_gate(
         to_physical_map=to_physical_map,
         logical_count=logical_count,
         out=(
-            (buf.topk_idx[:num_tokens], buf.topk_weights[:num_tokens])
+            (buf.topk_weights[:num_tokens], buf.topk_idx[:num_tokens])
             if in_buffer
             else None
         ),
