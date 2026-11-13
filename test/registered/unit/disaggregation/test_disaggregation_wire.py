@@ -78,6 +78,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class TestDisaggregationWire(unittest.TestCase):
     def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
         manager = object.__new__(MooncakeKVManager)
+        manager.failure_lock = threading.Lock()
         sender = object.__new__(MooncakeKVSender)
         sender.kv_mgr, sender.bootstrap_room = manager, 42
         for outstanding in (0, 1):
@@ -968,7 +969,13 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 ([[5, 1], [6, 2]], [[-0.5, -2.25], [-0.25, -1.75]]),
             )
 
-    def test_decode_input_requires_valid_seed_for_every_request(self):
+    # Isolate seed validation from backend eligibility. The latter reads the
+    # raw ServerArgs seed, while override_server_args publishes resolved bags.
+    @patch(
+        "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+        return_value=True,
+    )
+    def test_decode_input_requires_valid_seed_for_every_request(self, _backend_enabled):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),
             torch.tensor([4, 5, 6], dtype=torch.int32),
@@ -1035,7 +1042,15 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertIsNone(draft_input.dsa_topk_indices)
         self.assertTrue(draft_input.cuda_graph_compatible)
 
-    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
+    # Exercise position-to-slot remapping on an eligible backend, independently
+    # of startup configuration and the raw ServerArgs backend gate.
+    @patch(
+        "sglang.srt.speculative.eagle_disaggregation.dsa_seed_backend_enabled",
+        return_value=True,
+    )
+    def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(
+        self, _backend_enabled
+    ):
         wire_positions = (
             torch.tensor([2, 0, -1], dtype=torch.int32),
             torch.tensor([1, 3, -1], dtype=torch.int32),

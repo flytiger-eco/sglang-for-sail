@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
+    get_draft_total_num_kv_heads,
     get_kv_class,
     get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
@@ -61,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_pp,
     prepare_abort,
+    set_draft_kv_transfer_metadata,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -289,6 +291,18 @@ class PrefillBootstrapQueue:
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             num_draft_entries = len(draft_kv_data_ptrs)
+
+        set_draft_kv_transfer_metadata(
+            kv_args,
+            draft_kv_pool,
+            draft_kv_entry_count=num_draft_entries,
+            tp_size=get_parallel().attn_tp_size,
+            total_head_num=(
+                get_draft_total_num_kv_heads(self.scheduler)
+                if num_draft_entries
+                else None
+            ),
+        )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

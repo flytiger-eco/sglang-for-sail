@@ -44,6 +44,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
         )
+        manager._resolve_kv_entry_indices = (
+            MooncakeKVManager._resolve_kv_entry_indices.__get__(manager)
+        )
         return manager
 
     @staticmethod
@@ -159,6 +162,7 @@ class TestMiniMaxStateTransfer(CustomTestCase):
                     manager.engine = SimpleNamespace(batch_transfer_sync=copy_bytes)
                     manager.pp_size = manager.attn_tp_size = 1
                     manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+                    manager._mamba_state_cp_sharded = False
                     manager.enable_custom_mem_pool = False
                     manager.max_transfer_batch_indices = 0
                     peer = SimpleNamespace(
@@ -281,6 +285,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         kv_layer_ids=[47, 93, 93],
                         kv_data_ptrs=[10000, 100000, 200000],
                         num_draft_entries=2,
+                        draft_kv_entry_count=0,
                         engine_rank=src_rank + 2 * src_tp,
                     ),
                     attn_tp_size=src_tp,
@@ -290,6 +295,9 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     _await_transfer_futures=lambda futures: max(
                         f.result() for f in futures
                     ),
+                )
+                manager._resolve_kv_entry_indices = (
+                    MooncakeKVManager._resolve_kv_entry_indices.__get__(manager)
                 )
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     result = MooncakeKVManager.send_kvcache_dcp(
@@ -352,7 +360,14 @@ class TestDcpPackLifetime(CustomTestCase):
             enable_custom_mem_pool=True
         )
         manager.kv_args = SimpleNamespace(
-            page_size=1, kv_layer_ids=[], kv_data_ptrs=[1000, 2000], num_draft_entries=0
+            page_size=1,
+            kv_layer_ids=[],
+            kv_data_ptrs=[1000, 2000],
+            num_draft_entries=0,
+            draft_kv_entry_count=0,
+        )
+        manager.get_mla_kv_ptrs_with_pp = (
+            MooncakeKVManager.get_mla_kv_ptrs_with_pp.__get__(manager)
         )
         source = np.array([11], dtype=np.uint8)
         observed = []
