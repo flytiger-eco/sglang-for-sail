@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -34,7 +35,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
@@ -56,12 +58,16 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts=None) -> str:
     if experts is not None and experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
+    if _is_ppu and experts is not None:
+        mma_type = getattr(experts, "_mega_moe_mma_type", None)
+        if mma_type is not None:
+            return mma_type
     return "mxf4xmxf4" if get_exec().moe.enable_w4a4_mxfp4_megamoe else "fp8xfp4"
 
 
 @functools.lru_cache(maxsize=1)
 def _mega_moe_max_num_sms() -> Optional[int]:
-    if _device_sm < 100:
+    if not _is_ppu and _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
         return None
@@ -118,6 +124,7 @@ def _get_mega_moe_symm_buffer(
     hidden: int,
     intermediate_hidden: int,
     mma_type: Optional[str] = None,
+    activation: str = "swiglu",
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -132,6 +139,7 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             mma_type,
+            activation,
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
@@ -143,16 +151,53 @@ def _get_mega_moe_symm_buffer(
                 num_topk,
                 hidden,
                 intermediate_hidden,
-                mma_type=mma_type,
-                activation="swiglu",
+                mma_type=(
+                    "fp4xfp4" if _is_ppu and mma_type == "mxf4xmxf4" else mma_type
+                ),
+                activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
 
+@functools.lru_cache(maxsize=8)
+def _ppu_mega_moe_pre_dispatch_uses_views(pre_dispatch) -> bool:
+    # PPU wheels expose either a SymmBuffer or its four original tensor views.
+    # Inspect once, rather than catching a TypeError after dispatch has started.
+    try:
+        return "buf_x" in inspect.signature(pre_dispatch).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_ppu_mega_moe_pre_dispatch(
+    deep_gemm, hidden_states, topk_ids, topk_weights, buf, num_tokens
+) -> None:
+    pre_dispatch = deep_gemm.mega_moe_pre_dispatch
+    if _ppu_mega_moe_pre_dispatch_uses_views(pre_dispatch):
+        pre_dispatch(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            buf.x,
+            buf.x_sf,
+            buf.topk_idx,
+            buf.topk_weights,
+            num_tokens=num_tokens,
+            group_size=32,
+            mma_type=buf.mma_type,
+        )
+    else:
+        pre_dispatch(
+            hidden_states, topk_ids, topk_weights, buf, num_tokens=num_tokens
+        )
+
+
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if _is_ppu:
+        return _device_sm >= 89
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -319,14 +364,15 @@ def run_mega_routed_experts(
         mma_type=mma_type,
     )
 
+    topk_id_dtype = torch.int64 if _is_ppu else torch.int32
     if num_tokens > 0:
-        topk_ids_in = topk_ids.to(torch.int32)
+        topk_ids_in = topk_ids.to(topk_id_dtype)
         topk_weights_in = topk_weights.to(torch.float32)
     else:
-        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=topk_id_dtype)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
-    if _device_sm == 90:
+    if _device_sm == 90 and not _is_ppu:
         return run_sm90_mega_routed(
             experts,
             hidden_states,
@@ -340,7 +386,17 @@ def run_mega_routed_experts(
         )
 
     mega_kwargs = {"recipe": (1, 1, 32)}
-    if mma_type == "nvfp4xnvfp4":
+    if _is_ppu:
+        # PPU DeepGEMM owns the workspace layout and input quantization.
+        _call_ppu_mega_moe_pre_dispatch(
+            deep_gemm,
+            hidden_states.contiguous(),
+            topk_ids_in.contiguous(),
+            topk_weights_in.contiguous(),
+            buf,
+            num_tokens=num_tokens,
+        )
+    elif mma_type == "nvfp4xnvfp4":
         # Per-token outer scales go to buf.x_scales; the kernel folds them with
         # the per-expert alphas in the L1 / L2 epilogues.
         deep_gemm.mega_moe_pre_dispatch(
@@ -391,15 +447,20 @@ def run_mega_routed_experts(
             quant_group_size=32,
         )
 
-    # Allocate at least one row so y has a non-null CUDA data_ptr;
-    # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
+    # PPU derives the active token count from y.shape[0], including empty ranks.
+    # The CUDA tvm-ffi binding instead requires a non-null data_ptr.
     y = torch.empty(
-        (max(num_tokens, 1), hidden_size),
+        (num_tokens if _is_ppu else max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-        deep_gemm.fp8_fp4_mega_moe(
+        mega_moe_kernel = (
+            deep_gemm.fp4_fp4_mega_moe
+            if _is_ppu and mma_type == "mxf4xmxf4"
+            else deep_gemm.fp8_fp4_mega_moe
+        )
+        mega_moe_kernel(
             y,
             experts.mega_l1_weights,
             experts.mega_l2_weights,

@@ -774,13 +774,17 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
+            _call_ppu_mega_moe_pre_dispatch,
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
         )
         from sglang.srt.runtime_context import get_parallel
+
+        if not is_ppu():
+            from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -804,37 +808,66 @@ class KimiK3MoE(nn.Module):
             num_topk=self._mega_top_k,
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+            activation="situ",
         )
 
+        topk_id_dtype = torch.int64 if is_ppu() else torch.int32
         if num_tokens > 0:
-            topk_ids_in = topk_output.topk_ids.to(torch.int32)
+            topk_ids_in = topk_output.topk_ids.to(topk_id_dtype)
             topk_weights_in = topk_output.topk_weights.to(torch.float32)
         else:
             topk_ids_in = routed_input.new_empty(
-                (0, self._mega_top_k), dtype=torch.int32
+                (0, self._mega_top_k), dtype=topk_id_dtype
             )
             topk_weights_in = routed_input.new_empty(
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
-            routed_input,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-        )
-        # At least one row so the tvm-ffi binding sees a non-null data_ptr.
+        if is_ppu():
+            _call_ppu_mega_moe_pre_dispatch(
+                deep_gemm,
+                routed_input.contiguous(),
+                topk_ids_in.contiguous(),
+                topk_weights_in.contiguous(),
+                buf,
+                num_tokens,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                routed_input,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+            )
+        # PPU uses the output row count as the number of active tokens.
+        # CUDA's tvm-ffi binding requires a non-null data_ptr.
         y = torch.empty(
-            (max(num_tokens, 1), self.moe_hidden_size),
+            (num_tokens if is_ppu() else max(num_tokens, 1), self.moe_hidden_size),
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            deep_gemm.fp8_fp4_mega_moe(
+            mega_moe_kernel = (
+                deep_gemm.fp4_fp4_mega_moe
+                if is_ppu() and buf.mma_type in ("mxf4xmxf4", "fp4xfp4")
+                else deep_gemm.fp8_fp4_mega_moe
+            )
+            situ_kwargs = (
+                {
+                    "situ_beta": self.experts.moe_runner_config.gemm1_alpha,
+                    "situ_linear_beta": (
+                        self.experts.moe_runner_config.gemm1_clamp_limit
+                    ),
+                }
+                if is_ppu()
+                else {}
+            )
+            mega_moe_kernel(
                 y,
                 self.experts.mega_l1_weights,
                 self.experts.mega_l2_weights,
@@ -842,6 +875,7 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                **situ_kwargs,
             )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
