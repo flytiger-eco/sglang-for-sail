@@ -302,9 +302,27 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Select the Qwen query-sparse attention implementation (triton or fa3).
+    SGLANG_QSA_BACKEND = EnvStr("triton")
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # PPU HC and QSA query-only context parallel controls.
+    SGLANG_QWEN4_HC_SEQ_PARALLEL = EnvBool(False)
+    SGLANG_QWEN4_HC_SEQ_PARALLEL_INTERLEAVED = EnvBool(False)
+    SGLANG_QWEN4_HC_SEQ_PARALLEL_MIN_TOKENS = EnvInt(1024)
+    SGLANG_HC_MIX_UP_FUSED = EnvBool(True)
+    SGLANG_HC_MIX_CUDA = EnvBool(True)
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    SGLANG_QSA_USE_TILELANG = EnvBool(True)
+    SGLANG_QSA_TILELANG_NUM_SPLITS = EnvInt(0)
+    SGLANG_QSA_PREFILL_BF16_LOGITS = EnvBool(False)
+    SGLANG_QSA_PREFILL_BLOCK_N = EnvInt(0)
+    SGLANG_QSA_FUSED_PREFILL_PHYSICAL_SLOTS = EnvBool(False)
+    SGLANG_QSA_ONLY_CP_REPLICATE = EnvBool(False)
+    # Query-only prompt prefill; decode and MTP keep their current paths.
+    SGLANG_QSA_ONLY_CP_NO_HOST_SYNC = EnvBool(True)
+    SGLANG_QSA_ONLY_CP_PREFETCH_KV = EnvBool(True)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
@@ -721,6 +739,11 @@ class Envs:
     # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
+    SGLANG_DISAGG_EXPANDED_INPUT_LEN = EnvBool(False)
+    SGLANG_DISAGG_EXPANDED_LEN_WAIT_TIMEOUT = EnvFloat(180.0)
+    # Admit Prefill during bootstrap without spending optimistic-prefill attempts.
+    # The same PP and hierarchical-cache compatibility restrictions apply.
+    SGLANG_DISAGG_BOOTSTRAP_OVERLAP = EnvBool(False)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)

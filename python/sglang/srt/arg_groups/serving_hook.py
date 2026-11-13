@@ -132,7 +132,6 @@ def handle_vision_policy(server_args: Any):
     )
 
 
-
 def handle_multimodal(server_args: Any):
     """Validate mm_process_config structure before model loading."""
     cfg = resolving_view(server_args)
@@ -482,6 +481,17 @@ def handle_other_validations(server_args: Any):
     ):
         raise ValueError("--default-chat-template-kwargs must decode to a JSON object")
 
+    from sglang.srt.disaggregation.expanded_input import optimistic_prefill_supported
+
+    if (
+        cfg.disaggregation_mode == "prefill"
+        and envs.SGLANG_DISAGG_BOOTSTRAP_OVERLAP.get()
+        and not optimistic_prefill_supported(cfg)
+    ):
+        raise ValueError(
+            "Bootstrap overlap is unsupported for this PP/HiCache configuration"
+        )
+
     # Handle optimistic prefill validation
     if cfg.optimistic_prefill_attempts > 0 and cfg.disaggregation_mode == "prefill":
         if cfg.pp_size > 1:
@@ -491,17 +501,7 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and not (
-            (
-                cfg.hicache_storage_backend is None
-                and cfg.hicache_write_policy in ("write_back", "write_through")
-            )
-            or (
-                cfg.hicache_storage_backend is not None
-                and cfg.hicache_host_memory_mode == "buffer_only"
-                and cfg.hicache_write_policy == "write_through"
-            )
-        ):
+        elif not optimistic_prefill_supported(cfg):
             logger.warning(
                 "Optimistic prefill supports L2 write-back/write-through or "
                 "L3 buffer-only write-through hierarchical cache"

@@ -18,11 +18,20 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.qsa import qsa_tilelang
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.layers.attention.qsa.cp import QSAOnlyCPContext, qsa_only_cp_gather_rows
+from sglang.srt.layers.attention.qsa.fa3 import (
+    fa3_sparse_attention,
+    resolve_fa3_qsa,
+)
+from sglang.srt.layers.attention.qsa.kernel import (
+    QSAPrefillPhysicalSelection,
+    qsa_sparse_attention,
+)
 from sglang.srt.layers.attention.qsa.kv_cache import (
     get_qsa_kv_scales,
     is_qsa_fp8_pool,
@@ -52,7 +61,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_packed_decode_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_disagg
+from sglang.srt.runtime_context import get_disagg, get_stream
 from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
@@ -215,7 +224,7 @@ class QSAMTPSharedSparseIndices:
 
 
 class QwenSparseAttnBackend(AttentionBackend):
-    """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
+    """QSA with opt-in FA3, or Triton prefill and the existing packed decode."""
 
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
@@ -223,6 +232,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
+        self.qsa_backend = envs.SGLANG_QSA_BACKEND.get().lower()
+        if self.qsa_backend not in ("triton", "fa3"):
+            raise ValueError("SGLANG_QSA_BACKEND must be triton or fa3")
+        if self.qsa_backend == "fa3":
+            resolve_fa3_qsa()
+        logger.info("QSA attention backend: %s", self.qsa_backend)
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         model = getattr(runner, "model", None)
         if model is not None and self.token_to_kv_pool is not None:
@@ -250,6 +265,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
+        self._qsa_only_cp_pending = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
         ] = {}
@@ -828,6 +844,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
+        if self._qsa_only_cp_pending is not None:
+            torch.cuda.current_stream().wait_stream(get_stream("qsa_only_cp_kv"))
+            self._qsa_only_cp_pending = None
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
@@ -1436,9 +1455,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _logical_to_physical(
-        logical_indices: torch.Tensor, metadata: QwenSparseAttnMetadata
+        logical_indices: torch.Tensor,
+        metadata: QwenSparseAttnMetadata,
+        qsa_cp_context: Optional[QSAOnlyCPContext] = None,
     ) -> torch.Tensor:
-        sequence_ids = metadata.token_to_batch_idx.long()
+        sequence_ids = metadata.token_to_batch_idx
+        if qsa_cp_context is not None:
+            sequence_ids = qsa_cp_context.shard(
+                sequence_ids[: qsa_cp_context.total_rows]
+            )
+        sequence_ids = sequence_ids.long()
         if sequence_ids.numel() != logical_indices.shape[0]:
             raise ValueError("QSA top-k rows do not match query rows")
         row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
@@ -1450,6 +1476,36 @@ class QwenSparseAttnBackend(AttentionBackend):
         ).long()
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
+
+    def prefetch_qsa_only_cp_kv(self, layer, k, v, forward_batch, context):
+        """Gather K/V after index-key gather, overlapping indexer compute.
+
+        Keep the exact inputs alive until the main stream joins. Cache writes
+        still honor forward_extend's save_kv_cache flag on the main stream.
+        """
+        if self._qsa_only_cp_pending is not None:
+            raise RuntimeError("unjoined query-only CP K/V prefetch")
+        stream = get_stream("qsa_only_cp_kv")
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            # Match RadixAttention's head views before packing; model-side
+            # projections are flat while the backend receives [row, head, dim].
+            key = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            value = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            k_width, v_width = key.shape[-1], value.shape[-1]
+            packed = qsa_only_cp_gather_rows(torch.cat((key, value), dim=-1), context)
+            k_full, v_full = (
+                part.contiguous() for part in packed.split((k_width, v_width), dim=-1)
+            )
+        self._qsa_only_cp_pending = (
+            layer.layer_id,
+            forward_batch,
+            context,
+            k_full,
+            v_full,
+            k,
+            v,
+        )
 
     def forward_extend(
         self,
@@ -1465,10 +1521,45 @@ class QwenSparseAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
-        if save_kv_cache:
-            self._store_kv(layer, forward_batch.out_cache_loc, k, v)
+        qsa_cp_context = kwargs.get("qsa_cp_context")
+        pending = self._qsa_only_cp_pending if qsa_cp_context is not None else None
+        if pending is not None:
+            layer_id, batch, context, k_full, v_full, input_k, input_v = pending
+            if not (
+                layer_id == layer.layer_id
+                and batch is forward_batch
+                and context is qsa_cp_context
+            ):
+                raise RuntimeError("mismatched query-only CP K/V prefetch")
+            if not (
+                k.data_ptr() == input_k.data_ptr()
+                and k.numel() == input_k.numel()
+                and v.data_ptr() == input_v.data_ptr()
+                and v.numel() == input_v.numel()
+            ):
+                raise RuntimeError("query-only CP prefetch inputs changed")
+            main_stream = torch.cuda.current_stream()
+            main_stream.wait_stream(get_stream("qsa_only_cp_kv"))
+            # Side-stream allocations are subsequently read by the cache store
+            # on main; retain them until that stream completes its reads.
+            k_full.record_stream(main_stream)
+            v_full.record_stream(main_stream)
+            k, v = k_full, v_full
+            self._qsa_only_cp_pending = None
         if qsa_indexer_stream is not None:
             self._wait_for_qsa_indexer(q, qsa_indexer_stream)
+        if save_kv_cache:
+            cache_locs = forward_batch.out_cache_loc
+            if qsa_cp_context is not None and pending is None:
+                # Query rows are local, while every CP rank owns the complete KV.
+                k_width, v_width = k.shape[-1], v.shape[-1]
+                full = qsa_only_cp_gather_rows(
+                    torch.cat((k, v), dim=-1), qsa_cp_context
+                )
+                k, v = (x.contiguous() for x in full.split((k_width, v_width), dim=-1))
+            if qsa_cp_context is not None:
+                cache_locs = cache_locs[: qsa_cp_context.total_rows]
+            self._store_kv(layer, cache_locs, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1480,6 +1571,64 @@ class QwenSparseAttnBackend(AttentionBackend):
         # DP attention may pad q beyond the indexer's query rows.
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
+        if (
+            isinstance(topk_indices, QSAPrefillPhysicalSelection)
+            or qsa_cp_context is not None
+        ):
+            pool = self.token_to_kv_pool
+            keys, values = (
+                pool.get_key_buffer(layer.layer_id),
+                pool.get_value_buffer(layer.layer_id),
+            )
+            slots = (
+                topk_indices.slots
+                if isinstance(topk_indices, QSAPrefillPhysicalSelection)
+                else self._logical_to_physical(
+                    topk_indices, self._resolve_metadata(forward_batch), qsa_cp_context
+                )
+            )
+            k_scale, v_scale = self._kv_descales(layer, keys.dtype)
+            if q.is_cuda and self.qsa_backend == "fa3":
+                output = fa3_sparse_attention(
+                    q,
+                    keys,
+                    values,
+                    slots,
+                    None,
+                    None,
+                    None,
+                    layer.scaling,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    indices_are_physical=True,
+                )
+            elif q.is_cuda:
+                if not qsa_tilelang.is_available() or not qsa_tilelang.is_supported(
+                    q, keys
+                ):
+                    raise ValueError(
+                        "Physical QSA selections require FA3 or a supported TileLang layout"
+                    )
+                output = qsa_tilelang.sparse_qsa_tilelang(
+                    q, keys, values, slots, layer.scaling, 0
+                )
+            else:
+                output = qsa_sparse_attention(
+                    q,
+                    keys,
+                    values,
+                    slots,
+                    layer.scaling,
+                    **(
+                        {"k_scale": k_scale, "v_scale": v_scale}
+                        if is_fp8_kv_dtype(keys.dtype)
+                        else {}
+                    ),
+                )
+            return self._pad_extend_output(output, num_output_rows)
+        if q.is_cuda and self.qsa_backend == "fa3":
+            output = self._forward_fa3_attention(q, layer, forward_batch, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
@@ -1619,7 +1768,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:
-        output = output.reshape(output.shape[0], -1)
+        output = output.flatten(start_dim=1)
         if output.shape[0] == num_rows:
             return output
         if output.shape[0] > num_rows:
@@ -1774,6 +1923,36 @@ class QwenSparseAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
+    def _forward_fa3_attention(self, q, layer, forward_batch, topk_indices):
+        metadata = self._resolve_metadata(forward_batch)
+        positions = forward_batch.positions
+        if positions.ndim == 2:
+            positions = positions[0]
+        row_to_sequence = metadata.token_to_batch_idx
+        slots = metadata.token_slot_table
+        if metadata.is_cuda_graph:
+            # Graph metadata carries a one-column dummy slot table. Read the
+            # real request table with replay-updated request IDs instead.
+            row_to_sequence = metadata.row_req_pool_indices.index_select(
+                0, row_to_sequence.long()
+            )
+            slots = self.req_to_token_pool.req_to_token
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
+        return fa3_sparse_attention(
+            q,
+            k_buffer,
+            v_buffer,
+            topk_indices,
+            row_to_sequence,
+            slots,
+            positions.flatten()[: q.shape[0]],
+            layer.scaling,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
     def _forward_paged_attention(
         self,
         q: torch.Tensor,
@@ -1802,6 +1981,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return output.reshape(q.shape[0], -1)
 
+        if self.qsa_backend == "fa3":
+            return self._forward_fa3_attention(
+                q, layer, forward_batch, topk_indices
+            ).reshape(q.shape[0], -1)
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode()

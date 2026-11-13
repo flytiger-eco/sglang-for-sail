@@ -405,7 +405,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # cell_size is already a sum over heterogeneous sub-pools.
             return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
-            n = model_config.get_num_kv_heads(tp_size, dcp_size)
+            from sglang.srt.layers.attention.qsa.config import use_qsa_only_cp
+
+            replicated_kv = not kvc.is_draft_worker and use_qsa_only_cp(
+                model_config.hf_config
+            )
+            n = model_config.get_num_kv_heads(
+                1 if replicated_kv else tp_size, 1 if replicated_kv else dcp_size
+            )
             cell_size = (
                 n
                 * (model_config.head_dim + model_config.v_head_dim)

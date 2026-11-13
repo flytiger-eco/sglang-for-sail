@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.qsa.kv_cache import (
     merge_qsa_pp_components,
     protect_qsa_fp8_pd_weight_updates,
     qsa_fp8_transfer_contract,
+    validate_qsa_fp8_transfer_contract,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -185,6 +186,66 @@ def test_contract_decode_and_prefill_pp_shards_have_same_fingerprint():
     parts = [_envelope(left), _envelope(right)]
     for pool in (left, right):
         assert qsa_fp8_transfer_contract(pool, pp_group=_PPGroup(parts)) == expected
+
+
+def test_decode_with_mtp_accepts_main_only_pp_prefill_contract():
+    full, left, right, draft = _pool([3, 7]), _pool([3]), _pool([7]), _pool([0])
+    receiver = qsa_fp8_transfer_contract(full, draft)
+    parts = [_envelope(left), _envelope(right)]
+    for shard in (left, right):
+        sender = qsa_fp8_transfer_contract(shard, pp_group=_PPGroup(parts))
+        validate_qsa_fp8_transfer_contract(
+            receiver, sender, allow_missing_peer_draft=True
+        )
+        # Registry members must still describe exactly the same Prefill pools.
+        with pytest.raises(RuntimeError, match="contract mismatch"):
+            validate_qsa_fp8_transfer_contract(receiver, sender)
+
+
+@pytest.mark.parametrize("mismatch", ["scale", "layout"])
+def test_main_only_prefill_still_requires_matching_fp8_main_cache(mismatch):
+    target, sender = _pool([3, 7]), _pool([3, 7])
+    if mismatch == "scale":
+        sender.qsa_kv_scales[3] = (0.04, 0.03)
+    else:
+        sender.page_size = 1
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        validate_qsa_fp8_transfer_contract(
+            qsa_fp8_transfer_contract(target, _pool([0])),
+            qsa_fp8_transfer_contract(sender),
+            allow_missing_peer_draft=True,
+        )
+
+
+def test_transferred_draft_still_requires_matching_fp8_scales():
+    draft = _pool([0])
+    changed_draft = _pool([0])
+    changed_draft.qsa_kv_scales[0] = (0.04, 0.03)
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        validate_qsa_fp8_transfer_contract(
+            qsa_fp8_transfer_contract(_pool([3, 7]), draft),
+            qsa_fp8_transfer_contract(_pool([3, 7]), changed_draft),
+            allow_missing_peer_draft=True,
+        )
+
+
+def test_prefill_draft_cannot_be_received_without_a_draft_pool():
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        validate_qsa_fp8_transfer_contract(
+            qsa_fp8_transfer_contract(_pool([3, 7])),
+            qsa_fp8_transfer_contract(_pool([3, 7]), _pool([0])),
+            allow_missing_peer_draft=True,
+        )
+
+
+@pytest.mark.parametrize("peer", [None, "qsa-fp8-v1:legacy", "qsa-fp8-v2:invalid"])
+def test_main_only_compatibility_does_not_accept_missing_or_unknown_encoding(peer):
+    with pytest.raises(RuntimeError, match="contract mismatch"):
+        validate_qsa_fp8_transfer_contract(
+            qsa_fp8_transfer_contract(_pool([3, 7]), _pool([0])),
+            peer,
+            allow_missing_peer_draft=True,
+        )
 
 
 def test_no_fp8_stage_still_participates_in_pp_collective():

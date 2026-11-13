@@ -169,6 +169,32 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
+MULTIMODAL_DISABLED_BY_DEFAULT_ARCHS = frozenset(
+    {
+        "Gemma3ForConditionalGeneration",
+        "Llama4ForConditionalGeneration",
+        "Step3VLForConditionalGeneration",
+        "InklingForConditionalGeneration",
+    }
+)
+
+
+def resolve_enable_multimodal_default(
+    architecture: str,
+    enable_multimodal: Optional[bool],
+    model_impl: ModelImpl,
+) -> Optional[bool]:
+    """Preserve explicit choices; these architectures require multimodal opt-in."""
+    if enable_multimodal is not None:
+        return enable_multimodal
+    if (
+        architecture in MULTIMODAL_DISABLED_BY_DEFAULT_ARCHS
+        and model_impl != ModelImpl.TRANSFORMERS
+    ):
+        return False
+    return None
+
+
 def _hf_arch(config) -> Optional[str]:
     """First architecture from a HF config dict or PretrainedConfig (or None)."""
     archs = (
@@ -547,22 +573,17 @@ class ModelConfig:
         )
 
         # Set enable_multimodal
-        if enable_multimodal is None:
-            mm_disabled_models = [
-                "Gemma3ForConditionalGeneration",
-                "Llama4ForConditionalGeneration",
-                "Step3VLForConditionalGeneration",
-                "InklingForConditionalGeneration",
-            ]
-            if (
-                self.hf_config.architectures[0] in mm_disabled_models
-                and self.model_impl != ModelImpl.TRANSFORMERS
-            ):
-                enable_multimodal = False
+        resolved_enable_multimodal = resolve_enable_multimodal_default(
+            self.hf_config.architectures[0], enable_multimodal, self.model_impl
+        )
+        if resolved_enable_multimodal is not None:
+            if enable_multimodal is None and not resolved_enable_multimodal:
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
-            elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
+            enable_multimodal = resolved_enable_multimodal
+        elif enable_multimodal is None:
+            if self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
                 hasattr(self.hf_config, "vision_config")
                 and hasattr(self.hf_config, "audio_config")
             ):

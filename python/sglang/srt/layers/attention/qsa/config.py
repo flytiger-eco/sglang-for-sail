@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
 import msgspec
@@ -15,6 +17,10 @@ _COMPRESSED_FIELDS = (
 )
 # fast_topk_v2 only supports these compressed block top-k widths.
 _COMPRESSED_BLOCK_TOPK = frozenset({512, 2048})
+
+_QSA_BACKENDS_OVERRIDE: ContextVar[Optional[tuple[str, str]]] = ContextVar(
+    "qsa_backends_override", default=None
+)
 
 
 class QSAProfile(msgspec.Struct, frozen=True):
@@ -94,8 +100,47 @@ def is_qwen_qsa(config) -> bool:
     return parse_qsa_profile(config) is not None
 
 
+@contextmanager
+def qwen_qsa_backend_scope(backends: tuple[str, str]):
+    """Use one runner's backend choices during model construction/loading."""
+    token = _QSA_BACKENDS_OVERRIDE.set(backends)
+    try:
+        yield
+    finally:
+        _QSA_BACKENDS_OVERRIDE.reset(token)
+
+
+def use_qwen_qsa(config, backends=None) -> bool:
+    if not is_qwen_qsa(config):
+        return False
+    if backends is None:
+        backends = _QSA_BACKENDS_OVERRIDE.get()
+    if backends is None:
+        from sglang.srt.runtime_context import attention_backends
+
+        backends = attention_backends()
+    prefill_backend, decode_backend = backends
+    qsa_modes = (prefill_backend == "qsa", decode_backend == "qsa")
+    if any(qsa_modes) and not all(qsa_modes):
+        raise ValueError(
+            "Qwen QSA requires both prefill and decode attention backends to be "
+            f"'qsa', got prefill={prefill_backend}, decode={decode_backend}."
+        )
+    return all(qsa_modes)
+
+
+def use_qsa_only_cp(config, backends=None) -> bool:
+    """统一 QSA projection 复制与 KV 显存计费的门控。"""
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_QSA_ONLY_CP_REPLICATE.get() and use_qwen_qsa(config, backends)
+
+
 __all__ = [
     "QSAProfile",
     "is_qwen_qsa",
     "parse_qsa_profile",
+    "qwen_qsa_backend_scope",
+    "use_qwen_qsa",
+    "use_qsa_only_cp",
 ]

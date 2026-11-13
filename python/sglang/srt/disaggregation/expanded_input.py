@@ -5,6 +5,8 @@ original dispatcher must assign a fresh bootstrap_pair_key per paired attempt
 (and per batch item). Older gateways can carry an explicitly supplied unique
 X-Request-ID header instead. Worker-local generated IDs cannot identify a remote pair.
 Use the Python HTTP/tokenizer frontend; Rust and legacy SMG gRPC are unsupported.
+Prefill may use pipeline parallelism: its tokenizer owns expansion and the PP
+workers receive the expanded request. Decode currently requires a single PP stage.
 """
 
 from sglang.srt.environ import envs
@@ -22,6 +24,19 @@ DELTA_POSITION_ARCHS = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
+
+
+def expanded_input_pair_key(request, mode):
+    """Only media requests participate in generation-scoped preallocation aborts."""
+    if getattr(request, "needs_expanded_input_len", False) or (
+        getattr(mode, "value", mode) == "prefill"
+        and (
+            getattr(request, "mm_inputs", None) is not None
+            or getattr(request, "need_wait_for_mm_inputs", False)
+        )
+    ):
+        return request.bootstrap_pair_key
+    return None
 
 
 def original_pair_key(request, raw_request=None):
@@ -66,8 +81,11 @@ def validate_expanded_input_config(cfg, architecture):
         raise ValueError("Expanded-input Decode requires --tokenizer-worker-num=1")
     if cfg.disaggregation_mode == "decode" and cfg.attn_cp_size > 1:
         raise ValueError("Expanded-input Decode does not support context parallelism")
-    if cfg.pp_size > 1:
-        raise ValueError("Expanded-input PD does not support pipeline parallelism")
+    # Prefill publishes authoritative metadata in the tokenizer, independently
+    # of its PP workers. Decode's preallocation metadata is not synchronized
+    # across pipeline stages, so retain that side's PP restriction.
+    if cfg.disaggregation_mode == "decode" and cfg.pp_size > 1:
+        raise ValueError("Expanded-input Decode does not support pipeline parallelism")
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.language_only
@@ -78,6 +96,21 @@ def validate_expanded_input_config(cfg, architecture):
         )
     if cfg.disaggregation_mode == "prefill" and not cfg.disagg_decode_urls:
         raise ValueError("Expanded-input Prefill requires --disagg-decode-urls")
+
+
+def optimistic_prefill_supported(cfg):
+    return cfg.pp_size == 1 and (
+        not cfg.enable_hierarchical_cache
+        or (
+            cfg.hicache_storage_backend is None
+            and cfg.hicache_write_policy in ("write_back", "write_through")
+        )
+        or (
+            cfg.hicache_storage_backend is not None
+            and cfg.hicache_host_memory_mode == "buffer_only"
+            and cfg.hicache_write_policy == "write_through"
+        )
+    )
 
 
 def finalize_expanded_input_positions(req):
