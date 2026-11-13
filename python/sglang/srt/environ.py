@@ -313,6 +313,11 @@ class Envs:
     SGLANG_HC_MIX_UP_FUSED = EnvBool(True)
     SGLANG_HC_MIX_CUDA = EnvBool(True)
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    SGLANG_QSA_USE_TILELANG = EnvBool(True)
+    SGLANG_QSA_TILELANG_NUM_SPLITS = EnvInt(0)
+    SGLANG_QSA_PREFILL_BF16_LOGITS = EnvBool(False)
+    SGLANG_QSA_PREFILL_BLOCK_N = EnvInt(0)
+    SGLANG_QSA_FUSED_PREFILL_PHYSICAL_SLOTS = EnvBool(False)
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)

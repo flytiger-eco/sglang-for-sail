@@ -34,15 +34,22 @@ def _physical_sparse_rows(
     slot_width: tl.constexpr,
     pool_size: tl.constexpr,
     topk: tl.constexpr,
+    PHYSICAL_SLOTS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
-    seq = tl.load(row_to_sequence + row).to(tl.int64)
-    pos = tl.load(positions + row)
     logical = tl.load(indices + row * index_stride + cols, cols < topk, other=-1)
-    valid = (cols < topk) & (logical >= 0) & (logical <= pos) & (logical < slot_width)
-    token = tl.load(slots + seq * slot_stride + logical, valid, other=0)
+    if PHYSICAL_SLOTS:
+        token = logical
+        valid = (cols < topk) & (logical >= 0)
+    else:
+        seq = tl.load(row_to_sequence + row).to(tl.int64)
+        pos = tl.load(positions + row)
+        valid = (
+            (cols < topk) & (logical >= 0) & (logical <= pos) & (logical < slot_width)
+        )
+        token = tl.load(slots + seq * slot_stride + logical, valid, other=0)
     valid = valid & (token >= 0) & (token < pool_size)
     # Compact invalid columns before FA3's column-based causal mask. The indexer
     # normally puts -1 padding last, but speculative selections can have holes.
@@ -104,8 +111,18 @@ def quantize_q_fp8(q, num_kv_heads):
 
 
 def fa3_sparse_attention(
-    q, k, v, indices, row_to_sequence, slots, positions, scale,
-    *, k_scale=1.0, v_scale=1.0,
+    q,
+    k,
+    v,
+    indices,
+    row_to_sequence,
+    slots,
+    positions,
+    scale,
+    *,
+    k_scale=1.0,
+    v_scale=1.0,
+    indices_are_physical=False,
 ):
     """Return [rows, heads, dim], honoring per-row causal physical selections.
 
@@ -127,7 +144,9 @@ def fa3_sparse_attention(
         raise ValueError(
             "FA3 QSA requires a nonempty 2D sparse table with one row per query"
         )
-    if row_to_sequence.numel() != q.shape[0] or positions.numel() != q.shape[0]:
+    if not indices_are_physical and (
+        row_to_sequence.numel() != q.shape[0] or positions.numel() != q.shape[0]
+    ):
         raise ValueError("FA3 QSA query metadata must have one entry per query")
     if (
         q.shape[1] <= 0
@@ -150,10 +169,11 @@ def fa3_sparse_attention(
         physical,
         counts,
         indices.stride(0),
-        slots.stride(0),
-        slots.shape[1],
+        0 if indices_are_physical else slots.stride(0),
+        k.shape[0] if indices_are_physical else slots.shape[1],
         k.shape[0],
         topk,
+        PHYSICAL_SLOTS=indices_are_physical,
         BLOCK=triton.next_power_of_2(topk),
     )
     cu_q = torch.arange(rows + 1, dtype=torch.int32, device=q.device)

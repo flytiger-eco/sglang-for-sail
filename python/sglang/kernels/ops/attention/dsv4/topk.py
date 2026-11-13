@@ -430,10 +430,14 @@ def top_k_per_row_prefill_bf16(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    row_to_page: Optional[torch.Tensor] = None,
 ) -> None:
     """Top-K per row for prefill with bf16 scores input.
 
     Uses streaming cp.async pipeline for long sequences (>16K).
+
+    ``row_to_page`` lets a query-row batch address a compact per-request page
+    table without first materializing one page-table row per query.
     """
     module = _jit_topk_prefill_bf16_module(out_page_indices.shape[1])
     module.top_k_per_row_prefill_bf16(
@@ -444,4 +448,5 @@ def top_k_per_row_prefill_bf16(
         out_page_indices,
         page_size,
         out_raw_indices,
+        row_to_page,
     )

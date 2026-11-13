@@ -162,12 +162,11 @@ def test_fused_compress_matches_eager(num_groups, mrope_section, mrope_interleav
     pool_new.qsa_rope_position_buffer.copy_(positions)
     pool_ref.qsa_rope_position_buffer.copy_(positions)
 
-    # Random groups; slot 0 doubles as the CUDA-graph dummy write target, so
-    # allow repeats there too.
+    # Slot zero is reserved for padded plans and must not receive real data.
     group_locs = torch.randint(0, 8192, (num_groups, RATIO), device=device).to(
         torch.int32
     )
-    write_locs = torch.randperm(4096, device=device)[:num_groups].to(torch.int32)
+    write_locs = (torch.randperm(4095, device=device)[:num_groups] + 1).to(torch.int32)
 
     _eager_compress_reference(indexer, pool_ref, group_locs, write_locs)
     indexer._fused_compress_store(pool_new, group_locs, write_locs)
