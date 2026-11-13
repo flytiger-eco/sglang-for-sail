@@ -29,23 +29,22 @@ ARG PPU_PACKAGES="\
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
     cuda-bindings==13.0.0+v0.1.0.ppu2.2.0 \
     cuda-python==13.0.0+v0.1.0.ppu2.2.0 \
-    deep_ep==2.2.0+v0.1.0.ppu2.2.0 \
-    deep_gemm==1.1.0+v0.1.0.ppu2.2.0 \
+    deep_ep==2.2.1+v0.1.0.ppu2.2.0 \
+    deep_gemm==1.1.0+v1.0.0.ppu2.2.1 \
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
-    flash-attn==2.8.2+v0.2.0.ppu2.2.0 \
-    flash_attn_3==2.8.2+v0.2.0.ppu2.2.0 \
+    flash-attn==2.7.4.post1+v0.2.0.ppu2.2.0 \
+    flash_attn_3==3.0.0+v0.2.0.ppu2.2.0 \
     flash_mla==2.0.0+v0.2.0.ppu2.2.0 \
-    flashinfer_python==0.6.17+v0.1.0.ppu2.2.0 \
+    flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
-    pla==1.0.0+v0.1.0.ppu2.2.0 \
-    tilelang==0.1.11+v0.1.0.ppu2.2.0 \
+    tilelang==0.1.12+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
     torchcodec==0.15.0+v0.1.0.ppu2.2.0 \
     transformer-engine==2.5+v0.1.0.ppu2.2.0 \
-    triton==3.7.0+v0.1.0.ppu2.2.0"
+    triton==3.7.1+v0.1.0.ppu2.2.0"
 # torch/torchvision/torchaudio are expected to come with the base image. Only
 # list the ones the base image lacks; the default base image ships torch and
 # torchvision but not torchaudio. A full list would be e.g.
@@ -277,6 +276,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --no-deps /tmp/wheels/ppu/*.whl /tmp/wheels/gateway/*.whl \
     && rm -rf /tmp/wheels
 
+# Install pla from artifactory/pypi_tmp (not published on the flytiger simple
+# index yet). --no-deps matches the wheel install above; the pla pin is added
+# to ppu_constraints.txt below so the uv resolve keeps this exact wheel.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-deps \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-12-1644/pla-1.0.0-cp312-cp312-linux_x86_64.whl
+
 # Pin torch from the base image and the PPU builds so the dependency solve
 # below can never replace them with CUDA wheels from PyPI.
 RUN python3 -m pip list --format=freeze \
@@ -284,6 +290,7 @@ RUN python3 -m pip list --format=freeze \
     && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES}; do echo "${spec}"; done \
         | sed 's/^mooncake==/mooncake-transfer-engine==/' \
         >> /sgl-workspace/ppu_constraints.txt \
+    && echo "pla==1.0.0" >> /sgl-workspace/ppu_constraints.txt \
     && cat /sgl-workspace/ppu_constraints.txt
 
 # Install sglang dependencies from a stub project built from pyproject_ppu.toml.
