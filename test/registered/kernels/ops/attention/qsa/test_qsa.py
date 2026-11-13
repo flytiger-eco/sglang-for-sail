@@ -530,6 +530,7 @@ def test_qsa_cuda_graph_target_verify_ignores_capture_bucket_requests():
 
 def test_qsa_target_verify_rejects_branching_speculation():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.qsa_backend = "triton"
     backend.compress_ratio = 4
     try:
         backend._require_chain_speculation(
@@ -657,6 +658,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
         qsa_backend_module, "sparse_gqa_fwd_interface_triton", fake_sparse_gqa
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.qsa_backend = "triton"
 
     class Pool:
         def set_kv_buffer(self, layer, loc, k, v):
@@ -697,6 +699,7 @@ def _make_paged_extend_backend():
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
     )
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.qsa_backend = "triton"
     backend.forward_metadata = metadata
 
     class Pool:
@@ -874,6 +877,7 @@ def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
         seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
         forward_mode=ForwardMode.EXTEND,
         extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        extend_seq_lens_cpu=[num_tokens],
         extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
         positions=flat,
         mrope_positions=mrope,
@@ -1319,6 +1323,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
     def run_case(mode, bs, num_rows, seq_lens_list, extend_len, extend_lens=None):
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        backend.qsa_backend = "triton"
         # A page-aligned token table: request r's token i lives in full page
         # (r * 32 + i // 64) at offset i % 64, mirroring the paged allocator.
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
@@ -1482,6 +1487,7 @@ def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
     def run_case(mode, bs, num_rows, seq_lens, extend_lens, extend_len, num_padding):
         pool = _Pool()
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+        backend.qsa_backend = "triton"
         rows = torch.arange(8, dtype=torch.int32, device=device)[:, None]
         cols = torch.arange(4096, dtype=torch.int32, device=device)[None, :]
         backend.req_to_token = (

@@ -22,6 +22,10 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
+from sglang.srt.layers.attention.qsa.fa3 import (
+    fa3_sparse_attention,
+    resolve_fa3_qsa,
+)
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
 from sglang.srt.layers.attention.qsa.kv_cache import (
     get_qsa_kv_scales,
@@ -215,7 +219,7 @@ class QSAMTPSharedSparseIndices:
 
 
 class QwenSparseAttnBackend(AttentionBackend):
-    """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
+    """QSA with opt-in FA3, or Triton prefill and the existing packed decode."""
 
     # Every seq_lens_cpu read here has a device fallback (one readback);
     # the graphed decode path never reads it, so opting out is safe.
@@ -223,6 +227,12 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
+        self.qsa_backend = envs.SGLANG_QSA_BACKEND.get().lower()
+        if self.qsa_backend not in ("triton", "fa3"):
+            raise ValueError("SGLANG_QSA_BACKEND must be triton or fa3")
+        if self.qsa_backend == "fa3":
+            resolve_fa3_qsa()
+        logger.info("QSA attention backend: %s", self.qsa_backend)
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         model = getattr(runner, "model", None)
         if model is not None and self.token_to_kv_pool is not None:
@@ -1480,6 +1490,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # DP attention may pad q beyond the indexer's query rows.
         # The kernels see only valid rows; the output is zero-padded to q's row count.
         q = q[:num_valid_rows]
+        if q.is_cuda and self.qsa_backend == "fa3":
+            output = self._forward_fa3_attention(q, layer, forward_batch, topk_indices)
+            return self._pad_extend_output(output, num_output_rows)
         if self._is_speculative_paged_mode(forward_batch.forward_mode):
             output = self._forward_paged_attention(
                 q, layer, forward_batch, topk_indices
@@ -1774,6 +1787,36 @@ class QwenSparseAttnBackend(AttentionBackend):
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
+    def _forward_fa3_attention(self, q, layer, forward_batch, topk_indices):
+        metadata = self._resolve_metadata(forward_batch)
+        positions = forward_batch.positions
+        if positions.ndim == 2:
+            positions = positions[0]
+        row_to_sequence = metadata.token_to_batch_idx
+        slots = metadata.token_slot_table
+        if metadata.is_cuda_graph:
+            # Graph metadata carries a one-column dummy slot table. Read the
+            # real request table with replay-updated request IDs instead.
+            row_to_sequence = metadata.row_req_pool_indices.index_select(
+                0, row_to_sequence.long()
+            )
+            slots = self.req_to_token_pool.req_to_token
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
+        return fa3_sparse_attention(
+            q,
+            k_buffer,
+            v_buffer,
+            topk_indices,
+            row_to_sequence,
+            slots,
+            positions.flatten()[: q.shape[0]],
+            layer.scaling,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
     def _forward_paged_attention(
         self,
         q: torch.Tensor,
@@ -1802,6 +1845,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return output.reshape(q.shape[0], -1)
 
+        if self.qsa_backend == "fa3":
+            return self._forward_fa3_attention(
+                q, layer, forward_batch, topk_indices
+            ).reshape(q.shape[0], -1)
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode()

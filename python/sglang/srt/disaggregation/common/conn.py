@@ -980,7 +980,9 @@ class CommonKVManager(BaseKVManager):
             )
 
         validate_qsa_fp8_transfer_contract(
-            getattr(self.kv_args, "qsa_fp8_contract", None), info.qsa_fp8_contract
+            getattr(self.kv_args, "qsa_fp8_contract", None),
+            info.qsa_fp8_contract,
+            allow_missing_peer_draft=True,
         )
 
         local_layout = self.dsv41_spec_layout

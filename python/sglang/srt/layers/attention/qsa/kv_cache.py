@@ -293,14 +293,62 @@ def qsa_fp8_transfer_contract(main_pool, draft_pool=None, pp_group=None):
         if len(parts) > 1
         else parts[0]["components"]
     )
-    payload = json.dumps(components, sort_keys=True, separators=(",", ":"))
-    return "qsa-fp8-v1:" + hashlib.sha256(payload.encode()).hexdigest()
+    # Keep main and draft independently comparable, as they are independently
+    # selected by the regular PD transfer layout. Decode may own a draft pool
+    # even when Prefill only sends target KV.
+    fingerprints = [
+        hashlib.sha256(
+            json.dumps(component, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if component is not None
+        else None
+        for component in components
+    ]
+    return "qsa-fp8-v2:" + json.dumps(fingerprints, separators=(",", ":"))
 
 
-def validate_qsa_fp8_transfer_contract(local, peer):
-    if local != peer and (local is not None or peer is not None):
-        raise RuntimeError(
-            "QSA FP8 KV transfer contract mismatch: both P/D servers must run "
-            "the FP8 patch with identical main/draft scales and KV layouts. "
-            f"Local={local}, peer={peer}"
+def _qsa_contract_fingerprints(contract):
+    prefix = "qsa-fp8-v2:"
+    if not isinstance(contract, str) or not contract.startswith(prefix):
+        return None
+    try:
+        components = json.loads(contract[len(prefix) :])
+    except ValueError:
+        return None
+    if (
+        not isinstance(components, list)
+        or len(components) != 2
+        or components[0] is None
+        or any(
+            value is not None
+            and (
+                not isinstance(value, str)
+                or re.fullmatch("[0-9a-f]{64}", value) is None
+            )
+            for value in components
         )
+    ):
+        return None
+    return components
+
+
+def validate_qsa_fp8_transfer_contract(
+    local, peer, *, allow_missing_peer_draft=False
+):
+    if local == peer:
+        return
+    if allow_missing_peer_draft:
+        receiver = _qsa_contract_fingerprints(local)
+        sender = _qsa_contract_fingerprints(peer)
+        if (
+            receiver is not None
+            and sender is not None
+            and receiver[0] == sender[0]
+            and sender[1] is None
+        ):
+            return
+    raise RuntimeError(
+        "QSA FP8 KV transfer contract mismatch: transferred main/draft KV "
+        "scales and layouts must match. "
+        f"Local={local}, peer={peer}"
+    )
