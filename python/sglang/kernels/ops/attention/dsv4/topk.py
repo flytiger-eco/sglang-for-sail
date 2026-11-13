@@ -11,7 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_ppu, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -116,6 +116,10 @@ def _jit_topk_prefill_module(topk: int):
 
 @cache_once
 def _jit_topk_prefill_bf16_module(topk: int):
+    extra_cuda_cflags = [f"-DSGL_TOPK={topk}"]
+    if is_ppu():
+        # SIMT emulation of the VALU path is ~1.9x slower for prefill shapes.
+        extra_cuda_cflags.append("--no-simt")
     return load_jit(
         make_name("topk_prefill_bf16"),
         str(topk),
@@ -123,7 +127,7 @@ def _jit_topk_prefill_bf16_module(topk: int):
         cuda_wrappers=[
             ("top_k_per_row_prefill_bf16", "TopKPrefillBF16Kernel::transform"),
         ],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+        extra_cuda_cflags=extra_cuda_cflags,
     )
 
 
