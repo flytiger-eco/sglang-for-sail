@@ -8,7 +8,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_hip, print_info_once, print_warning_once
+from sglang.srt.utils.common import (
+    is_hip,
+    is_sail,
+    print_info_once,
+    print_warning_once,
+)
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -24,6 +29,15 @@ except ImportError:
     tilelang = None
     T = None
     HAS_TILELANG = False
+
+
+def _qsa_decode_padded_heads(query_heads: int) -> int:
+    # PPU actlize MMA and ROCm MFMA require n16; ordinary CUDA accepts n8.
+    head_alignment = 16 if is_hip() or is_sail() else 8
+    return max(
+        head_alignment,
+        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
+    )
 
 
 def _validate_q(q: torch.Tensor) -> None:
@@ -729,14 +743,10 @@ def tilelang_qsa_mqa_decode(
         )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # Share the fused-prep alignment so already-padded queries need no copy.
+    # Zero heads preserve the weight-free ReLU head sum.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
-    )
+    kernel_heads = _qsa_decode_padded_heads(query_heads)
     scoring_dtype = _scoring_dtype(q, k_cache)
     q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
