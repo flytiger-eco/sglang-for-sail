@@ -26,6 +26,10 @@ on:
         description: 'Seconds (600-3600); 0 derives a fixed timeout per suite'
         type: number
         default: 0
+      audit_resources_only:
+        description: 'Audit workbook models/datasets in sweep-models and skip test execution'
+        type: boolean
+        default: false
 
 concurrency:
   group: ppu-cuda-sweep-890p-${{ inputs.scope }}
@@ -971,12 +975,12 @@ jobs:
                       workflow = yaml.safe_load((ROOT / '.github/workflows/nightly-test-ppu.yml').read_text())
                       jobs = workflow['jobs']
                       inputs = workflow.get('on', workflow.get(True))['workflow_dispatch']['inputs']
-                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file'})
+                      self.assertEqual(set(inputs), {'ref', 'scope', 'suites', 'max_parallel', 'timeout_per_file', 'audit_resources_only'})
                       self.assertEqual(inputs['scope']['options'], ['base', 'extra', 'nightly'])
                       self.assertNotIn('if', jobs['sweep-image'])
                       self.assertNotIn('if', jobs['sweep-models'])
-                      self.assertNotIn('if', jobs['sweep-execute'])
-                      self.assertEqual(jobs['sweep-summarize']['if'], 'always()')
+                      self.assertEqual(jobs['sweep-execute']['if'], '${' + '{ ! inputs.audit_resources_only }}')
+                      self.assertEqual(jobs['sweep-summarize']['if'], '${' + '{ always() && ! inputs.audit_resources_only }}')
                       self.assertEqual(jobs['sweep-models']['runs-on'], 'k8s-runner-group-cpu-flytiger')
                       self.assertEqual(jobs['sweep-image']['needs'], 'sweep-prepare')
                       self.assertEqual(jobs['sweep-models']['needs'], ['sweep-prepare', 'sweep-image'])
@@ -1278,6 +1282,9 @@ jobs:
           export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
           export HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub
           export GITHUB_STEP_SUMMARY=/ppu-models/summary.log
+          if [[ "${AUDIT_RESOURCES_ONLY:-false}" == "true" ]]; then
+            python3 scripts/ci/ppu/audit_missing_resources.py --output /ppu-models/missing-resource-startup.json || echo "RESOURCE_AUDIT_EXECUTION_FAILED"
+          fi
           timeout --signal=TERM --kill-after=30s 600s python3 .ppu-sweep/sweep.py models-worker --destination /ppu-models
           SH
           cat > .ppu-sweep/worker.sh <<'SH'
@@ -1362,7 +1369,7 @@ jobs:
           job_suffix: sweep-models
           command: bash /workspace/source/.ppu-sweep/models.sh
           host_volumes: /wl_nas/pr-ci/sweep/${{ github.run_id }}/${{ github.run_attempt }}/models:/ppu-models
-          extra_env: "GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub"
+          extra_env: "GITHUB_RUN_ID=${{ github.run_id }},GITHUB_RUN_ATTEMPT=${{ github.run_attempt }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,AUDIT_RESOURCES_ONLY=${{ inputs.audit_resources_only }}"
           container_options: |
             privileged: true
             cpus: '2'
@@ -1375,6 +1382,9 @@ jobs:
         env:
           WORKER_OUTCOME: ${{ steps.model-worker.outcome }}
         run: python3 .ppu-sweep/sweep.py collect-models --source "$MODEL_EVIDENCE_SOURCE"
+      - name: Publish missing-resource startup audit
+        if: ${{ always() && inputs.audit_resources_only }}
+        run: python3 scripts/ci/ppu/audit_missing_resources.py --publish "$MODEL_EVIDENCE_SOURCE/missing-resource-startup.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -1409,6 +1419,7 @@ jobs:
 
   sweep-execute:
     needs: [sweep-prepare, sweep-models, sweep-image]
+    if: ${{ ! inputs.audit_resources_only }}
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
@@ -1498,7 +1509,7 @@ jobs:
 
   sweep-summarize:
     needs: [sweep-prepare, sweep-models, sweep-image, sweep-execute]
-    if: always()
+    if: ${{ always() && ! inputs.audit_resources_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
