@@ -5,6 +5,8 @@ original dispatcher must assign a fresh bootstrap_pair_key per paired attempt
 (and per batch item). Older gateways can carry an explicitly supplied unique
 X-Request-ID header instead. Worker-local generated IDs cannot identify a remote pair.
 Use the Python HTTP/tokenizer frontend; Rust and legacy SMG gRPC are unsupported.
+Prefill may use pipeline parallelism: its tokenizer owns expansion and the PP
+workers receive the expanded request. Decode currently requires a single PP stage.
 """
 
 from sglang.srt.environ import envs
@@ -79,8 +81,11 @@ def validate_expanded_input_config(cfg, architecture):
         raise ValueError("Expanded-input Decode requires --tokenizer-worker-num=1")
     if cfg.disaggregation_mode == "decode" and cfg.attn_cp_size > 1:
         raise ValueError("Expanded-input Decode does not support context parallelism")
-    if cfg.pp_size > 1:
-        raise ValueError("Expanded-input PD does not support pipeline parallelism")
+    # Prefill publishes authoritative metadata in the tokenizer, independently
+    # of its PP workers. Decode's preallocation metadata is not synchronized
+    # across pipeline stages, so retain that side's PP restriction.
+    if cfg.disaggregation_mode == "decode" and cfg.pp_size > 1:
+        raise ValueError("Expanded-input Decode does not support pipeline parallelism")
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.language_only
