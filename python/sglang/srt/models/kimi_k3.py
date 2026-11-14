@@ -774,13 +774,18 @@ class KimiK3MoE(nn.Module):
         applies the norm)."""
         import deep_gemm
 
-        from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
         )
         from sglang.srt.runtime_context import get_parallel
+
+        if is_ppu():
+            from deep_gemm import mega_moe_pre_dispatch
+        else:
+            from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -804,6 +809,8 @@ class KimiK3MoE(nn.Module):
             num_topk=self._mega_top_k,
             hidden=self.moe_hidden_size,
             intermediate_hidden=self._mega_intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+            activation="situ",
         )
 
         if num_tokens > 0:
@@ -817,6 +824,17 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
+        if is_ppu():
+            routed_input = routed_input.contiguous()
+            topk_ids_in = topk_ids_in.contiguous()
+            topk_weights_in = topk_weights_in.contiguous()
+            dispatch_kwargs = {
+                "num_tokens": num_tokens,
+                "group_size": 32,
+                "mma_type": buf.mma_type,
+            }
+        else:
+            dispatch_kwargs = {"quant_group_size": 32}
         mega_moe_pre_dispatch(
             routed_input,
             topk_ids_in,
@@ -825,7 +843,7 @@ class KimiK3MoE(nn.Module):
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
+            **dispatch_kwargs,
         )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
@@ -834,7 +852,22 @@ class KimiK3MoE(nn.Module):
             device=routed_input.device,
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            deep_gemm.fp8_fp4_mega_moe(
+            mega_moe_kernel = (
+                deep_gemm.fp4_fp4_mega_moe
+                if is_ppu() and buf.mma_type == "mxf4xmxf4"
+                else deep_gemm.fp8_fp4_mega_moe
+            )
+            situ_kwargs = (
+                {
+                    "situ_beta": self.experts.moe_runner_config.gemm1_alpha,
+                    "situ_linear_beta": (
+                        self.experts.moe_runner_config.gemm1_clamp_limit
+                    ),
+                }
+                if is_ppu()
+                else {}
+            )
+            mega_moe_kernel(
                 y,
                 self.experts.mega_l1_weights,
                 self.experts.mega_l2_weights,
@@ -842,6 +875,7 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                **situ_kwargs,
             )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
