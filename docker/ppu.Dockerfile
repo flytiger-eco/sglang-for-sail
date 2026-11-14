@@ -74,6 +74,14 @@ ENV PATH="${PPU_SDK}/bin:${PATH}" \
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# DeepGEMM's CUDA-compatible JIT invokes cuobjdump to extract kernel symbols.
+RUN cuda_home="${CUDA_HOME:-${CUDA_PATH:-${PPU_SDK}/CUDA_SDK}}" \
+    && test -x "${PPU_SDK}/bin/hgobjdump" \
+    && if [ ! -e "${cuda_home}/bin/cuobjdump" ] && [ ! -L "${cuda_home}/bin/cuobjdump" ]; then \
+        ln -s "${PPU_SDK}/bin/hgobjdump" "${cuda_home}/bin/cuobjdump"; \
+    fi \
+    && test -x "${cuda_home}/bin/cuobjdump"
+
 # Support both sources.list and deb822 ubuntu.sources on Ubuntu 24.04.
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
         for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
