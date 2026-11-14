@@ -14,7 +14,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class TestDSAPagedMQAMetadata(unittest.TestCase):
     def make_backend(self, pool):
         backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
-        backend.num_q_heads = 32
+        backend.num_q_heads = 128
+        backend.indexer_n_heads = 64
         backend.indexer_head_dim = 128
         backend.token_to_kv_pool = pool
         return backend
@@ -23,7 +24,7 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=True))
         with envs.SGLANG_SAIL_BF16_INDEXER.override(False):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 64, 1)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 64, 1)
             )
         self.assertEqual(backend.indexer_head_dim, 128)
 
@@ -35,7 +36,7 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 1)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 1)
             )
 
     def test_actual_fp4_pool_does_not_depend_on_a_later_flag_change(self):
@@ -45,21 +46,24 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 64, 1)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 64, 1)
             )
 
     def test_bf16_keeps_logical_width_and_two_byte_element_size(self):
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=False))
         with envs.SGLANG_SAIL_BF16_INDEXER.override(True):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 2)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 2)
             )
 
     def test_pool_without_fp4_attribute_keeps_existing_layout(self):
         backend = self.make_backend(SimpleNamespace())
-        with envs.SGLANG_SAIL_BF16_INDEXER.override(False):
+        with (
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=False),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 1)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 1)
             )
 
     def test_ppu_builder_forwards_packed_width_to_legacy_planner(self):
@@ -79,7 +83,7 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
             result = backend._build_paged_mqa_schedule_metadata(context_lens)
         self.assertIs(result, schedule)
         planner.assert_called_once_with(
-            context_lens, 64, 84, metadata_extra=(1, 32, 64, 1)
+            context_lens, 64, 84, metadata_extra=(1, 64, 64, 1)
         )
 
     def test_non_ppu_builder_does_not_add_legacy_metadata_extra(self):
@@ -116,12 +120,84 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         ):
             backend._refresh_paged_mqa_schedule_metadata(metadata, context_lens)
         planner.assert_called_once_with(
-            context_lens, 64, 84, metadata_extra=(1, 32, 64, 1)
+            context_lens, 64, 84, metadata_extra=(1, 64, 64, 1)
         )
         self.assertIs(metadata.paged_mqa_schedule_metadata, captured_schedule)
         self.assertEqual(captured_schedule.data_ptr(), original_ptr)
         self.assertTrue(torch.equal(captured_schedule[:2], schedule))
         self.assertEqual(torch.count_nonzero(captured_schedule[2:]).item(), 0)
+
+    # --- DeepSeek-V3.2 DSA: pools carry no use_fp4_indexer flag ---
+
+    def test_v32_pool_without_flag_packs_width_when_fp4_cache_active(self):
+        # V3.2 DSA pools expose no use_fp4_indexer attribute. When the FP4
+        # indexer cache is active (SGLANG_OPT_USE_FP4_INDEXER_CACHE on PPU),
+        # the planner must still receive the packed FP4 width.
+        backend = self.make_backend(SimpleNamespace())
+        with (
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=True),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
+            self.assertEqual(
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 64, 1)
+            )
+
+    def test_v32_pool_without_flag_keeps_width_when_fp4_cache_inactive(self):
+        backend = self.make_backend(SimpleNamespace())
+        with (
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=False),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
+            self.assertEqual(
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 1)
+            )
+
+    def test_pool_flag_takes_precedence_over_fp4_cache_helper(self):
+        # When the pool exposes the flag, trust its layout and never fall back
+        # to the V3.2 gate (a non-FP4 pool must keep the unpacked width).
+        backend = self.make_backend(SimpleNamespace(use_fp4_indexer=False))
+        with (
+            patch.object(
+                dsa_backend, "_fp4_indexer_cache_active", return_value=True
+            ) as helper,
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
+            self.assertEqual(
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 1)
+            )
+        helper.assert_not_called()
+
+    def test_v32_bf16_indexer_keeps_width_and_two_byte_element_size(self):
+        backend = self.make_backend(SimpleNamespace())
+        with (
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=False),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(True),
+        ):
+            self.assertEqual(
+                backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 2)
+            )
+
+    def test_v32_builder_forwards_packed_width_to_planner(self):
+        # End-to-end through the decode builder that feeds the PPU planner.
+        backend = self.make_backend(SimpleNamespace())
+        context_lens = torch.tensor([[128], [256]], dtype=torch.int32)
+        schedule = object()
+        planner = Mock(return_value=schedule)
+        deep_gemm = SimpleNamespace(
+            get_num_sms=Mock(return_value=84),
+            get_paged_mqa_logits_metadata=planner,
+        )
+        with (
+            patch.object(dsa_backend, "_is_ppu", True),
+            patch.object(dsa_backend, "deep_gemm", deep_gemm, create=True),
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=True),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
+            result = backend._build_paged_mqa_schedule_metadata(context_lens)
+        self.assertIs(result, schedule)
+        planner.assert_called_once_with(
+            context_lens, 64, 84, metadata_extra=(1, 64, 64, 1)
+        )
 
 
 if __name__ == "__main__":
