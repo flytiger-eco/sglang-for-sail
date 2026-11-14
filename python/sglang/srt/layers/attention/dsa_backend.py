@@ -148,6 +148,25 @@ def prepare_kv_for_attention(
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_ppu = is_ppu()
+
+
+def _fp4_indexer_cache_active() -> bool:
+    """Whether the DeepSeek-V3.2 DSA indexer K-cache is stored as packed FP4.
+
+    Mirrors ``dsa_indexer.use_fp4``: the FP4 indexer cache is opt-in via
+    ``SGLANG_OPT_USE_FP4_INDEXER_CACHE`` and only active on PPU. Used as a
+    fallback for pools that do not expose the V4-only ``use_fp4_indexer`` flag
+    (e.g. the DeepSeek-V3.2 DSA pool).
+    """
+    if not _is_ppu:
+        return False
+    from sglang.kernels.ops.attention.dsa.triton_kernel import (
+        is_fp4_indexer_cache_enabled,
+    )
+
+    return is_fp4_indexer_cache_enabled()
+
+
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
@@ -801,8 +820,17 @@ class DeepseekSparseAttnBackend(
 
     def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
         query_head_dim = self.indexer_head_dim
-        if getattr(self.token_to_kv_pool, "use_fp4_indexer", False):
+        pool = self.token_to_kv_pool
+        if hasattr(pool, "use_fp4_indexer"):
             # Use the actual pool layout: KPool can disable FP4 despite the flag.
+            use_fp4 = bool(pool.use_fp4_indexer)
+        else:
+            # DeepSeek-V3.2 DSA pools expose no FP4 layout flag; the indexer
+            # K-cache is FP4 when the FP4 indexer cache is enabled on PPU,
+            # mirroring dsa_indexer.use_fp4. Without this the planner keeps the
+            # unpacked width and faults inside the paged FP4 MQA kernel.
+            use_fp4 = _fp4_indexer_cache_active()
+        if use_fp4:
             # The PPU planner expects two FP4 values packed into each byte.
             query_head_dim //= 2
         return (
