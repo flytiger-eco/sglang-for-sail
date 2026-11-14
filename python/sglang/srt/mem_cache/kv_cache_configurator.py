@@ -2652,18 +2652,27 @@ def calculate_mla_kv_cache_dim(
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.
+    # On PPU, flashmla_sparse_q8 runs the native FP8 FlashMLA kernels, which
+    # consume the same raw layout.
+    raw_kv_layout_backends = {"trtllm"}
+    if current_platform.is_ppu():
+        raw_kv_layout_backends.add("flashmla_sparse_q8")
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_kv_layout = (
+            get_exec().kernel.dsa_decode_backend in raw_kv_layout_backends
+        )
     elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
+        uses_raw_kv_layout = (
+            get_exec().kernel.dsa_prefill_backend in raw_kv_layout_backends
+        )
     else:
-        uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_kv_layout = (
+            get_exec().kernel.dsa_prefill_backend in raw_kv_layout_backends
+            or get_exec().kernel.dsa_decode_backend in raw_kv_layout_backends
         )
 
-    if uses_trtllm_kv_layout:
+    if uses_raw_kv_layout:
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
