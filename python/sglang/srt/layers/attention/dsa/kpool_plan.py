@@ -580,11 +580,7 @@ def _compute_pool_schedule_metadata(
         pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
         slots_per_page,
         deep_gemm.get_num_sms(),
-        **(
-            dict(metadata_extra=metadata_extra)
-            if metadata_extra is not None
-            else {}
-        ),
+        **(dict(metadata_extra=metadata_extra) if metadata_extra is not None else {}),
     )
 
 
