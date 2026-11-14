@@ -37,11 +37,25 @@ def _cuda_expandable_segments_enabled() -> Optional[str]:
     return None
 
 
-def _validate_efa_allocator_compatibility(
+def _validate_mooncake_allocator_compatibility(
     enable_custom_mem_pool: bool, custom_mem_pool_type: Optional[str]
 ) -> None:
-    """Reject CUDA VMM allocators unsupported by the current libfabric EFA path."""
-    if envs.MOONCAKE_PROTOCOL.get().lower() != "efa":
+    """Reject allocator configs the selected Mooncake transport cannot register safely."""
+    protocol = envs.MOONCAKE_PROTOCOL.get().lower()
+    if protocol == "rdma":
+        expandable_segments_var = _cuda_expandable_segments_enabled()
+        if expandable_segments_var is not None:
+            raise ValueError(
+                f"{expandable_segments_var} enables expandable_segments, which is "
+                "incompatible with MOONCAKE_PROTOCOL=rdma. The CUDA VMM allocator "
+                "can remap the physical pages behind a registered KV buffer while "
+                "its RDMA memory region keeps pointing at the old pages, silently "
+                "corrupting KV transfers. Disable expandable_segments on both "
+                "prefill and decode workers."
+            )
+        return
+
+    if protocol != "efa":
         return
 
     if enable_custom_mem_pool and custom_mem_pool_type in ("NVLINK", "BAREX"):
