@@ -58,7 +58,10 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
 
     def test_pool_without_fp4_attribute_keeps_existing_layout(self):
         backend = self.make_backend(SimpleNamespace())
-        with envs.SGLANG_SAIL_BF16_INDEXER.override(False):
+        with (
+            patch.object(dsa_backend, "_fp4_indexer_cache_active", return_value=False),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
             self.assertEqual(
                 backend._paged_mqa_schedule_metadata_extra(), (1, 64, 128, 1)
             )
