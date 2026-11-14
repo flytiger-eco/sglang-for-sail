@@ -1862,6 +1862,12 @@ class Scheduler(
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
 
+        from sglang.srt.layers.attention.dsv4.ppu_logits_workspace import (
+            initialize_logits_workspaces,
+        )
+
+        initialize_logits_workspaces()
+
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
             # not PyTorch MPS streams.

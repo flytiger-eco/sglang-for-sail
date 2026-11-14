@@ -4,11 +4,16 @@ memory budget), the paged pool, or the published blocks of a sparse table."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Iterator, Tuple
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4.ppu_logits_workspace import (
+    logits_out_function,
+    logits_workspace,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
@@ -68,9 +73,15 @@ def flat_index_logits_tiles(
     )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
+        rows_in_tile = tile.stop - tile.start
+        lease = (
+            logits_workspace(device=q[0].device, rows=rows_in_tile, width=width)
+            if is_ppu()
+            else nullcontext(None)
+        )
+        with lease as out:
+            producer = fp8_fp4_mqa_logits if out is None else logits_out_function()
+            logits = producer(
                 (q[0][tile], q[1][tile]),
                 kv,
                 weights[tile],
@@ -78,8 +89,12 @@ def flat_index_logits_tiles(
                 starts[tile] + lengths[tile],
                 False,
                 width,
-            ),
-        )
+                **({"out": out} if out is not None else {}),
+            )
+            # Keep the lease until the caller finishes mask/candidate/final-topk
+            # consumers and resumes (or closes) this generator.
+            yield tile, logits
+            del logits
 
 
 def deep_gemm_fp4_paged_mqa_logits(
