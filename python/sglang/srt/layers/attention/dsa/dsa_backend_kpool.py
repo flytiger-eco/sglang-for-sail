@@ -87,6 +87,20 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return self.num_q_heads in (32, 64)
         return True
 
+    def _kpool_paged_metadata_extra(self) -> Optional[tuple]:
+        # DeepGEMM-for-sail 4ea6e59+ makes the keyword-only
+        # metadata_extra=(next_n, num_heads, logical_head_dim, qk_dtype) hint
+        # mandatory for every paged metadata build on PPU0010/PPU0015,
+        # including the pooled decode kick chain and its graph capture/replay
+        # twins (csrc/apis/attention.hpp). The pooled paged logits consumer is
+        # IndexerKPool, whose geometry is the indexer heads / logical
+        # index_head_dim / int8-or-fp8 q dtype;
+        # _paged_mqa_schedule_metadata_extra() (dsa_backend.py) returns
+        # exactly that. None keeps the legacy call shape on other platforms.
+        if not _is_ppu:
+            return None
+        return self._paged_mqa_schedule_metadata_extra()
+
     def _init_kpool_metadata(
         self,
         metadata: DSAMetadata,
@@ -126,6 +140,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
             return init_kpool_write_plan(
                 metadata,
@@ -137,6 +152,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 write_start=(forward_batch.seq_lens - 1).to(torch.int32),
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         if forward_mode.is_target_verify():
@@ -150,6 +166,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 write_start=forward_batch.seq_lens.to(torch.int32),
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         if forward_mode.is_draft_extend_v2():
@@ -173,6 +190,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 slots_per_page=slots_per_page,
                 effective_n_per_batch=effective_n_per_batch,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         return metadata
@@ -194,6 +212,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         if (
@@ -216,6 +235,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 slots_per_page=slots_per_page,
                 is_v2=is_v2,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         return metadata
@@ -242,6 +262,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         if not (
@@ -272,6 +293,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
             effective_n_per_batch=effective_n_per_batch,
+            metadata_extra=self._kpool_paged_metadata_extra(),
         )
 
     def _update_kpool_metadata_from_precomputed(
@@ -294,6 +316,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=self._kpool_paged_metadata_extra(),
             )
 
         if not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()):
@@ -316,4 +339,5 @@ class DeepseekSparseAttnBackendKPoolMixin:
             num_draft_tokens=self.speculative_num_draft_tokens if is_verify else 1,
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
+            metadata_extra=self._kpool_paged_metadata_extra(),
         )

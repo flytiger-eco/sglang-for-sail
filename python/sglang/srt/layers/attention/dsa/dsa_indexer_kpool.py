@@ -881,6 +881,21 @@ class IndexerKPool(MultiPlatformOp):
             page_table_row_index=page_table_row_index,
         )
 
+    def _kpool_paged_metadata_extra(self) -> tuple:
+        # DeepGEMM-for-sail commit 4ea6e59 (2026-11-06, "refactor(indexer):
+        # align quantized logits API contracts") made metadata_extra mandatory
+        # on PPU0010/PPU0015, as (next_n, num_heads, logical_head_dim,
+        # qk_dtype).  next_n is 1 here because the kpool decode path builds
+        # per-query context lengths shaped [Q, 1]; torch.int8 is the only
+        # accepted dtype on 810E (where use_int8 is forced) while M890 uses
+        # torch.float8_e4m3fn unless the int8 shim is active.
+        return (
+            1,
+            self.n_heads,
+            self.head_dim,
+            torch.int8 if self.use_int8 else torch.float8_e4m3fn,
+        )
+
     def _get_kpool_decode_metadata(
         self,
         metadata: BaseIndexerMetadata,
@@ -904,7 +919,14 @@ class IndexerKPool(MultiPlatformOp):
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                    pool_context_lens.clamp(min=1),
+                    blocksize,
+                    self.sm_count,
+                    **(
+                        dict(metadata_extra=self._kpool_paged_metadata_extra())
+                        if is_ppu()
+                        else {}
+                    ),
                 )
             return (
                 pool_seqlens,
@@ -939,7 +961,14 @@ class IndexerKPool(MultiPlatformOp):
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                pool_context_lens.clamp(min=1),
+                blocksize,
+                self.sm_count,
+                **(
+                    dict(metadata_extra=self._kpool_paged_metadata_extra())
+                    if is_ppu()
+                    else {}
+                ),
             )
 
         return (
@@ -1213,7 +1242,14 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    # PPU (DeepGEMM-for-sail) rejects clean_logits=True at the host
+                    # boundary of both fp8_mqa_logits and int8_mqa_logits. This is the
+                    # only literal True in the file; the int8 branch inherits the flag,
+                    # so one site covers both PPU variants. 0.5.21 spells the PPU
+                    # predicate is_ppu() (its srt/utils/common.py:246 body is byte-identical
+                    # to 0.5.23's is_sail()); is_ppu is already imported at :44, so this
+                    # adds no import. On CUDA/ROCm it is False, so those keep True.
+                    clean_logits=not is_ppu(),
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,

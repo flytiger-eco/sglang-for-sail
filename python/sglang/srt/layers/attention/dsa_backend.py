@@ -88,6 +88,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
+    get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -411,6 +412,11 @@ class DeepseekSparseAttnBackend(
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        # The DeepGEMM paged-MQA metadata contract (DeepGEMM-for-sail 4ea6e59+,
+        # docs/api/indexer.md) is written in indexer geometry, not MLA
+        # attention heads; keep the indexer head count alongside the indexer
+        # head dim.
+        self.indexer_n_heads = hf_config.index_n_heads
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -799,17 +805,29 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
-    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, torch.dtype]:
+        # DeepGEMM-for-sail 4ea6e59+ makes metadata_extra mandatory on
+        # PPU0010/PPU0015 as (next_n, num_heads, logical_head_dim, qk_dtype)
+        # with qk_dtype a torch.dtype from the legal set torch.int8 (810E
+        # INT8 / M890 MXFP4) or torch.float8_e4m3fn (M890 FP8) — csrc/apis/
+        # attention.hpp, docs/api/indexer.md. The legacy fourth item was the
+        # element-size integer and the legacy num_heads was the MLA attention
+        # head count, which the new TORCH_CHECK(h in {4,32,64}) rejects.
+        # Mapping mirrors IndexerKPool.use_int8 (dsa_indexer_kpool.py:264-266).
+        # The hint only selects tile/split heuristics; it does not quantize
+        # inputs (indexer.md). SGLANG_SAIL_BF16_INDEXER (R2 bypass) has no
+        # legal bf16 hint and stays out of scope here.
         query_head_dim = self.indexer_head_dim
         if getattr(self.token_to_kv_pool, "use_fp4_indexer", False):
             # Use the actual pool layout: KPool can disable FP4 despite the flag.
             # The PPU planner expects two FP4 values packed into each byte.
             query_head_dim //= 2
+        qk_dtype = torch.int8 if get_device_sm() < 89 else torch.float8_e4m3fn
         return (
             1,  # next_n
-            self.num_q_heads,  # num_heads
-            query_head_dim,  # head_dim (packed for FP4)
-            (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
+            self.indexer_n_heads,  # indexer num_heads (contract domain 32/64)
+            query_head_dim,  # head_dim (packed for FP4, logical otherwise)
+            qk_dtype,
         )
 
     def _build_paged_mqa_schedule_metadata(
