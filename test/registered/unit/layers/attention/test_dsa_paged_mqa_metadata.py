@@ -15,15 +15,20 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
     def make_backend(self, pool):
         backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
         backend.num_q_heads = 32
+        backend.indexer_n_heads = 32
         backend.indexer_head_dim = 128
         backend.token_to_kv_pool = pool
         return backend
 
     def test_fp4_uses_packed_width_without_changing_logical_dimension(self):
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=True))
-        with envs.SGLANG_SAIL_BF16_INDEXER.override(False):
+        with (
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 64, 1)
+                backend._paged_mqa_schedule_metadata_extra(),
+                (1, 32, 64, torch.float8_e4m3fn),
             )
         self.assertEqual(backend.indexer_head_dim, 128)
 
@@ -31,35 +36,51 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         # KPool and other pool fallbacks can keep FP8/INT8 despite the flag.
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=False))
         with (
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
             envs.SGLANG_OPT_USE_FP4_INDEXER_CACHE.override(True),
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 1)
+                backend._paged_mqa_schedule_metadata_extra(),
+                (1, 32, 128, torch.float8_e4m3fn),
             )
 
     def test_actual_fp4_pool_does_not_depend_on_a_later_flag_change(self):
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=True))
         with (
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
             envs.SGLANG_OPT_USE_FP4_INDEXER_CACHE.override(False),
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 64, 1)
+                backend._paged_mqa_schedule_metadata_extra(),
+                (1, 32, 64, torch.float8_e4m3fn),
             )
 
-    def test_bf16_keeps_logical_width_and_two_byte_element_size(self):
+    def test_bf16_bypass_has_no_legal_dtype_hint_and_keeps_logical_width(self):
+        # The realigned indexer contract only accepts torch.int8 /
+        # torch.float8_e4m3fn as the qk_dtype item (docs/api/indexer.md), so a
+        # BF16-indexer bypass cannot be expressed in the hint; the hint stays
+        # contract-legal and only the width semantics are exercised here.
+        # BF16-indexer configurations remain out of scope for this path.
         backend = self.make_backend(SimpleNamespace(use_fp4_indexer=False))
-        with envs.SGLANG_SAIL_BF16_INDEXER.override(True):
+        with (
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(True),
+        ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 2)
+                backend._paged_mqa_schedule_metadata_extra(),
+                (1, 32, 128, torch.float8_e4m3fn),
             )
 
     def test_pool_without_fp4_attribute_keeps_existing_layout(self):
         backend = self.make_backend(SimpleNamespace())
-        with envs.SGLANG_SAIL_BF16_INDEXER.override(False):
+        with (
+            patch.object(dsa_backend, "get_device_sm", return_value=80),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
             self.assertEqual(
-                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, 1)
+                backend._paged_mqa_schedule_metadata_extra(), (1, 32, 128, torch.int8)
             )
 
     def test_ppu_builder_forwards_packed_width_to_legacy_planner(self):
@@ -73,13 +94,17 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         )
         with (
             patch.object(dsa_backend, "_is_ppu", True),
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
             patch.object(dsa_backend, "deep_gemm", deep_gemm, create=True),
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             result = backend._build_paged_mqa_schedule_metadata(context_lens)
         self.assertIs(result, schedule)
         planner.assert_called_once_with(
-            context_lens, 64, 84, metadata_extra=(1, 32, 64, 1)
+            context_lens,
+            64,
+            84,
+            metadata_extra=(1, 32, 64, torch.float8_e4m3fn),
         )
 
     def test_non_ppu_builder_does_not_add_legacy_metadata_extra(self):
@@ -111,12 +136,16 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         )
         with (
             patch.object(dsa_backend, "_is_ppu", True),
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
             patch.object(dsa_backend, "deep_gemm", deep_gemm, create=True),
             envs.SGLANG_SAIL_BF16_INDEXER.override(False),
         ):
             backend._refresh_paged_mqa_schedule_metadata(metadata, context_lens)
         planner.assert_called_once_with(
-            context_lens, 64, 84, metadata_extra=(1, 32, 64, 1)
+            context_lens,
+            64,
+            84,
+            metadata_extra=(1, 32, 64, torch.float8_e4m3fn),
         )
         self.assertIs(metadata.paged_mqa_schedule_metadata, captured_schedule)
         self.assertEqual(captured_schedule.data_ptr(), original_ptr)
