@@ -904,7 +904,14 @@ class IndexerKPool(MultiPlatformOp):
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                    pool_context_lens.clamp(min=1),
+                    blocksize,
+                    self.sm_count,
+                    **(
+                        dict(metadata_extra=(1, self.n_heads, self.head_dim, 1))
+                        if is_ppu()
+                        else {}
+                    ),
                 )
             return (
                 pool_seqlens,
@@ -939,7 +946,14 @@ class IndexerKPool(MultiPlatformOp):
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                pool_context_lens.clamp(min=1), blocksize, self.sm_count
+                pool_context_lens.clamp(min=1),
+                blocksize,
+                self.sm_count,
+                **(
+                    dict(metadata_extra=(1, self.n_heads, self.head_dim, 1))
+                    if is_ppu()
+                    else {}
+                ),
             )
 
         return (

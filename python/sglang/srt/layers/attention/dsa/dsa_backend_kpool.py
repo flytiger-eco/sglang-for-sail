@@ -126,6 +126,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
             return init_kpool_write_plan(
                 metadata,
@@ -137,6 +140,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 write_start=(forward_batch.seq_lens - 1).to(torch.int32),
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         if forward_mode.is_target_verify():
@@ -150,6 +156,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 write_start=forward_batch.seq_lens.to(torch.int32),
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         if forward_mode.is_draft_extend_v2():
@@ -173,6 +182,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 slots_per_page=slots_per_page,
                 effective_n_per_batch=effective_n_per_batch,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         return metadata
@@ -194,6 +206,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         if (
@@ -216,6 +231,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 slots_per_page=slots_per_page,
                 is_v2=is_v2,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         return metadata
@@ -242,6 +260,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         if not (
@@ -272,6 +293,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
             effective_n_per_batch=effective_n_per_batch,
+            metadata_extra=(
+                self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+            ),
         )
 
     def _update_kpool_metadata_from_precomputed(
@@ -294,6 +318,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 real_page_size=self.real_page_size,
                 slots_per_page=slots_per_page,
                 build_schedule_metadata=build_schedule_metadata,
+                metadata_extra=(
+                    self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+                ),
             )
 
         if not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()):
@@ -316,4 +343,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
             num_draft_tokens=self.speculative_num_draft_tokens if is_verify else 1,
             forward_mode=forward_mode,
             slots_per_page=slots_per_page,
+            metadata_extra=(
+                self._paged_mqa_schedule_metadata_extra() if _is_ppu else None
+            ),
         )

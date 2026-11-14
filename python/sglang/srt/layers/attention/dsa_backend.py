@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -430,6 +434,7 @@ class DeepseekSparseAttnBackend(
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.indexer_head_dim = model_runner.model_config.index_head_dim
+        self.indexer_n_heads = get_dsa_index_n_heads(hf_config)
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -835,7 +840,7 @@ class DeepseekSparseAttnBackend(
             query_head_dim //= 2
         return (
             1,  # next_n
-            self.num_q_heads,  # num_heads
+            self.indexer_n_heads,  # indexer heads, independent of MLA/attention TP
             query_head_dim,  # head_dim (packed for FP4)
             (1 if not envs.SGLANG_SAIL_BF16_INDEXER.get() else 2),  # element size
         )
