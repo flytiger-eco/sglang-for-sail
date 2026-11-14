@@ -319,9 +319,31 @@ def sparse_attention_fwd_kernel_v1(
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
 
-    # Keep GEMM and per-head softmax fragment layouts compatible on PPU.
-    # Select once at specialization time and use it for QK, tail QK, and PV.
-    gemm_policy = T.GemmWarpPolicy.FullRow if is_ppu() else T.GemmWarpPolicy.FullCol
+    ppu_backend = is_ppu()
+    if ppu_backend:
+        # PPU MMA uses m16n16. FullRow can leave warps idle for a small QK
+        # tile while PV uses the entire CTA, giving their per-head scalars
+        # incompatible replication layouts. Pick the largest thread budget
+        # for which both GEMMs use every warp with the same row partition.
+        max_m_warps = H_per_block // 16
+        for warps in range(threads // 32, 0, -1):
+            m_warps = min(max_m_warps, warps)
+            n_warps = warps // m_warps
+            if (
+                m_warps * n_warps == warps
+                and H_per_block % (16 * m_warps) == 0
+                and BI % (16 * n_warps) == 0
+                and D % (16 * n_warps) == 0
+            ):
+                threads = warps * 32
+                break
+        else:
+            raise ValueError(
+                "PPU sparse MLA requires a full-warp m16n16 partition for QK and PV"
+            )
+
+    # Use one policy for QK, tail QK, and PV at specialization time.
+    gemm_policy = T.GemmWarpPolicy.FullRow if ppu_backend else T.GemmWarpPolicy.FullCol
 
     @T.prim_func
     def main(

@@ -37,7 +37,9 @@ class TestDSATileLangV1GemmPolicy(unittest.TestCase):
             and node.name == "sparse_attention_fwd_kernel_v1"
         )
 
-    def make_specialization(self, *, ppu, heads, dim, tail_dim):
+    def make_specialization(
+        self, *, ppu, heads, dim, tail_dim, block_i=64, threads=256, topk=128
+    ):
         factory = copy.deepcopy(self.factory_ast)
         factory.decorator_list = []
         module = ast.fix_missing_locations(ast.Module(body=[factory], type_ignores=[]))
@@ -57,7 +59,73 @@ class TestDSATileLangV1GemmPolicy(unittest.TestCase):
             ),
         }
         exec(compile(module, str(__file__), "exec"), namespace)
-        return namespace[factory.name](heads, dim, tail_dim, 128, num_stages=1)
+        return namespace[factory.name](
+            heads,
+            dim,
+            tail_dim,
+            topk,
+            block_I=block_i,
+            threads=threads,
+            num_stages=1,
+        )
+
+    def test_glm53_small_head_specialization_limits_ppu_threads(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                kernel = self.make_specialization(
+                    ppu=True, heads=heads, dim=512, tail_dim=0, topk=2048
+                )
+                self.assertEqual(
+                    inspect.getclosurevars(kernel).nonlocals["threads"], 128
+                )
+
+    def test_ppu_qk_and_pv_use_the_entire_thread_budget(self):
+        cases = (
+            (8, 512, 64, 256, 128),
+            (16, 256, 64, 512, 128),
+            (24, 512, 64, 256, 256),
+            (32, 512, 64, 512, 256),
+            (64, 512, 64, 256, 256),
+            (128, 512, 64, 256, 256),
+            (8, 512, 32, 256, 64),
+            (8, 64, 128, 256, 128),
+            (8, 192, 128, 256, 128),
+            (8, 448, 64, 256, 128),
+            (8, 192, 48, 96, 96),
+        )
+        for heads, dim, block_i, requested, expected in cases:
+            with self.subTest(heads=heads, dim=dim, block_i=block_i):
+                kernel = self.make_specialization(
+                    ppu=True,
+                    heads=heads,
+                    dim=dim,
+                    tail_dim=0,
+                    block_i=block_i,
+                    threads=requested,
+                    topk=block_i * 2,
+                )
+                closure = inspect.getclosurevars(kernel).nonlocals
+                self.assertEqual(closure["threads"], expected)
+                warps = expected // 32
+                m_warps = min(closure["H_per_block"] // 16, warps)
+                n_warps = warps // m_warps
+                self.assertEqual(m_warps * n_warps, warps)
+                self.assertEqual(closure["H_per_block"] % (16 * m_warps), 0)
+                self.assertEqual(block_i % (16 * n_warps), 0)
+                self.assertEqual(dim % (16 * n_warps), 0)
+
+    def test_non_ppu_keeps_the_requested_thread_count(self):
+        for threads in (128, 256, 512):
+            kernel = self.make_specialization(
+                ppu=False, heads=8, dim=512, tail_dim=0, threads=threads
+            )
+            self.assertEqual(
+                inspect.getclosurevars(kernel).nonlocals["threads"], threads
+            )
+
+    def test_ppu_rejects_a_tile_without_an_m16n16_partition(self):
+        with self.assertRaisesRegex(ValueError, "m16n16 partition"):
+            self.make_specialization(ppu=True, heads=8, dim=512, tail_dim=0, block_i=8)
 
     def test_ppu_uses_full_row_for_main_and_zero_tail_geometries(self):
         for heads in (16, 32, 64, 128):
