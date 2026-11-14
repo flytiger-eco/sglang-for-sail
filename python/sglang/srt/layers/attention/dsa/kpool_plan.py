@@ -565,6 +565,7 @@ def _compute_pool_schedule_metadata(
     pool_seqlens: torch.Tensor,
     *,
     slots_per_page: int,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> Optional[torch.Tensor]:
     if not is_cuda():
         return None
@@ -575,6 +576,7 @@ def _compute_pool_schedule_metadata(
         pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
         slots_per_page,
         deep_gemm.get_num_sms(),
+        **(dict(metadata_extra=metadata_extra) if metadata_extra is not None else {}),
     )
 
 
@@ -587,6 +589,7 @@ def init_pooled_paged_mqa_metadata(
     real_page_size: int,
     slots_per_page: int,
     build_schedule_metadata: bool = True,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> DSAMetadata:
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
@@ -605,6 +608,7 @@ def init_pooled_paged_mqa_metadata(
         _compute_pool_schedule_metadata(
             pool_seqlens,
             slots_per_page=slots_per_page,
+            metadata_extra=metadata_extra,
         )
         if build_schedule_metadata
         else None
@@ -627,6 +631,7 @@ def update_pooled_paged_mqa_metadata(
     real_page_size: int,
     slots_per_page: int,
     build_schedule_metadata: bool = True,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
@@ -660,6 +665,7 @@ def update_pooled_paged_mqa_metadata(
         new_schedule = _compute_pool_schedule_metadata(
             metadata.pooled_cache_seqlens_int32,
             slots_per_page=slots_per_page,
+            metadata_extra=metadata_extra,
         )
         if new_schedule is not None:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(new_schedule)
@@ -712,6 +718,7 @@ def init_kpool_write_plan_capture(
     slots_per_page: int,
     is_v2: bool = False,
     build_schedule_metadata: bool = True,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> DSAMetadata:
     if not _is_kpool_layout_enabled(pool_size, real_page_size) or num_draft_tokens == 0:
         return metadata
@@ -728,6 +735,7 @@ def init_kpool_write_plan_capture(
         schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,
+            metadata_extra=metadata_extra,
         )
         plan = dataclasses.replace(plan, pool_schedule_metadata=schedule)
     return dataclasses.replace(metadata, kpool_write_plan=plan)
@@ -745,6 +753,7 @@ def update_kpool_write_plan(
     forward_mode: ForwardMode,
     slots_per_page: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> None:
     if not _is_kpool_layout_enabled(pool_size, real_page_size) or not (
         is_cuda() or is_hip()
@@ -786,6 +795,7 @@ def update_kpool_write_plan(
         new_schedule = _compute_pool_schedule_metadata(
             plan.pool_seqlens_per_q,
             slots_per_page=slots_per_page,
+            metadata_extra=metadata_extra,
         )
         if new_schedule is not None:
             plan.pool_schedule_metadata.copy_(new_schedule)
@@ -803,6 +813,7 @@ def init_kpool_write_plan(
     slots_per_page: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
     build_schedule_metadata: bool = True,
+    metadata_extra: Optional[tuple[int, int, int, int]] = None,
 ) -> DSAMetadata:
     forward_mode = forward_batch.forward_mode
     is_verify = forward_mode.is_target_verify()
@@ -830,6 +841,7 @@ def init_kpool_write_plan(
         slots_per_page=slots_per_page,
         is_v2=is_v2,
         build_schedule_metadata=build_schedule_metadata,
+        metadata_extra=metadata_extra,
     )
     update_kpool_write_plan(
         metadata,
@@ -842,5 +854,6 @@ def init_kpool_write_plan(
         forward_mode=forward_mode,
         slots_per_page=slots_per_page,
         effective_n_per_batch=effective_n_per_batch,
+        metadata_extra=metadata_extra,
     )
     return metadata
