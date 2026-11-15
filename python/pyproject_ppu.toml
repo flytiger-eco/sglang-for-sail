@@ -100,6 +100,7 @@ dependencies = [
   "pla==1.0.1",
   "sglang-kernel==0.4.7",
   "sglang-router==0.3.2",
+  "tilelang==0.1.12",
   "torch>=2.11.0,<=2.13.0",
   "torch_memory_saver==0.0.9",
   "torchao==0.17.0",
@@ -138,6 +139,7 @@ nvidia-dali-cuda130 = { index = "flytiger" }
 pla = { index = "flytiger" }
 sglang-kernel = { index = "flytiger" }
 sglang-router = { index = "flytiger" }
+tilelang = { index = "flytiger" }
 torch = { index = "flytiger" }
 torch_memory_saver = { index = "flytiger" }
 torchao = { index = "flytiger" }
