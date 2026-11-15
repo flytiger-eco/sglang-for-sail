@@ -40,6 +40,7 @@ ARG PPU_PACKAGES="\
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     pla==1.0.1+v0.1.0.ppu2.2.0 \
+    tilelang==0.1.12+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
     torchcodec==0.15.0+v0.1.0.ppu2.2.0 \
