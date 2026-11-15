@@ -24,13 +24,16 @@ ARG MAX_JOBS=16
 # sglang-router is built from this repository in gateway_builder instead.
 # sglang-kernel is fetched from flytiger when available, with an AOT source
 # build fallback in ppu_kernels_builder.
+# Keep comments out of the continuation block below: a comment line there
+# drops the package line that follows it.
+# deep_gemm gotag commit: 8292bb50504556daceee820991158c759290a38c
+# pla gotag commit: ff5fb5f436a679d3bf4b15b61ddf470a2293e0cd
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
     cuda-bindings==13.0.0+v0.1.0.ppu2.2.0 \
     cuda-python==13.0.0+v0.1.0.ppu2.2.0 \
     deep_ep==2.2.1+v0.1.0.ppu2.2.0 \
-    # deep_gemm gotag commit: 8292bb50504556daceee820991158c759290a38c
     deep_gemm==1.1.0+v1.0.1.ppu2.2.1  \
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
     flash-attn==2.7.4.post1+v0.2.0.ppu2.2.0 \
@@ -40,8 +43,7 @@ ARG PPU_PACKAGES="\
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
-    # pla gotag commit: ff5fb5f436a679d3bf4b15b61ddf470a2293e0cd
-    pla==1.1.0+v0.1.0.ppu2.2.0 \
+    pla==1.0.1+v0.1.0.ppu2.2.0 \
     tilelang==0.1.12+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
@@ -301,6 +303,8 @@ RUN python3 -m pip list --format=freeze \
 # transformer-engine's nvdlfw-inspect git dependency is added as a constraint.
 # pyarrow>=26 requires numpy>=2, while the PPU numba/scipy/scikit-learn builds
 # keep numpy<2, so pyarrow is capped to stay importable.
+# The PPU tilelang from PPU_PACKAGES is then replaced by the upstream release
+# before constraints.txt is frozen, so the final images ship tilelang 0.1.12.
 COPY python/pyproject_ppu.toml /tmp/sglang_deps/python/pyproject.toml
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/uv \
@@ -322,6 +326,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip uninstall -y sglang \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
+    && python3 -m pip install tilelang==0.1.12 -i https://pypi.org/simple/ --force-reinstall --no-deps \
     && python3 -m pip list --format=freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
 
 ########################################################
