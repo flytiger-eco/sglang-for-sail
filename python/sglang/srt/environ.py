@@ -759,6 +759,15 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Replicated QSA-only CP defaults to full-page sends across source ranks.
+    # Explicit 0 retains head slicing / single-sender pages, respectively.
+    SGLANG_MOONCAKE_REPLICATED_KV_PAGE_TRANSFER = EnvBool(
+        lambda: envs.SGLANG_QSA_ONLY_CP_REPLICATE.get()
+    )
+    # Split each replicated main-KV page batch across the source TP ranks.
+    SGLANG_MOONCAKE_REPLICATED_KV_PAGE_TRANSFER_ALL_RANKS = EnvBool(
+        lambda: envs.SGLANG_QSA_ONLY_CP_REPLICATE.get()
+    )
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
