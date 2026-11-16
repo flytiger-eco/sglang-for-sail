@@ -801,6 +801,8 @@ class SchedulerDisaggregationPrefillMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                # Finish older KV transfers before waiting for this GPU result.
+                self.process_disagg_prefill_inflight_queue()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
