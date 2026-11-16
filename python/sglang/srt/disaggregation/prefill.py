@@ -815,6 +815,54 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    def prepare_disagg_transfer_indices(
+        self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> None:
+        # Snapshot physical slot ids on the forward stream. The result's D2H
+        # copy and copy_done event make them available without a later read on
+        # the schedule stream, which may already be waiting for the next forward.
+        # Unified-memory compaction can move physical slots after this snapshot;
+        # keep its existing just-in-time translation until it pins transfer ids.
+        if self.enable_unified_memory:
+            return
+        mapping = getattr(
+            self.req_to_token_pool, "req_index_to_mamba_index_mapping", None
+        )
+        if mapping is not None:
+            result.disagg_mamba_indices = (
+                self.req_to_token_pool.translate_mamba_indices(
+                    mapping[batch.req_pool_indices]
+                )
+            )
+        state_types = (
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        if (
+            StateType.QSA_COMPRESSED not in state_types
+            or not set(state_types).issubset(
+                {StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED}
+            )
+            or not isinstance(self.tree_cache, UnifiedRadixCache)
+            or _uses_write_through_cache(self.tree_cache)
+        ):
+            return
+        page_size = self.token_to_kv_pool_allocator.page_size
+        max_seq_len = int(batch.seq_lens_cpu.max())
+        raw_indices = self.req_to_token_pool.req_to_token[
+            batch.req_pool_indices, :max_seq_len:page_size
+        ]
+        physical_indices = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                raw_indices.reshape(-1)
+            ).reshape(raw_indices.shape)
+        )
+        result.disagg_kv_page_indices = physical_indices // page_size
+        if not getattr(self, "_disagg_page_snapshots_logged", False):
+            logger.info(
+                "Prefill QSA transfer index snapshots enabled (page_size=%s)", page_size
+            )
+            self._disagg_page_snapshots_logged = True
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -840,6 +888,16 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        mamba_indices = (
+            result.disagg_mamba_indices.numpy()
+            if result.disagg_mamba_indices is not None
+            else None
+        )
+        kv_page_indices = (
+            result.disagg_kv_page_indices.numpy()
+            if result.disagg_kv_page_indices is not None
+            else None
+        )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -944,7 +1002,17 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
-                self.cache_unfinished_disagg_prefill(req)
+                # Snapshot pages must stay owned by this request until RDMA
+                # completes. The normal final release inserts them into radix;
+                # an unfinished insert here could deduplicate/free and rebind
+                # pages after the snapshot. Pending bootstrap keeps the old path.
+                prepared_pages = (
+                    kv_page_indices[i]
+                    if kv_page_indices is not None and not req.pending_bootstrap
+                    else None
+                )
+                if prepared_pages is None:
+                    self.cache_unfinished_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -979,7 +1047,14 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=True,
+                        mamba_index=(
+                            mamba_indices[i] if mamba_indices is not None else None
+                        ),
+                        kv_page_indices=prepared_pages,
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
             else:
@@ -1384,6 +1459,8 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        mamba_index: Optional[np.ndarray] = None,
+        kv_page_indices: Optional[np.ndarray] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1396,13 +1473,21 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            mamba_index=mamba_index,
+            kv_page_indices=kv_page_indices,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        mamba_index: Optional[np.ndarray] = None,
+        kv_page_indices: Optional[np.ndarray] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1450,6 +1535,8 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
+                if mamba_index is not None:
+                    return [np.asarray(mamba_index)]
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
@@ -1475,6 +1562,8 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                if kv_page_indices is not None:
+                    return kv_page_indices[:kv_to_page_num(seq_len, page_size)]
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
@@ -1570,17 +1659,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            raw_kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    raw_kv_indices
+            if kv_page_indices is not None and seg_start % page_size == 0:
+                page_indices = kv_page_indices[
+                    seg_start // page_size : kv_to_page_num(seg_end, page_size)
+                ]
+            else:
+                raw_kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory needs its current physical mapping per segment.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        raw_kv_indices
+                    )
                 )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
