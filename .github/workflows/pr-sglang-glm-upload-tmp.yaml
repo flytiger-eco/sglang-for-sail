@@ -1,0 +1,261 @@
+name: SGLang GLM native temporary wheel upload
+
+# Build glm_dev_0521 directly from flytiger-eco/sglang-for-sail without conversion.
+# Requires RELEASE_USERNAME and RELEASE_TOKEN; private templates also need TEMPLATE_TOKEN.
+on:
+  push:
+    branches: [add_sglang_upload_action]
+  workflow_call:
+    inputs:
+      sail_image:
+        description: 'CUDA compatibility build image; empty uses the default temporary-upload image'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: 'Board JSON array: ZW-M890P and/or ZW-810E'
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+    outputs:
+      upload_url:
+        description: 'Temporary batch directory containing sglang and sglang-kernel wheels'
+        value: ${{ jobs.push.outputs.upload_url }}
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      sail_image:
+        description: 'CUDA compatibility build image; empty uses the default temporary-upload image'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: 'Board JSON array: ZW-M890P and/or ZW-810E'
+        required: true
+        type: string
+        default: '["ZW-M890P"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sglang-glm-upload-tmp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+
+jobs:
+  resolve:
+    name: Resolve and pin glm_dev_0521 source commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Validate board matrix
+        shell: bash
+        env:
+          BOARD_MATRIX: ${{ inputs.matrix || '["ZW-M890P"]' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          boards = json.loads(os.environ['BOARD_MATRIX'])
+          if (
+              not isinstance(boards, list)
+              or not boards
+              or any(board not in ('ZW-M890P', 'ZW-810E') for board in boards)
+              or len(set(boards)) != len(boards)
+          ):
+              raise SystemExit('matrix must be a nonempty JSON array of unique boards: ZW-M890P, ZW-810E')
+          PY
+
+      - name: Clone glm_dev_0521 and check native build entry points
+        id: source
+        shell: bash
+        env:
+          SOURCE_BRANCH: glm_dev_0521
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$SOURCE_BRANCH"
+          git clone --branch "$SOURCE_BRANCH" --single-branch --depth 1 https://github.com/flytiger-eco/sglang-for-sail.git sglang-source
+          cd sglang-source
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          for file in python/pyproject_other.toml \
+                      python/setup.py \
+                      scripts/ci/utils/install_protoc.sh \
+                      scripts/ci/utils/install_rustup.sh \
+                      python/sglang/kernels/aot/setup_ppu.py \
+                      python/sglang/kernels/aot/pyproject_ppu.toml; do
+            test -f "$file" || { printf '::error::Selected source is missing %s\n' "$file" >&2; exit 1; }
+          done
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          printf 'flytiger-eco/sglang-for-sail source: %s -> %s\n' "$SOURCE_BRANCH" "$commit" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.package }} (${{ matrix.runner }})
+    needs: resolve
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+        package: [sglang, sglang-kernel]
+    concurrency:
+      group: sglang-glm-upload-tmp-${{ matrix.package }}-${{ matrix.runner }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build native wheels
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 330
+          command: |
+            set -eo pipefail
+            unset PIP_INDEX_URL
+            # Remove image-provided Git URL rewrites to unreachable mirrors.
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            TARGET_ROOT=/workspace/target
+            TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
+            PACKAGE='${{ matrix.package }}'
+            git clone --no-checkout https://github.com/flytiger-eco/sglang-for-sail.git "$TARGET_ROOT"
+            git -C "$TARGET_ROOT" fetch --no-tags origin "$TARGET_COMMIT"
+            git -C "$TARGET_ROOT" checkout --detach "$TARGET_COMMIT"
+            git -C "$TARGET_ROOT" submodule update --init --recursive
+            cd "$TARGET_ROOT"
+
+            export HOME=$(eval echo ~$(id -un))
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            if [[ "$PACKAGE" == sglang ]]; then
+              source scripts/ci/utils/install_protoc.sh
+              source scripts/ci/utils/install_rustup.sh
+              cd python
+              cp pyproject_other.toml pyproject.toml
+              cp ../README.md ../LICENSE .
+              python3 -m pip install --no-input build 'wheel==0.45.1' setuptools setuptools-scm setuptools-rust
+              git config --global --add safe.directory '*'
+              python3 -m build --wheel
+            else
+              # This branch's native setup_ppu.py already uses CUDAExtension and CUDA dependencies.
+              python3 - <<'PY'
+            import torch
+            from torch.utils import cpp_extension
+
+            print(f'torch {torch.__version__} (cuda {torch.version.cuda})')
+            if torch.version.cuda is None or getattr(cpp_extension, 'IS_PPU_EXTENSION', False):
+                raise SystemExit('::error::This branch requires a CUDA-compatible Torch image, not cuda-free')
+            PY
+              export MAX_JOBS="${MAX_JOBS:-$(nproc)}"
+              git config --global --add safe.directory '*'
+              # Pin build tools to avoid packaging/setuptools API incompatibilities in the image.
+              python3 -m pip install --no-input 'setuptools==75.8.0' 'wheel==0.45.1' 'packaging==24.2'
+              python3 - <<'PY'
+            from importlib.metadata import version
+            from packaging.utils import canonicalize_version
+
+            for name in ('setuptools', 'wheel', 'packaging'):
+                print(f'{name} {version(name)}')
+            assert canonicalize_version('1.0.0', strip_trailing_zero=False) == '1.0.0'
+            PY
+              cd python/sglang/kernels/aot
+              test -f setup_ppu.py || { echo '::error::Missing python/sglang/kernels/aot/setup_ppu.py' >&2; exit 1; }
+              cp pyproject_ppu.toml pyproject.toml
+              python3 setup_ppu.py bdist_wheel
+            fi
+
+            # Record the pinned source commit in both wheels and their WHEEL/RECORD metadata.
+            python3 -m wheel tags --build "1g${TARGET_COMMIT:0:12}" --remove dist/*.whl
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/sglang-ci/glm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${PACKAGE}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp dist/*.whl "$NAS_RESULT_DIR/wheels/"
+
+      - name: Save wheel artifact
+        # Wheels are board-independent; upload both packages from the first board, and only verify other boards.
+        if: ${{ success() && matrix.runner == fromJson(inputs.matrix || '["ZW-M890P"]')[0] }}
+        uses: actions/upload-artifact@v4
+        with:
+          # Isolate by source commit without attempt, allowing failed-job reruns to reuse the other package.
+          name: sglang-glm-tmp-wheel-${{ github.run_id }}-${{ needs.resolve.outputs.commit }}-${{ matrix.package }}
+          # Container /mnt/wl_nas maps to runner /wl_nas.
+          path: /wl_nas/devops/sglang-ci/glm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.package }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  merge:
+    name: Merge wheels from both packages
+    # Upload only after both packages build successfully on every board.
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: echo 'artifact_name=sglang-glm-tmp-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: sglang-glm-tmp-wheel-${{ github.run_id }}-${{ needs.resolve.outputs.commit }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Upload to temporary directory
+    needs: merge
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show temporary download URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write URL to logs and Summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Temporary wheel directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
