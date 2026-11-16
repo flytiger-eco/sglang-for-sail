@@ -4468,6 +4468,8 @@ class Scheduler(
                         )
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
+                        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                            self.prepare_disagg_transfer_indices(batch, batch_result)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).

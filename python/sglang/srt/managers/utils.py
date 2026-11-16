@@ -73,6 +73,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Prefill transfer slot ids, copied with the result before the next forward.
+    disagg_mamba_indices: Optional[torch.Tensor] = None
+    disagg_kv_page_indices: Optional[torch.Tensor] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -211,6 +214,11 @@ class GenerationBatchResult:
         ):
             if holder is not None:
                 holder.map_device_tensors(_async_d2h)
+
+        if self.disagg_mamba_indices is not None:
+            self.disagg_mamba_indices = _async_d2h(self.disagg_mamba_indices)
+        if self.disagg_kv_page_indices is not None:
+            self.disagg_kv_page_indices = _async_d2h(self.disagg_kv_page_indices)
 
         self.copy_auxiliary_output_to_cpu()
 
