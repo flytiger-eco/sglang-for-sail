@@ -653,6 +653,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        # Every CP rank may have a scratch copy of this layer, even when
+        # only the owner will actually submit an H2D transfer.
+        if not is_draft and self._is_device_layer_sharded(device_pool):
+            device_pool.invalidate_kv_buffer_for_layer(
+                device_pool.start_layer + layer_id
+            )
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
         assert not getattr(self, "_is_dummy", False), (
@@ -882,7 +888,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     draft_device_pool,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    self.target_layer_num + draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )

@@ -1378,7 +1378,7 @@ def build_anchor_sidecar_stack(
         full_layer_mapping = _with_mtp_layer_mapping(
             full_layer_mapping,
             transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
+            target_device_layer_num=kv_host_pool.target_layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
     entries = [

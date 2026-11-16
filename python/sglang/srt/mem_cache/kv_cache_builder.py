@@ -328,14 +328,17 @@ def build_kv_cache(
         and dsa_cp_prefix_cache_enabled()
         and supports_dsa_cp_prefix_cache()
     ):
-        # Experimental un-bypass for DSA prefill CP: it relies on the CP KV
-        # pool keeping a full logical-order copy on every rank, and on the
-        # 64-token unpooled indexer geometry. Pooled index pages need separate
-        # ownership handling before divergent suffixes can safely share them.
+        # CP ranks share logical token indices even when layers have distinct owners.
         validate_dsa_cp_prefix_cache_geometry(
             page_size=page_size,
             index_kpool=get_dsa_index_kpool(model_config.hf_config),
             cache_layer_split=get_parallel().enable_dsa_cache_layer_split,
+            hicache_layout=(
+                get_memory().hicache_mem_layout if enable_hierarchical_cache else None
+            ),
+            hicache_io_backend=(
+                get_memory().hicache_io_backend if enable_hierarchical_cache else None
+            ),
         )
         logger.info(
             "DSA prefill CP prefix cache is ENABLED (experimental): the radix "

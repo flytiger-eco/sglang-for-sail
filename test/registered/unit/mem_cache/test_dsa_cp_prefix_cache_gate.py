@@ -486,6 +486,17 @@ class TestBypassPredicates(CustomTestCase):
             page_size=64, index_kpool=1, cache_layer_split=False
         )
 
+    def test_layer_split_hicache_layout(self):
+        validate_dsa_cp_prefix_cache_geometry(
+            page_size=64, index_kpool=1, cache_layer_split=True,
+            hicache_layout="layer_first", hicache_io_backend="kernel",
+        )
+        with self.assertRaisesRegex(ValueError, "layer_first"):
+            validate_dsa_cp_prefix_cache_geometry(
+                page_size=64, index_kpool=1, cache_layer_split=True,
+                hicache_layout="page_first", hicache_io_backend="kernel",
+            )
+
 
 class TestWrapperCowMambaGate(CustomTestCase):
     """``match_prefix_for_req(cow_mamba=True)`` must roll back, not just zero.
