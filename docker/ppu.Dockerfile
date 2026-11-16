@@ -56,8 +56,8 @@ ARG PPU_WHEEL_URLS="\
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2345/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl \
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2252/pla-1.1.0-cp312-cp312-linux_x86_64.whl \
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2111/msa_for_sail-0.1.1+v0.1.0.ppu2.2.0-py3-none-any.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-13-2125/sglang-0.5.23-1gd9e1212901db-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-13-2125/sglang_kernel-0.4.10-1gd9e1212901db-cp310-abi3-linux_x86_64.whl"
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-16-2002/sglang-0.5.23-1ge21094abca90-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-16-2002/sglang_kernel-0.4.10-1ge21094abca90-cp310-abi3-linux_x86_64.whl"
 
 FROM ${PPU_BASE_IMAGE} AS base
 
