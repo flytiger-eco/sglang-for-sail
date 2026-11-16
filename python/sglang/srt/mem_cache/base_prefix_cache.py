@@ -5,7 +5,6 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -326,12 +325,17 @@ def zero_match_result(
         # describes the discarded prefix and would mis-drive checkpointing on
         # the recomputed one.
         mamba_branching_seqlen=None,
+        cache_protected_len=0,
         full_kv_hit_length=0,
     )
 
 
 def rollback_matched_mamba_state(
-    tree_cache, req, *, mamba_held_before_match: Optional[bool] = None
+    tree_cache,
+    req,
+    *,
+    mamba_held_before_match: Optional[bool] = None,
+    recompute_prefix: bool = False,
 ) -> None:
     """Undo the mamba state a discarded ``match_prefix`` left on ``req``.
 
@@ -348,7 +352,9 @@ def rollback_matched_mamba_state(
     post-hoc behaviour for requests that have never been admitted.
 
     Session-held slots have their own lifecycle; freeing one here causes a
-    double free, so they are always skipped.
+    double free, so they are always skipped. A retained slot must still be
+    cleared before full prefix recomputation, rather than reused as stale SSM
+    state. Admission rollback alone does not request that recomputation.
     """
     req.kv.mamba_cow_src_index = None
     req.kv.mamba_needs_clear = False
@@ -363,42 +369,45 @@ def rollback_matched_mamba_state(
     ):
         mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(-1))
         req.kv.mamba_pool_idx = None
+    req.kv.mamba_needs_clear = recompute_prefix and req.kv.holds_mamba
 
 
-@lru_cache(maxsize=1)
 def dsa_cp_prefix_cache_alignment() -> int:
     """Prefix-hit length alignment required by the DSA prefill-CP kpool path.
 
     Returns 1 (no constraint) unless the experimental DSA prefill-CP prefix
     cache is active. When active, a reused prefix must satisfy
-    ``prefix_len % lcm(page_size, index_kpool) == 0``: the kpool write path
-    derives pooled slots from ``global_position // index_kpool`` and rejects a
-    non-aligned chunk start deep inside the indexer, so an unaligned hit must
-    be dropped before allocation instead of raising there. The radix tree
-    matches whole pages and ``index_kpool`` divides ``page_size`` today, so
-    this is a defence-in-depth guard for future granularity changes.
+    the physical page boundary. Use resolved page geometry, not the pristine
+    operator input (whose page_size may be None). This value must follow
+    scoped configuration/environment overrides, so it is not process-cached.
+    Pooled index layouts additionally need a complete packed indexer page;
+    startup currently rejects them until prefix-page ownership is supported.
     """
     from sglang.srt.environ import envs
 
-    if not envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+    if not envs.SGLANG_ENABLE_DSA_CP_PREFIX_CACHE.get():
         return 1
 
     from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_interleave
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_memory,
+        get_schedule,
+        process_model_config,
+    )
 
-    if not is_dsa_prefill_cp_interleave():
+    if (
+        get_disagg().disaggregation_mode != "prefill"
+        or get_memory().disable_radix_cache
+        or not is_dsa_prefill_cp_interleave()
+    ):
         return 1
 
-    from math import lcm
-
     from sglang.srt.configs.model_config import get_dsa_index_kpool
-    from sglang.srt.runtime_context import get_server_args, process_model_config
 
-    page_size = int(getattr(get_server_args(), "page_size", 1) or 1)
+    page_size = int(get_schedule().page_size)
     index_kpool = int(get_dsa_index_kpool(process_model_config().hf_config))
-    return lcm(max(1, page_size), max(1, index_kpool))
-
-
-_MISALIGNED_PREFIX_HIT_WARNED = False
+    return max(1, page_size) * max(1, index_kpool)
 
 
 def dsa_cp_prefix_reuse_length(match_result: MatchResult) -> int:
@@ -426,15 +435,12 @@ def is_dsa_cp_prefix_hit_misaligned(match_result: MatchResult) -> bool:
     if hit_len == 0 or hit_len % alignment == 0:
         return False
 
-    global _MISALIGNED_PREFIX_HIT_WARNED
-    if not _MISALIGNED_PREFIX_HIT_WARNED:
-        _MISALIGNED_PREFIX_HIT_WARNED = True
-        logger.warning(
-            "DSA prefill CP prefix cache: a %d-token prefix hit is not aligned "
-            "to %d; dropping the reuse for this request (recompute).",
-            hit_len,
-            alignment,
-        )
+    logger.warning(
+        "DSA prefill CP prefix cache: a %d-token prefix hit is not aligned "
+        "to %d; dropping the reuse for this request (recompute).",
+        hit_len,
+        alignment,
+    )
     return True
 
 
@@ -456,7 +462,10 @@ def drop_misaligned_dsa_cp_prefix_reuse(
     if not is_dsa_cp_prefix_hit_misaligned(match_result):
         return match_result
     rollback_matched_mamba_state(
-        tree_cache, req, mamba_held_before_match=mamba_held_before_match
+        tree_cache,
+        req,
+        mamba_held_before_match=mamba_held_before_match,
+        recompute_prefix=True,
     )
     return zero_match_result(tree_cache, match_result, extra_key=extra_key)
 
