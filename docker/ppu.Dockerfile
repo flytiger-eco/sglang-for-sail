@@ -44,7 +44,6 @@ ARG PPU_PACKAGES="\
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
     torchcodec==0.15.0+v0.1.0.ppu2.2.0 \
-    transformer-engine==2.5+v0.1.0.ppu2.2.0 \
     triton==3.7.1+v0.1.0.ppu2.2.0"
 # torch/torchvision/torchaudio are expected to come with the base image. Only
 # list the ones the base image lacks; the default base image ships torch and
@@ -295,8 +294,7 @@ RUN python3 -m pip list --format=freeze \
 # uv is used instead of pip: pip's backtracking on this dependency set falls
 # back to building PPU shim sdists (which fail outside the builder), whereas
 # uv resolves it directly. --only-binary on the pinned PPU packages makes any
-# such fallback fail loudly instead. uv rejects transitive URL dependencies, so
-# transformer-engine's nvdlfw-inspect git dependency is added as a constraint.
+# such fallback fail loudly instead.
 # pyarrow>=26 requires numpy>=2, while the PPU numba/scipy/scikit-learn builds
 # keep numpy<2, so pyarrow is capped to stay importable.
 # tilelang is installed from the official PyPI wheel (not the PPU index) below,
@@ -305,8 +303,6 @@ COPY python/pyproject_ppu.toml /tmp/sglang_deps/python/pyproject.toml
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/uv \
     python3 -m pip install uv \
-    && echo "nvdlfw-inspect @ git+https://github.com/NVIDIA/nvidia-dlfw-inspect.git@v0.1" \
-        >> /sgl-workspace/ppu_constraints.txt \
     && echo "pyarrow<26" >> /sgl-workspace/ppu_constraints.txt \
     && cd /tmp/sglang_deps/python \
     && mkdir -p sglang \
