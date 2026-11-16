@@ -95,5 +95,43 @@ def test_segmented_last_chunk_uses_snapshot_without_reading_device_indices(pendi
     assert req.start_send_idx == 11 and not scheduler.disagg_prefill_pending_chunk_rids
 
 
+def test_overlap_polls_completed_transfers_before_waiting_for_the_previous_result():
+    events = []
+    class Loop:
+        def __init__(self):
+            self.gracefully_exit = False
+            self._engine_paused = False
+            self.waiting_queue = []
+            self.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
+            self.running_batch = self.last_batch = self.chunked_req = None
+            self.enable_staging = False
+            self.iteration = 0
+            self.ngram_embedding_manager = SimpleNamespace(
+                prepare_for_forward=lambda batch, **kwargs: batch
+            )
+        def ingest_requests(self):
+            self.iteration += 1
+            self.gracefully_exit = self.iteration == 3
+        def get_next_disagg_prefill_batch_to_run(self, **kwargs):
+            batch = SimpleNamespace(name=self.iteration)
+            batch.copy = lambda: batch
+            return SimpleNamespace(running_batch=None, batch_to_run=batch)
+        def run_batch(self, batch):
+            events.append(('launch', batch.name))
+            return batch.name
+        def _apply_war_barrier(self):
+            pass
+        def process_batch_result(self, batch, result):
+            events.append(('result', result, self.iteration))
+        def process_disagg_prefill_inflight_queue(self):
+            events.append(('poll', self.iteration))
+        def launch_batch_sample_if_needed(self, result, batch):
+            pass
+    SchedulerDisaggregationPrefillMixin.event_loop_overlap_disagg_prefill(Loop())
+    # Batch 1's RDMA can finish while batch 2 computes. Polling before batch 2's
+    # result is consumed lets batch 1 complete without waiting for that compute.
+    assert events.index(('poll', 3)) < events.index(('result', 2, 3))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
