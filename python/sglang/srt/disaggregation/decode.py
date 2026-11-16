@@ -790,6 +790,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
         """
+        # The DSA prefill-CP alignment gate runs inside ``match_prefix_for_req``
+        # (cow_mamba-aware: rollback + zero), so the returned match is already
+        # safe to lock and reuse here.
         result = match_prefix_for_req(
             self.tree_cache,
             req,

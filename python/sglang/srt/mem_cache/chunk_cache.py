@@ -50,6 +50,20 @@ class ChunkCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         self.protected_size_ = 0
+        # HiCache poll surfaces: ChunkCache never enqueues GPU<->host
+        # write-through / load-back operations and has no storage backend.
+        # Scheduler.is_fully_idle() polls these containers based purely on
+        # `enable_hierarchical_cache`, so a radix-disabled worker (e.g. PD
+        # DSA prefill CP with the experimental prefix-cache switch off,
+        # which force-disables the radix cache) reached the base class with
+        # no such attributes and raised AttributeError on the very first
+        # idle poll, killing the process tree during startup. Overriding
+        # them here matches the existing ChunkCache convention for
+        # operations it cannot perform (`evict`, `reset`,
+        # `check_hicache_events`, `ready_to_load_host_cache` are vacuous).
+        self.ongoing_write_through: dict = {}
+        self.ongoing_load_back: dict = {}
+        self.enable_storage = False
 
     def is_chunk_cache(self) -> bool:
         return True
@@ -88,6 +102,27 @@ class ChunkCache(BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
+
+    def check_hicache_events(self) -> Any:
+        """HiCache drain is vacuous when the radix tree is switched off.
+
+        ``ChunkCache`` is what the cache registry hands back whenever radix
+        cache is disabled, including the automatic disable for DSA prefill CP.
+        ``Scheduler._process_hicache_events`` calls this purely based on
+        ``enable_hierarchical_cache``, so a PD prefill worker started with
+        ``--enable-hierarchical-cache`` plus prefill CP reached the
+        ``BasePrefixCache`` stub and raised ``NotImplementedError`` on the very
+        first scheduled batch. Overriding it here matches the existing
+        ChunkCache convention for operations it cannot perform (``evict``,
+        ``inc_lock_ref``/``dec_lock_ref``, ``reset`` are all no-ops).
+        """
+        return None
+
+    def ready_to_load_host_cache(self) -> Any:
+        # -1 is ScheduleBatch.hicache_consumer_index's "no host load pending"
+        # sentinel, and tp_worker.set_hicache_consumer is a no-op without a
+        # hicache_layer_transfer_counter, which ChunkCache never creates.
+        return -1
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         return IncLockRefResult(delta=0)
