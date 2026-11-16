@@ -3935,6 +3935,11 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if self.chunked_req is not None and self.chunked_req not in adder.can_run_list:
+                # A parked continuation computed no KV for this scheduling pass.
+                prefix_len = len(self.chunked_req.prefix_indices)
+                self.chunked_req.set_extend_range(prefix_len, prefix_len)
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {

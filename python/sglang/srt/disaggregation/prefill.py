@@ -1247,7 +1247,9 @@ class SchedulerDisaggregationPrefillMixin:
         chunked_req_to_exclude = set()
         if (req := self.chunked_req) is not None:
             chunked_req_to_exclude.add(req)
-            self.cache_unfinished_disagg_prefill(req, chunked=True)
+            computed = req.extend_range.end > len(req.prefix_indices)
+            if computed:
+                self.cache_unfinished_disagg_prefill(req, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1259,13 +1261,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif computed and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif computed:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
