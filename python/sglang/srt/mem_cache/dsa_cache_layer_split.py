@@ -30,6 +30,7 @@ PD prefill workers under prefill-CP (see
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Optional
 
@@ -208,6 +209,15 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
+        # Supported paths use batch pages; retain the original full-pool fallback.
+        self.batch_page_broadcast_enabled = (
+            os.environ.get("SGLANG_DSA_LAYER_SPLIT_BATCH_PAGES", "1") == "1"
+        )
+        self.batch_page_broadcast_plan = None
+        self.batch_page_verify = (
+            os.environ.get("SGLANG_DSA_LAYER_SPLIT_BATCH_PAGES_VERIFY", "0") == "1"
+        )
+        self.batch_page_verified_collectives = 0
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
@@ -250,6 +260,45 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- broadcast plumbing -----------------------------------------------
 
+    def reset_batch_page_broadcast(self) -> None:
+        if not self.batch_page_broadcast_enabled:
+            return
+        # Join the old stream before dropping its plan/workspaces. A scratch
+        # cache valid for one batch is not valid for a different page union.
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
+        self.pending_remote_kv_layer_id = None
+        self.index_key_cache.remote_layer_id = None
+        self.batch_page_broadcast_plan = None
+
+    def begin_batch_page_broadcast(self, token_table, seq_lens) -> None:
+        if not self.batch_page_broadcast_enabled:
+            return
+        from sglang.srt.mem_cache.layer_split_batch_pages import (
+            BatchPageBroadcastPlan,
+            build_batch_page_ids,
+        )
+
+        pages = build_batch_page_ids(
+            token_table, seq_lens, self.page_size,
+            self.remote_kv_buffer.shape[0] // self.page_size,
+            group=get_parallel().attn_cp_group.device_group,
+            verify=self.batch_page_verify,
+        )
+        # Dense batches can cost more to pack/scatter than full broadcast.
+        # This initial conservative threshold needs calibration on real PPU.
+        if pages.numel() * 5 >= (self.remote_kv_buffer.shape[0] // self.page_size) * 3:
+            return
+        self.batch_page_broadcast_plan = BatchPageBroadcastPlan(pages)
+        if not getattr(self, "_batch_page_plan_logged", False):
+            logger.info(
+                "LayerSplit batch-page transport active: rank=%s, pages=%s/%s, verify=%s",
+                self.layer_shard_rank, pages.numel(),
+                self.remote_kv_buffer.shape[0] // self.page_size,
+                self.batch_page_verify,
+            )
+            self._batch_page_plan_logged = True
+
     def _init_layer_broadcast_comm(self) -> None:
         cp_group = get_parallel().attn_cp_group
         if cp_group.world_size <= 1 or cp_group.pynccl_comm is None:
@@ -269,6 +318,62 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         )
 
     def _broadcast_tensor_from_owner(
+        self,
+        tensor: torch.Tensor,
+        layer_id: int,
+        src_tensor: Optional[torch.Tensor] = None,
+        use_layer_broadcast_comm: bool = False,
+    ) -> torch.Tensor:
+        plan = self.batch_page_broadcast_plan
+        if plan is None:
+            return self._broadcast_full_tensor_from_owner(
+                tensor, layer_id, src_tensor, use_layer_broadcast_comm
+            )
+        if tensor is self.remote_kv_buffer:
+            shape = (-1, self.page_size) + tuple(tensor.shape[1:])
+            destination_pages = tensor.view(shape)
+            source_pages = src_tensor.view(shape) if src_tensor is not None else None
+        elif tensor is self.index_key_cache.remote_buffer:
+            # Indexer K and scale already share a page-major packed row.
+            destination_pages = tensor
+            source_pages = src_tensor
+        else:
+            raise RuntimeError("Unrecognized LayerSplit broadcast buffer")
+
+        def collective(packed):
+            self._broadcast_full_tensor_from_owner(
+                packed, layer_id,
+                src_tensor=packed if src_tensor is not None else None,
+                use_layer_broadcast_comm=use_layer_broadcast_comm,
+            )
+
+        plan.broadcast(destination_pages, source_pages, collective)
+        if getattr(self, "batch_page_verify", False):
+            # Deliberately expensive correctness-only mode. Compare the exact
+            # referenced bytes against an independent full owner broadcast.
+            # Never enable this during TTFT measurement.
+            reference = torch.empty_like(tensor)
+            self._broadcast_full_tensor_from_owner(
+                reference, layer_id, src_tensor=src_tensor,
+                use_layer_broadcast_comm=use_layer_broadcast_comm,
+            )
+            reference_pages = reference.view_as(destination_pages)
+            actual = destination_pages.index_select(0, plan.page_ids).view(torch.uint8)
+            expected = reference_pages.index_select(0, plan.page_ids).view(torch.uint8)
+            if not torch.equal(actual, expected):
+                raise RuntimeError(
+                    f"LayerSplit batch-page byte mismatch: layer={layer_id}, "
+                    f"rank={self.layer_shard_rank}"
+                )
+            self.batch_page_verified_collectives += 1
+            if self.batch_page_verified_collectives % self.layer_num == 0:
+                logger.info(
+                    "LayerSplit byte comparisons passed: rank=%s, collectives=%s",
+                    self.layer_shard_rank, self.batch_page_verified_collectives,
+                )
+        return tensor
+
+    def _broadcast_full_tensor_from_owner(
         self,
         tensor: torch.Tensor,
         layer_id: int,
