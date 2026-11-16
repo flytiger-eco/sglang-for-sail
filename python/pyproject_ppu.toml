@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-dynamic = ["version"]
+version = "0.5.21"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -107,7 +107,6 @@ dependencies = [
   "torchaudio==2.11.0",
   "torchcodec==0.15.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # Not available on Linux ARM.
   "torchvision",
-  "transformer-engine==2.5",
   "triton==3.7.1",
 ]
 
@@ -146,7 +145,6 @@ torchao = { index = "flytiger" }
 torchaudio = { index = "flytiger" }
 torchcodec = { index = "flytiger" }
 torchvision = { index = "flytiger" }
-transformer-engine = { index = "flytiger" }
 triton = { index = "flytiger" }
 
 [project.optional-dependencies]
