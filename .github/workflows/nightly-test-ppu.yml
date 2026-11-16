@@ -6,12 +6,20 @@ name: Nightly Test (PPU K8s)
 #
 # The old '0 16 * * *' schedule is gone: it started at the same moment as the
 # build, knew nothing about the outcome, so "which image was actually tested" had
-# no answer. workflow_run now carries that link.
+# no answer. workflow_run now carries that link, and the build publishes the
+# digest of what it pushed: prepare consumes that value rather than reconstructing
+# a tag and resolving it, because a tag names the *latest* build, not the one that
+# triggered this run.
 #
 # A non-empty test_image switches to "test the artifact": the pod runs on that
 # image (it already ships sglang and sgl-kernel, so the source install is skipped)
 # after image_healthcheck.sh has looked at it. Empty keeps the previous behaviour
 # exactly: fixed PPU base image plus a source install.
+#
+# In that mode the setup scripts come from this file's own revision, in a
+# ci-harness checkout beside the tested sources: an image built before the
+# harness knew about image mode must not be prepared by the installer that
+# revision shipped. The cases still come from the tested commit.
 #
 # Only the scheduled build is auto-linked. A manually dispatched build may carry
 # push=false and then finish with nothing to pull. To test a manual rebuild,
@@ -68,6 +76,9 @@ concurrency:
 
 permissions:
   contents: read
+  # prepare reads the build run's artifact to learn which digest that attempt
+  # pushed; artifacts of another run are only readable with this scope.
+  actions: read
 
 defaults:
   run:
@@ -122,6 +133,11 @@ jobs:
       # in release-docker-ppu-nightly.yml character for character: lowercased owner,
       # / turned into - in the branch, UTC date, first 7 of the sha. Several
       # candidates are produced because the date is the one part that can differ.
+      #
+      # This is the fallback name only. A tag names a build just until the next
+      # build overwrites it -- and the commit cannot tell two images of the same
+      # commit apart -- so the pin step below prefers the digest the build itself
+      # published, and resolves these tags only when that is unavailable.
       - name: Derive the image under test
         id: image
         env:
@@ -173,6 +189,21 @@ jobs:
           printf 'tag=%s\n' "${candidates%% *}" >> "$GITHUB_OUTPUT"
           printf 'candidates=%s\n' "$candidates" >> "$GITHUB_OUTPUT"
 
+      # The build names the artifact it pushed, under an artifact named after its
+      # run *attempt*, so a re-run is not confused with the attempt it replaced.
+      # Absent -- an older build, or a dispatch with no build behind it -- the pin
+      # step falls back to resolving tags, so nothing here is required to exist.
+      - name: Fetch the digest the build published
+        id: published
+        if: ${{ github.event_name == 'workflow_run' && inputs.test_image == '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-nightly-image-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: .build-attempt
+
       # Pin the artifact here, once, rather than in each worker: four workers
       # asking the registry about the same tag can land on two different images
       # when a same-day rebuild overwrites it between their queries.
@@ -181,6 +212,8 @@ jobs:
         env:
           CANDIDATES: ${{ steps.image.outputs.candidates }}
           REQUESTED_IMAGE: ${{ inputs.test_image }}
+          BUILT_IMAGE: .build-attempt/image.json
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -uo pipefail
           if [ -z "${CANDIDATES}" ]; then
@@ -188,39 +221,91 @@ jobs:
             printf 'digest=\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          resolved=0
-          for candidate in ${CANDIDATES}; do
-            if [ -n "${REQUESTED_IMAGE}" ]; then
-              # A tag the caller named is honoured as given: a registry this runner
-              # cannot reach anonymously must not turn an explicit run into a failed
-              # one, and the pod is still pinned to an immutable tag.
-              PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
-                PPU_RESOLVE_STRICT=0 bash scripts/ci/ppu/resolve_image_digest.sh
-              resolved=1
-              break
+          ref=''
+          digest=''
+          source=''
+          # 1. The exact digest this build attempt pushed, if it said so. This is
+          #    the only value that survives a same-day rebuild overwriting the tag
+          #    and a build crossing UTC midnight onto the next date's tag.
+          if [ -f "${BUILT_IMAGE}" ]; then
+            if published="$(python3 - "${BUILT_IMAGE}" "${BUILD_SHA}" <<'PY'
+          import json
+          import re
+          import sys
+
+          path, expected_commit = sys.argv[1:3]
+          try:
+              with open(path, encoding="utf-8") as handle:
+                  data = json.load(handle)
+          except (OSError, ValueError):
+              sys.exit(1)
+
+          image = str(data.get("image") or "")
+          digest = str(data.get("digest") or "")
+          commit = str(data.get("commit") or "")
+          # Read back from another run, so it is data: admitted only in the two
+          # shapes it is supposed to have, and never otherwise passed on to an
+          # env file or a pod spec.
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", image):
+              sys.exit(1)
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              sys.exit(1)
+          # The build stamps the commit it built into the image and the health
+          # check compares it; a digest of another commit would only fail there.
+          if expected_commit and commit != expected_commit:
+              sys.exit(1)
+          print(f"{image}@{digest}")
+          PY
+            )"; then
+              ref="${published}"
+              digest="${published#*@}"
+              source='build-run'
+            else
+              echo "::warning::the build published no usable digest; resolving tags instead"
             fi
-            # A tag this file derived must resolve. If none of them does, the pods
-            # are about to pull nothing and the run should say so here instead of
-            # turning into an ImagePullBackOff after the cases have been scheduled.
-            if PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
-              PPU_RESOLVE_STRICT=1 bash scripts/ci/ppu/resolve_image_digest.sh; then
-              resolved=1
-              break
+          fi
+          # 2. Otherwise resolve the derived tags. A tag the caller named is
+          #    honoured as given: a registry this runner cannot reach anonymously
+          #    must not turn an explicit run into a failed one, and the pod is
+          #    still pinned to an immutable tag. A tag this file derived must
+          #    resolve, because the pods are about to pull nothing otherwise.
+          if [ -z "${ref}" ]; then
+            resolved=0
+            for candidate in ${CANDIDATES}; do
+              if [ -n "${REQUESTED_IMAGE}" ]; then
+                PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
+                  PPU_RESOLVE_STRICT=0 bash scripts/ci/ppu/resolve_image_digest.sh
+                resolved=1
+                break
+              fi
+              if PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
+                PPU_RESOLVE_STRICT=1 bash scripts/ci/ppu/resolve_image_digest.sh; then
+                resolved=1
+                break
+              fi
+            done
+            if [ "${resolved}" != 1 ]; then
+              echo "::error::none of ${CANDIDATES} resolve in the registry"
+              exit 1
             fi
-          done
-          if [ "${resolved}" != 1 ]; then
-            echo "::error::none of ${CANDIDATES} resolve in the registry"
+            # resolve_image_digest.sh publishes through GITHUB_ENV, which only
+            # later steps see; read the two values back as data. Sourcing that
+            # file would execute whatever a caller put in test_image.
+            while IFS='=' read -r key value; do
+              case "${key}" in
+                PPU_TEST_IMAGE_REF) ref="${value}" ;;
+                PPU_TEST_IMAGE_DIGEST) digest="${value}" ;;
+              esac
+            done < "${GITHUB_ENV}"
+            source='tag-lookup'
+          fi
+          if [ -z "${ref}" ]; then
+            echo "::error::the image under test could not be named; refusing to schedule cases against it"
             exit 1
           fi
-          # resolve_image_digest.sh publishes through GITHUB_ENV, which only later
-          # steps see; read it back so the workers inherit the same answer.
-          set -a
-          # shellcheck disable=SC1090
-          . "${GITHUB_ENV}"
-          set +a
-          printf 'ref=%s\n' "${PPU_TEST_IMAGE_REF}" >> "$GITHUB_OUTPUT"
-          printf 'digest=%s\n' "${PPU_TEST_IMAGE_DIGEST:-}" >> "$GITHUB_OUTPUT"
-          echo "image under test: ${PPU_TEST_IMAGE_REF} (${PPU_TEST_IMAGE_DIGEST:-unresolved})"
+          printf 'ref=%s\n' "${ref}" >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "${digest}" >> "$GITHUB_OUTPUT"
+          echo "image under test: ${ref} (${digest:-unresolved}, from ${source})"
 
   # Run each shard on both supported board families. Include the board slug in
   # cluster-task staging, K8s Job names, local caches, and evidence artifacts.
@@ -243,6 +328,23 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 2
+      # Image mode runs the setup from this workflow's own revision, not from the
+      # checkout above: a build made before image mode landed has an installer
+      # that would reinstall sglang from source inside the artifact and no
+      # image_healthcheck.sh at all. The cases still come from the checkout above,
+      # so "tested == code" is unchanged.
+      - name: Checkout the CI harness at the workflow revision
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ci-harness
+          fetch-depth: 1
+          # Only the setup scripts are needed, and the whole workspace is
+          # archived to NAS for the pod: without these two the second checkout
+          # would add a second full tree and a full .git to that archive.
+          filter: blob:none
+          sparse-checkout: scripts/ci
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
       # The image under test, already pinned to a digest by prepare. Resolving it
@@ -277,7 +379,18 @@ jobs:
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
-            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            # Which harness prepares the pod. Image mode needs the one from this
+            # workflow's revision -- it is what knows how to prepare an artifact;
+            # source mode keeps the tested commit's scripts, unchanged.
+            harness="$PWD"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              harness="$PWD/ci-harness"
+              if [ ! -f "$harness/scripts/ci/ppu/image_healthcheck.sh" ]; then
+                echo "::error::$harness carries no CI harness; image mode cannot validate the artifact"
+                exit 1
+              fi
+            fi
+            bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
@@ -294,7 +407,7 @@ jobs:
             # surface, and one server brought up for /health plus one request. If
             # any of that fails, more cases cannot change the conclusion.
             # In source mode the script exits 0 and behaviour is unchanged.
-            bash scripts/ci/ppu/image_healthcheck.sh "$PPU_EVIDENCE_DIR"
+            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
             # Reserve 900 seconds for scheduling, setup, timeout handling, and export.
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 5700
           container_options: |
@@ -343,6 +456,23 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 2
+      # Image mode runs the setup from this workflow's own revision, not from the
+      # checkout above: a build made before image mode landed has an installer
+      # that would reinstall sglang from source inside the artifact and no
+      # image_healthcheck.sh at all. The cases still come from the checkout above,
+      # so "tested == code" is unchanged.
+      - name: Checkout the CI harness at the workflow revision
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ci-harness
+          fetch-depth: 1
+          # Only the setup scripts are needed, and the whole workspace is
+          # archived to NAS for the pod: without these two the second checkout
+          # would add a second full tree and a full .git to that archive.
+          filter: blob:none
+          sparse-checkout: scripts/ci
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
       # The image under test, already pinned to a digest by prepare. Resolving it
@@ -377,7 +507,18 @@ jobs:
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
-            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            # Which harness prepares the pod. Image mode needs the one from this
+            # workflow's revision -- it is what knows how to prepare an artifact;
+            # source mode keeps the tested commit's scripts, unchanged.
+            harness="$PWD"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              harness="$PWD/ci-harness"
+              if [ ! -f "$harness/scripts/ci/ppu/image_healthcheck.sh" ]; then
+                echo "::error::$harness carries no CI harness; image mode cannot validate the artifact"
+                exit 1
+              fi
+            fi
+            bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
@@ -436,6 +577,23 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 2
+      # Image mode runs the setup from this workflow's own revision, not from the
+      # checkout above: a build made before image mode landed has an installer
+      # that would reinstall sglang from source inside the artifact and no
+      # image_healthcheck.sh at all. The cases still come from the checkout above,
+      # so "tested == code" is unchanged.
+      - name: Checkout the CI harness at the workflow revision
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ci-harness
+          fetch-depth: 1
+          # Only the setup scripts are needed, and the whole workspace is
+          # archived to NAS for the pod: without these two the second checkout
+          # would add a second full tree and a full .git to that archive.
+          filter: blob:none
+          sparse-checkout: scripts/ci
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
       # The image under test, already pinned to a digest by prepare. Resolving it
@@ -468,7 +626,18 @@ jobs:
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
-            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            # Which harness prepares the pod. Image mode needs the one from this
+            # workflow's revision -- it is what knows how to prepare an artifact;
+            # source mode keeps the tested commit's scripts, unchanged.
+            harness="$PWD"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              harness="$PWD/ci-harness"
+              if [ ! -f "$harness/scripts/ci/ppu/image_healthcheck.sh" ]; then
+                echo "::error::$harness carries no CI harness; image mode cannot validate the artifact"
+                exit 1
+              fi
+            fi
+            bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
@@ -519,6 +688,23 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 2
+      # Image mode runs the setup from this workflow's own revision, not from the
+      # checkout above: a build made before image mode landed has an installer
+      # that would reinstall sglang from source inside the artifact and no
+      # image_healthcheck.sh at all. The cases still come from the checkout above,
+      # so "tested == code" is unchanged.
+      - name: Checkout the CI harness at the workflow revision
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ci-harness
+          fetch-depth: 1
+          # Only the setup scripts are needed, and the whole workspace is
+          # archived to NAS for the pod: without these two the second checkout
+          # would add a second full tree and a full .git to that archive.
+          filter: blob:none
+          sparse-checkout: scripts/ci
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
       # The image under test, already pinned to a digest by prepare. Resolving it
@@ -550,7 +736,18 @@ jobs:
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
-            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            # Which harness prepares the pod. Image mode needs the one from this
+            # workflow's revision -- it is what knows how to prepare an artifact;
+            # source mode keeps the tested commit's scripts, unchanged.
+            harness="$PWD"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              harness="$PWD/ci-harness"
+              if [ ! -f "$harness/scripts/ci/ppu/image_healthcheck.sh" ]; then
+                echo "::error::$harness carries no CI harness; image mode cannot validate the artifact"
+                exit 1
+              fi
+            fi
+            bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh

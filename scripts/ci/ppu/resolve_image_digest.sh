@@ -54,6 +54,15 @@ if [ -z "${image}" ]; then
   exit 1
 fi
 
+# The reference is written to GITHUB_ENV verbatim and ends up in a pod spec, and
+# callers may have taken it straight from a dispatch input. Only the characters a
+# real image reference uses are admitted: whitespace, quotes, $() or a backtick
+# would otherwise travel into a file other steps read as an environment.
+if [[ ! "${image}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]]; then
+  echo "::error::'${image}' is not a valid image reference" >&2
+  exit 1
+fi
+
 # Give up rather than fail, in one place, so that every unhappy path below leaves
 # the run exactly as it was before this step existed -- unless the caller asked
 # for strict, in which case giving up is itself the failure.
