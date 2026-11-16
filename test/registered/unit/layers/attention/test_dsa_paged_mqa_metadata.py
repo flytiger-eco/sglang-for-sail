@@ -12,10 +12,14 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSAPagedMQAMetadata(unittest.TestCase):
-    def make_backend(self, pool):
+    def make_backend(self, pool, *, num_q_heads=16, indexer_n_heads=32):
+        # Distinct counts on purpose: the realigned indexer contract takes the
+        # indexer head count in metadata_extra, and under tensor parallelism the
+        # MLA attention count differs from it. Equal values here would let a
+        # regression to self.num_q_heads pass.
         backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
-        backend.num_q_heads = 32
-        backend.indexer_n_heads = 32
+        backend.num_q_heads = num_q_heads
+        backend.indexer_n_heads = indexer_n_heads
         backend.indexer_head_dim = 128
         backend.token_to_kv_pool = pool
         return backend
@@ -151,6 +155,51 @@ class TestDSAPagedMQAMetadata(unittest.TestCase):
         self.assertEqual(captured_schedule.data_ptr(), original_ptr)
         self.assertTrue(torch.equal(captured_schedule[:2], schedule))
         self.assertEqual(torch.count_nonzero(captured_schedule[2:]).item(), 0)
+
+    def test_hint_tracks_the_indexer_head_count_not_the_attention_heads(self):
+        """The legacy helper passed ``self.num_q_heads`` here; the realigned
+        DeepGEMM-for-sail contract takes the indexer head count (legal domain
+        4/32/64) instead.  With the fixture's distinct counts the assertions
+        above already fail on such a regression; these two cases pin the
+        direction explicitly, in both orderings, so the dependency cannot be
+        swapped back silently.
+        """
+        for num_q_heads, indexer_n_heads in ((16, 32), (64, 16)):
+            with self.subTest(num_q_heads=num_q_heads, indexer_n_heads=indexer_n_heads):
+                backend = self.make_backend(
+                    SimpleNamespace(use_fp4_indexer=False),
+                    num_q_heads=num_q_heads,
+                    indexer_n_heads=indexer_n_heads,
+                )
+                with (
+                    patch.object(dsa_backend, "get_device_sm", return_value=90),
+                    envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+                ):
+                    hint = backend._paged_mqa_schedule_metadata_extra()
+                self.assertEqual(hint[1], indexer_n_heads)
+                self.assertNotEqual(hint[1], backend.num_q_heads)
+
+    def test_planner_receives_the_indexer_head_count(self):
+        backend = self.make_backend(SimpleNamespace(use_fp4_indexer=False))
+        context_lens = torch.tensor([[128]], dtype=torch.int32)
+        planner = Mock(return_value=object())
+        deep_gemm = SimpleNamespace(
+            get_num_sms=Mock(return_value=84),
+            get_paged_mqa_logits_metadata=planner,
+        )
+        with (
+            patch.object(dsa_backend, "_is_ppu", True),
+            patch.object(dsa_backend, "get_device_sm", return_value=90),
+            patch.object(dsa_backend, "deep_gemm", deep_gemm, create=True),
+            envs.SGLANG_SAIL_BF16_INDEXER.override(False),
+        ):
+            backend._build_paged_mqa_schedule_metadata(context_lens)
+        planner.assert_called_once_with(
+            context_lens,
+            64,
+            84,
+            metadata_extra=(1, 32, 128, torch.float8_e4m3fn),
+        )
 
 
 if __name__ == "__main__":
