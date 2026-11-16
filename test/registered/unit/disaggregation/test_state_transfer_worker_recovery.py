@@ -11,6 +11,7 @@ from unittest.mock import Mock
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
+from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -98,7 +99,7 @@ class TestStateTransferWorkerRecovery(CustomTestCase):
             )
             manager.transfer_infos[room] = {0: req}
             queue.put(
-                SimpleNamespace(
+                TransferKVChunk(
                     room=room,
                     staging_counted=False,
                     index_slice=slice(0, 0),

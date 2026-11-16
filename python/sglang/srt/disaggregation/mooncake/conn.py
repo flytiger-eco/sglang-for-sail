@@ -1541,9 +1541,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         Sends KV cache slices from this Prefill rank to a target Decode rank,
         supporting generic M-to-N TP size configurations.
 
-        NOTE: This implementation calls the transfer engine for each token slot within
-        each page to ensure correctness for any page_size and head-slicing configuration.
-        This may introduce performance overhead (increased TTFT) for long sequences.
+        Replicated sources can send complete pages to full-head Decode ranks.
+        Other supported layouts retain token/head slices within each page.
         """
         from sglang.srt.disaggregation.common.staging_buffer import (
             compute_head_slice_params,
@@ -1593,6 +1592,66 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if src_kv_item_len // src_denominator != bytes_per_head_slice_to_send:
             raise RuntimeError("PD peers disagree on target KV bytes per head")
 
+        src_data_ptrs = self.kv_args.kv_data_ptrs
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if (src_layer_ids or dst_layer_ids) and any(
+            item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+        ):
+            logger.error(
+                f"[{mooncake_session_id}] KV transfer assumes one item "
+                f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
+            )
+            return -1
+
+        if (
+            envs.SGLANG_MOONCAKE_REPLICATED_KV_PAGE_TRANSFER.get()
+            and source_is_replicated
+            and dst_heads_per_rank == total_kv_heads
+            and src_kv_item_len == dst_kv_item_len
+            and not self.kv_args.num_draft_entries
+        ):
+            # QSA-only CP materializes all main-model KV heads on every P rank.
+            # A DEP attention rank also owns the complete head set. Sending one
+            # complete page avoids one RDMA descriptor per token/head shard.
+            # Keep every sender's aux/state completion; only main KV is partitioned.
+            # Draft pools are not replicated, so mixed main/draft registrations
+            # must retain the existing sliced path.
+            sender_rank = self.kv_args.engine_rank % self.attn_tp_size
+            if envs.SGLANG_MOONCAKE_REPLICATED_KV_PAGE_TRANSFER_ALL_RANKS.get():
+                if prefill_kv_indices.size != dst_kv_indices.size:
+                    raise ValueError(
+                        "Replicated KV source and destination page counts differ"
+                    )
+                # Partition by position in this transfer batch, not by physical
+                # page ID: source/destination allocations need not share IDs.
+                # Contiguous ranges retain page coalescing and cover each page
+                # once, including uneven batches and batches smaller than TP.
+                pages_per_rank, remainder = divmod(
+                    prefill_kv_indices.size, self.attn_tp_size
+                )
+                start = sender_rank * pages_per_rank + min(sender_rank, remainder)
+                stop = start + pages_per_rank + int(sender_rank < remainder)
+                if start == stop:
+                    return 0
+                prefill_kv_indices = prefill_kv_indices[start:stop]
+                dst_kv_indices = dst_kv_indices[start:stop]
+            elif sender_rank != 0:
+                return 0
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=src_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                force_flat=True,
+                src_layer_ids=src_layer_ids,
+                dst_layer_ids=dst_layer_ids or [],
+            )
+
+        # The remaining layouts require token/head slicing. Build their layer
+        # mapping only here; the page path uses _send_kvcache_generic's mapping.
         (
             src_head_start_offset,
             num_heads_to_send,
@@ -1619,19 +1678,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "Target KV head slice exceeds source or destination cache"
             )
 
-        src_data_ptrs = self.kv_args.kv_data_ptrs
-        src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
-            # Draft buffers break the flat [K block, V block] layout, so pair by
-            # layer ID instead of the half-split used by get_mha_kv_ptrs_with_pp.
-            if any(
-                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
-            ):
-                logger.error(
-                    f"[{mooncake_session_id}] head-sliced transfer assumes one item "
-                    f"length for every KV entry, got {set(self.kv_args.kv_item_lens)}"
-                )
-                return -1
+            # Draft buffers require explicit entry pairing rather than a K/V split.
             layer_ptr_pairs = [
                 (src_data_ptrs[i], dst_kv_ptrs[j])
                 for i, j in build_transfer_entry_pairs(
@@ -2390,6 +2438,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
+                # Early prefix sends are queued before the next forward. Only
+                # the transfer worker waits for preceding writes; the scheduler
+                # remains free to launch the suffix on forward_stream.
+                if kv_chunk.wait_event is not None:
+                    kv_chunk.wait_event.synchronize()
+                    kv_chunk.wait_event = None
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -2928,6 +2983,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        wait_event: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2967,6 +3023,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
+                wait_event=wait_event,
             )
         )
 
@@ -3124,6 +3181,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        wait_event = getattr(self, "_early_send_wait_event", None)
+        self._early_send_wait_event = None
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
@@ -3138,6 +3197,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 False,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -3149,6 +3209,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                wait_event=wait_event,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
