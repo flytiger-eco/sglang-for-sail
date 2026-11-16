@@ -269,6 +269,42 @@ def set_mla_kv_buffer_dcp_sharded_triton(
 
 
 @triton.jit
+def set_mla_kv_buffer_fp8_quant_row_kernel(
+    kv_buffer_fp8_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    reserved_skip_index,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_stride: tl.constexpr,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    """Cast and write one complete raw MLA KV row per program."""
+    pid = tl.program_id(0).to(tl.int64)
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    loc = tl.load(loc_ptr + pid).to(tl.int64)
+    is_valid = loc != reserved_skip_index
+    safe_loc = tl.where(is_valid, loc, 0)
+    dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride
+
+    nope_offsets = tl.arange(0, NOPE)
+    nope = tl.load(cache_k_nope_ptr + pid * nope_stride + nope_offsets)
+    tl.store(dst_ptr + nope_offsets, nope, mask=is_valid)
+
+    rope_offsets = tl.arange(0, ROPE)
+    rope = tl.load(cache_k_rope_ptr + pid * rope_stride + rope_offsets)
+    tl.store(dst_ptr + NOPE + rope_offsets, rope, mask=is_valid)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,
     cache_k_nope_ptr,
@@ -300,7 +336,13 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     safe_loc = tl.where(is_valid, loc, 0)
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
-    if base + BLOCK <= nope_dim:
+    if rope_dim == 0:
+        src = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask,
+            other=0.0,
+        )
+    elif base + BLOCK <= nope_dim:
         src = tl.load(
             cache_k_nope_ptr + pid_loc * nope_stride + offs,
             mask=mask,
@@ -346,18 +388,36 @@ def set_mla_kv_buffer_triton_fp8_quant(
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
+    ``cache_k_rope`` may be zero-width for zero-RoPE MLA.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
+    rope_stride = cache_k_rope.stride(0)
     total_dim = nope_dim + rope_dim
-    BLOCK = 128
     n_loc = loc.numel()
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
 
+    if all(v > 0 and (v & (v - 1)) == 0 for v in (nope_dim, rope_dim)):
+        set_mla_kv_buffer_fp8_quant_row_kernel[(n_loc,)](
+            kv_buffer_fp8,
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            reserved_skip_index,
+            kv_buffer_fp8.stride(0),
+            cache_k_nope.stride(0),
+            rope_stride,
+            NOPE=nope_dim,
+            ROPE=rope_dim,
+            **pdl_kwargs,
+        )
+        return
+
+    BLOCK = 128
+    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,
         cache_k_nope,
@@ -366,7 +426,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
         reserved_skip_index,
         kv_buffer_fp8.stride(0),
         cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
+        rope_stride,
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,

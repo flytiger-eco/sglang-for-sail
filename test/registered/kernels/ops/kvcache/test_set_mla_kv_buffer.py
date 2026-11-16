@@ -13,17 +13,25 @@ from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
     can_use_set_mla_kv_buffer,
     set_mla_kv_buffer,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
+# backend-specific: PPU raw FP8 zero-RoPE writes pass a null pointer to Triton.
+register_ppu_ci(est_time=30, suite="stage-b-test-1-gpu-ppu")
 
 DEVICE = "cuda"
 CACHE_SIZE = 4096
 TRITON_NOPE_DIM = 128
 TRITON_ROPE_DIM = 64
 CUDA_TMA_ONLY = pytest.mark.skipif(
-    torch.version.hip is not None,
+    torch.version.hip is not None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9,
     reason="The TMA bulk-store kernel requires CUDA SM90+",
 )
 
@@ -283,6 +291,39 @@ def test_set_mla_kv_buffer_triton_fp8_quant_reserved_skip_index():
     torch.testing.assert_close(
         kv_buffer[7, 0], expected.view(torch.uint8), rtol=0.0, atol=0.0
     )
+
+
+@pytest.mark.parametrize("nope_dim", [512, 193])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_set_mla_kv_buffer_triton_fp8_quant_zero_rope(
+    nope_dim, loc_dtype, byte_storage
+):
+    """Exercise the block writer with zero-width RoPE and a partial final block."""
+    fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
+    cache_k_nope = torch.randn((4, 1, nope_dim), dtype=torch.bfloat16, device=DEVICE)
+    cache_k_nope[[0, 2]] = torch.nan
+    cache_k_rope = torch.empty((4, 1, 0), dtype=torch.bfloat16, device=DEVICE)
+    initial = torch.ones((32, 1, nope_dim), device=DEVICE).to(fp8_dtype)
+    kv_buffer = initial.view(torch.uint8) if byte_storage else initial
+    expected_bytes = kv_buffer.view(torch.uint8).clone()
+    loc = torch.tensor([0, 7, 0, 9], dtype=loc_dtype, device=DEVICE)
+    for source_row, slot in ((1, 7), (3, 9)):
+        expected_bytes[slot] = cache_k_nope[source_row].to(fp8_dtype).view(torch.uint8)
+
+    set_mla_kv_buffer_triton_fp8_quant(
+        kv_buffer, loc, cache_k_nope, cache_k_rope, fp8_dtype
+    )
+    torch.cuda.synchronize()
+    # Full byte equality also protects every untouched slot, including slot zero
+    # whose source rows contain NaNs and must never overwrite the reserved data.
+    assert torch.equal(kv_buffer.view(torch.uint8), expected_bytes)
+
+    before = kv_buffer.view(torch.uint8).clone()
+    set_mla_kv_buffer_triton_fp8_quant(
+        kv_buffer, loc[:0], cache_k_nope[:0], cache_k_rope[:0], fp8_dtype
+    )
+    assert torch.equal(kv_buffer.view(torch.uint8), before)
 
 
 def test_set_mla_kv_scale_buffer_triton_reserved_skip_index():

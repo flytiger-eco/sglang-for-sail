@@ -8,6 +8,8 @@ Exported symbols
 get_mla_metadata
 flash_mla_with_kvcache
 flash_mla_sparse_fwd
+flash_mla_sparse_quantized_fwd
+flash_mla_sparse_quantized_decode_fwd
 """
 
 from typing import Optional, Tuple
@@ -197,5 +199,53 @@ def flash_mla_sparse_fwd(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+
+
+def flash_mla_sparse_quantized_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    compute_aux: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run PPU native FP8 sparse prefill attention."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    # The PR17 quantized API defaults to unit per-tensor Q/KV scales.
+    return _flashmla.flash_mla_sparse_quantized_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        compute_aux=compute_aux,
+    )
+
+
+def flash_mla_sparse_quantized_decode_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run PPU native FP8 sparse decode attention."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    # Split counts and head tiles are selected internally by FlashMLA.
+    return _flashmla.flash_mla_sparse_quantized_decode_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
         topk_length=topk_length,
     )

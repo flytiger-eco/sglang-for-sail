@@ -52,14 +52,14 @@ class DeepseekSparseAttnBackendKPoolMixin:
             or self.dsa_index_kpool <= 1
             # PPU int8: allow flashmla_sparse for kpool on SM80
             or dsa_impl in ("fa3", "tilelang", "trtllm", "flashmla_sparse")
-            # Allow FlashMLA-KV KPool tails on PPU
-            or (_is_ppu and dsa_impl == "flashmla_kv")
+            # Allow FlashMLA-KV and native FP8 sparse KPool tails on PPU
+            or (_is_ppu and dsa_impl in ("flashmla_kv", "flashmla_sparse_q8"))
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
             f"currently only supported by the FA3/TileLang/TRTLLM/FlashMLA-sparse DSA {phase} "
-            "backend (plus FlashMLA-KV on PPU)."
+            "backend (plus FlashMLA-KV and FlashMLA-sparse-q8 on PPU)."
         )
 
     def _resolve_kpool_tail_backend(
