@@ -240,11 +240,14 @@ class TestChatTemplateCache(CustomTestCase):
         self.assertEqual(self._render(), ([11, 12], "decoded"))
         self.assertEqual(self._render(render_only=True), ([], "rendered"))
         self.assertEqual(self._render(), ([11, 12], "decoded"))
-        self.assertEqual(self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2)
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2
+        )
 
     def test_render_only_keeps_round_trip_when_normalization_changes_text(self):
-        from types import SimpleNamespace
         import unicodedata
+        from types import SimpleNamespace
+
         self.chat._prefill_text_normalizer = SimpleNamespace(
             normalize_str=lambda text: unicodedata.normalize("NFC", text)
         )
@@ -255,6 +258,7 @@ class TestChatTemplateCache(CustomTestCase):
 
     def test_expanded_prefill_renders_raw_prompt_only_for_eligible_processors(self):
         from types import SimpleNamespace
+
         self.chat._prefill_text_normalizer = None
         self.chat._can_render_prefill_text = True
         self.chat._tokenizer_auto_adds_specials = False

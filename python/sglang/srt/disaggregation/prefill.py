@@ -825,7 +825,11 @@ class SchedulerDisaggregationPrefillMixin:
         # the schedule stream, which may already be waiting for the next forward.
         # Unified-memory compaction can move physical slots after this snapshot;
         # keep its existing just-in-time translation until it pins transfer ids.
-        if self.enable_unified_memory:
+        if (
+            self.enable_unified_memory
+            or batch.req_pool_indices is None
+            or batch.req_pool_indices.numel() == 0
+        ):
             return
         mapping = getattr(
             self.req_to_token_pool, "req_index_to_mamba_index_mapping", None
@@ -836,9 +840,7 @@ class SchedulerDisaggregationPrefillMixin:
                     mapping[batch.req_pool_indices]
                 )
             )
-        state_types = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-        )
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
         if (
             StateType.QSA_COMPRESSED not in state_types
             or not set(state_types).issubset(
@@ -1565,7 +1567,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _full_kv_pages_payload():
                 if kv_page_indices is not None:
-                    return kv_page_indices[:kv_to_page_num(seq_len, page_size)]
+                    return kv_page_indices[: kv_to_page_num(seq_len, page_size)]
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, :seq_len
                 ]
