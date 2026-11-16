@@ -20,6 +20,8 @@ ARG PIP_DEFAULT_INDEX
 ARG PPU_PIP_INDEX=https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple
 ARG UBUNTU_MIRROR
 ARG MAX_JOBS=16
+ARG FFMPEG_VERSION=7.1.3
+ARG FFMPEG_SHA256=e0b04c4b43d7e6d67cb6710334fb513adf13ac860532f30e1d0ac4c231f232fb
 # Download the pinned sailify wheel directly instead of building from Git.
 ARG SAILIFY_WHEEL_URL=https://download.t-head.cn/artifactory/pypi_tmp/2026-11-03-0938/sailify-1.0.0-py3-none-any.whl
 # Keep explicit PPU local-version pins for dependencies without temporary wheels
@@ -33,6 +35,7 @@ ARG PPU_PACKAGES="\
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
     flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
+    sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
     tilelang==0.1.12+v0.1.0.ppu2.2.0 \
@@ -105,6 +108,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=ppu-base-apt \
     locales \
     build-essential \
     cmake \
+    nasm \
+    zlib1g-dev \
     pkg-config \
     patchelf \
     ccache \
@@ -144,6 +149,24 @@ RUN locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
+
+FROM base AS ffmpeg_builder
+
+ARG MAX_JOBS
+ARG FFMPEG_VERSION
+ARG FFMPEG_SHA256
+
+WORKDIR /build/ffmpeg
+RUN curl --fail --location --retry 3 --connect-timeout 30 \
+        "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/refs/tags/n${FFMPEG_VERSION}" \
+        -o /tmp/ffmpeg.tar.gz \
+    && echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/ffmpeg.tar.gz --strip-components=1 \
+    && ./configure --prefix=/opt/ffmpeg7 \
+        --enable-shared --disable-static --disable-programs \
+        --disable-doc --disable-debug --disable-autodetect --enable-zlib \
+    && make -j"${MAX_JOBS}" \
+    && make install
 
 ########################################################
 # STAGE 1: Prepare PPU dependency and precompiled SGLang/kernel/router wheels
@@ -196,6 +219,9 @@ ARG TRANSFORMERS_VERSION
 ARG DEEPSEEK_RECIPE_VERSION
 
 WORKDIR /sgl-workspace
+
+COPY --from=ffmpeg_builder /opt/ffmpeg7/lib /opt/ffmpeg7/lib
+ENV LD_LIBRARY_PATH="/opt/ffmpeg7/lib:${LD_LIBRARY_PATH}"
 
 COPY --from=ppu_wheels_builder /wheels /tmp/wheels/ppu
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -250,6 +276,8 @@ ARG DEEPSEEK_RECIPE_VERSION
 WORKDIR /sgl-workspace
 RUN mkdir -p /sgl-workspace/sglang /root/.cache/huggingface /root/.cache/sglang \
     && python3 -c "import sglang, sglang_router, torch, deepseek_recipe; from importlib.metadata import version; assert version('transformers') == '${TRANSFORMERS_VERSION}'; assert version('deepseek-recipe') == '${DEEPSEEK_RECIPE_VERSION}'; print('sglang:', sglang.__version__, 'sglang-kernel:', version('sglang-kernel'), 'sglang-router:', version('sglang-router'), 'torch:', torch.__version__, 'transformers:', version('transformers'), 'deepseek-recipe:', version('deepseek-recipe'))"
+
+RUN python3 -c "from torchcodec.decoders import AudioDecoder, VideoDecoder; from importlib.metadata import version; print('TorchCodec 音视频解码器加载成功:', version('torchcodec'))"
 
 ENV SGLANG_RUST_BUILD_MODE=never
 
