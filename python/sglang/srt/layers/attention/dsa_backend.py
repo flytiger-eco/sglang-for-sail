@@ -1160,7 +1160,7 @@ class DeepseekSparseAttnBackend(
                 else None
             )
             if strategy is not None:
-                if use_kpool and envs.SGLANG_DSA_CP_PREFIX_CACHE.get():
+                if use_kpool and envs.SGLANG_ENABLE_DSA_CP_PREFIX_CACHE.get():
                     # A reused prefix must end on a kpool boundary. The compress
                     # tail buffer is per-request, so a partial pool belonging to
                     # the shared prefix is invisible to this request's pooled
