@@ -11,7 +11,8 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_ppu, is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
 from .utils import make_name
@@ -116,14 +117,19 @@ def _jit_topk_prefill_module(topk: int):
 
 @cache_once
 def _jit_topk_prefill_bf16_module(topk: int):
+    module_args = [make_name("topk_prefill_bf16"), str(topk)]
+    extra_cuda_cflags = [f"-DSGL_TOPK={topk}"]
+    if envs.SGLANG_DSA_TOPK_NO_SIMT.get() and is_ppu():
+        # Keep this build separate from the default JIT module.
+        module_args.append("nosimt")
+        extra_cuda_cflags.append("--no-simt")
     return load_jit(
-        make_name("topk_prefill_bf16"),
-        str(topk),
+        *module_args,
         cuda_files=["deepseek_v4/topk_prefill_bf16.cuh"],
         cuda_wrappers=[
             ("top_k_per_row_prefill_bf16", "TopKPrefillBF16Kernel::transform"),
         ],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+        extra_cuda_cflags=extra_cuda_cflags,
     )
 
 
