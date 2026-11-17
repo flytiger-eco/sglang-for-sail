@@ -46,10 +46,13 @@ class _StubKVManager:
         item_len: int = ITEM_LEN,
     ):
         self.pp_size = pp_size
+        self.attn_cp_size = 1
         self.is_mla_backend = is_mla_backend
         self.is_hybrid_mla_backend = is_hybrid_mla_backend
         self.kv_args = SimpleNamespace(
             prefill_start_layer=prefill_start_layer,
+            prefill_end_layer=prefill_start_layer + n_src,
+            num_draft_entries=0,
             kv_layer_ids=list(kv_layer_ids),
             kv_item_lens=[item_len] * n_src,
             mla_compression_ratios=mla_compression_ratios,
@@ -147,9 +150,9 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
                     list(range(num)),
                 )
 
-    def test_one_sided_layer_ids_are_rejected(self):
+    def test_one_sided_layer_ids_use_verified_plain_mla_span(self):
         start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
-        with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):
+        self.assertEqual(
             _resolve(
                 _StubKVManager(
                     pp_size=4,
@@ -160,11 +163,39 @@ class TestExistingPairingIsUnchanged(CustomTestCase):
                 _peer(n_dst=NUM_LAYERS),
                 num,
                 NUM_LAYERS,
-            )
-        with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):
+            ),
+            list(range(start, start + num)),
+        )
+        self.assertEqual(
             _resolve(
                 _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
                 _peer(n_dst=NUM_LAYERS, dst_kv_layer_ids=range(NUM_LAYERS)),
+                num,
+                NUM_LAYERS,
+            ),
+            list(range(start, start + num)),
+        )
+
+    def test_one_sided_layer_ids_reject_wrong_target_span(self):
+        start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
+        with self.assertRaises(RuntimeError):
+            _resolve(
+                _StubKVManager(
+                    pp_size=4,
+                    prefill_start_layer=start,
+                    n_src=num,
+                    kv_layer_ids=range(start + 1, start + num + 1),
+                ),
+                _peer(n_dst=NUM_LAYERS),
+                num,
+                NUM_LAYERS,
+            )
+        missing_layer_ids = list(range(NUM_LAYERS))
+        missing_layer_ids[start] = NUM_LAYERS
+        with self.assertRaises(RuntimeError):
+            _resolve(
+                _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
+                _peer(n_dst=NUM_LAYERS, dst_kv_layer_ids=missing_layer_ids),
                 num,
                 NUM_LAYERS,
             )

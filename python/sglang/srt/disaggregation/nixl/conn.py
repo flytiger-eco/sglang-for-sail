@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
+    build_mla_target_entry_pairs,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
@@ -1019,7 +1020,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         peer_info.kv_xfer_segments = prepared_segments
 
     def _build_transfer_dst_indices(
-        self, *, peer_info: KVArgsRegisterInfo, n_src: int, n_dst: int
+        self,
+        *,
+        peer_info: KVArgsRegisterInfo,
+        n_src: int,
+        n_dst: int,
+        is_dcp_transfer: bool = False,
     ) -> List[int]:
         """Map source entries to destination entries for this transfer.
 
@@ -1035,7 +1041,34 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             and not self.is_hybrid_mla_backend
             and not self.kv_args.mla_compression_ratios
         )
-        if not use_pp_mla_offsets:
+        use_target_layer_ids = (
+            bool(self.kv_args.kv_layer_ids) != bool(peer_info.dst_kv_layer_ids)
+            and self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and not self.kv_args.mla_compression_ratios
+            and self.kv_args.num_draft_entries == 0
+        )
+        if use_target_layer_ids:
+            # A contiguous target may omit IDs while decode publishes them for
+            # its draft suffix. Verify target layers rather than discarding IDs.
+            pairs = build_mla_target_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                peer_info.dst_kv_layer_ids,
+                n_src,
+                n_dst,
+                prefill_start_layer=self.kv_args.prefill_start_layer,
+                prefill_end_layer=self.kv_args.prefill_end_layer,
+                allow_same_pp_layout=self.pp_size > 1 and self.attn_cp_size == 1,
+            )
+            indices = [j for _, j in pairs]
+        elif not use_pp_mla_offsets:
+            if is_dcp_transfer:
+                return resolve_dcp_dst_entry_indices(
+                    self.kv_args.kv_layer_ids,
+                    peer_info.dst_kv_layer_ids,
+                    n_src,
+                    n_dst,
+                )
             pairs = build_transfer_entry_pairs(
                 self.kv_args.kv_layer_ids,
                 peer_info.dst_kv_layer_ids,
@@ -1045,20 +1078,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             return [j for _, j in pairs]
 
-        start, end = self._mla_kv_entry_span_with_pp(n_src)
-        # Bootstrap admits a peer running our pp or 1, so a peer that does not cover the
-        # span is a matched-pp stage above 0, whose entries start at its own index 0.
-        if end > n_dst:
-            pairs = build_transfer_entry_pairs(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
-                allow_positional_fallback=False,
-            )
-            return [j for _, j in pairs]
+        else:
+            start, end = self._mla_kv_entry_span_with_pp(n_src)
+            # Bootstrap admits our PP or 1. A peer smaller than this span is a
+            # matched-PP stage, whose entries start at its own index zero.
+            if end > n_dst:
+                pairs = build_transfer_entry_pairs(
+                    self.kv_args.kv_layer_ids,
+                    peer_info.dst_kv_layer_ids,
+                    n_src,
+                    n_dst,
+                    allow_positional_fallback=False,
+                )
+                return [j for _, j in pairs]
+            indices = list(range(start, end))
 
-        indices = list(range(start, end))
+        if is_dcp_transfer:
+            # DCP validates physical target and virtual draft page widths in
+            # prepare_dcp_token_item_lens after selecting these entries.
+            return indices
         src_item_lens = list(self.kv_args.kv_item_lens)
         dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
         if src_item_lens != dst_item_lens:
@@ -1066,8 +1104,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # writing anyway would silently corrupt the peer's pool.
             raise RuntimeError(
                 "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
-                f"prefill over layers [{start}, {end}): prefill item_lens="
-                f"{src_item_lens}, decode item_lens={dst_item_lens}"
+                f"prefill over entries {indices}: prefill item_lens={src_item_lens}, "
+                f"decode item_lens={dst_item_lens}"
             )
         return indices
 
@@ -1089,11 +1127,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         decode_only_spec_dec = n_dst > n_src
 
         if peer_info.requires_dcp_relayout:
-            dst_indices = resolve_dcp_dst_entry_indices(
-                self.kv_args.kv_layer_ids,
-                peer_info.dst_kv_layer_ids,
-                n_src,
-                n_dst,
+            dst_indices = self._build_transfer_dst_indices(
+                peer_info=peer_info,
+                n_src=n_src,
+                n_dst=n_dst,
+                is_dcp_transfer=True,
             )
             peer_info.dcp_dst_region_indices = dst_indices
             dst_kv_mem_kinds = [peer_info.dst_kv_mem_kinds[j] for j in dst_indices]

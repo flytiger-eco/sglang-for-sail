@@ -347,6 +347,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         )
 
         # Set attributes that register_to_bootstrap reads
+        mgr.mixed_kv_transfer_version = CommonKVManager.mixed_kv_transfer_version
         mgr.dist_init_addr = dist_init_addr
         mgr.bootstrap_host = "127.0.0.1"
         mgr.bootstrap_port = 8765

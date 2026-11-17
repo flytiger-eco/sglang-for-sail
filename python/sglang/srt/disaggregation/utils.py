@@ -998,6 +998,73 @@ def build_transfer_entry_pairs(
     return [(i, i) for i in range(n_src)]
 
 
+def build_mla_target_entry_pairs(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+    *,
+    prefill_start_layer: Optional[int],
+    prefill_end_layer: Optional[int],
+    allow_same_pp_layout: bool = False,
+) -> List[Tuple[int, int]]:
+    """Pair ordinary MLA targets using a verified global layer span.
+
+    Callers must exclude compressed/hybrid pools and remove source drafts.
+    Explicit IDs may describe a CP-owned subset of the prefill stage. Missing
+    IDs describe a continuous pool, never an arbitrary positional fallback.
+    """
+    start, end = prefill_start_layer, prefill_end_layer
+    if start is None or end is None or start < 0 or end < start:
+        raise RuntimeError("Ordinary MLA mapping requires a valid prefill layer span")
+    if src_layer_ids:
+        if (
+            len(src_layer_ids) != n_src
+            or src_layer_ids != sorted(src_layer_ids)
+            or len(set(src_layer_ids)) != n_src
+            or any(lid < start or lid >= end for lid in src_layer_ids)
+        ):
+            raise RuntimeError("Source MLA target IDs do not match the prefill span")
+        source_ids = src_layer_ids
+    else:
+        if end - start != n_src:
+            raise RuntimeError("Missing MLA target IDs require a continuous pool")
+        source_ids = list(range(start, end))
+    if dst_layer_ids:
+        if len(dst_layer_ids) != n_dst:
+            raise RuntimeError("Destination layer metadata length differs from entries")
+        # A matched PP stage may append a native draft or repeated K/V IDs.
+        # Recognize only the consecutive reserved band above its target span.
+        draft_ids = sorted(set(dst_layer_ids[end - start :]))
+        if dst_layer_ids != sorted(dst_layer_ids) or (
+            dst_layer_ids
+            and dst_layer_ids[0] != 0
+            and not (
+                allow_same_pp_layout
+                and dst_layer_ids[: end - start] == list(range(start, end))
+                and draft_ids == list(range(end, end + len(draft_ids)))
+            )
+        ):
+            raise RuntimeError(
+                "Destination MLA target IDs do not describe a known span"
+            )
+        positions = {}
+        for index, lid in enumerate(dst_layer_ids):
+            positions.setdefault(lid, []).append(index)
+        if any(len(positions.get(lid, [])) != 1 for lid in source_ids):
+            raise RuntimeError("Decode peer must expose each requested MLA target once")
+        return [(i, positions[lid][0]) for i, lid in enumerate(source_ids)]
+    if (
+        allow_same_pp_layout
+        and n_src == n_dst
+        and source_ids == list(range(start, end))
+    ):
+        return [(i, i) for i in range(n_src)]
+    if any(lid >= n_dst for lid in source_ids):
+        raise RuntimeError("Decode MLA target pool does not cover the prefill span")
+    return [(i, lid) for i, lid in enumerate(source_ids)]
+
+
 def build_kv_layer_ids(
     *,
     token_to_kv_pool,
@@ -1020,6 +1087,25 @@ def build_kv_layer_ids(
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+        # Keep the legacy positional registration for non-hybrid NPU pools.
+        # Their layer IDs do not necessarily match the exported buffer groups.
+        if not is_npu() and is_mla_backend(token_to_kv_pool):
+            layer_ids = get_transfer_kv_layer_ids(
+                token_to_kv_pool, draft_token_to_kv_pool, num_hidden_layers
+            )
+            # An ordinary contiguous MLA target needs no new wire metadata.
+            # Preserve rolling upgrades in both directions, including P PP2
+            # -> D PP1; CP layer shards and multi-group layouts keep exact IDs.
+            start = getattr(token_to_kv_pool, "start_layer", None)
+            layers = getattr(token_to_kv_pool, "layer_num", 0)
+            if (
+                not num_draft_entries
+                and not getattr(token_to_kv_pool, "layer_shard_enabled", False)
+                and start is not None
+                and layer_ids == list(range(start, start + layers))
+            ):
+                return []
+            return layer_ids
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1875,3 +1961,110 @@ def is_aborted(req: Req) -> bool:
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
     )
+
+
+def set_draft_kv_transfer_metadata(
+    kv_args: KVArgs,
+    draft_kv_pool,
+    *,
+    draft_kv_entry_count: int,
+    tp_size: int,
+    total_head_num: Optional[int] = None,
+) -> None:
+    """Populate metadata for heterogeneous-TP draft MHA KV transfer.
+
+    ``draft_kv_entry_count`` is also the switch that makes Mooncake interpret the
+    trailing draft entries as head-sharded MHA buffers. MLA/DSA pools store one
+    latent KV row per token instead, so they must keep this metadata zero and use
+    the generic whole-entry transfer path.
+
+    Hybrid pools expose model-level ``head_num`` even when their full-attention
+    backing pool is MLA. Always inspect the backing pool before deciding whether
+    head slicing applies.
+    """
+    kv_args.draft_kv_entry_count = 0
+    kv_args.draft_kv_head_num = 0
+    kv_args.draft_total_kv_head_num = 0
+    kv_args.draft_kv_token_major = False
+
+    if draft_kv_pool is None or draft_kv_entry_count <= 0:
+        return
+
+    backing_pool = getattr(draft_kv_pool, "full_kv_pool", draft_kv_pool)
+    if is_mla_backend(backing_pool):
+        return
+
+    head_num = getattr(backing_pool, "head_num", None)
+    if head_num is None:
+        # Unknown/non-MHA layouts retain the generic transfer behavior.
+        return
+
+    head_num = int(head_num)
+    if head_num <= 0 or tp_size <= 0:
+        raise ValueError(
+            "Draft MHA KV transfer requires positive head and TP counts, got "
+            f"head_num={head_num}, tp_size={tp_size}"
+        )
+
+    if total_head_num is None or total_head_num <= 0:
+        raise ValueError("Draft transfer requires the draft model total KV-head count")
+
+    kv_args.draft_kv_entry_count = int(draft_kv_entry_count)
+    kv_args.draft_kv_head_num = head_num
+    kv_args.draft_total_kv_head_num = int(total_head_num)
+
+    # A contiguous allocation is not necessarily contiguous per token (e.g.
+    # vectorized_5d). Inspect the buffers represented by the transfer pointers,
+    # including their row stride and advertised page width. Keep draft metadata
+    # even for unsupported layouts: only the mixed path must reject them.
+    buffers = list(getattr(backing_pool, "k_buffer", [])) + list(
+        getattr(backing_pool, "v_buffer", [])
+    )
+    if not buffers:
+        return
+    ptrs, lengths, item_lens = draft_kv_pool.get_contiguous_buf_infos()
+    kv_args.draft_kv_token_major = bool(
+        len(buffers) == len(ptrs) == len(lengths) == len(item_lens)
+        and len(buffers) == draft_kv_entry_count
+        and all(
+            tensor.ndim == 3
+            and tensor.shape[1] == head_num
+            and tensor.is_contiguous()
+            and tensor.stride() == (head_num * tensor.shape[2], tensor.shape[2], 1)
+            and tensor.data_ptr() == ptr
+            and tensor.numel() * tensor.element_size() == length
+            and tensor.stride(0) * tensor.element_size() * backing_pool.page_size
+            == item_len
+            for tensor, ptr, length, item_len in zip(buffers, ptrs, lengths, item_lens)
+        )
+    )
+
+
+def get_draft_total_num_kv_heads(scheduler) -> Optional[int]:
+    """Read unsharded draft heads from its own model, never the target model."""
+    worker = getattr(scheduler, "draft_worker", None)
+    if worker is None:
+        return None
+    runners = worker._draft_model_runners()
+    if not runners:
+        return None
+    return int(runners[0].model_config.get_total_num_kv_heads())
+
+
+def get_transfer_kv_layer_ids(target_pool, draft_pool, target_layers: int) -> List[int]:
+    """Keep draft layer IDs outside the target's layer namespace."""
+    if not hasattr(target_pool, "get_kv_layer_ids"):
+        return []
+    target_ids = list(target_pool.get_kv_layer_ids())
+    if draft_pool is None:
+        return target_ids
+    if hasattr(draft_pool, "get_kv_layer_ids"):
+        draft_ids = list(draft_pool.get_kv_layer_ids())
+    else:
+        start = int(getattr(draft_pool, "start_layer", 0))
+        layers = int(getattr(draft_pool, "layer_num", 0))
+        count = len(draft_pool.get_contiguous_buf_infos()[0])
+        if layers <= 0 or count not in (layers, 2 * layers):
+            raise ValueError("Cannot derive draft KV layer metadata")
+        draft_ids = list(range(start, start + layers)) * (count // layers)
+    return target_ids + [target_layers + layer for layer in draft_ids]

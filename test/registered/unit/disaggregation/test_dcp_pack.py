@@ -1,3 +1,4 @@
+import threading
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -207,6 +208,9 @@ class TestDcpCachedPrefixSend(CustomTestCase):
         mgr.transfer_queues = [None]
         mgr._register_staging_memory = Mock()
         mgr.request_status = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._pending_status_notifications = {}
         mgr.is_dummy_cp_rank = False
         mgr.enable_all_cp_ranks_for_transfer = False
         mgr.decode_kv_args_table = {

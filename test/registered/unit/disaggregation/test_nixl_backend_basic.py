@@ -601,6 +601,7 @@ class TestNixlAbortHandling(CustomTestCase):
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        mgr._pending_status_notifications = {}
         # These cases cover the legacy no-ack behavior; the deferred-release ack
         # path is exercised in test_nixl_deferred_kv_release.py.
         mgr.enable_deferred_decode_kv_release = False
@@ -664,6 +665,9 @@ class TestNixlUpdateStatus(CustomTestCase):
     def _make_manager(self, request_status):
         mgr = object.__new__(NixlKVManager)
         mgr.request_status = dict(request_status)
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._pending_status_notifications = {}
         return mgr
 
     def test_given_failed_room_when_status_is_promoted_then_failed_is_preserved(self):
@@ -736,6 +740,7 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
+        mgr._pending_status_notifications = {}
 
         def check_xfer_state(_handle):
             mgr.update_status(room, KVPoll.Failed)
@@ -1057,6 +1062,7 @@ class TestNixlNodeFailure(CustomTestCase):
         }
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        mgr._pending_status_notifications = {}
         mgr.update_status = CommonKVManager.update_status.__get__(mgr, CommonKVManager)
         mgr.check_status = CommonKVManager.check_status.__get__(mgr, CommonKVManager)
         mgr.record_failure = CommonKVManager.record_failure.__get__(
@@ -1084,6 +1090,9 @@ class TestNixlNodeFailure(CustomTestCase):
     def test_late_failed_update_does_not_resurrect_cleared_room(self):
         mgr = object.__new__(CommonKVManager)
         mgr.request_status = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr._pending_status_notifications = {}
 
         CommonKVManager.update_status(mgr, 9, KVPoll.Failed)
 

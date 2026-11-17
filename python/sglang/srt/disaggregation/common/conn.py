@@ -91,6 +91,13 @@ class KVTransferError(Exception):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
+@dataclasses.dataclass(eq=False)
+class _PendingKVStatus:
+    # Identity matters: concurrent notifications can have the same status/reason.
+    status: KVPoll
+    failure_reason: Optional[str]
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -103,6 +110,9 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    draft_kv_entry_count: Optional[int] = None
+    mixed_kv_transfer_version: int = 0
+    dcp_size: Optional[int] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -138,6 +148,9 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    mixed_kv_transfer_version: int = 0
+    dcp_size: Optional[int] = None
+    dcp_rank: Optional[int] = None
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
@@ -154,6 +167,9 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_carries_reason: bool = False
 
     dsv41_spec_layout: Optional[dict] = None
+    # Independently negotiated from draft presence: legacy senders may expose
+    # drafts without implementing mixed target/draft remapping.
+    mixed_kv_transfer_version: int = 0
 
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
@@ -246,7 +262,10 @@ class CommonKVManager(BaseKVManager):
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
+        # Serialize room transitions and clear(), but never hold during I/O.
+        # Lock-owning callers must use _update_status_locked(), not update_status().
         self.failure_lock = threading.Lock()
+        self._pending_status_notifications: Dict[int, List[_PendingKVStatus]] = {}
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
@@ -415,9 +434,21 @@ class CommonKVManager(BaseKVManager):
         self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
-        return self.request_status[bootstrap_room]
+        with self.failure_lock:
+            return self.request_status[bootstrap_room]
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
+    def update_status(self, bootstrap_room: int, status: KVPoll) -> Optional[KVPoll]:
+        with self.failure_lock:
+            return self._update_status_locked(bootstrap_room, status)
+
+    def _update_status_locked(
+        self, bootstrap_room: int, status: KVPoll
+    ) -> Optional[KVPoll]:
+        """Update a room while holding failure_lock, returning its actual status."""
+        if status == KVPoll.Failed:
+            self._fail_pending_notifications_locked(
+                bootstrap_room, self.failure_records.get(bootstrap_room)
+            )
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # The room does not exist yet, or clear() already popped it. Only a
@@ -427,19 +458,31 @@ class CommonKVManager(BaseKVManager):
             # request that reuses the same bootstrap_room.
             if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
                 self.request_status[bootstrap_room] = status
-            return
+                return status
+            return None
         if status == KVPoll.Failed:
             self.request_status[bootstrap_room] = KVPoll.Failed
-            return
+            return KVPoll.Failed
         if current == KVPoll.Failed:
             # Failed is terminal. It also sorts lowest, so the max() below would
             # happily promote it back to Transferring or Success.
-            return
+            return KVPoll.Failed
         self.request_status[bootstrap_room] = max(current, status)
+        return self.request_status[bootstrap_room]
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+            self._fail_pending_notifications_locked(bootstrap_room, failure_reason)
+
+    def _fail_pending_notifications_locked(
+        self, bootstrap_room: int, failure_reason: Optional[str]
+    ) -> None:
+        # clear() may have removed the room while an already-committed terminal
+        # notification waits for its socket. Keep that notification downgraded.
+        for pending in self._pending_status_notifications.get(bootstrap_room, ()):
+            pending.status = KVPoll.Failed
+            pending.failure_reason = failure_reason or pending.failure_reason
 
     def _room_notify_targets(self, bootstrap_room: int) -> List[Tuple[str, int]]:
         infos = self.transfer_infos.get(bootstrap_room)
@@ -510,19 +553,35 @@ class CommonKVManager(BaseKVManager):
         bootstrap_room: int,
         status: KVPoll,
         failure_reason: Optional[str] = None,
+        _pending_status: Optional[_PendingKVStatus] = None,
     ) -> None:
-        """Push of a terminal transfer status to decode endpoints."""
-        if not targets:
-            return
-        parts = self._encode_kv_status_message(
-            bootstrap_room=bootstrap_room,
-            status=status,
-            failure_reason=failure_reason,
-        )
+        """Send a committed terminal status or an early bootstrap rejection."""
         for endpoint, dst_port in targets:
             na = NetworkAddress(endpoint, dst_port)
             try:
-                self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
+                endpoint = na.to_tcp()
+                sock = self._connect(endpoint, is_ipv6=na.is_ipv6)
+                # Serialize the final state check with sends to this endpoint.
+                # Failed cannot be followed by a stale Success, while a slow
+                # socket must not block unrelated room transitions or clear().
+                with self._socket_send_locks[endpoint]:
+                    with self.failure_lock:
+                        if _pending_status is not None:
+                            emitted_status = _pending_status.status
+                            emitted_reason = _pending_status.failure_reason
+                        else:
+                            # Bootstrap rejections can precede room creation.
+                            emitted_status = KVPoll.Failed
+                            emitted_reason = (
+                                self.failure_records.get(bootstrap_room)
+                                or failure_reason
+                            )
+                        parts = self._encode_kv_status_message(
+                            bootstrap_room=bootstrap_room,
+                            status=emitted_status,
+                            failure_reason=emitted_reason,
+                        )
+                    sock.send_multipart(parts)
             except Exception as e:
                 logger.warning(
                     f"Failed to sync status {status} of room {bootstrap_room} to "
@@ -537,44 +596,81 @@ class CommonKVManager(BaseKVManager):
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
     ) -> Optional[KVPoll]:
-        """Returns the status emitted, or None for a cleared room.
+        """Returns the notification's final status, or None for a cleared room.
 
         Runs more than once for a room when a staging chunk is deferred past the
         last one. ``targets`` defaults to the room's non-dummy decode endpoints.
         """
-        if bootstrap_room not in self.request_status:
-            # The sender already cleared this room. Concluding now would
-            # re-create it in request_status and leave a failure record that a
-            # request reusing this bootstrap_room would adopt as its own.
-            return None
-        if status == KVPoll.Success:
-            with self.failure_lock:
+        # Commit atomically; send_kv_status_message rechecks under the endpoint
+        # lock so a concurrent rejection cannot be followed by a stale Success.
+        with self.failure_lock:
+            if bootstrap_room not in self.request_status:
+                # Do not resurrect a cleared room or leave a failure record for
+                # a future request reusing its bootstrap_room.
+                return None
+            if status == KVPoll.Success:
                 recorded = self.failure_records.get(bootstrap_room)
-            if recorded is not None:
-                status = KVPoll.Failed
-                failure_reason = recorded
-            elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
-                status = KVPoll.Failed
-                failure_reason = (
-                    failure_reason or "Room marked Failed before the transfer ended"
-                )
-        if status == KVPoll.Failed:
-            with self.failure_lock:
+                if recorded is not None:
+                    status = KVPoll.Failed
+                    failure_reason = recorded
+                elif self.request_status.get(bootstrap_room) == KVPoll.Failed:
+                    status = KVPoll.Failed
+                    failure_reason = (
+                        failure_reason or "Room marked Failed before the transfer ended"
+                    )
+            if status == KVPoll.Failed:
                 # Keep the first root cause; later callers see the symptom.
                 failure_reason = self.failure_records.setdefault(
                     bootstrap_room, failure_reason or "KV transfer failed"
                 )
 
-        if targets is None:
-            targets = self._room_notify_targets(bootstrap_room)
-        self.update_status(bootstrap_room, status)
-        self.send_kv_status_message(
-            targets=targets,
-            bootstrap_room=bootstrap_room,
-            status=status,
-            failure_reason=failure_reason,
+            if targets is None:
+                targets = self._room_notify_targets(bootstrap_room)
+            status = self._update_status_locked(bootstrap_room, status)
+            pending = self._track_status_notification_locked(
+                bootstrap_room, status, failure_reason
+            )
+        return self._send_tracked_status_notification(
+            bootstrap_room=bootstrap_room, targets=targets, pending=pending
         )
-        return status
+
+    def _track_status_notification_locked(
+        self, bootstrap_room: int, status: KVPoll, failure_reason: Optional[str]
+    ) -> _PendingKVStatus:
+        """Retain a committed notification while holding failure_lock."""
+        pending = _PendingKVStatus(status, failure_reason)
+        self._pending_status_notifications.setdefault(bootstrap_room, []).append(
+            pending
+        )
+        return pending
+
+    def _send_tracked_status_notification(
+        self,
+        *,
+        bootstrap_room: int,
+        targets: List[Tuple[str, int]],
+        pending: _PendingKVStatus,
+    ) -> KVPoll:
+        """Send outside failure_lock and retire exactly this notification."""
+        try:
+            # The scheduler may observe the terminal status and clear the room
+            # now. The latch preserves this committed notification, including
+            # any concurrent downgrade to Failed, without holding locks over I/O.
+            self.send_kv_status_message(
+                targets=targets,
+                bootstrap_room=bootstrap_room,
+                status=pending.status,
+                failure_reason=pending.failure_reason,
+                _pending_status=pending,
+            )
+        finally:
+            with self.failure_lock:
+                notifications = self._pending_status_notifications[bootstrap_room]
+                notifications.remove(pending)
+                if not notifications:
+                    del self._pending_status_notifications[bootstrap_room]
+                final_status = pending.status
+        return final_status
 
     def conclude_failure(
         self,
@@ -600,6 +696,22 @@ class CommonKVManager(BaseKVManager):
         failure_reason: Optional[str] = None,
     ) -> None:
         """Decode-side handling of one prefill rank's terminal status."""
+        with self.failure_lock:
+            self._apply_prefill_status_locked(
+                bootstrap_room=bootstrap_room,
+                status=status,
+                prefill_rank=prefill_rank,
+                failure_reason=failure_reason,
+            )
+
+    def _apply_prefill_status_locked(
+        self,
+        *,
+        bootstrap_room: int,
+        status: int,
+        prefill_rank: int,
+        failure_reason: Optional[str],
+    ) -> None:
         if bootstrap_room not in self.request_status:
             # The room concluded and was cleared. Recording a failure now would
             # leave an entry that a later request reusing this bootstrap_room
@@ -607,6 +719,8 @@ class CommonKVManager(BaseKVManager):
             logger.debug("Dropping late status for cleared room %s", bootstrap_room)
             return
         if status == KVPoll.Success:
+            if self.request_status[bootstrap_room] == KVPoll.Failed:
+                return
             self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
             expected_response_num = self.required_prefill_response_num_table.get(
                 bootstrap_room
@@ -630,13 +744,13 @@ class CommonKVManager(BaseKVManager):
                 handler = self._staging_handler
                 if handler.is_staging_room(bootstrap_room):
                     handler.submit_last_scatter_async(bootstrap_room)
-            self.update_status(bootstrap_room, KVPoll.Success)
+            self._update_status_locked(bootstrap_room, KVPoll.Success)
             return
         if status == KVPoll.Failed:
-            self.record_failure(
+            self.failure_records.setdefault(
                 bootstrap_room, failure_reason or self.DEFAULT_PREFILL_FAILURE_REASON
             )
-            self.update_status(bootstrap_room, KVPoll.Failed)
+            self._update_status_locked(bootstrap_room, KVPoll.Failed)
             return
         logger.warning(
             "Ignoring non-terminal status %s for room %s from prefill rank %s",
@@ -935,6 +1049,9 @@ class CommonKVManager(BaseKVManager):
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
         if bootstrap_addr in self.prefill_info_table:
+            self._validate_prefill_transfer_capability(
+                self.prefill_info_table[bootstrap_addr]
+            )
             return True
 
         info: PrefillServerInfo = None
@@ -943,6 +1060,7 @@ class CommonKVManager(BaseKVManager):
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
+                "&kv_transfer_capabilities=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -1034,10 +1152,20 @@ class CommonKVManager(BaseKVManager):
                     f"got {info.attn_cp_size}."
                 )
 
+        self._validate_prefill_transfer_capability(info)
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    def _deduplicate_mla_senders(self, info: PrefillServerInfo) -> bool:
+        return self.is_mla_backend
+
+    def _validate_prefill_transfer_capability(
+        self, info: PrefillServerInfo, rank_info: Optional[dict] = None
+    ) -> None:
+        """Backend-specific protocol check, before caching or registration."""
+        pass
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
@@ -1078,7 +1206,7 @@ class CommonKVManager(BaseKVManager):
             # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
-            if self.is_mla_backend:
+            if self._deduplicate_mla_senders(info):
                 required_prefill_response_num = 1
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
@@ -1192,6 +1320,18 @@ class CommonKVManager(BaseKVManager):
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
         }
+        # Older bootstrap peers do not accept this optional extension. Only
+        # advertise it when head-sharded draft buffers require extra senders.
+        if self.kv_args.draft_kv_entry_count:
+            payload["draft_kv_entry_count"] = self.kv_args.draft_kv_entry_count
+        # The Rust registry has its own schema. Until it exposes this extension,
+        # leave capability unknown rather than claiming support through it.
+        if self.mixed_kv_transfer_version and not envs.SGLANG_RUST_SERVER.get():
+            payload.update(
+                mixed_kv_transfer_version=self.mixed_kv_transfer_version,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+            )
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -1628,13 +1768,16 @@ class CommonKVSender(BaseKVSender):
     def get_max_transfer_tokens(self) -> Optional[int]:
         if self.kv_mgr._dcp_pack_max_tokens is None:
             return None
-        for peer, info in self.kv_mgr.transfer_infos.get(
-            self.bootstrap_room, {}
-        ).items():
-            if (
-                not info.is_dummy
-                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
-            ):
+        for peer, info in list(
+            self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).items()
+        ):
+            if info.is_dummy:
+                continue
+            registration = self.kv_mgr.decode_kv_args_table.get(peer)
+            # A rejected registration is removed before its room is drained.
+            # Keep the conservative cap until the normal failure path handles
+            # that room, rather than crashing the scheduler or dropping the cap.
+            if registration is None or registration.requires_dcp_relayout:
                 return self.kv_mgr._dcp_pack_max_tokens
         return None
 
@@ -1724,11 +1867,12 @@ class CommonKVSender(BaseKVSender):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
-            self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "transfer_infos"):
-            self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+                self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "transfer_infos"):
+                self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
             if hasattr(self.kv_mgr, "_staging_outstanding"):
                 # Preserve the target until in-flight writes drain, even when
@@ -1831,7 +1975,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if self.kv_mgr._deduplicate_mla_senders(self.prefill_info):
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank
@@ -1858,6 +2002,9 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
+                if not self._validate_bootstrap_infos():
+                    self.invalidate_cached_bootstrap_infos()
+                    return
                 self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
                 # Register kv_args only once to prefill KVManager according to the info fetched
@@ -1878,11 +2025,28 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_infos = cached_bootstrap_infos
 
             self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
+            if not self._validate_bootstrap_infos():
+                self.invalidate_cached_bootstrap_infos()
+                return
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
 
         self.bootstrap_infos = all_bootstrap_infos
+
+    def _validate_bootstrap_infos(self) -> bool:
+        try:
+            for info in self.bootstrap_infos:
+                self.kv_mgr._validate_prefill_transfer_capability(
+                    self.prefill_info, info
+                )
+        except RuntimeError as exc:
+            self.kv_mgr.record_failure(self.bootstrap_room, str(exc))
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            self.bootstrap_infos = None
+            return False
+        return True
 
     def invalidate_cached_bootstrap_infos(self) -> None:
         with self.kv_mgr.connection_lock:
@@ -1896,7 +2060,7 @@ class CommonKVReceiver(BaseKVReceiver):
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}&kv_transfer_capabilities=1"
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -2038,12 +2202,15 @@ class CommonKVReceiver(BaseKVReceiver):
         return KVPoll.Failed
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-            self.bootstrap_room
-        )
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+            self.kv_mgr.required_prefill_response_num_table.pop(
+                self.bootstrap_room, None
+            )
+            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                self.bootstrap_room
+            )
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -2122,6 +2289,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.draft_kv_entry_count: Optional[int] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2191,6 +2359,14 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        draft_kv_entry_count = data.get("draft_kv_entry_count")
+        if draft_kv_entry_count:
+            # A layer-sharded rank may own no draft buffers. Retain senders
+            # whenever any rank advertises head-sharded draft KV.
+            self.draft_kv_entry_count = max(
+                self.draft_kv_entry_count or 0,
+                int(draft_kv_entry_count),
+            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -2245,6 +2421,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             tp_group_table[pp_rank] = PrefillRankInfo(
                 rank_ip=rank_ip,
                 rank_port=rank_port,
+                mixed_kv_transfer_version=int(data.get("mixed_kv_transfer_version", 0)),
+                dcp_size=data.get("dcp_size"),
+                dcp_rank=data.get("dcp_rank"),
             )
 
             self._registered_count += 1
@@ -2256,6 +2435,24 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         return web.Response(text="OK", status=200)
+
+    def _transfer_capabilities(self):
+        # Inspect every expected rank. A maximum (or registration count) could
+        # hide an old/missing PP stage or a rank replaced during rolling upgrade.
+        versions, dcp_sizes = [], set()
+        for dp in range(self.dp_size):
+            for cp in range(self.attn_cp_size):
+                for tp in range(self.attn_tp_size):
+                    for pp in range(self.pp_size):
+                        try:
+                            rank = self.prefill_port_table[dp][cp][tp][pp]
+                        except KeyError:
+                            return 0, None
+                        versions.append(rank.mixed_kv_transfer_version)
+                        dcp_sizes.add(rank.dcp_size)
+        return min(versions, default=0), (
+            dcp_sizes.pop() if len(dcp_sizes) == 1 else None
+        )
 
     async def _handle_route_get(self, request: web.Request):
         prefill_dp_rank = request.query.get("prefill_dp_rank")
@@ -2297,10 +2494,22 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                draft_kv_entry_count=self.draft_kv_entry_count,
             )
             payload = dataclasses.asdict(info)
+            if request.query.get("kv_transfer_capabilities") == "1":
+                version, dcp_size = self._transfer_capabilities()
+                payload.update(mixed_kv_transfer_version=version, dcp_size=dcp_size)
+            else:
+                payload.pop("mixed_kv_transfer_version")
+                payload.pop("dcp_size")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if (
+                request.query.get("kv_transfer_capabilities") != "1"
+                or not info.draft_kv_entry_count
+            ):
+                payload.pop("draft_kv_entry_count")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
@@ -2323,7 +2532,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=404,
             )
 
-        return web.json_response(dataclasses.asdict(bootstrap_info), status=200)
+        payload = dataclasses.asdict(bootstrap_info)
+        if request.query.get("kv_transfer_capabilities") != "1":
+            for key in ("mixed_kv_transfer_version", "dcp_size", "dcp_rank"):
+                payload.pop(key)
+        return web.json_response(payload, status=200)
 
     async def _handle_register_dp_rank(self, request: web.Request):
         data = await request.json()

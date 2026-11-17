@@ -692,6 +692,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr.waiting_timeout = 300
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
+        mgr._pending_status_notifications = {}
         # Only the attn-tp/attn-cp group leader on the first PP stage issues the
         # single rebootstrap /generate; default the mock manager to that leader.
         mgr.attn_tp_rank = 0
