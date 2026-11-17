@@ -103,15 +103,23 @@ jobs:
         run: |
           set -uo pipefail
           conclusion=''
-          # Only finished jobs are listed with a conclusion, and a re-run may
-          # find the producing job still going, so look a few times.
+          # The attempt this event is about, not the newest one: the run-level jobs
+          # endpoint follows the latest attempt, and the digest artifact is
+          # selected by the attempt that triggered this run, so a failed or
+          # in-flight re-run would otherwise answer for the wrong build.
           for _ in $(seq 1 6); do
-            conclusion="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?per_page=100" \
+            conclusion="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/attempts/${{ github.event.workflow_run.run_attempt }}/jobs?per_page=100" \
               --jq '[.jobs[] | select(.name == "build")] | if length == 0 then "" else (.[0].conclusion // "") end')" || conclusion=''
             [ -n "${conclusion}" ] && break
             sleep 10
           done
-          echo "the job that publishes the nightly image: ${conclusion:-<not finished>}"
+          # Unknown is not a reason to skip: a skipped run reads as green to the
+          # issue tracker, and a night would pass without anyone noticing.
+          if [ -z "${conclusion}" ]; then
+            echo '::error::the nightly image job is not readable in this run attempt; refusing to guess whether an image was published'
+            exit 1
+          fi
+          echo "the job that publishes the nightly image: ${conclusion}"
           if [ "${conclusion}" = success ]; then
             printf 'ok=true\n' >> "$GITHUB_OUTPUT"
           else
@@ -122,9 +130,12 @@ jobs:
   prepare:
     needs: [gate]
     # Under workflow_run the gate above has already settled the event, the branch
-    # and the producing job; a dispatch is its own decision.
+    # and the producing job; a dispatch is its own decision. !cancelled() because
+    # a skipped need would otherwise apply its implicit success() and skip this
+    # job too, which is exactly the dispatch case -- gate never runs there.
     if: >-
-      github.event_name != 'workflow_run' || needs.gate.outputs.ok == 'true'
+      !cancelled() &&
+      (github.event_name != 'workflow_run' || needs.gate.outputs.ok == 'true')
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.source.outputs.ref }}

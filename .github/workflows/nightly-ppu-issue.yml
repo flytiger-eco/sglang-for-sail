@@ -20,11 +20,12 @@ permissions:
   # all-skipped run still reports success.
   actions: read
 
-# Serialise updates per tracked workflow: one group for the build and one for the
-# test would otherwise replace each other's pending tracker run, and only one
-# pending run per group is ever kept.
+# Serialise updates per tracked workflow and event: one group for scheduled
+# completions, one for manual ones. Only one pending run per group is ever kept,
+# so sharing a group would let a manual completion replace the pending run of a
+# scheduled failure, and that failure would never be recorded.
 concurrency:
-  group: nightly-ppu-issue-${{ github.event.workflow_run.workflow_id }}
+  group: nightly-ppu-issue-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.event }}
   cancel-in-progress: false
 
 jobs:
