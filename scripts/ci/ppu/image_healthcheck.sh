@@ -13,7 +13,7 @@
 # Reads:
 #   PPU_TEST_MODE                image enters here, anything else skips
 #   SGLANG_BUILD_COMMIT          baked into the image, the Dockerfile records the built commit
-#   PPU_EXPECTED_COMMIT          head_sha of the build event; only compared when it is a full 40-char sha
+#   PPU_EXPECTED_COMMIT          the commit this run tests; prepare resolves it to a full 40-char sha, and it is compared strictly with what the image reports
 #   PPU_EXPECTED_SGLANG_PREFIX   where sglang should load from, defaults to /sgl-workspace
 #   PPU_MIN_KERNEL_OPS           lower bound on the number of sgl_kernel:: ops the
 #                                dispatcher registered, defaults to 20. A healthy build
@@ -119,10 +119,12 @@ rm -f "${provenance_err}"
 version="$(python3 -c 'import sglang; print(sglang.__version__)' 2>/dev/null || true)"
 case "${version}" in
   ""|0.0.0|0.0.0*)
-    # The Dockerfile installs editable over the local source; with .git missing
-    # setuptools-scm falls back to 0.0.0, after which the version field in every
-    # report is meaningless and the trend cannot be attributed.
-    fail "version" "sglang version is '${version:-<empty>}', the image did not carry one in"
+    # Tagless builds are the normal case here: the nightly checkout carries no
+    # tag, so setuptools-scm falls back to pyproject_ppu.toml's fallback_version
+    # and 0.0.0.dev0 is what a correct nightly image reports. Record it instead
+    # of failing on it; which build this is comes from image-commit, which is a
+    # strict check above.
+    warn "version" "sglang version is '${version:-<empty>}' (tagless build, so the commit in image-commit is the identity)"
     ;;
   *) pass "version" "${version}" ;;
 esac

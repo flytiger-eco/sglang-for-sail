@@ -38,6 +38,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
       WF_NAME: ${{ github.event.workflow_run.name }}
+      WF_EVENT: ${{ github.event.workflow_run.event }}
       WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
       RUN_URL: ${{ github.event.workflow_run.html_url }}
       RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -67,6 +68,14 @@ jobs:
           # close an open test-failure issue on a run that executed no test at all,
           # so check that the finish job really ran before calling a test run green.
           if [ "$outcome" = green ] && [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+            # Only the run the build scheduled proves the artifact was recovered.
+            # A manual dispatch defaults to source mode and also ends green, and
+            # closing on that would retire the issue while nothing tested the
+            # image.
+            if [ "$WF_EVENT" != "workflow_run" ]; then
+              echo "this test was a '${WF_EVENT}' run, not the one the build scheduled; leaving the issue open"
+              exit 0
+            fi
             finish="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
               --jq '[.jobs[] | select(.name == "nightly-test-ppu-finish")]
                     | if length == 0 then "absent" else (.[0].conclusion // "null") end')"

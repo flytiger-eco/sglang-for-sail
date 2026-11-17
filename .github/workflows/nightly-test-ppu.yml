@@ -110,7 +110,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Validate the requested source ref
-        id: source
+        id: shape
         env:
           # There are no inputs under workflow_run, and github.sha is the head of
           # the default branch rather than the commit that was built and is under
@@ -126,7 +126,28 @@ jobs:
             echo 'ref must be a full commit SHA or a valid branch/tag ref' >&2
             exit 1
           fi
-          printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+          printf 'requested=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+
+      # Apart from the harness checkout above: that one is the revision this
+      # workflow runs at, this one is the revision under test.
+      - name: Check out the requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.shape.outputs.requested }}
+          path: .requested
+          fetch-depth: 1
+          filter: blob:none
+
+      # The workers' checkouts and PPU_EXPECTED_COMMIT both come from this value.
+      # A branch or tag name would be resolved again by every consumer, and the
+      # health check only compares a 40-char SHA -- it would skip the comparison
+      # for everything else, which is exactly the manual case.
+      - name: Resolve the requested ref to a commit
+        id: source
+        run: |
+          resolved="$(git -C .requested rev-parse HEAD)"
+          printf 'ref=%s\n' "$resolved" >> "$GITHUB_OUTPUT"
+          echo "sources under test: ${resolved}"
 
       # Settle "which image is under test" once, in prepare, so all four test jobs
       # work from the same answer. The tag rule has to match Compute image metadata
@@ -191,11 +212,24 @@ jobs:
 
       # The build names the artifact it pushed, under an artifact named after its
       # run *attempt*, so a re-run is not confused with the attempt it replaced.
-      # Absent -- an older build, or a dispatch with no build behind it -- the pin
-      # step falls back to resolving tags, so nothing here is required to exist.
+      # An automatic run has this and nothing else: the pin step refuses to guess
+      # a tag, so a build that published no digest stops the run here.
       - name: Fetch the digest the build published
         id: published
         if: ${{ github.event_name == 'workflow_run' && inputs.test_image == '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ppu-nightly-image-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: .build-attempt
+
+      # One retry, because the pin step now treats a missing artifact as a reason
+      # to stop: a transient 5xx on the first attempt would otherwise fail a whole
+      # night over a download that has nothing to do with sglang.
+      - name: Fetch the digest the build published (retry)
+        if: ${{ steps.published.outcome == 'failure' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -261,23 +295,26 @@ jobs:
               digest="${published#*@}"
               source='build-run'
             else
-              echo "::warning::the build published no usable digest; resolving tags instead"
+              echo "::warning::the build published no usable digest; nothing else names this image, so the next block decides"
             fi
           fi
-          # 2. Otherwise resolve the derived tags. A tag the caller named is
-          #    honoured as given: a registry this runner cannot reach anonymously
-          #    must not turn an explicit run into a failed one, and the pod is
-          #    still pinned to an immutable tag. A tag this file derived must
-          #    resolve, because the pods are about to pull nothing otherwise.
+          # 2. Only a caller-supplied image is left. Its tag has to resolve too:
+          #    four workers re-pulling an unpinned reference can land on two
+          #    different images if the tag moves between their pulls. Callers whose
+          #    registry this runner cannot reach anonymously pass image@sha256:...,
+          #    which resolve_image_digest.sh returns as it stands.
           if [ -z "${ref}" ]; then
+            # An automatic run names its image one way only: the digest its own
+            # build attempt published. Falling back to the derived tags would
+            # resolve whatever they point at by now, and a same-day rebuild
+            # carries the same commit -- the health check could not tell the two
+            # images apart.
+            if [ -z "${REQUESTED_IMAGE}" ]; then
+              echo '::error::this run has no digest published by its build attempt; refusing to test a mutable tag. Re-dispatch this workflow with test_image=image@sha256:<the digest that build reported> to test it explicitly.'
+              exit 1
+            fi
             resolved=0
             for candidate in ${CANDIDATES}; do
-              if [ -n "${REQUESTED_IMAGE}" ]; then
-                PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
-                  PPU_RESOLVE_STRICT=0 bash scripts/ci/ppu/resolve_image_digest.sh
-                resolved=1
-                break
-              fi
               if PPU_RESOLVE_INPUT="${candidate}" PPU_RESOLVE_PREFIX=PPU_TEST_IMAGE \
                 PPU_RESOLVE_STRICT=1 bash scripts/ci/ppu/resolve_image_digest.sh; then
                 resolved=1
@@ -529,6 +566,9 @@ jobs:
             else
               echo 'Skipped JIT mtime pinning; JIT will recompile'
             fi
+            # The same gate as 1a: an artifact that cannot carry its own commit,
+            # import, or serve once does not earn two hours of cases either.
+            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
             # Reserve 900 seconds for scheduling, setup, timeout handling, and export.
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 1 "$PPU_EVIDENCE_DIR" 6600
           container_options: |
@@ -641,6 +681,8 @@ jobs:
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
+            # Same gate as 1a; see the note there.
+            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-2-ppu "" "$PPU_EVIDENCE_DIR" 7500
           container_options: |
             privileged: true
@@ -751,6 +793,8 @@ jobs:
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
+            # Same gate as 1a; see the note there.
+            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-4-ppu "" "$PPU_EVIDENCE_DIR" 9300
           container_options: |
             privileged: true
