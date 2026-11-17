@@ -619,3 +619,135 @@ def concat_cast_kv_fp8_pad(
         ROPE=rope,
     )
     return out
+
+
+_DEQUANT_FAST_TOKENS_PER_PROG = 4
+
+
+def dequantize_k_cache_paged_dispatch(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    group_size: int = 128,
+):
+    """Serving entry: opt-in vectorized variant via SGLANG_DSA_DEQUANT_PAGED_FAST."""
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DSA_DEQUANT_PAGED_FAST.get():
+        return dequantize_k_cache_paged_fast(
+            quant_k_cache, page_table_1_flattened, group_size
+        )
+    return dequantize_k_cache_paged(quant_k_cache, page_table_1_flattened, group_size)
+
+
+def dequantize_k_cache_paged_fast(
+    quant_k_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+    group_size: int = 128,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """BF16-output variant of ``dequantize_k_cache_paged`` (vectorized).
+
+    Same math as the legacy kernel (fp8 -> f32 * group scale -> bf16; rope is a
+    bf16 copy), but one program handles TOKENS_PER_PROG whole rows so each
+    thread moves 16 contiguous bytes per access instead of 1.  Experimental:
+    the serving path still uses the legacy kernel.
+    """
+    dim_quant = quant_k_cache.shape[-1]
+    dim_nope, dim_rope = _infer_dsa_dims(dim_quant)
+    quant_k_cache = quant_k_cache.view((-1, dim_quant))
+    num_tokens = page_table_1_flattened.shape[0]
+    num_tiles = dim_nope // group_size
+    out_dim = dim_nope + dim_rope
+    if out is None:
+        output = torch.empty(
+            (num_tokens, 1, out_dim), dtype=torch.bfloat16, device=quant_k_cache.device
+        )
+    else:
+        assert out.dtype == torch.bfloat16 and out.is_contiguous()
+        output = out.view(num_tokens, 1, out_dim)
+
+    input_nope_q = quant_k_cache[:, :dim_nope]
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
+        torch.float32
+    )
+    input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
+
+    grid = (triton.cdiv(num_tokens, _DEQUANT_FAST_TOKENS_PER_PROG),)
+    _dequantize_k_cache_paged_fast_kernel[grid](
+        output.view(-1, out_dim),
+        input_nope_q,
+        input_nope_s,
+        input_rope,
+        page_table_1_flattened,
+        num_tokens,
+        output.view(-1, out_dim).stride(0),
+        input_nope_q.stride(0),
+        input_nope_s.stride(0),
+        input_rope.stride(0),
+        NUM_NOPE_BLOCKS=num_tiles,
+        NUM_NOPE_BLOCKS_P2=triton.next_power_of_2(num_tiles),
+        GROUP_SIZE=group_size,
+        DIM_NOPE=dim_nope,
+        DIM_ROPE=dim_rope,
+        TOKENS_PER_PROG=_DEQUANT_FAST_TOKENS_PER_PROG,
+        num_warps=4,
+    )
+    return output
+
+
+@triton.jit
+def _dequantize_k_cache_paged_fast_kernel(
+    output_ptr,
+    input_nope_q_ptr,
+    input_nope_s_ptr,
+    input_rope_ptr,
+    page_table_1_ptr,
+    num_tokens: int,
+    output_stride_0: int,
+    input_nope_q_stride_0: int,
+    input_nope_s_stride_0: int,
+    input_rope_stride_0: int,
+    NUM_NOPE_BLOCKS: tl.constexpr,
+    NUM_NOPE_BLOCKS_P2: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_t = pid * TOKENS_PER_PROG + tl.arange(0, TOKENS_PER_PROG)
+    in_range = offs_t < num_tokens
+    paged = tl.load(page_table_1_ptr + offs_t, mask=in_range, other=0).to(tl.int64)
+    offs_t64 = offs_t.to(tl.int64)
+
+    # tl.arange needs a power-of-two extent: iterate the padded group axis and
+    # mask off the lanes beyond the real tile count.
+    offs_g = tl.arange(0, NUM_NOPE_BLOCKS_P2)
+    g_mask = offs_g < NUM_NOPE_BLOCKS
+    offs_i = tl.arange(0, GROUP_SIZE)
+
+    ptr_q = (
+        input_nope_q_ptr
+        + paged[:, None, None] * input_nope_q_stride_0
+        + offs_g[None, :, None] * GROUP_SIZE
+        + offs_i[None, None, :]
+    )
+    q_mask = in_range[:, None, None] & g_mask[None, :, None]
+    y_q = tl.load(ptr_q, mask=q_mask, other=0.0).to(tl.float32)
+    ptr_s = input_nope_s_ptr + paged[:, None] * input_nope_s_stride_0 + offs_g[None, :]
+    y_s = tl.load(ptr_s, mask=in_range[:, None] & g_mask[None, :], other=0.0)
+    y = (y_q * y_s[:, :, None]).to(tl.bfloat16)
+    dst_q = (
+        output_ptr
+        + offs_t64[:, None, None] * output_stride_0
+        + offs_g[None, :, None] * GROUP_SIZE
+        + offs_i[None, None, :]
+    )
+    tl.store(dst_q, y, mask=q_mask)
+
+    if DIM_ROPE > 0:
+        offs_r = tl.arange(0, DIM_ROPE)
+        src_r = input_rope_ptr + paged[:, None] * input_rope_stride_0 + offs_r[None, :]
+        data = tl.load(src_r, mask=in_range[:, None], other=0.0)
+        dst_r = output_ptr + offs_t64[:, None] * output_stride_0 + DIM_NOPE + offs_r[None, :]
+        tl.store(dst_r, data, mask=in_range[:, None])

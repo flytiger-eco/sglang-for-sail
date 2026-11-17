@@ -2040,6 +2040,9 @@ class Envs:
     SGLANG_SPARSE_INDEXER_MAX_LOGITS_MB = EnvInt(4096)
     # Use dsv4's bf16 topk kernel for PAGED path; requires logits to be bf16.
     SGLANG_DSA_USE_DSV4_BF16_TOPK = EnvBool(True)
+    # Vectorized paged k-cache dequant (bit-identical to the legacy Triton kernel,
+    # ~6.5x faster); only used by the fp8 KV dequant path.
+    SGLANG_DSA_DEQUANT_PAGED_FAST = EnvBool(False)
     # Enable NaN check on logits valid range before topk_transform (debug/diag).
     SGLANG_BF16_TOPK_DEBUG = EnvBool(False)
 
