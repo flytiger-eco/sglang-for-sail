@@ -196,7 +196,7 @@ fi
 if [ "${serve}" != "1" ]; then
   warn "serve" "PPU_HEALTHCHECK_SERVE=0, skipping the server step"
 elif [ ! -d "${model}" ]; then
-  warn "serve" "model directory ${model} is absent, skipping the server step"
+  fail "serve" "model directory ${model} is absent, so the server cannot be verified; set PPU_HEALTHCHECK_SERVE=0 to opt out"
 else
   server_log="$(mktemp -t ppu-healthcheck-server.XXXXXX.log)"
   python3 -m sglang.launch_server \
@@ -206,9 +206,15 @@ else
     --disable-cuda-graph >"${server_log}" 2>&1 &
   server_pid=$!
 
+  # Deadline on the wall clock, not a count of polls: one poll can spend five
+  # seconds in curl and five more sleeping, so 180 of them run past the 15 minutes
+  # the workers reserve for this check.
   ready=0
-  for _ in $(seq 1 180); do
+  reason='not ready within 15 minutes'
+  deadline=$((SECONDS + 900))
+  while [ "${SECONDS}" -lt "${deadline}" ]; do
     if ! kill -0 "${server_pid}" 2>/dev/null; then
+      reason='the launcher exited before /health came up'
       break
     fi
     if curl -fsS -m 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
@@ -219,11 +225,11 @@ else
   done
 
   if [ "${ready}" != "1" ]; then
-    fail "serve" "/health was not ready within 15 minutes; tail of the server log: $(tail -5 "${server_log}" | tr '\n' ' ')"
+    fail "serve" "${reason}; tail of the server log: $(tail -5 "${server_log}" | tr '\n' ' ')"
   elif body="$(curl -fsS -m 120 -H 'Content-Type: application/json' \
       -d '{"text":"Hello","sampling_params":{"max_new_tokens":8,"temperature":0}}' \
       "http://127.0.0.1:${port}/generate" 2>&1)" &&
-    printf '%s' "${body}" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("text") is not None else 1)' 2>/dev/null; then
+    printf '%s' "${body}" | python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(0 if isinstance(r.get("text"), str) and (r.get("meta_info") or {}).get("completion_tokens", 0) > 0 else 1)' 2>/dev/null; then
     pass "serve" "/health came up and one 8-token generate returned text"
   else
     fail "serve" "/health came up but generate failed: $(printf '%s' "${body}" | head -c 300)"
@@ -268,6 +274,7 @@ if [ -n "${evidence_dir}" ] && [ -d "${evidence_dir}" ]; then
   python3 - "${health_rows}" "${evidence_dir}/image_healthcheck.json" \
     "${failures}" "${expected_commit}" <<'PY'
 import json
+import os
 import sys
 
 rows_path, out_path, failures, expected_commit = sys.argv[1:5]
@@ -284,6 +291,10 @@ with open(out_path, "w", encoding="utf-8") as handle:
         {
             "mode": "image",
             "expected_commit": expected_commit,
+            # The artifact this shard actually ran on: two nightlies of one
+            # commit differ only here, so the evidence has to say which.
+            "artifact_image": os.environ.get("PPU_TEST_IMAGE_REF") or None,
+            "artifact_image_digest": os.environ.get("PPU_TEST_IMAGE_DIGEST") or None,
             "failures": int(failures),
             "checks": checks,
         },

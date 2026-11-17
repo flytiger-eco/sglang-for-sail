@@ -40,18 +40,10 @@ on:
         required: false
         type: string
         default: ''
-  workflow_call:
-    inputs:
-      ref:
-        description: 'Git ref (branch, tag, or SHA) to test.'
-        required: false
-        type: string
-        default: ''
-      test_image:
-        description: 'Image under test (tag or image@sha256:...). Empty keeps the fixed PPU base image and installs sglang from source.'
-        required: false
-        type: string
-        default: ''
+# No workflow_call: nothing calls this file, and under a call the github context
+# is the caller's, so both the harness checkout and the build-event gate would be
+# looking at the caller's repository and the caller's build. Dispatch is the way
+# in; a real reusable entry point has to take its own revision explicitly.
 
 # A rejected build completion must not cancel a nightly test that is already
 # running. Concurrency is evaluated before prepare's `if`, so a failed build, a
@@ -68,8 +60,7 @@ concurrency:
     github.event.workflow_run.head_branch == github.event.repository.default_branch))
     && 'active' || github.run_id }}
   cancel-in-progress: >-
-    ${{ github.event_name != 'workflow_call' &&
-    (github.event_name != 'workflow_run' ||
+    ${{ github.event_name != 'workflow_run' ||
     (github.event.workflow_run.conclusion == 'success' &&
     github.event.workflow_run.event == 'schedule' &&
     github.event.workflow_run.head_branch == github.event.repository.default_branch)) }}
@@ -362,6 +353,22 @@ jobs:
           printf 'digest=%s\n' "${digest}" >> "$GITHUB_OUTPUT"
           echo "image under test: ${ref} (${digest:-unresolved}, from ${source})"
 
+      # The issue workflow runs outside this one and only sees run metadata, where
+      # head_sha is the revision this file ran at -- the default branch, which can
+      # move while the image builds. Publish the commit actually under test so a
+      # red test is filed against it.
+      - name: Publish the commit under test
+        if: ${{ always() }}
+        run: printf 'tested_sha=%s\n' "${{ steps.source.outputs.ref }}" > tested_sha.txt
+      - name: Upload the commit under test
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-tested-ref
+          path: tested_sha.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Run each shard on both supported board families. Include the board slug in
   # cluster-task staging, K8s Job names, local caches, and evidence artifacts.
   nightly-1a-ppu:
@@ -420,7 +427,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}-${{ matrix.board.slug }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_HEALTHCHECK_SERVE=${{ vars.PPU_HEALTHCHECK_SERVE || '1' }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -551,7 +558,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}-${{ matrix.board.slug }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_HEALTHCHECK_SERVE=${{ vars.PPU_HEALTHCHECK_SERVE || '1' }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -677,7 +684,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}-${{ matrix.board.slug }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_HEALTHCHECK_SERVE=${{ vars.PPU_HEALTHCHECK_SERVE || '1' }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -792,7 +799,7 @@ jobs:
           namespace: ppu-sched
           job_suffix: ${{ github.job }}-${{ matrix.board.slug }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ needs.prepare.outputs.test_image_ref }},PPU_TEST_IMAGE_DIGEST=${{ needs.prepare.outputs.test_image_digest }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_HEALTHCHECK_SERVE=${{ vars.PPU_HEALTHCHECK_SERVE || '1' }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source

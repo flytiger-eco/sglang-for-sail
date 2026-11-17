@@ -98,24 +98,43 @@ jobs:
           number="$(head -1 /tmp/open_nightly_issues.txt)"
 
           if [ "$outcome" = red ]; then
+            # For a test run, head_sha is the revision the harness ran at -- the
+            # default branch, which can move while the image builds. What the run
+            # actually tested is the commit it published.
+            commit="$RUN_SHA"
+            if [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+              rm -rf /tmp/tested-ref
+              if gh run download "$RUN_ID" --repo "$REPO" \
+                  -n ppu-nightly-tested-ref -D /tmp/tested-ref 2>/dev/null; then
+                published="$(sed -n 's/^tested_sha=//p' /tmp/tested-ref/tested_sha.txt 2>/dev/null | head -1)"
+                if [ -n "$published" ]; then
+                  commit="$published"
+                fi
+              fi
+            fi
+
             if [ -z "$number" ]; then
               gh issue create --repo "$REPO" --title "$title" --label nightly-red \
                 --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n' \
-                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${RUN_SHA:0:12}")"
+                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}")"
               exit 0
             fi
 
             # Retrying the same run delivers the same URL again; keying on the URL
-            # keeps the thread from filling up. The body is searched too: the URL of
-            # the first failure was written there, not in a comment.
-            if gh issue view "$number" --repo "$REPO" --json body,comments \
-                --jq '.body, .comments[].body' | grep -qF "$RUN_URL"; then
-              echo "run already recorded in #${number}, not commenting again"
-            else
-              gh issue comment "$number" --repo "$REPO" \
-                --body "$(printf 'Failed again: **%s** (attempt %s)\n\n- run: %s' \
-                  "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")"
-            fi
+            # keeps the thread from filling up. The body counts too: the first
+            # failure was recorded there, not in a comment. The lookup is not piped
+            # into grep: its early exit closes the pipe, and pipefail would read
+            # that as a miss and post the duplicate this is meant to prevent.
+            recorded="$(gh issue view "$number" --repo "$REPO" --json body,comments \
+              --jq '.body, .comments[].body')"
+            case "$recorded" in
+              *"$RUN_URL"*)
+                echo "run already recorded in #${number}, not commenting again" ;;
+              *)
+                gh issue comment "$number" --repo "$REPO" \
+                  --body "$(printf 'Failed again: **%s** (attempt %s)\n\n- run: %s' \
+                    "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")" ;;
+            esac
           elif [ -n "$number" ]; then
             gh issue comment "$number" --repo "$REPO" \
               --body "$(printf 'Recovered (%s)\n\n- run: %s' "$WF_NAME" "$RUN_URL")"

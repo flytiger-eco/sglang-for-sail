@@ -209,8 +209,10 @@ fi # PPU_TEST_MODE != image
 if [[ "$PPU_TEST_MODE" == "image" ]]; then
     # PyYAML is left unpinned: the image ships it and sglang.srt imports it at
     # runtime, so pinning a version here would replace the shipped one before the
-    # checks look at it. Installing a package that is already there is a no-op.
-    ${PIP_INSTALL} pytest==8.3.5 PyYAML jsonschema tabulate
+    # checks look at it. The image's own constraints keep the rest from moving
+    # either -- it is the same file docker/ppu.Dockerfile installs its tools with.
+    ${PIP_INSTALL} -c /sgl-workspace/constraints.txt \
+        pytest==8.3.5 PyYAML jsonschema tabulate
     # What the artifact actually carries. Source mode repairs these above; here
     # they are only looked at, so a case that dies on an old one is attributable
     # to the image.
