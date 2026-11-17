@@ -1,6 +1,7 @@
 name: Nightly PPU Issue Tracker
 
-# Issues only: no Slack, no mail (as requested).
+# Issues only: no Slack, no mail (as requested). The optional DingTalk step at
+# the end is a no-op unless the two secrets below are configured.
 #
 # Why a separate workflow instead of an if: always() job at the end of the test
 # file: when the build fails, needs holds the whole test line back, so that job
@@ -56,6 +57,7 @@ jobs:
             --description "nightly red tracking (maintained automatically, closed on recovery)" || true
 
       - name: Upsert the tracking issue
+        id: upsert
         run: |
           set -euo pipefail
 
@@ -66,6 +68,7 @@ jobs:
             cancelled|skipped) echo "conclusion=${WF_CONCLUSION}, not tracked"; exit 0 ;;
             *) outcome=red ;;
           esac
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
 
           # A test run whose every job was skipped can still conclude success:
           # prepare is skipped when the build failed or was not scheduled, every
@@ -101,6 +104,7 @@ jobs:
             --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .number" \
             > /tmp/open_nightly_issues.txt
           number="$(head -1 /tmp/open_nightly_issues.txt)"
+          printf 'number=%s\n' "$number" >> "$GITHUB_OUTPUT"
 
           if [ "$outcome" = red ]; then
             # For a test run, head_sha is the revision the harness ran at -- the
@@ -117,6 +121,7 @@ jobs:
                 fi
               fi
             fi
+            printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
             if [ -z "$number" ]; then
               gh issue create --repo "$REPO" --title "$title" --label nightly-red \
@@ -147,3 +152,55 @@ jobs:
           else
             echo "green and no open issue"
           fi
+
+      # A new failure, and the recovery of an issue that is still open, are the two
+      # things a group is worth waking up for; a green night that had nothing to
+      # retract stays silent. With no webhook configured this step is a no-op, which
+      # is what forks and repos that do not want the messages get.
+      - name: Notify the DingTalk group
+        if: >-
+          always() &&
+          (steps.upsert.outputs.outcome == 'red' ||
+           (steps.upsert.outputs.outcome == 'green' && steps.upsert.outputs.number != ''))
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          OUTCOME: ${{ steps.upsert.outputs.outcome }}
+          COMMIT: ${{ steps.upsert.outputs.commit }}
+        run: |
+          set -uo pipefail
+          if [ -z "${DINGTALK_WEBHOOK}" ]; then
+            echo 'DINGTALK_WEBHOOK is not set, skipping the notification'
+            exit 0
+          fi
+
+          if [ "${OUTCOME}" = green ]; then
+            headline='Nightly PPU recovered'
+          else
+            headline="Nightly PPU red: ${WF_NAME}"
+          fi
+          text="$(printf '%s\n\n- conclusion: **%s** (attempt %s)\n- commit: `%s`\n- run: %s\n' \
+            "${headline}" "${WF_CONCLUSION}" "${RUN_ATTEMPT}" "${COMMIT:-${RUN_SHA}}" "${RUN_URL}")"
+
+          url="${DINGTALK_WEBHOOK}"
+          # A robot with signing enabled rejects unsigned posts. The sign is
+          # base64(HMAC-SHA256(secret, "<ms timestamp>\n<secret>")), urlencoded.
+          if [ -n "${DINGTALK_SECRET:-}" ]; then
+            ts="$(date +%s000)"
+            sign="$(printf '%s\n%s' "${ts}" "${DINGTALK_SECRET}" \
+              | openssl dgst -sha256 -hmac "${DINGTALK_SECRET}" -binary \
+              | base64 | tr -d '\n')"
+            sign="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote_plus(sys.argv[1]))' "${sign}")"
+            url="${url}&timestamp=${ts}&sign=${sign}"
+          fi
+
+          body="$(python3 -c 'import json,sys; print(json.dumps({"msgtype": "markdown", "markdown": {"title": sys.argv[1], "text": sys.argv[2]}}))' \
+            "${headline}" "${text}")"
+          # The robot answers 200 with a non-zero errcode on a bad token or a
+          # missing keyword, so the body, not the status, decides whether it landed.
+          response="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' -d "${body}" "${url}")" || response=''
+          echo "${response}"
+          case "${response}" in
+            *'"errcode":0'*) ;;
+            *) echo "::error::the DingTalk robot did not accept the message"; exit 1 ;;
+          esac
