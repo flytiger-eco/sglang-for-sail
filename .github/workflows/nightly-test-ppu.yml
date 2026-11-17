@@ -210,30 +210,44 @@ jobs:
           printf 'tag=%s\n' "${candidates%% *}" >> "$GITHUB_OUTPUT"
           printf 'candidates=%s\n' "$candidates" >> "$GITHUB_OUTPUT"
 
-      # The build names the artifact it pushed, under an artifact named after its
-      # run *attempt*, so a re-run is not confused with the attempt it replaced.
+      # The build names the artifact it pushed after its run *attempt*, and this
+      # event carries an attempt too -- but not necessarily the same one. The build
+      # workflow has three jobs, so one branch job failing makes "Re-run failed
+      # jobs" the way back; that bumps the attempt without re-running the build job
+      # that already succeeded, and the attempt named here has uploaded nothing.
+      # Ask the run which artifact it actually holds.
+      - name: Find the digest artifact of this build run
+        id: artifact
+        if: ${{ github.event_name == 'workflow_run' && inputs.test_image == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts?per_page=100" --jq '[.artifacts[] | select(.name | startswith("ppu-nightly-image-${{ github.event.workflow_run.id }}-"))] | sort_by(.created_at) | last | .name // empty')"
+          printf 'name=%s\n' "${name}" >> "$GITHUB_OUTPUT"
+          echo "digest artifact for this run: ${name:-<none>}"
+
       # An automatic run has this and nothing else: the pin step refuses to guess
       # a tag, so a build that published no digest stops the run here.
       - name: Fetch the digest the build published
         id: published
-        if: ${{ github.event_name == 'workflow_run' && inputs.test_image == '' }}
+        if: ${{ github.event_name == 'workflow_run' && inputs.test_image == '' && steps.artifact.outputs.name != '' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ppu-nightly-image-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          name: ${{ steps.artifact.outputs.name }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
           path: .build-attempt
 
-      # One retry, because the pin step now treats a missing artifact as a reason
-      # to stop: a transient 5xx on the first attempt would otherwise fail a whole
-      # night over a download that has nothing to do with sglang.
+      # One retry, because the pin step treats a missing artifact as a reason to
+      # stop: a transient 5xx would otherwise fail a whole night over a download
+      # that has nothing to do with sglang.
       - name: Fetch the digest the build published (retry)
         if: ${{ steps.published.outcome == 'failure' }}
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ppu-nightly-image-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          name: ${{ steps.artifact.outputs.name }}
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
           path: .build-attempt
@@ -358,7 +372,13 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 120
+    # The cluster timeout below is the suite budget the pod runs with plus 30
+    # minutes: the 900 seconds the suite line reserves for scheduling, setup,
+    # timeout handling and export, and another 15 for the health check, which may
+    # wait that long for /health on its own. A slow but successful startup must
+    # not get the pod killed mid-suite, and this job's own timeout stays 10
+    # minutes above the cluster's.
+    timeout-minutes: 135
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -443,8 +463,11 @@ jobs:
             # really comes from the image rather than this checkout, the kernel op
             # surface, and one server brought up for /health plus one request. If
             # any of that fails, more cases cannot change the conclusion.
-            # In source mode the script exits 0 and behaviour is unchanged.
-            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            # In source mode behaviour is unchanged -- and the script need not exist
+            # at the tested ref at all, which is why the mode decides, not the file.
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            fi
             # Reserve 900 seconds for scheduling, setup, timeout handling, and export.
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 5700
           container_options: |
@@ -452,7 +475,7 @@ jobs:
             host_ipc: true
             host_network: false
             shm_size: 8Gi
-          timeout_minutes: 110
+          timeout_minutes: 125
           cleanup_policy: always
       - name: Export sanitized PPU nightly evidence
         if: always()
@@ -486,7 +509,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 135
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -568,7 +591,9 @@ jobs:
             fi
             # The same gate as 1a: an artifact that cannot carry its own commit,
             # import, or serve once does not earn two hours of cases either.
-            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            fi
             # Reserve 900 seconds for scheduling, setup, timeout handling, and export.
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 1 "$PPU_EVIDENCE_DIR" 6600
           container_options: |
@@ -576,7 +601,7 @@ jobs:
             host_ipc: true
             host_network: false
             shm_size: 8Gi
-          timeout_minutes: 125
+          timeout_minutes: 140
           cleanup_policy: always
       - name: Export sanitized PPU nightly evidence
         if: always()
@@ -610,7 +635,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 150
+    timeout-minutes: 165
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -682,14 +707,16 @@ jobs:
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
             # Same gate as 1a; see the note there.
-            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            fi
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-2-ppu "" "$PPU_EVIDENCE_DIR" 7500
           container_options: |
             privileged: true
             host_ipc: true
             host_network: false
             shm_size: 8Gi
-          timeout_minutes: 140
+          timeout_minutes: 155
           cleanup_policy: always
       - name: Export sanitized PPU nightly evidence
         if: always()
@@ -723,7 +750,7 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 180
+    timeout-minutes: 195
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -794,14 +821,16 @@ jobs:
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
             # Same gate as 1a; see the note there.
-            bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            if [ "${PPU_TEST_MODE:-source}" = image ]; then
+              bash "$harness/scripts/ci/ppu/image_healthcheck.sh" "$PPU_EVIDENCE_DIR"
+            fi
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-4-ppu "" "$PPU_EVIDENCE_DIR" 9300
           container_options: |
             privileged: true
             host_ipc: true
             host_network: false
             shm_size: 8Gi
-          timeout_minutes: 170
+          timeout_minutes: 185
           cleanup_policy: always
       - name: Export sanitized PPU nightly evidence
         if: always()

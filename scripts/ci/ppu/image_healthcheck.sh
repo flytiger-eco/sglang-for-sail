@@ -13,7 +13,8 @@
 # Reads:
 #   PPU_TEST_MODE                image enters here, anything else skips
 #   SGLANG_BUILD_COMMIT          baked into the image, the Dockerfile records the built commit
-#   PPU_EXPECTED_COMMIT          the commit this run tests; prepare resolves it to a full 40-char sha, and it is compared strictly with what the image reports
+#   PPU_EXPECTED_COMMIT          the commit this run tests; prepare resolves it to a
+#                                full 40-char sha, and image mode fails if it is not one
 #   PPU_EXPECTED_SGLANG_PREFIX   where sglang should load from, defaults to /sgl-workspace
 #   PPU_MIN_KERNEL_OPS           lower bound on the number of sgl_kernel:: ops the
 #                                dispatcher registered, defaults to 20. A healthy build
@@ -83,7 +84,11 @@ warn() {
 actual_commit="${SGLANG_BUILD_COMMIT:-}"
 if [ -z "${actual_commit}" ] || [ "${actual_commit}" = "unknown" ]; then
   fail "image-commit" "no SGLANG_BUILD_COMMIT in the image, so there is no proof which build this is"
-elif [[ "${expected_commit}" =~ ^[0-9a-fA-F]{40}$ ]] && [ "${actual_commit}" != "${expected_commit}" ]; then
+elif [[ ! "${expected_commit}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  # prepare resolves the requested ref to a commit before handing it over, so any
+  # other shape is a wiring error rather than a reason to skip the comparison.
+  fail "image-commit" "PPU_EXPECTED_COMMIT is '${expected_commit}', not a commit sha, so the build cannot be checked"
+elif [ "${actual_commit}" != "${expected_commit}" ]; then
   fail "image-commit" "image was built from ${actual_commit:0:7}, expected ${expected_commit:0:7}"
 else
   pass "image-commit" "${actual_commit:0:12}"
