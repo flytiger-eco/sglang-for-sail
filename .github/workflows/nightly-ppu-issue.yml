@@ -56,8 +56,33 @@ jobs:
           gh label create nightly-red --repo "$REPO" --color B60205 \
             --description "nightly red tracking (maintained automatically, closed on recovery)" || true
 
+      # Incidents are ordered by the build that was tested, not by this run: a
+      # rerun of yesterday's build after this morning's failure creates a test run
+      # with a larger id, and its green would close an incident that is still open.
+      # The test workflow publishes the build it tested whatever the gate decided,
+      # so a build that published nothing can be ordered too.
+      - name: Resolve the build under test
+        id: build
+        run: |
+          set -uo pipefail
+          build=''
+          if [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+            rm -rf /tmp/tested-build
+            if gh run download "$RUN_ID" --repo "$REPO" \
+                -n ppu-nightly-tested-build -D /tmp/tested-build 2>/dev/null; then
+              build="$(sed -n 's/^build_run=//p' /tmp/tested-build/tested_build.txt 2>/dev/null | head -1)"
+            fi
+          else
+            # The build workflow itself: its own run is the generation.
+            build="$RUN_ID"
+          fi
+          printf 'id=%s\n' "$build" >> "$GITHUB_OUTPUT"
+          echo "build under test: ${build:-unknown}"
+
       - name: Upsert the tracking issue
         id: upsert
+        env:
+          BUILD: ${{ steps.build.outputs.id }}
         run: |
           set -euo pipefail
 
@@ -126,10 +151,12 @@ jobs:
             fi
             printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
+            red_marker=''
+            [ -n "$BUILD" ] && red_marker="<!-- nightly-ppu-last-red: ${BUILD} -->"
             if [ -z "$number" ]; then
               gh issue create --repo "$REPO" --title "$title" --label nightly-red \
                 --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n\n%s\n' \
-                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}" "<!-- nightly-ppu-last-red: ${RUN_ID} -->")"
+                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}" "$red_marker")"
               exit 0
             fi
 
@@ -149,35 +176,48 @@ jobs:
                     "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")" ;;
             esac
 
-            # The issue keeps the failing run it is about, so a later green run can
-            # tell whether it is recovering this incident or merely finishing an
-            # older one. The marker lives in the body, which is always fetched, so
-            # there is one place to update instead of "whichever comment was last".
+            # The issue keeps the *build* it is about, so a later green run can tell
+            # whether it is recovering this incident or merely finishing an older
+            # one. The marker lives in the body, which is always fetched, so there is
+            # one place to update instead of "whichever comment was last".
             body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
-            case "$body" in
-              *'nightly-ppu-last-red:'*)
-                # The marker only moves forward. A failed rerun of an older build
-                # would otherwise lower it, and a green rerun newer than that --
-                # but older than the newest failure -- would then close an incident
-                # nothing has fixed.
-                previous_red="$(printf '%s' "$body" | sed -n 's/.*nightly-ppu-last-red: \([0-9][0-9]*\).*/\1/p' | head -1)"
-                if [ -z "$previous_red" ] || [ "$RUN_ID" -ge "$previous_red" ]; then
-                  body="$(printf '%s' "$body" | sed -E "s|<!-- nightly-ppu-last-red: [0-9]+ -->|<!-- nightly-ppu-last-red: ${RUN_ID} -->|")"
-                fi ;;
-              *)
-                body="$(printf '%s\n\n<!-- nightly-ppu-last-red: %s -->' "$body" "$RUN_ID")" ;;
-            esac
-            gh issue edit "$number" --repo "$REPO" --body "$body" > /dev/null
+            if [ -z "$BUILD" ]; then
+              # Nothing to order against; the comment above still records what failed.
+              echo "::warning::the build under test is unknown; leaving the recorded build of #${number} untouched"
+            else
+              case "$body" in
+                *'nightly-ppu-last-red:'*)
+                  # The marker only moves forward. A failed rerun of an older build
+                  # would otherwise lower it, and a green rerun newer than that --
+                  # but older than the newest failure -- would then close an incident
+                  # nothing has fixed.
+                  previous_red="$(printf '%s' "$body" | sed -n 's/.*nightly-ppu-last-red: \([0-9][0-9]*\).*/\1/p' | head -1)"
+                  if [ -z "$previous_red" ] || [ "$BUILD" -ge "$previous_red" ]; then
+                    body="$(printf '%s' "$body" | sed -E "s|<!-- nightly-ppu-last-red: [0-9]+ -->|<!-- nightly-ppu-last-red: ${BUILD} -->|")"
+                  fi ;;
+                *)
+                  body="$(printf '%s\n\n<!-- nightly-ppu-last-red: %s -->' "$body" "$BUILD")" ;;
+              esac
+              gh issue edit "$number" --repo "$REPO" --body "$body" > /dev/null
+            fi
           elif [ -n "$number" ]; then
             # A green run that predates the failure on record does not clear it:
             # rerunning last night's build after this morning's failure would
-            # otherwise close an incident nothing has fixed yet. Comparing run ids
-            # still lets a successful rerun of the failing run recover its own.
+            # otherwise close an incident nothing has fixed yet. Comparing the build
+            # under test still lets a successful rerun of the failing build recover
+            # its own. Unknown only happens when the artifact is gone, and guessing
+            # there would retire an incident on no evidence.
             body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
             last_red="$(printf '%s' "$body" | sed -n 's/.*nightly-ppu-last-red: \([0-9][0-9]*\).*/\1/p' | head -1)"
-            if [ -n "$last_red" ] && [ "$RUN_ID" -lt "$last_red" ]; then
-              echo "run ${RUN_ID} predates the failure recorded in #${number} (${last_red}); leaving it open"
-              exit 0
+            if [ -n "$last_red" ]; then
+              if [ -z "$BUILD" ]; then
+                echo "the build tested by run ${RUN_ID} is unknown; leaving #${number} open"
+                exit 0
+              fi
+              if [ "$BUILD" -lt "$last_red" ]; then
+                echo "build ${BUILD} predates the failure recorded in #${number} (${last_red}); leaving it open"
+                exit 0
+              fi
             fi
             gh issue comment "$number" --repo "$REPO" \
               --body "$(printf 'Recovered (%s)\n\n- run: %s' "$WF_NAME" "$RUN_URL")"

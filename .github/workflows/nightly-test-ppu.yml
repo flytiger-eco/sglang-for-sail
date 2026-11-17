@@ -128,6 +128,30 @@ jobs:
             printf 'ok=false\n' >> "$GITHUB_OUTPUT"
             echo "no image was published by this build run; not testing a partial run"
           fi
+      # The issue workflow sees only this run's metadata, where nothing names the
+      # build whose artifact was tested. Publish that identity here rather than in
+      # prepare, which does not run when this gate rejects a build -- "this build
+      # published nothing" is itself an incident that has to be ordered against
+      # later recoveries, and ordering it by test run id would let a rerun of an
+      # older build close it.
+      - name: Publish the build under test
+        if: ${{ always() }}
+        run: |
+          mkdir -p tested-build
+          printf 'build_run=%s\nbuild_attempt=%s\n' \
+            "${{ github.event.workflow_run.id }}" "${{ github.event.workflow_run.run_attempt }}" \
+            > tested-build/tested_build.txt
+      - name: Upload the build under test
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-tested-build
+          # A re-run of this job in a later attempt would otherwise collide with
+          # the artifact the first attempt left behind.
+          overwrite: true
+          path: tested-build/tested_build.txt
+          if-no-files-found: ignore
+          retention-days: 14
 
   prepare:
     needs: [gate]
