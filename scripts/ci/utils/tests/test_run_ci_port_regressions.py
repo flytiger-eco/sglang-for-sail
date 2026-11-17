@@ -130,7 +130,11 @@ class PpuWorkflowPortRegressionTest(unittest.TestCase):
         for stage, devices, dependency in (
             ("a", 1, "check-changes"),
             ("b", 1, "check-changes, stage-a-test-1-gpu-ppu"),
-            ("c", 2, "check-changes, stage-b-test-1-gpu-ppu"),
+            (
+                "c",
+                2,
+                "check-changes, stage-b-test-1-gpu-ppu, stage-b-test-1-gpu-ppu-m890",
+            ),
         ):
             suite = f"stage-{stage}-test-{devices}-gpu-ppu"
             with self.subTest(stage=stage):
@@ -144,6 +148,16 @@ class PpuWorkflowPortRegressionTest(unittest.TestCase):
                 if stage != "a":
                     self.assertIn("!failure()", job)
                     self.assertIn("!cancelled()", job)
+
+        suite = "stage-b-test-1-gpu-ppu-m890"
+        m890 = self.job("pr-test-ppu.yml", suite)
+        self.assertIn("needs: [check-changes, stage-a-test-1-gpu-ppu]", m890)
+        self.assertIn("!failure()", m890)
+        self.assertIn("!cancelled()", m890)
+        self.assertIn("needs.check-changes.outputs.mega_gate == 'true'", m890)
+        self.assertIn("board-type=ZW-M890P", m890)
+        self.assertIn(f"run_suite.py --hw ppu --suite {suite}", m890)
+        self.assertIn(suite, self.job("pr-test-ppu.yml", "pr-test-ppu-finish"))
 
     def test_workflow_uses_sdk_220_and_describes_actual_coverage(self):
         workflow = (ROOT / ".github/workflows/pr-test-ppu.yml").read_text()
