@@ -2058,6 +2058,7 @@ class MMReceiverBase(ABC):
         req_id = None
         recv_socket = None
         encode_task = None
+        text_task = None
         recv_task = None
         send_time = time.monotonic()
         try:
@@ -2092,8 +2093,11 @@ class MMReceiverBase(ABC):
             # Parts stream onto the socket while other parts are still
             # encoding, so receive concurrently with the dispatch; the dispatch
             # result only matters for failing fast when nothing will arrive.
+            from sglang.srt.disaggregation.encoder.text_overlap import prepare_text
+
+            text_task = prepare_text(mm_processor, prompt, mm_data)
             recv_task = asyncio.create_task(
-                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt)
+                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt, text_task)
             )
             done, _ = await asyncio.wait(
                 {encode_task, recv_task},
@@ -2124,7 +2128,7 @@ class MMReceiverBase(ABC):
             logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
             return None
         finally:
-            tasks = [task for task in (encode_task, recv_task) if task is not None]
+            tasks = [task for task in (encode_task, recv_task, text_task) if task is not None]
             for task in tasks:
                 if not task.done():
                     task.cancel()
@@ -2133,7 +2137,9 @@ class MMReceiverBase(ABC):
             if recv_socket is not None:
                 recv_socket.close(linger=0)
 
-    async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
+    async def _recv_mm_data(
+        self, req_id, recv_socket, mm_processor, prompt, text_task=None
+    ):
         """zmq_to_tokenizer receive: embedding parts arrive as 2-frame ZMQ
         messages on the tokenizer's PULL socket. (mooncake/zmq_to_scheduler lands on scheduler ranks via
         WaitingMMRequest.)"""
@@ -2175,6 +2181,8 @@ class MMReceiverBase(ABC):
                 )
 
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+            if text_task is not None:
+                prompt = await text_task
             return mm_processor.get_validated_mm_data(
                 prompt,
                 recv_embedding,
