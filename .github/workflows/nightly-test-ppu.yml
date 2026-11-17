@@ -103,13 +103,15 @@ jobs:
         run: |
           set -uo pipefail
           conclusion=''
-          # The attempt this event is about, not the newest one: the run-level jobs
-          # endpoint follows the latest attempt, and the digest artifact is
-          # selected by the attempt that triggered this run, so a failed or
-          # in-flight re-run would otherwise answer for the wrong build.
+          # The latest producer run at or before this event's attempt, not this
+          # attempt's own: "Re-run failed jobs" starts an attempt that contains
+          # only the jobs that failed, so an exact-attempt lookup finds no build
+          # at all. The same bound the artifact selection uses keeps the two in
+          # step -- an attempt that succeeds without running the build again is
+          # reuse of the earlier digest, not a reason to skip the night.
           for _ in $(seq 1 6); do
-            conclusion="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/attempts/${{ github.event.workflow_run.run_attempt }}/jobs?per_page=100" \
-              --jq '[.jobs[] | select(.name == "build")] | if length == 0 then "" else (.[0].conclusion // "") end')" || conclusion=''
+            conclusion="$(gh api --paginate --slurp "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?filter=all&per_page=100" \
+              --jq '[.[].jobs[] | select(.name == "build" and .run_attempt <= ${{ github.event.workflow_run.run_attempt }})] | if length == 0 then "" else (max_by(.run_attempt).conclusion // "") end')" || conclusion=''
             [ -n "${conclusion}" ] && break
             sleep 10
           done
