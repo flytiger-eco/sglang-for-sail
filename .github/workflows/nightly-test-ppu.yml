@@ -63,7 +63,7 @@ concurrency:
     ${{ github.event_name != 'workflow_run' ||
     (github.event.workflow_run.conclusion == 'success' &&
     github.event.workflow_run.event == 'schedule' &&
-    github.event.workflow_run.head_branch == github.event.repository.default_branch)) }}
+    github.event.workflow_run.head_branch == github.event.repository.default_branch) }}
 
 permissions:
   contents: read
@@ -80,16 +80,51 @@ env:
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
-  prepare:
-    # workflow_run fires on every completed build: the failed ones, and the
-    # push-triggered runs the build file keeps for debugging. Only the scheduled
-    # build on the default branch is what this test line covers; nothing else
-    # enters.
+  # workflow_run fires on every completed build: the failed ones, and the
+  # push-triggered runs the build file keeps for debugging. Only the scheduled
+  # build on the default branch is what this test line covers.
+  #
+  # The run's own conclusion cannot answer whether *this* image was produced: the
+  # build file also carries the branch-tag jobs, and either of them failing turns
+  # the whole run red. Ask the job that publishes the digest instead.
+  gate:
     if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'schedule' &&
-       github.event.workflow_run.head_branch == github.event.repository.default_branch)
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.job.outputs.ok }}
+    steps:
+      - name: Resolve the producing job's conclusion
+        id: job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          conclusion=''
+          # Only finished jobs are listed with a conclusion, and a re-run may
+          # find the producing job still going, so look a few times.
+          for _ in $(seq 1 6); do
+            conclusion="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "build")] | if length == 0 then "" else (.[0].conclusion // "") end')" || conclusion=''
+            [ -n "${conclusion}" ] && break
+            sleep 10
+          done
+          echo "the job that publishes the nightly image: ${conclusion:-<not finished>}"
+          if [ "${conclusion}" = success ]; then
+            printf 'ok=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'ok=false\n' >> "$GITHUB_OUTPUT"
+            echo "no image was published by this build run; not testing a partial run"
+          fi
+
+  prepare:
+    needs: [gate]
+    # Under workflow_run the gate above has already settled the event, the branch
+    # and the producing job; a dispatch is its own decision.
+    if: >-
+      github.event_name != 'workflow_run' || needs.gate.outputs.ok == 'true'
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.source.outputs.ref }}
@@ -365,6 +400,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ppu-nightly-tested-ref
+          # A re-run of prepare in a later attempt would otherwise collide with
+          # the artifact the first attempt left behind.
+          overwrite: true
           path: tested_sha.txt
           if-no-files-found: ignore
           retention-days: 14
