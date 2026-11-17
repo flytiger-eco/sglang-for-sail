@@ -1,99 +1,289 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# 长序列 Prefill Only CP+EP 开启 MegaMoE（GLM-5.3 MXFP4，in100k out1）
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+本节为《GLM-5.3 推理最佳实践》「MXFP4 长序列 Prefill Only CP+EP（in100k out1）」的补充：在sglang 0.5.21上开启 MegaMoE 的配置方法
 
-</div>
+## 环境准备2
 
---------------------------------------------------------------------------------
+| 硬件配置 | 真武 890P 单机4卡 |
+|------------|----------------------|
+| 软件配置 | pkg.flytiger-eco.com/docker_tmp/llm:pytorch2.13.0-ubuntu24.04-cuda13.0-sglang0.5.21-py312-ppu202609291857 |
+| 模型权重 | GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken |
 
-<p align="center">
-<a href="https://www.sglang.io/"><b>🌐 Website</b></a> |
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+容器内装包：
+```shell
+# 1) SGLang 0.5.21（base v0.5.21 + 7 个 open PR，实机验证交付包，测了部分精度，ifbench没测完）
+# https://github.com/flytiger-eco/sglang-for-sail/commit/665352faf98b21b09621e5e7bc78aafbea6aaecd
+pip install https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-16-2014/sglang-0.0.0.dev19247+g665352faf.d20261116-1g665352faf98b-cp312-cp312-linux_x86_64.whl --force-reinstall --no-deps
 
-## News
-- [2026/07] 🔥 SGLang and Miles add day-0 support for Kimi K3 ([blog](https://lmsys.org/blog/2026-07-27-kimi-k3-day0-support/)).
-- [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
-- [2026/07] Serving GLM5.2 NVFP4 agentic workloads with SGLang: Reaching 500 TPS in two weeks ([blog](https://lmsys.org/blog/2026-07-13-glm52-optimization/)).
-- [2026/06] 🔥 The next generation of speculative decoding: DFlash and Spec V2 ([blog](https://lmsys.org/blog/2026-06-15-next-generation-speculative-decoding-dflash-v2/)).
-- [2026/06] SGLang provides day-0 support for latest open models ([Nemotron 3 Ultra](https://lmsys.org/blog/2026-06-04-nvidia-run-nemotron-3-ultra/), [Nemotron 3 Super](https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/), [Higgs Audio v3 TTS](https://lmsys.org/blog/2026-06-04-higgs-audio-v3-tts/)).
-- [2026/04] 🔥 DeepSeek-V4 on Day 0: From Fast Inference to Verified RL with SGLang and Miles ([blog](https://lmsys.org/blog/2026-04-25-deepseek-v4/)).
-- [2026/02] 🔥 Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72 ([blog](https://lmsys.org/blog/2026-02-20-gb300-inferencex/)).
-- [2026/01] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
+# 在上面的版本的基础上另外还有 5 个 open PR，新编译完全未测试（可选安装这个版本替代上面的版本）
+# https://github.com/flytiger-eco/sglang-for-sail/commit/5ade84608bb88d0a5c9b190fe3d074a3563269bd
+# pip install https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-16-2113/sglang-0.0.0.dev19252+g5ade84608.d20261116-1g5ade84608bb8-cp312-cp312-linux_x86_64.whl
 
-<details>
-<summary>More</summary>
+# 2) DeepGEMM
+pip install https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-09-1445/deep_gemm-1.1.0.dev15+v1.0.0.ppu2.2.0.g8ce3962-cp312-cp312-linux_x86_64.whl --force-reinstall --no-deps
 
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+# 3) FlashMLA
+pip install https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-09-1445/flash_mla-2.1.0.dev105+v1.0.0.ppu2.2.0.g4305d1bd-cp312-cp312-linux_x86_64.whl --force-reinstall --no-deps
 
-</details>
+# 校验版本
+python3 -c "import sglang; print(sglang.__version__)"                       # 0.5.21
+python3 -c "import deep_gemm, flash_mla; print('deep_gemm / flash_mla ok')"
+```
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Cookbook](https://docs.sglang.io/cookbook) — the deployment command we recommend for each supported model
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+## server 命令
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
+### **Prefill Only**
+```shell
+# 进到容器(示例命令如下)
+sudo docker run --privileged -it -e HOST_HOSTNAME=$(hostname) \
+    --network=host --device=/dev/infiniband --ipc=host --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    --shm-size=8g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --init --pid=host \
+    -v <path to your workspace> \
+    -w <path to your workspace> \
+    --name <your docker_name> \
+    <PPU DOCKER NAME>
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, NVIDIA, AMD, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, RunPod, InnoMatrix, Modal, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Baseten, Baidu, AntGroup, Alibaba, Tencent, and other major technology organizations.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+# 关掉代理
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+# optional 设置deepgemm cache
+CACHE_DIR=/path/to/dg_cache/
+export SGLANG_DG_CACHE_DIR=${CACHE_DIR}
+export DG_JIT_CACHE_DIR=${SGLANG_DG_CACHE_DIR}
+export DG_CACHE_DIR=${SGLANG_DG_CACHE_DIR}
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at [sglang@lmsys.org](mailto:sglang@lmsys.org).
+# 本包叠加态必需（与下方 --weight-loader-disable-mmap 配套）
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 
-Long-term active SGLang contributors are eligible for coding agent sponsorship, such as Cursor, Claude Code, or OpenAI Codex. Email [sglang@lmsys.org](mailto:sglang@lmsys.org) with your most important commits or pull requests.
+# 单机4卡【推荐】
+# Attn CP + MoE EP，开启 megamoe
+python3 -m sglang.launch_server \
+  --model-path <GLM-5.3-MXFP4-权重路径> \
+  --host 127.0.0.1 --port 31010 \
+  --tp-size 4 --ep-size 4 --attn-cp-size 4 --enable-prefill-cp --cp-strategy interleave \
+  --chunked-prefill-size 32768 --mem-fraction-static 0.9 \
+  --attention-backend dsa --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+  --moe-a2a-backend megamoe --enable-w4a4-mxfp4-megamoe \
+  --disable-custom-all-reduce --disable-cuda-graph --disable-overlap-schedule \
+  --cuda-graph-max-bs-decode 16 --max-running-requests 16 --num-continuous-decode-steps 1 \
+  --disable-radix-cache --trust-remote-code --disable-shared-experts-fusion --enable-metrics \
+  --reasoning-parser glm45 --tool-call-parser glm47 \
+  --watchdog-timeout 24000 --dist-timeout 24000 \
+  --weight-loader-disable-mmap
+```
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+关闭 megamoe 的对照配置与上述相同，仅把两枚开关替换为 `--moe-a2a-backend deepep --deepep-mode auto`。
+
+## client 命令
+```bash
+# In 100000 / Out 1，Concurrency 1
+python3 -m sglang.bench_serving --max-concurrency 1 --dataset-name random --random-input-len=100000 --random-output-len=1 --random-range-ratio 1 --num-prompts 10 --host 127.0.0.1 --port 31010
+```
+
+## 参考性能
+
+| 并行配置 | 节点-卡数 | In / Out | Concurrency | Mean TTFT (ms) | Mean TPOT (ms) | 单卡 Total Throughput (tok/s) | 单卡 Output Throughput (tok/s) |
+|------------|-------------|--------|-----------|--------------|--------------|-------------------------------|--------------------------------|
+| EP4 TP4 CP4（开 megamoe） | 1-4 | 100000 / 1 | 1 | 9216.67 | — | 2712.13 | 0.03 |
+| EP4 TP4 CP4（关 deepep 对照） | 1-4 | 100000 / 1 | 1 | 9640.83 | — | 2592.84 | 0.03 |
+
+
+
+## PD 分离配置（P_Node 开启 MegaMoE，890P MXFP4 1P1D）
+
+### P_Node（Prefill，开启 megamoe）
+```shell
+# 进到容器(示例命令如下)
+sudo docker run --privileged -it -e HOST_HOSTNAME=$(hostname) \
+    --network=host --device=/dev/infiniband --ipc=host --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    --shm-size=8g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --init --pid=host \
+    -v <path to your workspace> \
+    -w <path to your workspace> \
+    --name <your docker_name> \
+    <PPU DOCKER NAME>
+
+export SGLANG_DG_CACHE_DIR="/mnt/dg_cache0"
+export DG_JIT_CACHE_DIR="/mnt/dg_cache0"
+export DG_CACHE_DIR="/mnt/dg_cache0"
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+export TP_SOCKET_IFNAME=eth0
+
+# 本包叠加态必需（megamoe 相关，与环境章一致）
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+
+# PR #224：PD+CP 前缀缓存开关（默认关；如需开启见章末「如何开启 radix cache」小节，需同时去掉 --disable-radix-cache）
+# export SGLANG_DSA_CP_PREFIX_CACHE=1
+
+# Attn CP + MoE EP，开启 megamoe
+export DG_USE_MOE_DYNAMIC_TILE=1
+export MC_LOG_LEVEL=TRACE
+export MC_NUM_QP_PER_EP=4
+export MC_TE_METRIC=1
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT
+export SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+export SGLANG_SAIL_DEEPEP_RECV_HOOK=0
+python3 -m sglang.launch_server --host 0.0.0.0 --port 8999 --disable-radix-cache --trust-remote-code \
+  --model-path <YOUR_MODEL_PATH> --log-level info --enable-cache-report --enable-metrics \
+  --dist-timeout 60000 --watchdog-timeout 60000 \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 --tp-size 8 \
+  --page-size 64 --speculative-algorithm EAGLE --speculative-attention-mode decode \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
+  --disable-custom-all-reduce --moe-a2a-backend megamoe --enable-w4a4-mxfp4-megamoe \
+  --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 \
+  --disaggregation-mode prefill --mem-fraction-static 0.85 \
+  --attention-backend dsa --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+  --enable-prefill-cp --cp-strategy interleave \
+  --chunked-prefill-size 32768 --attn-cp-size 8 --disable-overlap-schedule --ep-size 8 \
+  --enable-request-time-stats-logging --disable-cuda-graph \
+  --weight-loader-disable-mmap
+```
+
+### D_Node EP（context 100k）
+```shell
+sudo docker run --privileged -it -e HOST_HOSTNAME=$(hostname) \
+    --network=host --device=/dev/infiniband --ipc=host --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    --shm-size=8g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --init --pid=host \
+    -v <path to your workspace> \
+    -w <path to your workspace> \
+    --name <your docker_name> \
+    <PPU DOCKER NAME>
+
+export SGLANG_DG_CACHE_DIR="/mnt/dg_cache0"
+export DG_JIT_CACHE_DIR="/mnt/dg_cache0"
+export DG_CACHE_DIR="/mnt/dg_cache0"
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+export TP_SOCKET_IFNAME=eth0
+
+# 本包叠加态必需（与 P_Node/单机章一致，缺失会触发全量 precompile warmup 数小时）
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+
+# Attn TP + MoE EP（照参考，deepep 不变）
+export DG_USE_MOE_DYNAMIC_TILE=1
+export MC_LOG_LEVEL=TRACE
+export MC_NUM_QP_PER_EP=4
+export MC_TE_METRIC=1
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT
+export SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+export SGLANG_SAIL_DEEPEP_RECV_HOOK=0
+python3 -m sglang.launch_server --host 0.0.0.0 --port 8999 --disable-radix-cache --trust-remote-code \
+  --model-path <YOUR_MODEL_PATH> --log-level info --enable-cache-report --enable-metrics \
+  --dist-timeout 60000 --watchdog-timeout 60000 \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 --tp-size 8 \
+  --page-size 64 --speculative-algorithm EAGLE --speculative-attention-mode decode \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
+  --disable-custom-all-reduce --moe-a2a-backend deepep --deepep-mode auto \
+  --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 \
+  --disaggregation-mode decode --mem-fraction-static 0.8 \
+  --prefill-attention-backend fa3 --decode-attention-backend flashmla --cuda-graph-max-bs-decode 32 \
+  --max-running-requests 1280 --enable-dp-lm-head --enable-dp-attention --stream-interval 64 \
+  --dp-size 8 \
+  --weight-loader-disable-mmap
+```
+
+### D_Node DP + EP（context 4k）
+```shell
+sudo docker run --privileged -it -e HOST_HOSTNAME=$(hostname) \
+    --network=host --device=/dev/infiniband --ipc=host --device=/dev/alixpu_ctl --device=/dev/alixpu \
+    --shm-size=8g --ulimit memlock=-1 --ulimit stack=67108864 \
+    --init --pid=host \
+    -v <path to your workspace> \
+    -w <path to your workspace> \
+    --name <your docker_name> \
+    <PPU DOCKER NAME>
+
+export SGLANG_DG_CACHE_DIR="/mnt/dg_cache0"
+export DG_JIT_CACHE_DIR="/mnt/dg_cache0"
+export DG_CACHE_DIR="/mnt/dg_cache0"
+export GLOO_SOCKET_IFNAME=eth0
+export NCCL_SOCKET_IFNAME=eth0
+export TP_SOCKET_IFNAME=eth0
+
+# 本包叠加态必需（与 P_Node/单机章一致，缺失会触发全量 precompile warmup 数小时）
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+
+# Attn DP + MoE EP（照参考，deepep 不变）
+export DG_USE_MOE_DYNAMIC_TILE=1
+export MC_LOG_LEVEL=TRACE
+export MC_NUM_QP_PER_EP=4
+export MC_TE_METRIC=1
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT
+export SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+export SGLANG_SAIL_DEEPEP_RECV_HOOK=0
+python3 -m sglang.launch_server --host 0.0.0.0 --port 8999 --disable-radix-cache --trust-remote-code \
+  --model-path <YOUR_MODEL_PATH> --log-level info --enable-cache-report --enable-metrics \
+  --dist-timeout 60000 --watchdog-timeout 60000 \
+  --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 --tp-size 8 \
+  --page-size 64 --speculative-algorithm EAGLE --speculative-attention-mode decode \
+  --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
+  --disable-custom-all-reduce --moe-a2a-backend deepep --deepep-mode auto \
+  --disable-shared-experts-fusion --reasoning-parser glm45 --tool-call-parser glm47 \
+  --disaggregation-mode decode --mem-fraction-static 0.8 \
+  --prefill-attention-backend fa3 --decode-attention-backend flashmla --cuda-graph-max-bs-decode 32 \
+  --chunked-prefill-size 2048 --max-running-requests 1280 --enable-dp-lm-head --enable-dp-attention \
+  --stream-interval 64 --dp-size 8 \
+  --weight-loader-disable-mmap
+```
+
+### Router（on P_node）
+```shell
+export PREFILL_NODE=<prefill-ip>
+export DECODE_NODE=<decode-ip>
+
+#router运行在Prefill相同的Node上 (可以选择不相同的Node)
+#router服务需要指明Prefill Node和Decode Node的服务接口
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --host 0.0.0.0 \
+  --mini-lb \
+  --port 7000 \
+  --prefill "http://<prefill-ip>:8999" \
+  --decode "http://<decode-ip>:8999"
+```
+
+硬口径注（router 地址必须可路由）：--prefill/--decode 必须填对端真实可路由 IP（如 http://<prefill-ip>:8999），不能填 127.0.0.1 或 localhost；填了回环地址时 D 节点会把 router 当 prefill 去握手，PD 间 KV 传输根本建立不起来，但 bench 仍把 HTTP 200＋finish_reason=abort 计入 Successful requests，表面全成功、数据全假。识别法：P 节点日志 ReqTimeStats 中 transfer_total>0 且无 AbortReq/handshake failed；D 日志无「Error fetching prefill server info from bootstrap … Connection refused」。
+
+### client
+```bash
+DATASET_PATH=<YOUR_LOCAL_DATASET_PATH>
+
+# In 4096 / Out 1500，Concurrency 8
+python3 -m sglang.bench_serving --max-concurrency 8 --dataset-name random --random-input-len=4096 --random-output-len=1500 --random-range-ratio 1 --num-prompts 80 --dataset-path ${DATASET_PATH} --host 0.0.0.0 --port 7000
+
+# In 100000 / Out 1000，Concurrency 1
+python3 -m sglang.bench_serving --max-concurrency 1 --dataset-name random --random-input-len=100000 --random-output-len=1000 --random-range-ratio 1 --num-prompts 10 --dataset-path ${DATASET_PATH} --host 0.0.0.0 --port 7000
+```
+
+口径注（PD 压测合格判据）：PD 链路可能静默失败——router 地址填错（见 Router 小节硬口径注）时 KV 传输建立不起来，bench 仍把 abort 请求计入 Successful requests。识别特征：Total generated tokens (retokenized): 0 且每请求时延≈14s（bootstrap 15 次重试常数）。合格判据：P 日志 ReqTimeStats transfer_total>0 且无 AbortReq/handshake failed，retokenized 非零。链路健康时 bench 的 TTFT/TPOT 可信（本包已用 /generate stream=true 直测交叉验证，差约1%）。
+
+### 参考性能
+
+| Prefill 并行 | Decode 并行 | 节点-卡数 | In / Out | Concurrency | Mean TTFT (ms) | Mean TPOT (ms) | 单卡 Total Throughput (tok/s) | 单卡 Output Throughput (tok/s) |
+|--------------|-------------|-------------|--------|-----------|--------------|--------------|-------------------------------|--------------------------------|
+| CP8 TP8 EP8（开 megamoe） | EP8 TP1 DP8 | 2-8 | 4096 / 1500 | 8 | 790.48 | 13.52 | 131.59 | 35.27 |
+| CP8 TP8 EP8（开 megamoe） | EP8 TP1 DP8 | 2-8 | 100000 / 1000 | 1 | 24723.00 | 17.85 | 148.33 | 1.47 |
+
+表注：
+- 数据为 1P1D 两台×8卡共16卡（P 开 megamoe、D deepep），单卡＝总量÷16；两侧均开 MTP（EAGLE）。
+- TTFT/TPOT 为 bench_serving 实测，已与 /generate 流式直测交叉验证（100k 稳态 TTFT 直测中位 4850.62ms，与 bench 中位 4904.11ms 差约1%）。
+- 100k case 的 Mean TTFT 受 2 个 prefill 长尾请求拉高（中位 4904.11ms），长尾根因待后续单请求取证，如实标注。
+
+### 如何开启 radix cache（前缀缓存）
+- 配置方法：P 节点设置环境变量 SGLANG_DSA_CP_PREFIX_CACHE=1，且启动命令不带 --disable-radix-cache。两件事必须一起做：该旗标是显式关闭，带着它时环境变量无效。
+- 生效条件（缺一不可）：PD 分离 prefill 节点 ＋ --enable-prefill-cp ＋ --cp-strategy interleave ＋ --page-size 64（page_size≠64 会直接拒启）。
+- 生效判据：server.log 出现 "DSA prefill CP prefix cache is ENABLED (experimental)"；若仍出现 "Radix cache is disabled on this PD worker because DSA prefill CP requires…" 说明未生效。
+- 不开启时：保持默认（不设该变量）即可，行为与之前一致。D 节点不适用此开关。
+
+
