@@ -12,6 +12,8 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
+from sglang.srt.layers.attention.dsv4.ppu_logits_workspace import causal_mask_workspace
+from sglang.srt.utils.common import is_ppu
 
 from .scoring import (
     DeepGEMMPrefillData,
@@ -154,7 +156,8 @@ class DenseBlocksBackend:
         selected, blocks = _publish_prefill_blocks(
             data=data,
             kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
+                inputs.layer_id,
+                data.k_slots,
             ),
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
@@ -177,7 +180,8 @@ class DenseBlocksBackend:
         selected = _consume_prefill_blocks(
             data=data,
             kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
+                inputs.layer_id,
+                data.k_slots,
             ),
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,
@@ -259,7 +263,7 @@ def _publish_prefill_blocks(
     blocks = torch.full(
         (data.num_rows, width), -1, dtype=torch.int32, device=selected.device
     )
-    for tile, logits in score_tiles(data, kv, width_align=4):
+    for tile, logits in score_tiles(data, kv, width_align=block_size):
         _publish_tile_blocks(
             data=data,
             tile=tile,
@@ -290,11 +294,21 @@ def _publish_tile_blocks(
 ) -> None:
     lens = data.compress_lens[tile]
     for rows, lc in _requests_in_tile(data, tile):
-        scores = logits[rows, :lc]
-        scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
-            -torch.inf,
+        aligned_lc = -(-lc // block_size) * block_size
+        scores = logits[rows, :aligned_lc]
+        mask = (
+            causal_mask_workspace(
+                device=logits.device, rows=scores.shape[0], width=aligned_lc
+            )
+            if is_ppu()
+            else None
         )
+        columns = torch.arange(aligned_lc, device=logits.device)[None, :]
+        if mask is None:
+            mask = columns >= lens[rows, None]
+        else:
+            torch.ge(columns, lens[rows, None], out=mask)
+        scores.masked_fill_(mask, -torch.inf)
         ids = select_candidate_block_ids(
             logits=scores,
             compress_lens=lens[rows, None],

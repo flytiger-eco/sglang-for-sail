@@ -91,6 +91,12 @@ def make_full_topk_indexer(
 ) -> FullTopKIndexer:
     from sglang.srt.layers.attention.dsv4.indexer_quant import use_dsv41_int8_indexer
 
+    if is_ppu() and _use_deep_gemm_prefill():
+        from sglang.srt.layers.attention.dsv4.ppu_logits_workspace import (
+            register_logits_workspace,
+        )
+
+        register_logits_workspace(req_to_token.device)
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
@@ -113,6 +119,12 @@ def make_candidate_indexer(
     from .dense_blocks import DenseBlocksBackend
 
     use_deep_gemm_prefill = _use_deep_gemm_prefill()
+    if is_ppu() and use_deep_gemm_prefill:
+        from sglang.srt.layers.attention.dsv4.ppu_logits_workspace import (
+            register_logits_workspace,
+        )
+
+        register_logits_workspace(req_to_token.device)
     dense_blocks = DenseBlocksBackend(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
