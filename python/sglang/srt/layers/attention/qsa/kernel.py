@@ -166,7 +166,7 @@ def torch_expand_qsa_block_indices(
     return result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(torch.int32)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["token_stride", "token_width"])
 def _expand_qsa_block_indices_kernel(
     block_indices,
     query_positions,
@@ -176,8 +176,8 @@ def _expand_qsa_block_indices_kernel(
     token_slot_table,
     block_stride: tl.constexpr,
     output_stride: tl.constexpr,
-    token_stride: tl.constexpr,
-    token_width: tl.constexpr,
+    token_stride,
+    token_width,
     PHYSICAL_SLOTS: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
@@ -185,6 +185,8 @@ def _expand_qsa_block_indices_kernel(
     FINAL_TOPK: tl.constexpr,
     OUTPUT_BLOCK_SIZE: tl.constexpr,
 ):
+    # Table width and row stride vary with the request length. Keep them as
+    # runtime scalars so a new prompt length reuses the compiled mapping kernel.
     row = tl.program_id(0)
     cols = tl.arange(0, OUTPUT_BLOCK_SIZE)
     sequence_length = tl.load(sequence_lengths + row)
