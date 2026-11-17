@@ -69,6 +69,9 @@ jobs:
             *) outcome=red ;;
           esac
           printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          # Only a new failure, and a recovery that actually closed something, are
+          # worth a message; a green run that leaves the issue open announces nothing.
+          printf 'announce=false\n' >> "$GITHUB_OUTPUT"
 
           # A test run whose every job was skipped can still conclude success:
           # prepare is skipped when the build failed or was not scheduled, every
@@ -104,9 +107,9 @@ jobs:
             --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .number" \
             > /tmp/open_nightly_issues.txt
           number="$(head -1 /tmp/open_nightly_issues.txt)"
-          printf 'number=%s\n' "$number" >> "$GITHUB_OUTPUT"
 
           if [ "$outcome" = red ]; then
+            printf 'announce=true\n' >> "$GITHUB_OUTPUT"
             # For a test run, head_sha is the revision the harness ran at -- the
             # default branch, which can move while the image builds. What the run
             # actually tested is the commit it published.
@@ -125,8 +128,8 @@ jobs:
 
             if [ -z "$number" ]; then
               gh issue create --repo "$REPO" --title "$title" --label nightly-red \
-                --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n' \
-                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}")"
+                --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n\n%s\n' \
+                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}" "<!-- nightly-ppu-last-red: ${RUN_ID} -->")"
               exit 0
             fi
 
@@ -145,10 +148,34 @@ jobs:
                   --body "$(printf 'Failed again: **%s** (attempt %s)\n\n- run: %s' \
                     "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")" ;;
             esac
+
+            # The issue keeps the failing run it is about, so a later green run can
+            # tell whether it is recovering this incident or merely finishing an
+            # older one. The marker lives in the body, which is always fetched, so
+            # there is one place to update instead of "whichever comment was last".
+            body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
+            case "$body" in
+              *'nightly-ppu-last-red:'*)
+                body="$(printf '%s' "$body" | sed -E "s|<!-- nightly-ppu-last-red: [0-9]+ -->|<!-- nightly-ppu-last-red: ${RUN_ID} -->|")" ;;
+              *)
+                body="$(printf '%s\n\n<!-- nightly-ppu-last-red: %s -->' "$body" "$RUN_ID")" ;;
+            esac
+            gh issue edit "$number" --repo "$REPO" --body "$body" > /dev/null
           elif [ -n "$number" ]; then
+            # A green run that predates the failure on record does not clear it:
+            # rerunning last night's build after this morning's failure would
+            # otherwise close an incident nothing has fixed yet. Comparing run ids
+            # still lets a successful rerun of the failing run recover its own.
+            body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
+            last_red="$(printf '%s' "$body" | sed -n 's/.*nightly-ppu-last-red: \([0-9][0-9]*\).*/\1/p' | head -1)"
+            if [ -n "$last_red" ] && [ "$RUN_ID" -lt "$last_red" ]; then
+              echo "run ${RUN_ID} predates the failure recorded in #${number} (${last_red}); leaving it open"
+              exit 0
+            fi
             gh issue comment "$number" --repo "$REPO" \
               --body "$(printf 'Recovered (%s)\n\n- run: %s' "$WF_NAME" "$RUN_URL")"
             gh issue close "$number" --repo "$REPO"
+            printf 'announce=true\n' >> "$GITHUB_OUTPUT"
           else
             echo "green and no open issue"
           fi
@@ -158,10 +185,7 @@ jobs:
       # retract stays silent. With no webhook configured this step is a no-op, which
       # is what forks and repos that do not want the messages get.
       - name: Notify the DingTalk group
-        if: >-
-          always() &&
-          (steps.upsert.outputs.outcome == 'red' ||
-           (steps.upsert.outputs.outcome == 'green' && steps.upsert.outputs.number != ''))
+        if: ${{ always() && steps.upsert.outputs.announce == 'true' }}
         env:
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
@@ -200,7 +224,11 @@ jobs:
           # missing keyword, so the body, not the status, decides whether it landed.
           response="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' -d "${body}" "${url}")" || response=''
           echo "${response}"
-          case "${response}" in
+          # The spacing inside the JSON is not contractual -- {"errcode": 0} answers
+          # the same as {"errcode":0} -- so compare against a copy with the
+          # whitespace removed rather than against one exact spelling.
+          compact="$(printf '%s' "${response}" | tr -d '[:space:]')"
+          case "${compact}" in
             *'"errcode":0'*) ;;
             *) echo "::error::the DingTalk robot did not accept the message"; exit 1 ;;
           esac

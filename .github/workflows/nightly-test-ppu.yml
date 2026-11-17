@@ -45,25 +45,27 @@ on:
 # looking at the caller's repository and the caller's build. Dispatch is the way
 # in; a real reusable entry point has to take its own revision explicitly.
 
-# A rejected build completion must not cancel a nightly test that is already
-# running. Concurrency is evaluated before prepare's `if`, so a failed build, a
-# push=false debug build or a build off another branch would otherwise join the
-# default-branch group and preempt the run it is about to skip. Those events get a
-# group of their own and forfeit cancellation; everything else keeps the stable
-# group, so a newer nightly still replaces an older one.
+# One group per producer run, and one per manual dispatch. A retry of the same
+# build replaces the test that build started, while another night, a rejected
+# build and a manual debugging run all get groups of their own, so none of them
+# can cancel a test that is already going -- concurrency is evaluated before
+# prepare's `if`, so it cannot tell that a run it is about to preempt would have
+# skipped itself, and a source dispatch has no business cancelling the only test
+# of the night's image.
+#
+# Cancellation is limited to the scheduled default-branch completion, the one
+# event whose artifact the gate will accept. Keying the group by the producer run
+# is what makes that safe: a failed rebuild is harmless without cancelling
+# anything, and a retry lands in the group of the run it belongs to.
 concurrency:
   group: >-
-    nightly-test-ppu-${{ inputs.ref || github.ref }}-${{
-    (github.event_name != 'workflow_run' ||
-    (github.event.workflow_run.conclusion == 'success' &&
-    github.event.workflow_run.event == 'schedule' &&
-    github.event.workflow_run.head_branch == github.event.repository.default_branch))
-    && 'active' || github.run_id }}
+    ${{ github.event_name == 'workflow_run' &&
+    format('nightly-test-ppu-build-{0}', github.event.workflow_run.id) ||
+    format('nightly-test-ppu-manual-{0}', github.run_id) }}
   cancel-in-progress: >-
-    ${{ github.event_name != 'workflow_run' ||
-    (github.event.workflow_run.conclusion == 'success' &&
+    ${{ github.event_name == 'workflow_run' &&
     github.event.workflow_run.event == 'schedule' &&
-    github.event.workflow_run.head_branch == github.event.repository.default_branch) }}
+    github.event.workflow_run.head_branch == github.event.repository.default_branch }}
 
 permissions:
   contents: read
@@ -202,6 +204,8 @@ jobs:
         id: image
         env:
           REQUESTED_IMAGE: ${{ inputs.test_image }}
+          TRUSTED_IMAGE_REPOS: ${{ vars.PPU_TRUSTED_IMAGE_REPOS }}
+          BASE_IMAGE: ${{ env.PPU_BASE_IMAGE }}
           BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
           BUILD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           # The build stamps its tag with `date -u +%Y%m%d` when it executes, not
@@ -212,6 +216,36 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$REQUESTED_IMAGE" ]; then
+            # This reference becomes the root filesystem of a pod that carries the
+            # Artifactory credentials in its environment, writable shared mounts and
+            # privileged: true. An unrelated repository would hand all three to
+            # whatever a dispatcher pasted, and the in-image health check runs far
+            # too late to establish trust, so the decision is made here: only
+            # repositories this project builds itself are admitted.
+            repo="${REQUESTED_IMAGE%%@*}"
+            case "${repo##*/}" in
+              *:*) repo="${repo%:*}" ;;
+            esac
+            base_repo="${BASE_IMAGE%%@*}"
+            case "${base_repo##*/}" in
+              *:*) base_repo="${base_repo%:*}" ;;
+            esac
+            owner_lc=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+            trusted="ghcr.io/${owner_lc}/sglang-ppu-nightly ${base_repo}"
+            if [ -n "${TRUSTED_IMAGE_REPOS:-}" ]; then
+              trusted="${trusted} $(printf '%s' "${TRUSTED_IMAGE_REPOS}" | tr ',' ' ')"
+            fi
+            admitted=''
+            for candidate_repo in ${trusted}; do
+              if [ "${repo}" = "${candidate_repo}" ]; then
+                admitted=1
+                break
+              fi
+            done
+            if [ -z "${admitted}" ]; then
+              echo "::error::test_image '${REQUESTED_IMAGE}' comes from '${repo}', which this project does not build; trusted repositories: ${trusted}. Set PPU_TRUSTED_IMAGE_REPOS to add one on purpose."
+              exit 1
+            fi
             printf 'tag=%s\n' "$REQUESTED_IMAGE" >> "$GITHUB_OUTPUT"
             printf 'candidates=%s\n' "$REQUESTED_IMAGE" >> "$GITHUB_OUTPUT"
             exit 0
