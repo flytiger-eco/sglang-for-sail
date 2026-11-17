@@ -550,7 +550,18 @@ class DeepseekSparseAttnBackend(
                     f"--kv-cache-dtype fp8_e4m3 (got kv_cache_dtype={self.kv_cache_dtype}); "
                     "use --dsa-prefill-backend flashmla_sparse for the bf16 path."
                 )
-            if self.device_sm_major != 9:
+            if _is_ppu:
+                if not (self.device_sm_major == 8 and self.device_capability[1] >= 9):
+                    raise ValueError(
+                        "PPU flashmla_sparse_q8 requires sm_89 (ZW-M890P); got "
+                        f"compute capability {self.device_capability}."
+                    )
+                from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+                    validate_flash_mla_sparse_quantized_fwd,
+                )
+
+                validate_flash_mla_sparse_quantized_fwd()
+            elif self.device_sm_major != 9:
                 raise ValueError(
                     "--dsa-prefill-backend flashmla_sparse_q8 is SM90-only; got compute "
                     f"capability sm_{self.device_sm_major}x."
@@ -2967,9 +2978,14 @@ class DeepseekSparseAttnBackend(
             (``gather_dequant_requant_fp8_paged``) — no intermediate bf16
             materialization.
         """
-        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
-            sparse_mla_q8kv8_prefill_fwd,
-        )
+        if _is_ppu:
+            from sglang.srt.hardware_backend.ppu.attention.flash_mla import (
+                flash_mla_sparse_quantized_fwd,
+            )
+        else:
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+                sparse_mla_q8kv8_prefill_fwd,
+            )
 
         num_tokens, num_heads, d_nope = q_nope.shape
         head_dim = d_nope + q_rope.shape[-1]
@@ -3045,7 +3061,7 @@ class DeepseekSparseAttnBackend(
         # Identity per-tensor scale, cached: creating it per call is a
         # host->device copy that synchronizes the stream.
         identity_scale = self._q8kv8_identity_scale
-        if identity_scale is None:
+        if not _is_ppu and identity_scale is None:
             identity_scale = torch.tensor([1.0], dtype=torch.float32, device=dev)
             self._q8kv8_identity_scale = identity_scale
 
@@ -3070,7 +3086,8 @@ class DeepseekSparseAttnBackend(
             num_kv_tokens = kv_k.shape[0]
         else:
             num_kv_tokens = kv_bf16.shape[0]
-        total_kv_rows = num_kv_tokens + topk
+        extra_rows = 0 if _is_ppu else topk
+        total_kv_rows = num_kv_tokens + extra_rows
         kv_buf = self._q8kv8_kv_buf
         if kv_buf is None or kv_buf.shape[0] < total_kv_rows:
             kv_buf = torch.empty(
@@ -3083,7 +3100,7 @@ class DeepseekSparseAttnBackend(
             kv_padded = gather_dequant_requant_fp8_paged(
                 paged_kv_cache,
                 page_table_1_flattened,
-                extra_rows=topk,
+                extra_rows=extra_rows,
                 out=kv_buf[:total_kv_rows],
             ).view(-1, 1, head_dim)
         elif kv_k is not None:
@@ -3100,7 +3117,8 @@ class DeepseekSparseAttnBackend(
             # bf16 -> fp8 cast copy, same op as the previous fresh-buffer
             # path (bit-identical bytes).
             kv_padded[:num_kv_tokens].copy_(kv_bf16.view(num_kv_tokens, head_dim))
-            kv_padded[num_kv_tokens:].zero_()
+            if extra_rows:
+                kv_padded[num_kv_tokens:].zero_()
             kv_padded = kv_padded.view(-1, 1, head_dim)
 
         # Per-row valid-topk count = last non-pad position + 1.  Bit-exact
@@ -3133,20 +3151,32 @@ class DeepseekSparseAttnBackend(
             )
             self._q8kv8_out_bufs = out_bufs
 
-        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
-            q=q_fp8,
-            kv=kv_padded,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            q_scale=identity_scale,
-            kv_scale=identity_scale,
-            d_v=v_head_dim,
-            attn_sink=None,
-            topk_length=topk_length,
-            out=out_bufs[0][:s_q],
-            max_logits=out_bufs[1][:s_q],
-            lse=out_bufs[2][:s_q],
-        )
+        if _is_ppu:
+            o, _, _ = flash_mla_sparse_quantized_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+            )
+        else:
+            o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+                q=q_fp8,
+                kv=kv_padded,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                q_scale=identity_scale,
+                kv_scale=identity_scale,
+                d_v=v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+                out=out_bufs[0][:s_q],
+                max_logits=out_bufs[1][:s_q],
+                lse=out_bufs[2][:s_q],
+            )
 
         # Trim the output back to the original head count if we padded.
         if need_padding:

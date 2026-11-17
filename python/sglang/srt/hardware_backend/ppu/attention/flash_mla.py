@@ -203,3 +203,40 @@ def flash_mla_sparse_fwd(
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
+
+
+def validate_flash_mla_sparse_quantized_fwd() -> None:
+    """Fail at backend construction when PPU FlashMLA lacks native Q8/KV8."""
+    if _import_error is not None:
+        raise _IMPORT_ERROR from _import_error
+    if not callable(getattr(_flashmla, "flash_mla_sparse_quantized_fwd", None)):
+        raise ImportError(
+            "PPU flashmla_sparse_q8 requires FlashMLA exposing "
+            "flash_mla_sparse_quantized_fwd. Build and install a compatible "
+            "FlashMLA-for-sail package."
+        )
+
+
+def flash_mla_sparse_quantized_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run native PPU Q8/KV8/P8 sparse prefill on flat E4M3 operands."""
+    validate_flash_mla_sparse_quantized_fwd()
+    return _flashmla.flash_mla_sparse_quantized_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        out=out,
+        compute_aux=False,
+    )
