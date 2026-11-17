@@ -222,7 +222,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          name="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts?per_page=100" --jq '[.artifacts[] | select(.name | startswith("ppu-nightly-image-${{ github.event.workflow_run.id }}-"))] | sort_by(.created_at) | last | .name // empty')"
+          # The attempt is the last segment of the name. Only attempts at or
+          # below this event's own are eligible: a later attempt of the same
+          # build run is a rebuild this test was not triggered by, and being
+          # newer it would otherwise win.
+          name="$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts?per_page=100" --jq '[.artifacts[] | select(.name | startswith("ppu-nightly-image-${{ github.event.workflow_run.id }}-")) | select((.name | split("-") | last | tonumber?) <= ${{ github.event.workflow_run.run_attempt }})] | sort_by(.name | split("-") | last | tonumber?) | last | .name // empty')"
           printf 'name=%s\n' "${name}" >> "$GITHUB_OUTPUT"
           echo "digest artifact for this run: ${name:-<none>}"
 

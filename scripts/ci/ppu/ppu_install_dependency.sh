@@ -207,7 +207,10 @@ fi # PPU_TEST_MODE != image
 # in image mode. These packages never touch the sglang under test; they are only
 # what run_suite.py needs in order to start.
 if [[ "$PPU_TEST_MODE" == "image" ]]; then
-    ${PIP_INSTALL} pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate
+    # PyYAML is left unpinned: the image ships it and sglang.srt imports it at
+    # runtime, so pinning a version here would replace the shipped one before the
+    # checks look at it. Installing a package that is already there is a no-op.
+    ${PIP_INSTALL} pytest==8.3.5 PyYAML jsonschema tabulate
     # What the artifact actually carries. Source mode repairs these above; here
     # they are only looked at, so a case that dies on an old one is attributable
     # to the image.

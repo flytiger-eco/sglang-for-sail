@@ -230,6 +230,19 @@ else
   fi
 
   kill "${server_pid}" 2>/dev/null || true
+  # Bounded: `wait` alone has no deadline, so a launcher that ignores SIGTERM would
+  # hold the pod until the job timeout and this summary would never be written.
+  for _ in $(seq 1 30); do
+    kill -0 "${server_pid}" 2>/dev/null || break
+    sleep 1
+  done
+  # Still there: take it down with the scheduler and detokenizer children it would
+  # otherwise leave holding device memory. Older images may not carry the helper,
+  # hence the plain kill.
+  python3 -c 'import sys
+from sglang.srt.utils import kill_process_tree
+kill_process_tree(int(sys.argv[1]))' "${server_pid}" 2>/dev/null ||
+    kill -9 "${server_pid}" 2>/dev/null || true
   wait "${server_pid}" 2>/dev/null || true
   rm -f "${server_log}"
 fi

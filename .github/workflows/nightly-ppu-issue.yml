@@ -106,9 +106,10 @@ jobs:
             fi
 
             # Retrying the same run delivers the same URL again; keying on the URL
-            # keeps the thread from filling up.
-            if gh issue view "$number" --repo "$REPO" --json comments \
-                --jq '.comments[].body' | grep -qF "$RUN_URL"; then
+            # keeps the thread from filling up. The body is searched too: the URL of
+            # the first failure was written there, not in a comment.
+            if gh issue view "$number" --repo "$REPO" --json body,comments \
+                --jq '.body, .comments[].body' | grep -qF "$RUN_URL"; then
               echo "run already recorded in #${number}, not commenting again"
             else
               gh issue comment "$number" --repo "$REPO" \
