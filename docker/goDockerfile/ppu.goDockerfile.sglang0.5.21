@@ -26,15 +26,15 @@ ARG MAX_JOBS=16
 # build fallback in ppu_kernels_builder.
 # Keep comments out of the continuation block below: a comment line there
 # drops the package line that follows it.
-# deep_gemm gotag commit: 8292bb50504556daceee820991158c759290a38c
-# pla gotag commit: ff5fb5f436a679d3bf4b15b61ddf470a2293e0cd
+# deep_gemm==1.1.0+v1.0.1.ppu2.2.0, gotag commit==8292bb50504556daceee820991158c759290a38c
+# pla==1.0.1+v0.1.0.ppu2.2.0, gotag commit==ff5fb5f436a679d3bf4b15b61ddf470a2293e0cd
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
     cuda-bindings==13.0.0+v0.1.0.ppu2.2.0 \
     cuda-python==13.0.0+v0.1.0.ppu2.2.0 \
     deep_ep==2.2.1+v0.1.0.ppu2.2.0 \
-    deep_gemm==1.1.0+v1.0.1.ppu2.2.1  \
+    deep_gemm==1.1.0+v1.0.1.ppu2.2.0  \
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
     flash-attn==2.7.4.post1+v0.2.0.ppu2.2.0 \
     flash_attn_3==3.0.0+v0.2.0.ppu2.2.0 \
