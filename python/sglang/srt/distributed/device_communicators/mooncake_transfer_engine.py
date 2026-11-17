@@ -144,13 +144,18 @@ class MooncakeTransferEngine:
         ).to_host_port_str()
 
     def register(self, ptr, length) -> None:
+        region = f"ptr={ptr:#x}, length={length}"
         try:
             ret_value = self.engine.register_memory(ptr, length)
         except Exception as exc:
-            raise RuntimeError("Mooncake memory registration failed") from exc
+            raise RuntimeError(
+                f"Mooncake memory registration failed ({region})"
+            ) from exc
 
         if ret_value != 0:
-            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
+            raise RuntimeError(
+                f"Mooncake memory registration failed ({region}, ret={ret_value})"
+            )
 
     def deregister(self, ptr) -> None:
         try:
