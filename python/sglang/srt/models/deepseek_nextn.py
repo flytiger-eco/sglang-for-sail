@@ -17,6 +17,7 @@
 import logging
 import os
 from contextlib import ExitStack
+from copy import deepcopy
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -342,6 +343,20 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         return cls.hf_to_sglang_mapper
 
     def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is not None and quant_config.get_name() == "mxfp4":
+            # Checkpoint MTP weights follow the target's last layer; the draft
+            # module uses model.decoder. Do not mutate the target's metadata.
+            quant_config = deepcopy(quant_config)
+            layer_prefix = f"model.layers.{config.num_hidden_layers}."
+            mapping = {layer_prefix: "model.decoder."}
+            # The weight loader places these outside the decoder block.
+            for name in ("shared_head.norm", "eh_proj", "enorm", "hnorm"):
+                mapping[layer_prefix + name] = "model." + name
+                mapping["model.decoder." + name] = "model." + name
+            quant_config.apply_weight_name_mapper(
+                WeightsMapper(orig_to_new_prefix=mapping)
+            )
+            return quant_config
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
 
