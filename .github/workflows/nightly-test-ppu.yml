@@ -45,22 +45,20 @@ on:
 # looking at the caller's repository and the caller's build. Dispatch is the way
 # in; a real reusable entry point has to take its own revision explicitly.
 
-# One group per producer run, and one per manual dispatch. A retry of the same
-# build replaces the test that build started, while another night, a rejected
-# build and a manual debugging run all get groups of their own, so none of them
-# can cancel a test that is already going -- concurrency is evaluated before
-# prepare's `if`, so it cannot tell that a run it is about to preempt would have
-# skipped itself, and a source dispatch has no business cancelling the only test
-# of the night's image.
+# One group per producer attempt, and one per manual dispatch. A retry gets its
+# own group because concurrency is evaluated before the gate: an attempt whose
+# build job failed cancels nothing, so it must not cancel the test its earlier
+# attempt already started and would then skip. Same for another night and for a
+# manual debugging run, which has no business replacing the night's only test.
 #
 # Cancellation is limited to the scheduled default-branch completion, the one
-# event whose artifact the gate will accept. Keying the group by the producer run
-# is what makes that safe: a failed rebuild is harmless without cancelling
-# anything, and a retry lands in the group of the run it belongs to.
+# event whose artifact the gate will accept. The price is that a retry that does
+# publish again may overlap the test of the attempt before it -- a duplicate
+# night instead of a lost one.
 concurrency:
   group: >-
     ${{ github.event_name == 'workflow_run' &&
-    format('nightly-test-ppu-build-{0}', github.event.workflow_run.id) ||
+    format('nightly-test-ppu-build-{0}-{1}', github.event.workflow_run.id, github.event.workflow_run.run_attempt) ||
     format('nightly-test-ppu-manual-{0}', github.run_id) }}
   cancel-in-progress: >-
     ${{ github.event_name == 'workflow_run' &&
@@ -216,6 +214,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$REQUESTED_IMAGE" ]; then
+            # Everything below assumes one image reference, and the value is
+            # written into $GITHUB_OUTPUT, which is line-oriented: a newline would
+            # turn the tail into a second output that a later step reads as its
+            # own. Only the characters a real reference uses are admitted, checked
+            # on the whole input so no parsing step has to be trusted for it.
+            if [[ ! "${REQUESTED_IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]]; then
+              echo "::error::test_image must be a single image reference; '${REQUESTED_IMAGE}' carries whitespace, a newline or another character a reference cannot contain"
+              exit 1
+            fi
             # This reference becomes the root filesystem of a pod that carries the
             # Artifactory credentials in its environment, writable shared mounts and
             # privileged: true. An unrelated repository would hand all three to
@@ -458,6 +465,7 @@ jobs:
   # cluster-task staging, K8s Job names, local caches, and evidence artifacts.
   nightly-1a-ppu:
     name: nightly-1a-ppu-${{ matrix.board.slug }}
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -528,10 +536,6 @@ jobs:
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
             export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}-${{ matrix.board.slug }}"
             mkdir -p "$PPU_EVIDENCE_DIR"
-            python3 scripts/ci/ppu/check_nightly_board.py \
-              --board "${{ matrix.board.slug }}" \
-              --devices "$PPU_EXPECTED_DEVICES" \
-              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             # Which harness prepares the pod. Image mode needs the one from this
             # workflow's revision -- it is what knows how to prepare an artifact;
             # source mode keeps the tested commit's scripts, unchanged.
@@ -543,6 +547,14 @@ jobs:
                 exit 1
               fi
             fi
+            # The fingerprint checker comes from the same harness: a tested ref
+            # that predates it would otherwise fail the line before a single case
+            # ran, and what it checks -- which board this pod got -- is a property
+            # of the pod, not of the commit under test.
+            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+              --board "${{ matrix.board.slug }}" \
+              --devices "$PPU_EXPECTED_DEVICES" \
+              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
@@ -659,10 +671,6 @@ jobs:
               /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
             export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}-${{ matrix.board.slug }}"
             mkdir -p "$PPU_EVIDENCE_DIR"
-            python3 scripts/ci/ppu/check_nightly_board.py \
-              --board "${{ matrix.board.slug }}" \
-              --devices "$PPU_EXPECTED_DEVICES" \
-              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             # Which harness prepares the pod. Image mode needs the one from this
             # workflow's revision -- it is what knows how to prepare an artifact;
             # source mode keeps the tested commit's scripts, unchanged.
@@ -674,6 +682,14 @@ jobs:
                 exit 1
               fi
             fi
+            # The fingerprint checker comes from the same harness: a tested ref
+            # that predates it would otherwise fail the line before a single case
+            # ran, and what it checks -- which board this pod got -- is a property
+            # of the pod, not of the commit under test.
+            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+              --board "${{ matrix.board.slug }}" \
+              --devices "$PPU_EXPECTED_DEVICES" \
+              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
@@ -783,10 +799,6 @@ jobs:
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}-${{ matrix.board.slug }}"
             mkdir -p "$PPU_EVIDENCE_DIR"
-            python3 scripts/ci/ppu/check_nightly_board.py \
-              --board "${{ matrix.board.slug }}" \
-              --devices "$PPU_EXPECTED_DEVICES" \
-              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             # Which harness prepares the pod. Image mode needs the one from this
             # workflow's revision -- it is what knows how to prepare an artifact;
             # source mode keeps the tested commit's scripts, unchanged.
@@ -798,6 +810,14 @@ jobs:
                 exit 1
               fi
             fi
+            # The fingerprint checker comes from the same harness: a tested ref
+            # that predates it would otherwise fail the line before a single case
+            # ran, and what it checks -- which board this pod got -- is a property
+            # of the pod, not of the commit under test.
+            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+              --board "${{ matrix.board.slug }}" \
+              --devices "$PPU_EXPECTED_DEVICES" \
+              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"
@@ -897,10 +917,6 @@ jobs:
               /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
             export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-nightly-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}-${{ matrix.board.slug }}"
             mkdir -p "$PPU_EVIDENCE_DIR"
-            python3 scripts/ci/ppu/check_nightly_board.py \
-              --board "${{ matrix.board.slug }}" \
-              --devices "$PPU_EXPECTED_DEVICES" \
-              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             # Which harness prepares the pod. Image mode needs the one from this
             # workflow's revision -- it is what knows how to prepare an artifact;
             # source mode keeps the tested commit's scripts, unchanged.
@@ -912,6 +928,14 @@ jobs:
                 exit 1
               fi
             fi
+            # The fingerprint checker comes from the same harness: a tested ref
+            # that predates it would otherwise fail the line before a single case
+            # ran, and what it checks -- which board this pod got -- is a property
+            # of the pod, not of the commit under test.
+            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+              --board "${{ matrix.board.slug }}" \
+              --devices "$PPU_EXPECTED_DEVICES" \
+              --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
             bash "$harness/scripts/ci/ppu/ppu_install_dependency.sh" 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-nightly-tvm-ffi-${{ github.job }}-${{ matrix.board.slug }}"

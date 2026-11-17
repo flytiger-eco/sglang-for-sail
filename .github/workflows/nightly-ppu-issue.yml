@@ -156,7 +156,14 @@ jobs:
             body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
             case "$body" in
               *'nightly-ppu-last-red:'*)
-                body="$(printf '%s' "$body" | sed -E "s|<!-- nightly-ppu-last-red: [0-9]+ -->|<!-- nightly-ppu-last-red: ${RUN_ID} -->|")" ;;
+                # The marker only moves forward. A failed rerun of an older build
+                # would otherwise lower it, and a green rerun newer than that --
+                # but older than the newest failure -- would then close an incident
+                # nothing has fixed.
+                previous_red="$(printf '%s' "$body" | sed -n 's/.*nightly-ppu-last-red: \([0-9][0-9]*\).*/\1/p' | head -1)"
+                if [ -z "$previous_red" ] || [ "$RUN_ID" -ge "$previous_red" ]; then
+                  body="$(printf '%s' "$body" | sed -E "s|<!-- nightly-ppu-last-red: [0-9]+ -->|<!-- nightly-ppu-last-red: ${RUN_ID} -->|")"
+                fi ;;
               *)
                 body="$(printf '%s\n\n<!-- nightly-ppu-last-red: %s -->' "$body" "$RUN_ID")" ;;
             esac
