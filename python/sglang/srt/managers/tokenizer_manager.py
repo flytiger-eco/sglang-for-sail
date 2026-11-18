@@ -89,6 +89,7 @@ from sglang.srt.managers.io_struct import (
     ExpandedInputLenReleaseReq,
     ExpandedInputLenReq,
     PrefillMMReadyOutput,
+    EncoderReceiveEndpointOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -874,6 +875,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             [
                 (AbortReq, self._handle_abort_req),
                 (PrefillMMReadyOutput, self._handle_prefill_mm_ready),
+                (EncoderReceiveEndpointOutput, self._handle_encoder_receive_endpoint),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1897,6 +1899,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
+            # Hand raw text IDs to the CPU lane before the scheduler can be
+            # delayed by another request's forward. No visual payload goes on
+            # this control connection.
+            if getattr(tokenized_obj, "need_wait_for_mm_inputs", False):
+                await self.mm_receiver.prepare_background(tokenized_obj)
             tokenized_obj.wrap_pickle_fields()
             self._register_expanded_input_owner(tokenized_obj)
             self._dispatch_to_scheduler(tokenized_obj)
@@ -1952,6 +1959,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
+                if getattr(tokenized_obj, "need_wait_for_mm_inputs", False):
+                    await self.mm_receiver.prepare_background(tokenized_obj)
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -4111,6 +4120,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 child.need_wait_for_mm_inputs = bool(
                     obj.need_wait_for_mm_inputs and child.contains_mm_input()
                 )
+
+    def _handle_encoder_receive_endpoint(self, endpoint: EncoderReceiveEndpointOutput):
+        self.mm_receiver.background_endpoints[endpoint.tp_rank] = endpoint
 
     def _handle_prefill_mm_ready(self, notification: PrefillMMReadyOutput):
         # Ignore late completion for a retired/reused HTTP owner. Use the
