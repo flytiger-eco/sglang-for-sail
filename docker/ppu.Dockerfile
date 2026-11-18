@@ -7,7 +7,7 @@
 # framework/runtime targets.
 # Use CUDA-compatible PPU wheels; do not compile SGLang, AOT kernels or gateway.
 # NVIDIA-only components and kernels-community CUDA cubins are not installed.
-ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103
 # The pinned SGLang wheel provides runtime_common/tracing extras; install ray
 # separately for the DeepGEMM tuner.
 # Avoid CUDA diffusion dependencies from all and torch-for-sail/triton-for-sail
@@ -46,18 +46,18 @@ ARG PPU_PACKAGES="\
     triton==3.7.1+v0.1.0.ppu2.2.0"
 # The base image provides torch/torchvision; only add torchaudio.
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
-# The 2026-11-11-2345 directory contains flash_attn and flash_attn_3; pin both URLs.
+# Pin flash_attn and flash_attn_3 separately to their requested wheel URLs.
 # These projects are excluded from PPU_PACKAGES so old index versions cannot
 # replace the requested wheels.
 ARG PPU_WHEEL_URLS="\
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-17-2011/deep_gemm-1.1.0.dev316+v1.1.0.ppu2.2.0.g0fcb94b0-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-17-2028/flash_mla-2.1.0.dev9+v1.0.0.ppu2.2.0.g2b70d8d-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2345/flash_attn-2.8.2-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2345/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2252/pla-1.1.0-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-11-2111/msa_for_sail-0.1.1+v0.1.0.ppu2.2.0-py3-none-any.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-17-1949/sglang-0.5.23-1g7bee0230de49-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-17-1949/sglang_kernel-0.4.10-1g7bee0230de49-cp310-abi3-linux_x86_64.whl"
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1553/deep_gemm-1.1.0.dev316+v1.1.0.ppu2.2.1.g0fcb94b0-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1628/flash_mla-2.1.0.dev9+v1.0.0.ppu2.2.1.g2b70d8d-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn-2.8.2-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1607/pla-1.1.0-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1535/msa_for_sail-0.1.1+v0.1.0.ppu2.2.1-py3-none-any.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-2047/sglang-0.5.23-1g7bee0230de49-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-2047/sglang_kernel-0.4.10-1g7bee0230de49-cp310-abi3-linux_x86_64.whl"
 
 FROM ${PPU_BASE_IMAGE} AS base
 
@@ -76,14 +76,6 @@ ENV PATH="${PPU_SDK}/bin:${PATH}" \
 
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-# DeepGEMM's CUDA-compatible JIT invokes cuobjdump to extract kernel symbols.
-RUN cuda_home="${CUDA_HOME:-${CUDA_PATH:-${PPU_SDK}/CUDA_SDK}}" \
-    && test -x "${PPU_SDK}/bin/hgobjdump" \
-    && if [ ! -e "${cuda_home}/bin/cuobjdump" ] && [ ! -L "${cuda_home}/bin/cuobjdump" ]; then \
-        ln -s "${PPU_SDK}/bin/hgobjdump" "${cuda_home}/bin/cuobjdump"; \
-    fi \
-    && test -x "${cuda_home}/bin/cuobjdump"
 
 # Support both sources.list and deb822 ubuntu.sources on Ubuntu 24.04.
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
