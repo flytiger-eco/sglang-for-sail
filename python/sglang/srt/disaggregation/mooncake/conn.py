@@ -362,6 +362,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._prealloc_abort_reservations.add(key)
             return True
 
+    def reject_before_sender(self, room: int, pair_key: str) -> bool:
+        """Retain a terminal E failure so D's paired cancel can be ACKed.
+
+        No sender or destination has been published for this request. Never
+        acknowledge a live/reused room or bypass the drain protocol for writes.
+        The same bounded, generation-keyed replay table fences late retries.
+        """
+        if not pair_key:
+            return False
+        key = (room, pair_key)
+        with self._prealloc_abort_lock:
+            if (
+                room in self.request_status
+                or room in self._prealloc_abort_attempts
+                or self._staging_outstanding.get(room, 0) > 0
+            ):
+                return False
+            record = self._get_prealloc_abort_replay(key, create=True)
+            if record is None:
+                return False
+            record.drained = True
+            return True
+
     def release_prealloc_abort_reservation(self, room: int, pair_key: str) -> None:
         """Undo an admission reservation without touching a published owner."""
         with self._prealloc_abort_lock:

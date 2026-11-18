@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -245,6 +246,22 @@ class SchedulerRequestReceiver:
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
+                # Independent E can fail before Prefill has a KV sender. D
+                # still owns a paired preallocation waiter; let its cancellation
+                # observe this terminal attempt instead of waiting for a sender
+                # that will never exist. DP1/PP1 needs no room-to-rank publish.
+                if (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and os.environ.get("SGLANG_ENCODER_BACKGROUND_READY") == "1"
+                    and get_parallel().pp_size == 1
+                    and get_parallel().dp_size == 1
+                ):
+                    queue = self.mm_receiver.scheduler.disagg_prefill_bootstrap_queue
+                    reject = getattr(queue.kv_manager, "reject_before_sender", None)
+                    pair_key = getattr(req, "_expanded_input_pair_key", None)
+                    if reject is not None and pair_key:
+                        if not reject(req.bootstrap_room, pair_key):
+                            logger.warning("Cannot retain early Prefill rejection rid=%s", req.rid)
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs

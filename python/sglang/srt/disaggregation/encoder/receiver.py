@@ -30,6 +30,7 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
 )
+from sglang.srt.disaggregation.expanded_input import expanded_input_pair_key
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
@@ -2686,6 +2687,11 @@ class MMReceiverBase(ABC):
             dllm_config=self.scheduler.dllm_config,
         )
         req.tokenizer = self.scheduler.tokenizer
+        # E failures use this lightweight Req before Scheduler.create_req runs.
+        # Preserve the dispatcher's generation key for paired D cancellation.
+        req._expanded_input_pair_key = expanded_input_pair_key(
+            recv_req, self.scheduler.disaggregation_mode
+        )
         return req
 
     def _assign_items_by_modality(
