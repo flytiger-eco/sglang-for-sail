@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
 )
 from sglang.srt.layers.attention.qsa.mqa import (
+    HAS_TILELANG,
     qsa_mqa_decode,
     qsa_mqa_padded_heads,
     qsa_mqa_prefill,
@@ -31,17 +32,20 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.common import is_ppu
 
-# Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
+# Cap on the stored [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
-def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
+def _qsa_prefill_row_chunk_size(
+    rows: int, keys: int, heads: int, logits_dtype: torch.dtype = torch.float32
+) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
-    bytes_per_row = keys * torch.float32.itemsize
+    bytes_per_row = keys * logits_dtype.itemsize
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
@@ -482,9 +486,18 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return QSAPrefillPhysicalSelection(output) if physical else output
 
+        ppu_prefill = is_ppu() and q.is_cuda
+        bf16_logits = HAS_TILELANG and envs.SGLANG_QSA_PREFILL_BF16_LOGITS.get()
+        logits_dtype = torch.bfloat16 if bf16_logits else torch.float32
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
+            rows,
+            compressed_keys.shape[0],
+            q.shape[1],
+            logits_dtype if ppu_prefill else torch.float32,
         )
+        # Only the PPU BF16 native TopK contract reads [start,end), so invalid
+        # logits need no materialization. Other consumers keep masked logits.
+        skip_mask = ppu_prefill and bf16_logits and self.block_topk in (512, 2048)
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
@@ -502,6 +515,7 @@ class QSAIndexer(MultiPlatformOp):
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
+                    mask_logits=not skip_mask,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -509,6 +523,9 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+            # Expand directly into the final row slice, avoiding a second
+            # selection allocation and copy for every logits chunk.
+            chunk_output = output[chunk_slice] if ppu_prefill else None
             if physical:
                 selected = expand_map_qsa_physical_slots(
                     block_indices,
@@ -518,6 +535,7 @@ class QSAIndexer(MultiPlatformOp):
                     token_slot_table,
                     compress_ratio=self.compress_ratio,
                     token_topk=self.token_topk,
+                    out=chunk_output,
                 )
             else:
                 selected = expand_qsa_block_indices(
@@ -526,8 +544,10 @@ class QSAIndexer(MultiPlatformOp):
                     sequence_lengths_for_rows[chunk_slice],
                     compress_ratio=self.compress_ratio,
                     token_topk=self.token_topk,
+                    out=chunk_output,
                 )
-            output[chunk_slice].copy_(selected)
+            if chunk_output is None:
+                output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
         return QSAPrefillPhysicalSelection(output) if physical else output
 

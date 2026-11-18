@@ -397,6 +397,9 @@ def _prefill_mqa_block_n(keys: int, heads: int, head_dim: int) -> int:
         if override not in (64, 128, 256):
             raise ValueError("SGLANG_QSA_PREFILL_BLOCK_N must be 0/64/128/256")
         return override
+    # Four-head Qwen prefill benefits from a wider K tile on long rows.
+    if is_ppu() and heads == 4 and head_dim == 128 and keys >= 2048:
+        return 128
     if is_ppu() and heads == 8 and head_dim == 128:
         return 64 if keys <= 4096 else 256
     return 64
@@ -408,8 +411,14 @@ def tilelang_qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    *,
+    mask_logits: bool = True,
 ) -> torch.Tensor:
-    """Validated TileLang packed prefill kernel with weights removed."""
+    """Packed prefill scores; callers normally receive fully masked logits.
+
+    The PPU BF16 native TopK reads only [row_starts, row_ends), so its caller
+    may skip materializing invalid logits with mask_logits=False.
+    """
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -427,9 +436,12 @@ def tilelang_qsa_mqa_prefill(
     block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
-    # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
+    # A torch.cat of the padding rows would copy the whole [rows, keys] logits matrix,
     # doubling the dominant prefill buffer; allocate pre-padded instead.
-    logits = torch.zeros((padded_rows, keys), dtype=logits_dtype, device=q.device)
+    # Scoring writes every valid element; the mask (when requested) writes
+    # every invalid element. Zero-filling this matrix is redundant.
+    allocate = torch.empty if is_ppu() and output_bf16 else torch.zeros
+    logits = allocate((padded_rows, keys), dtype=logits_dtype, device=q.device)
     scoring_dtype = _scoring_dtype(q, k)
     q_padded = q.to(scoring_dtype).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
@@ -459,9 +471,10 @@ def tilelang_qsa_mqa_prefill(
     logits = logits[:rows]
     if not output_bf16:
         logits.div_(score_scale or math.sqrt(head_dim))
-    _tilelang_qsa_mqa_mask_kernel(output_bf16=output_bf16)(
-        logits, starts[:rows], ends[:rows]
-    )
+    if mask_logits:
+        _tilelang_qsa_mqa_mask_kernel(output_bf16=output_bf16)(
+            logits, starts[:rows], ends[:rows]
+        )
     return logits
 
 
@@ -550,9 +563,13 @@ def qsa_mqa_prefill(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
+    *,
+    mask_logits: bool = True,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
-        return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
+        return tilelang_qsa_mqa_prefill(
+            q, k, row_starts, row_ends, score_scale, mask_logits=mask_logits
+        )
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
 
 
