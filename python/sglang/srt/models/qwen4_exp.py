@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -93,7 +91,10 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_hip, is_ppu, logger
+from torch import nn
+
+_is_ppu = is_ppu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -155,6 +156,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    query_start_loc: Optional[torch.Tensor] = None
 
 
 def _prepare_ple_batch(
@@ -192,6 +194,7 @@ def _prepare_ple_batch(
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
+    query_start_loc = None
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
@@ -318,6 +321,7 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        query_start_loc=query_start_loc,
     )
 
 
@@ -1177,12 +1181,33 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
-        state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
-        padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+        from sglang.kernels.ops.mamba.qwen4_ple_prefill import (
+            can_pack_ple_prefill,
+            pack_ple_prefill,
         )
-        padded_seq[batch.req_indices, batch.token_offsets] = x
-        conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+
+        pack_args = (
+            x,
+            conv_state,
+            batch.state_indices,
+            batch.lengths,
+            batch.query_start_loc,
+            batch.row_width,
+        )
+        if (
+            _is_ppu
+            and self.ple_embedding.enable_ple_fusion
+            and batch.mode == ForwardMode.EXTEND
+            and can_pack_ple_prefill(*pack_args)
+        ):
+            conv_input = pack_ple_prefill(*pack_args)
+        else:
+            state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+            padded_seq = x.new_zeros(
+                (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            )
+            padded_seq[batch.req_indices, batch.token_offsets] = x
+            conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
             self.conv1d.weight.to(dtype=x.dtype),
@@ -1387,7 +1412,18 @@ class Qwen4ExpPLELayer(nn.Module):
             else:
                 gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
                 gate = torch.sigmoid(gate)
-                gated_value = gate * value.unsqueeze(-2)
+                if (
+                    _is_ppu
+                    and self.ple_embedding.enable_ple_fusion
+                    and batch.mode == ForwardMode.EXTEND
+                ):
+                    from sglang.kernels.ops.mamba.qwen4_ple_prefill import (
+                        apply_ple_prefill_gate,
+                    )
+
+                    gated_value = apply_ple_prefill_gate(gate, value)
+                else:
+                    gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
