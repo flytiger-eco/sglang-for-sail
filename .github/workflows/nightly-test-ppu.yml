@@ -95,6 +95,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ok: ${{ steps.job.outputs.ok }}
+      # The attempt whose build job produced the image, which is not always the
+      # attempt this event was delivered for: a "Re-run failed jobs" attempt that
+      # did not rerun the build reuses the image of the attempt before it.
+      attempt: ${{ steps.job.outputs.attempt }}
     steps:
       - name: Resolve the producing job's conclusion
         id: job
@@ -102,7 +106,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          conclusion=''
+          resolved=''
           # The latest producer run at or before this event's attempt, not this
           # attempt's own: "Re-run failed jobs" starts an attempt that contains
           # only the jobs that failed, so an exact-attempt lookup finds no build
@@ -110,18 +114,21 @@ jobs:
           # step -- an attempt that succeeds without running the build again is
           # reuse of the earlier digest, not a reason to skip the night.
           for _ in $(seq 1 6); do
-            conclusion="$(gh api --paginate --slurp "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?filter=all&per_page=100" \
-              --jq '[.[].jobs[] | select(.name == "build" and .run_attempt <= ${{ github.event.workflow_run.run_attempt }})] | if length == 0 then "" else (max_by(.run_attempt).conclusion // "") end')" || conclusion=''
-            [ -n "${conclusion}" ] && break
+            resolved="$(gh api --paginate --slurp "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/jobs?filter=all&per_page=100" \
+              --jq '[.[].jobs[] | select(.name == "build" and .run_attempt <= ${{ github.event.workflow_run.run_attempt }})] | if length == 0 then "" else (max_by(.run_attempt) | "\(.run_attempt) \(.conclusion // "")") end')" || resolved=''
+            [ -n "${resolved}" ] && break
             sleep 10
           done
           # Unknown is not a reason to skip: a skipped run reads as green to the
           # issue tracker, and a night would pass without anyone noticing.
-          if [ -z "${conclusion}" ]; then
+          if [ -z "${resolved}" ]; then
             echo '::error::the nightly image job is not readable in this run attempt; refusing to guess whether an image was published'
             exit 1
           fi
-          echo "the job that publishes the nightly image: ${conclusion}"
+          attempt="${resolved%% *}"
+          conclusion="${resolved#* }"
+          echo "the job that publishes the nightly image: ${conclusion} (in attempt ${attempt})"
+          printf 'attempt=%s\n' "${attempt}" >> "$GITHUB_OUTPUT"
           if [ "${conclusion}" = success ]; then
             printf 'ok=true\n' >> "$GITHUB_OUTPUT"
           else
@@ -139,7 +146,7 @@ jobs:
         run: |
           mkdir -p tested-build
           printf 'build_run=%s\nbuild_attempt=%s\n' \
-            "${{ github.event.workflow_run.id }}" "${{ github.event.workflow_run.run_attempt }}" \
+            "${{ github.event.workflow_run.id }}" "${{ steps.job.outputs.attempt }}" \
             > tested-build/tested_build.txt
       - name: Upload the build under test
         if: ${{ always() }}
@@ -519,15 +526,18 @@ jobs:
       # image_healthcheck.sh at all. The cases still come from the checkout above,
       # so "tested == code" is unchanged.
       - name: Checkout the CI harness at the workflow revision
-        if: ${{ needs.prepare.outputs.test_image != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: ci-harness
           fetch-depth: 1
-          # Only the setup scripts are needed, and the whole workspace is
-          # archived to NAS for the pod: without these two the second checkout
-          # would add a second full tree and a full .git to that archive.
+          # Needed in both modes: the board fingerprint checker lives here, and a
+          # source-mode dispatch of a ref that predates it would otherwise fail
+          # before a single case ran. Only scripts/ci is fetched, and the whole
+          # workspace is archived to NAS for the pod, so a full second tree and a
+          # full .git are what these two settings avoid. Image mode also takes its
+          # setup scripts from here; source mode keeps the installer of the tested
+          # checkout, which is the point of that mode.
           filter: blob:none
           sparse-checkout: scripts/ci
       - name: Resolve the base image digest
@@ -571,11 +581,16 @@ jobs:
                 exit 1
               fi
             fi
-            # The fingerprint checker comes from the same harness: a tested ref
-            # that predates it would otherwise fail the line before a single case
-            # ran, and what it checks -- which board this pod got -- is a property
-            # of the pod, not of the commit under test.
-            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+            # The fingerprint checker always comes from the workflow revision: it
+            # reports which board this pod got, which is a property of the pod, not
+            # of the commit under test. In source mode the harness is a second,
+            # sparse checkout, so a tested ref that predates the checker still runs.
+            checker="$PWD/ci-harness"
+            if [ ! -f "$checker/scripts/ci/ppu/check_nightly_board.py" ]; then
+              echo "::error::$checker carries no board fingerprint checker"
+              exit 1
+            fi
+            python3 "$checker/scripts/ci/ppu/check_nightly_board.py" \
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
@@ -654,15 +669,18 @@ jobs:
       # image_healthcheck.sh at all. The cases still come from the checkout above,
       # so "tested == code" is unchanged.
       - name: Checkout the CI harness at the workflow revision
-        if: ${{ needs.prepare.outputs.test_image != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: ci-harness
           fetch-depth: 1
-          # Only the setup scripts are needed, and the whole workspace is
-          # archived to NAS for the pod: without these two the second checkout
-          # would add a second full tree and a full .git to that archive.
+          # Needed in both modes: the board fingerprint checker lives here, and a
+          # source-mode dispatch of a ref that predates it would otherwise fail
+          # before a single case ran. Only scripts/ci is fetched, and the whole
+          # workspace is archived to NAS for the pod, so a full second tree and a
+          # full .git are what these two settings avoid. Image mode also takes its
+          # setup scripts from here; source mode keeps the installer of the tested
+          # checkout, which is the point of that mode.
           filter: blob:none
           sparse-checkout: scripts/ci
       - name: Resolve the base image digest
@@ -706,11 +724,16 @@ jobs:
                 exit 1
               fi
             fi
-            # The fingerprint checker comes from the same harness: a tested ref
-            # that predates it would otherwise fail the line before a single case
-            # ran, and what it checks -- which board this pod got -- is a property
-            # of the pod, not of the commit under test.
-            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+            # The fingerprint checker always comes from the workflow revision: it
+            # reports which board this pod got, which is a property of the pod, not
+            # of the commit under test. In source mode the harness is a second,
+            # sparse checkout, so a tested ref that predates the checker still runs.
+            checker="$PWD/ci-harness"
+            if [ ! -f "$checker/scripts/ci/ppu/check_nightly_board.py" ]; then
+              echo "::error::$checker carries no board fingerprint checker"
+              exit 1
+            fi
+            python3 "$checker/scripts/ci/ppu/check_nightly_board.py" \
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
@@ -784,15 +807,18 @@ jobs:
       # image_healthcheck.sh at all. The cases still come from the checkout above,
       # so "tested == code" is unchanged.
       - name: Checkout the CI harness at the workflow revision
-        if: ${{ needs.prepare.outputs.test_image != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: ci-harness
           fetch-depth: 1
-          # Only the setup scripts are needed, and the whole workspace is
-          # archived to NAS for the pod: without these two the second checkout
-          # would add a second full tree and a full .git to that archive.
+          # Needed in both modes: the board fingerprint checker lives here, and a
+          # source-mode dispatch of a ref that predates it would otherwise fail
+          # before a single case ran. Only scripts/ci is fetched, and the whole
+          # workspace is archived to NAS for the pod, so a full second tree and a
+          # full .git are what these two settings avoid. Image mode also takes its
+          # setup scripts from here; source mode keeps the installer of the tested
+          # checkout, which is the point of that mode.
           filter: blob:none
           sparse-checkout: scripts/ci
       - name: Resolve the base image digest
@@ -834,11 +860,16 @@ jobs:
                 exit 1
               fi
             fi
-            # The fingerprint checker comes from the same harness: a tested ref
-            # that predates it would otherwise fail the line before a single case
-            # ran, and what it checks -- which board this pod got -- is a property
-            # of the pod, not of the commit under test.
-            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+            # The fingerprint checker always comes from the workflow revision: it
+            # reports which board this pod got, which is a property of the pod, not
+            # of the commit under test. In source mode the harness is a second,
+            # sparse checkout, so a tested ref that predates the checker still runs.
+            checker="$PWD/ci-harness"
+            if [ ! -f "$checker/scripts/ci/ppu/check_nightly_board.py" ]; then
+              echo "::error::$checker carries no board fingerprint checker"
+              exit 1
+            fi
+            python3 "$checker/scripts/ci/ppu/check_nightly_board.py" \
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
@@ -903,15 +934,18 @@ jobs:
       # image_healthcheck.sh at all. The cases still come from the checkout above,
       # so "tested == code" is unchanged.
       - name: Checkout the CI harness at the workflow revision
-        if: ${{ needs.prepare.outputs.test_image != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: ci-harness
           fetch-depth: 1
-          # Only the setup scripts are needed, and the whole workspace is
-          # archived to NAS for the pod: without these two the second checkout
-          # would add a second full tree and a full .git to that archive.
+          # Needed in both modes: the board fingerprint checker lives here, and a
+          # source-mode dispatch of a ref that predates it would otherwise fail
+          # before a single case ran. Only scripts/ci is fetched, and the whole
+          # workspace is archived to NAS for the pod, so a full second tree and a
+          # full .git are what these two settings avoid. Image mode also takes its
+          # setup scripts from here; source mode keeps the installer of the tested
+          # checkout, which is the point of that mode.
           filter: blob:none
           sparse-checkout: scripts/ci
       - name: Resolve the base image digest
@@ -952,11 +986,16 @@ jobs:
                 exit 1
               fi
             fi
-            # The fingerprint checker comes from the same harness: a tested ref
-            # that predates it would otherwise fail the line before a single case
-            # ran, and what it checks -- which board this pod got -- is a property
-            # of the pod, not of the commit under test.
-            python3 "$harness/scripts/ci/ppu/check_nightly_board.py" \
+            # The fingerprint checker always comes from the workflow revision: it
+            # reports which board this pod got, which is a property of the pod, not
+            # of the commit under test. In source mode the harness is a second,
+            # sparse checkout, so a tested ref that predates the checker still runs.
+            checker="$PWD/ci-harness"
+            if [ ! -f "$checker/scripts/ci/ppu/check_nightly_board.py" ]; then
+              echo "::error::$checker carries no board fingerprint checker"
+              exit 1
+            fi
+            python3 "$checker/scripts/ci/ppu/check_nightly_board.py" \
               --board "${{ matrix.board.slug }}" \
               --devices "$PPU_EXPECTED_DEVICES" \
               --output "$PPU_EVIDENCE_DIR/device_fingerprint.json"
