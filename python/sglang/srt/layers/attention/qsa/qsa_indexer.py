@@ -173,11 +173,17 @@ class QSAIndexer(MultiPlatformOp):
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
+        key_state_buffer = (
+            pool.get_qsa_key_state_buffer(self.layer_id)
+            if pool is not None and self._use_fused_prep(qk)
+            else None
+        )
         if (
-            pool is not None
-            and cache_loc is not None
+            key_state_buffer is not None
             and qk.shape[0] > 0
-            and self._use_fused_prep(qk)
+            and qk.dtype == self.q_layernorm.weight.dtype == key_state_buffer.dtype
+            and pool.get_qsa_compressed_k_buffer(self.layer_id).dtype
+            in (qk.dtype, torch.float8_e4m3fn)
         ):
             from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
@@ -192,14 +198,13 @@ class QSAIndexer(MultiPlatformOp):
                 if rope_max_position is None:
                     rope_max_position = int(positions.max().item())
                 self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
-            key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
                 positions.long(),
                 self.rotary_emb.cos_sin_cache,
                 self._rope_axis_map(qk.device),
                 self.q_layernorm.weight.data,
-                cache_loc[: qk.shape[0]].long(),
+                cache_loc[: qk.shape[0]].long() if cache_loc is not None else None,
                 key_state_buffer.view(key_state_buffer.shape[0], -1),
                 pool.qsa_rope_position_buffer,
                 self.index_n_heads,
@@ -209,7 +214,7 @@ class QSAIndexer(MultiPlatformOp):
                 q_heads_padded=q_heads_padded,
                 out_dtype=pool.get_qsa_compressed_k_buffer(self.layer_id).dtype,
             )
-            return q, token_k, True
+            return q, token_k, cache_loc is not None
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
@@ -650,7 +655,9 @@ class QSAIndexer(MultiPlatformOp):
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
-            pool=indexer_metadata.token_to_kv_pool if qsa_cp_context is None else None,
+            # CP still uses the fused Q norm/RoPE/cast; raw-K stores wait until
+            # the local index keys have been gathered into global token order.
+            pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             rope_max_position=getattr(indexer_metadata, "rope_max_position", None),
             ensure_cos_sin_cache=not (
