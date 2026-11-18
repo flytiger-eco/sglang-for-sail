@@ -445,7 +445,19 @@ def grouped_gemm_nt_f4f4bf16_fused(
     return m_rows, inv_perm, expert_ids
 
 
-@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_f4f4bf16_fused_fake)
+def grouped_gemm_nt_f8f4bf16_fused_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inv_scale: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return grouped_gemm_nt_f4f4bf16_fused_fake(A, As, B, Bs, C, topk_ids)
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_f8f4bf16_fused_fake)
 def grouped_gemm_nt_f8f4bf16_fused(
     A: torch.Tensor,
     As: torch.Tensor,
@@ -453,6 +465,7 @@ def grouped_gemm_nt_f8f4bf16_fused(
     Bs: torch.Tensor,
     C: torch.Tensor,
     topk_ids: torch.Tensor,
+    inv_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (
         config,
@@ -472,6 +485,7 @@ def grouped_gemm_nt_f8f4bf16_fused(
         sorted_token_ids,
         aligned_num_m_blocks,
         config,
+        inv_scale=inv_scale,
     )
     return m_rows, inv_perm, expert_ids
 
@@ -729,9 +743,7 @@ def deep_moe_impl_fused(
     act_scale_col_major = False
 
     if use_mxfp4_w4a8:
-        hidden_states, hidden_states_scale = sglang_per_token_quant_fp8(
-            hidden_states, scale_multiplier=w1_inv_scale
-        )
+        hidden_states, hidden_states_scale = sglang_per_token_quant_fp8(hidden_states)
         block_k = K
     elif use_int8:
         assert per_channel_quant and block_shape is None, (
@@ -777,7 +789,13 @@ def deep_moe_impl_fused(
 
         if use_mxfp4_w4a8:
             m_rows, inv_perm, expert_ids = grouped_gemm_nt_f8f4bf16_fused(
-                hidden_states, hidden_states_scale, w1, w1_scale, out1, topk_ids
+                hidden_states,
+                hidden_states_scale,
+                w1,
+                w1_scale,
+                out1,
+                topk_ids,
+                inv_scale=w1_inv_scale,
             )
         elif use_int8:
             m_rows, inv_perm, expert_ids = grouped_gemm_nt_i8i8bf16_fused(
@@ -878,6 +896,7 @@ def deep_moe_impl_fused(
                 out1,
                 expert_ids,
                 num_recv_tokens_per_expert,
+                inv_scale=w1_inv_scale,
             )
         elif use_int8:
             grouped_gemm_nt_i8i8bf16_nopad(
@@ -914,19 +933,19 @@ def deep_moe_impl_fused(
         import deep_gemm
 
         if activation == "situ":
-            a, a_scale = deep_gemm.situ_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            a, a_scale = deep_gemm.activation_and_mul(
+                deep_gemm.ActivationMode.SITU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 out1,
                 beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
                 linear_beta=gemm1_limit,
-                weight_inv_scale=w2_inv_scale,
             )
         else:
-            a, a_scale = deep_gemm.silu_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            a, a_scale = deep_gemm.activation_and_mul(
+                deep_gemm.ActivationMode.SILU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 out1,
                 swiglu_limit=swiglu_limit,
-                weight_inv_scale=w2_inv_scale,
             )
         down_k_pad = w2.shape[-1] * 2 - a.shape[-1]
         if down_k_pad:
@@ -1002,6 +1021,7 @@ def deep_moe_impl_fused(
             out3,
             expert_ids,
             num_recv_tokens_per_expert,
+            inv_scale=w2_inv_scale,
         )
     elif use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(

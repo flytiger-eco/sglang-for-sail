@@ -158,21 +158,6 @@ def _relative_l2(actual, expected):
     return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
 
 
-@pytest.mark.parametrize("m,hidden", [(1, 256), (8, 3584), (2048, 1076), (4096, 3584)])
-def test_w4a8_fp8_quant_folds_inverse_without_changing_codes(m, hidden):
-    from sgl_kernel import sgl_per_token_quant_fp8 as sgl_per_token_quant_fp8_aot
-
-    from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
-
-    x = torch.randn((m, hidden), device="cuda", dtype=torch.bfloat16)
-    values = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    scales = torch.empty((m, 1), device="cuda", dtype=torch.float32)
-    sgl_per_token_quant_fp8_aot(x, values, scales)
-    fused_values, fused_scales = sglang_per_token_quant_fp8(x, scale_multiplier=0.0625)
-    torch.testing.assert_close(fused_values.float(), values.float(), rtol=0, atol=0)
-    torch.testing.assert_close(fused_scales, scales * 0.0625, rtol=1e-5, atol=0)
-
-
 @pytest.mark.parametrize("fused", [False, True])
 def test_w4a8_silu_accuracy(fused):
     case = _case(8)

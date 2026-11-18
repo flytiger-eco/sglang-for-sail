@@ -941,10 +941,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 getattr(layer, weight_name).data = weight
                 getattr(layer, scale_name).data = scale
                 setattr(layer, f"{weight_name}_inv_scale", inv_scale)
-            if get_moe_a2a_backend().is_deepep():
-                layer.dispatcher.quant_config["w4a8_scale_multiplier"] = (
-                    layer.w13_weight_inv_scale
-                )
             torch.cuda.empty_cache()
             return
 

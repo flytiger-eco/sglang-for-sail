@@ -286,7 +286,6 @@ class DeepGemmRunnerInput(RunnerInput):
     # Number of activation elements sharing one scale along K.
     # Records the actual input quantization group, independently of weight scales.
     activation_scale_block_size: Optional[int] = None
-    w13_scale_compensated: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -543,18 +542,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (all_tokens, n), device=hidden_states.device, dtype=torch.bfloat16
         )
         hidden_states_scale = runner_input.hidden_states_scale
-        if not runner_input.w13_scale_compensated:
-            hidden_states_scale = hidden_states_scale * quant_info.w13_inv_scale
         deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_nopad(
             (hidden_states, hidden_states_scale),
             (quant_info.w13_weight, quant_info.w13_scale),
             gateup_output,
             runner_input.m_indices,
             running_state.get("m_rows"),
+            inv_scale=quant_info.w13_inv_scale,
         )
         if self.config.activation == "situ":
-            down_input, down_scale = deep_gemm.situ_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            down_input, down_scale = deep_gemm.activation_and_mul(
+                deep_gemm.ActivationMode.SITU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 gateup_output,
                 beta=(
                     self.config.gemm1_alpha
@@ -562,14 +561,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     else 4.0
                 ),
                 linear_beta=self.config.gemm1_clamp_limit,
-                weight_inv_scale=quant_info.w2_inv_scale,
             )
         else:
-            down_input, down_scale = deep_gemm.silu_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            down_input, down_scale = deep_gemm.activation_and_mul(
+                deep_gemm.ActivationMode.SILU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 gateup_output,
                 swiglu_limit=self.swiglu_limit,
-                weight_inv_scale=quant_info.w2_inv_scale,
             )
         down_k_pad = quant_info.w2_weight.shape[-1] * 2 - down_input.shape[-1]
         if down_k_pad:
@@ -583,6 +581,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             runner_input.m_indices,
             running_state.get("m_rows"),
+            inv_scale=quant_info.w2_inv_scale,
         )
         return down_output
 
@@ -596,37 +595,36 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             (e, t, n), device=hidden_states.device, dtype=torch.bfloat16
         )
         hidden_states_scale = runner_input.hidden_states_scale
-        if not runner_input.w13_scale_compensated:
-            hidden_states_scale = hidden_states_scale * quant_info.w13_inv_scale
         deep_gemm_wrapper.grouped_gemm_nt_f8f4bf16_masked(
             (hidden_states, hidden_states_scale.contiguous()),
             (quant_info.w13_weight, quant_info.w13_scale),
             gateup_output,
             runner_input.masked_m,
             runner_input.expected_m,
+            inv_scale=quant_info.w13_inv_scale,
         )
         if self.config.activation == "situ":
-            down_input, down_scale = deep_gemm.situ_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            down_input, down_scale = deep_gemm.activation_and_mul_masked(
+                deep_gemm.ActivationMode.SITU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 gateup_output,
+                runner_input.masked_m,
                 beta=(
                     self.config.gemm1_alpha
                     if self.config.gemm1_alpha is not None
                     else 4.0
                 ),
                 linear_beta=self.config.gemm1_clamp_limit,
-                masked_m=runner_input.masked_m,
                 expected_m=runner_input.expected_m,
-                weight_inv_scale=quant_info.w2_inv_scale,
             )
         else:
-            down_input, down_scale = deep_gemm.silu_and_mul(
-                deep_gemm.ActivationQuantMode.FP8_CHANNEL,
+            down_input, down_scale = deep_gemm.activation_and_mul_masked(
+                deep_gemm.ActivationMode.SILU,
+                deep_gemm.QuantMode.FP8_CHANNEL,
                 gateup_output,
-                masked_m=runner_input.masked_m,
+                runner_input.masked_m,
                 expected_m=runner_input.expected_m,
                 swiglu_limit=self.swiglu_limit,
-                weight_inv_scale=quant_info.w2_inv_scale,
             )
         down_k_pad = quant_info.w2_weight.shape[-1] * 2 - down_input.shape[-1]
         if down_k_pad:
@@ -640,6 +638,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             runner_input.masked_m,
             runner_input.expected_m,
+            inv_scale=quant_info.w2_inv_scale,
         )
         return down_output
 
@@ -2356,9 +2355,6 @@ def pre_permute_standard_to_deep_gemm(
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
                 expert_start=expert_start,
-                scale_multiplier=(
-                    quant_info.w13_inv_scale if quant_info.use_mxfp4_w4a8 else 1.0
-                ),
             )
         )
         # Use the global expert count because expected_m is a tuning hint, not
@@ -2389,7 +2385,6 @@ def pre_permute_standard_to_deep_gemm(
             activation_scale_block_size=(
                 quant_info.block_shape[1] if quant_info.block_shape else 128
             ),
-            w13_scale_compensated=quant_info.use_mxfp4_w4a8,
         )
 
     # The compact layout avoids scaling masked buffers with the expert count.
@@ -2833,7 +2828,6 @@ def pre_permute_deepep_normal_to_deep_gemm(
         use_masked_gemm=False,
         m_indices=m_indices,
         activation_scale_block_size=128,
-        w13_scale_compensated=quant_info.use_mxfp4_w4a8,
     )
 
 
