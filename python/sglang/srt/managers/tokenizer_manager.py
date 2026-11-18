@@ -4004,8 +4004,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     get_disagg().disaggregation_mode in ("prefill", "decode")
                     and child.contains_mm_input()
-                    and (child.session_id or child.session_params)
+                    and child.session_params
                 ):
+                    # 仅拒绝真正的会话状态 API（session_params）。客户端自带的
+                    # session_id 标签（如 MTP agent_session 注入）不参与展开输入
+                    # 握手，予以放行。
                     raise ValueError(
                         "Expanded-input PD does not support multimodal sessions"
                     )

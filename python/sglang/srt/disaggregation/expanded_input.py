@@ -38,6 +38,13 @@ def original_pair_key(request, raw_request=None):
         header = raw_request.headers.get("x-request-id")
         if isinstance(header, str):
             return header
+    # 兜底：router 在 PD 派发时注入的 bootstrap_room 逐请求唯一、P/D 同源，
+    # 满足 dispatcher-provided 契约。兼容不发送任何配对键的压测平台（如 MTP）。
+    room = getattr(request, "bootstrap_room", None)
+    if isinstance(room, int):
+        return str(room)
+    if isinstance(room, (list, tuple)) and room and all(isinstance(r, int) for r in room):
+        return ",".join(str(r) for r in room)[:128]
     return None
 
 
