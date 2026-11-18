@@ -257,19 +257,37 @@ def _expand_qsa_block_indices_kernel(
     )
 
 
+def _selection_output(
+    block_indices: torch.Tensor, rows: int, width: int, out: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty(
+            (rows, width), dtype=torch.int32, device=block_indices.device
+        )
+    if (
+        out.shape != (rows, width)
+        or out.dtype != torch.int32
+        or out.device != block_indices.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "QSA output must be contiguous int32 [rows, width] on the input device"
+        )
+    return out
+
+
 def triton_expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
     rows, block_topk = block_indices.shape
     final_topk = token_topk + compress_ratio - 1
-    output = torch.empty(
-        (rows, final_topk), dtype=torch.int32, device=block_indices.device
-    )
+    output = _selection_output(block_indices, rows, final_topk, out)
     if rows == 0:
         return output
     _expand_qsa_block_indices_kernel[(rows,)](
@@ -300,6 +318,7 @@ def expand_qsa_block_indices(
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
 
@@ -321,14 +340,20 @@ def expand_qsa_block_indices(
             sequence_lengths.to(device=block_indices.device).contiguous(),
             compress_ratio,
             token_topk,
+            out=out,
         )
-    return torch_expand_qsa_block_indices(
+    result = torch_expand_qsa_block_indices(
         block_indices,
         query_positions,
         sequence_lengths,
         compress_ratio,
         token_topk,
     )
+
+    if out is not None:
+        _selection_output(block_indices, rows, result.shape[1], out).copy_(result)
+        return out
+    return result
 
 
 def expand_map_qsa_physical_slots(
@@ -340,6 +365,7 @@ def expand_map_qsa_physical_slots(
     *,
     compress_ratio: int,
     token_topk: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """逐 query 融合 block 展开与 KV 映射，不共享其他 query 的 selection。"""
     rows = block_indices.shape[0]
@@ -364,11 +390,13 @@ def expand_map_qsa_physical_slots(
             token_to_batch_idx.long()[:, None],
             logical.clamp(0, token_slot_table.shape[1] - 1).long(),
         ]
-        return torch.where(valid, slots, -1).to(torch.int32)
+        result = torch.where(valid, slots, -1).to(torch.int32)
+        if out is not None:
+            _selection_output(block_indices, rows, result.shape[1], out).copy_(result)
+            return out
+        return result
     final_topk = token_topk + compress_ratio - 1
-    slots = torch.empty(
-        (rows, final_topk), dtype=torch.int32, device=block_indices.device
-    )
+    slots = _selection_output(block_indices, rows, final_topk, out)
     if rows:
         _expand_qsa_block_indices_kernel[(rows,)](
             block_indices,
