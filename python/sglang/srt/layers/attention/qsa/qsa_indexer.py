@@ -580,10 +580,18 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
         qsa_cp_context: QSAOnlyCPContext | None = None,
         on_index_keys_gathered: Callable[[], None] | None = None,
-    ) -> torch.Tensor | QSAPrefillPhysicalSelection:
+        skip_selection: bool = False,
+    ) -> torch.Tensor | QSAPrefillPhysicalSelection | None:
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+        if skip_selection and (
+            not forward_mode.is_extend()
+            or forward_mode.is_decode()
+            or is_target_verify
+            or is_draft_extend
+        ):
+            raise ValueError("Dense QSA bypass requires ordinary prompt prefill")
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
             # from the physical paged-KV position.  Compression and sparse
@@ -697,6 +705,11 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
         )
+        if skip_selection:
+            # Compression and pending-ring stores above remain mandatory: the
+            # next chunk or Decode can exceed the dense attention budget.
+            return None
+
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

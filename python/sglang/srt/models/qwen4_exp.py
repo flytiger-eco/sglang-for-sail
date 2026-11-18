@@ -1821,7 +1821,7 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         qsa_cp_context: Optional[QSAOnlyCPContext] = None,
         on_index_keys_gathered=None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
@@ -1839,9 +1839,17 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
+        use_dense = getattr(sparse_backend, "should_use_short_ctx_dense", None)
+        indexer_kwargs = {}
+        if hidden_states.is_cuda and use_dense is not None and use_dense(forward_batch):
+            indexer_kwargs["skip_selection"] = True
         if qsa_cp_context is None:
             topk_indices = self.indexer(
-                hidden_states, positions, forward_batch, indexer_metadata
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                **indexer_kwargs,
             )
         else:
             topk_indices = self.indexer.forward_cuda(
@@ -1851,11 +1859,16 @@ class Qwen4ExpAttentionDecoderLayer(
                 indexer_metadata,
                 qsa_cp_context=qsa_cp_context,
                 on_index_keys_gathered=on_index_keys_gathered,
+                **indexer_kwargs,
             )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
         )
-        if should_capture is not None and should_capture(forward_batch):
+        if (
+            topk_indices is not None
+            and should_capture is not None
+            and should_capture(forward_batch)
+        ):
             sparse_backend.capture_mtp_sparse_indices(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
