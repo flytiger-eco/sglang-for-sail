@@ -2447,6 +2447,17 @@ def default_provenance(
         # would read as a recorded value and compare unequal to every real digest;
         # absent is what it actually is.
         "base_image_digest": os.environ.get("PPU_BASE_IMAGE_DIGEST") or None,
+        # What the pods actually ran. When the nightly tests a pushed artifact the
+        # two differ, and ``base_image`` alone would attribute the numbers to the
+        # platform image that artifact was built from. Absent in source mode, where
+        # the pods do run the base image.
+        #
+        # Recorded for the evidence and the report. Attribution in the trend still
+        # goes through trend_contract.PROVENANCE, which is a versioned whitelist and
+        # still keys on base_image_digest; giving it an artifact key is a contract
+        # change of its own, not something to slip in beside this one.
+        "artifact_image": os.environ.get("PPU_TEST_IMAGE_REF") or None,
+        "artifact_image_digest": os.environ.get("PPU_TEST_IMAGE_DIGEST") or None,
         "served_model_name": served_model_name,
         "checkpoint_name": Path(model_path).name if model_path else None,
         "checkpoint_config_sha256": checkpoint_config_digest(model_path),

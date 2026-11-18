@@ -15,6 +15,41 @@ class RunCiWorkflowContractTest(unittest.TestCase):
     def read_workflow(self, name):
         return (ROOT / ".github/workflows" / name).read_text()
 
+    def test_nightly_runs_all_shards_on_both_board_families(self):
+        text = self.read_workflow("nightly-test-ppu.yml")
+        workflow = yaml.safe_load(text)
+        expected_boards = [
+            ("zw-810e", "board-type=ZW-810E"),
+            ("zw-m890p", "board-type=ZW-M890P"),
+        ]
+        for name in (
+            "nightly-1a-ppu",
+            "nightly-1b-ppu",
+            "nightly-2-ppu",
+            "nightly-4-ppu",
+        ):
+            job = workflow["jobs"][name]
+            boards = job["strategy"]["matrix"]["board"]
+            self.assertEqual(
+                [(board["slug"], board["selector"]) for board in boards],
+                expected_boards,
+            )
+            self.assertFalse(job["strategy"]["fail-fast"])
+        self.assertEqual(text.count("node_selector: ${{ matrix.board.selector }}"), 4)
+        # Each shard mentions the checker twice: once to prove the workflow
+        # revision carries it, which a source-mode dispatch needs, and once to run
+        # it. The contract is the invocation -- every shard fingerprints its board
+        # -- so count that instead of every mention of the file name.
+        self.assertEqual(
+            text.count('python3 "$checker/scripts/ci/ppu/check_nightly_board.py"'), 4
+        )
+        self.assertEqual(
+            text.count('-f "$checker/scripts/ci/ppu/check_nightly_board.py"'), 4
+        )
+        self.assertNotIn('${{ github.job }}"', text)
+        self.assertIn('nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 5700', text)
+        self.assertIn('nightly-1-ppu 1 "$PPU_EVIDENCE_DIR" 6600', text)
+
     def test_slash_handler_executes_default_branch_code(self):
         workflow = self.read_workflow("slash-command-handler.yml")
 
