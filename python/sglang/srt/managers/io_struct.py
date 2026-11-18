@@ -2226,6 +2226,16 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
     error_code: int
 
 
+class EncoderReceiveEndpointOutput(BaseReq, kw_only=True):
+    """Single-host TP worker endpoints, advertised once before serving."""
+
+    tp_rank: int
+    host: str
+    embedding_port: int
+    control_port: int
+    epoch: str
+
+
 class PrefillMMReadyOutput(BaseReq, kw_only=True):
     """Scheduler-to-tokenizer notification after TP-wide visual readiness."""
 

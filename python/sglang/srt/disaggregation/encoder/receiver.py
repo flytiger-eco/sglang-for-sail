@@ -1,6 +1,7 @@
 import asyncio
 import itertools
 import logging
+import os
 import random
 import threading
 import time
@@ -34,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
     PrefillMMReadyOutput,
+    EncoderReceiveEndpointOutput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -978,13 +980,13 @@ class WaitingMMRequestBase(ABC):
             if self.status != WaitingMMRequestStatus.PENDING:
                 return
 
-    def consume_parts(self, parts) -> None:
+    def consume_parts(self, parts, decoded=None) -> None:
         """Consume one message from either a per-request or shared ZMQ socket."""
         if self.status != WaitingMMRequestStatus.PENDING:
             return
 
         try:
-            recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
+            recv_obj: EmbeddingData = decoded if decoded is not None else safe_pickle_loads(parts[0])
             if not self._is_valid_embedding_part(recv_obj):
                 return
             if getattr(recv_obj, "error_msg", None) is not None:
@@ -1299,6 +1301,40 @@ class WaitingZmqRequest(WaitingMMRequestBase):
         for i in range(len(parts)):
             parts[i] = None
         return True
+
+
+class BackgroundWaitingRequest(WaitingZmqRequest):
+    """Scheduler-side handle; the background lane owns receive and assembly."""
+
+    def __init__(self, *args, worker, **kwargs):
+        self.worker = worker
+        super().__init__(*args, **kwargs)
+
+    def send_encode_request(self):
+        # The frontend already registered both destinations with E.
+        pass
+
+    def _try_recv_mm_data(self):
+        if self.status != WaitingMMRequestStatus.PENDING:
+            return
+        result = self.worker.snapshot(self.rid)
+        if result is None:
+            if self.worker.failure is not None:
+                self._fail_and_release(self.worker.failure, 500)
+            return
+        self.status = WaitingMMRequestStatus(result.status)
+        self.error_msg, self.error_code = result.error, result.code
+        if self.status == WaitingMMRequestStatus.SUCCESS:
+            self.recv_req.mm_inputs = result.request.mm_inputs
+            self.recv_req.input_ids = result.request.input_ids
+
+    def release_resources(self):
+        self.worker.discard(self.rid)
+        super().release_resources()
+
+    def close_recv_socket(self):
+        self.worker.discard(self.rid)
+        super().close_recv_socket()
 
 
 class WaitingZmqRequestGrpc(WaitingZmqRequest):
@@ -1904,12 +1940,24 @@ class MMReceiverBase(ABC):
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
+        self.background_ready = os.environ.get("SGLANG_ENCODER_BACKGROUND_READY", "0") == "1"
+        self.background_endpoints = {}
+        self.background_control_sockets = {}
+        self.background_worker = None
+        if self.background_ready:
+            if (self.encoder_transfer_backend != "zmq_to_scheduler"
+                or get_parallel().pp_size != 1 or self.nnodes != 1
+                or get_parallel().attn_cp_size != 1 or get_parallel().dp_size != 1
+                or getattr(hf_config, "model_type", "").lower() != "qwen4_exp"):
+                raise ValueError("Background visual readiness requires single-host Qwen4Exp TP, PP1/CP1/DP1 and zmq_to_scheduler")
+            if envs.SGLANG_EMBEDDING_POOL_SIZE_MB.is_set() and envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get() > 0:
+                raise ValueError("Background visual readiness is CPU-only; GPU embedding pool must be disabled")
         self.registration_runner = None
         self.scheduler_embedding_port = None
         self.scheduler_recv_socket = None
         if (
             self.encoder_transfer_backend == "zmq_to_scheduler"
-            and scheduler is not None
+            and scheduler is not None and not self.background_ready
         ):
             self.registration_runner = _ReceiveRegistrationRunner(
                 f"encoder-receive-registration-{tp_rank}"
@@ -1993,6 +2041,54 @@ class MMReceiverBase(ABC):
                         else None
                     ),
                 )
+
+        if self.background_ready and scheduler is not None:
+            from sglang.srt.disaggregation.encoder.background_receiver import BackgroundReceiver
+
+            def factory(req, port):
+                return WaitingZmqRequest(
+                    rid=req.rid, recv_req=req, mm_processor=self.mm_processor,
+                    encoder_urls=[], model_type=self.model_type, host_name=self.hostname,
+                    receive_count=self.tp_size, zmq_context=self.scheduler_context,
+                    embedding_port=port,
+                )
+            self.background_worker = BackgroundReceiver(
+                self.hostname, factory, safe_pickle_loads,
+                _resolve_embedding_part_request_id, timeout=self.wait_timeout,
+            )
+            worker = self.background_worker
+            endpoint = dict(tp_rank=self.tp_rank, host=self.hostname,
+                            embedding_port=worker.embedding_port, control_port=worker.control_port,
+                            epoch=worker.epoch)
+            endpoints = self.tp_group.all_gather_object(endpoint) if self.tp_size > 1 else [endpoint]
+            if self.tp_rank == 0:
+                for endpoint in endpoints:
+                    scheduler.ipc_channels.send_to_tokenizer.send_output(EncoderReceiveEndpointOutput(**endpoint))
+
+    def _background_endpoint_snapshot(self):
+        endpoints = [self.background_endpoints.get(i) for i in range(self.tp_size)]
+        if any(x is None for x in endpoints):
+            raise RuntimeError("Background visual receive endpoints are not ready")
+        return endpoints
+
+    async def prepare_background(self, req):
+        if not self.background_ready:
+            return
+        for endpoint in self._background_endpoint_snapshot():
+            key = (endpoint.tp_rank, endpoint.epoch)
+            socket = self.background_control_sockets.get(key)
+            if socket is None:
+                socket = self.context.socket(zmq.PUSH)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.SNDHWM, 128)
+                socket.setsockopt(zmq.SNDTIMEO, 1000)
+                socket.connect(f"tcp://127.0.0.1:{endpoint.control_port}")
+                self.background_control_sockets[key] = socket
+            await socket.send_json({
+                "rid": req.rid, "epoch": endpoint.epoch,
+                "prompt": {"text": req.input_text, "ids": list(req.input_ids) if req.input_ids is not None else None,
+                           "pretokenized": req.epd_prompt_pretokenized},
+            })
 
     def _init_mm_processor(
         self,
@@ -2368,7 +2464,9 @@ class MMReceiverBase(ABC):
                             if self.scheduler_recv_socket is not None
                             else self.scheduler_context
                         ),
-                        embedding_port=self.scheduler_embedding_port,
+                        embedding_port=(self.background_worker.embedding_port
+                                        if self.background_worker is not None
+                                        else self.scheduler_embedding_port),
                         **extra_kwargs,
                     )
                     self.waiting_by_rid[waiting_req.rid] = waiting_req
@@ -2428,7 +2526,8 @@ class MMReceiverBase(ABC):
         if len(self.waiting_list) == 0:
             return new_recv_reqs, abort_reqs
 
-        self._drain_scheduler_embeddings()
+        if self.background_worker is None:
+            self._drain_scheduler_embeddings()
         current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
@@ -2740,6 +2839,10 @@ class MMReceiverHTTP(MMReceiverBase):
                 gpu_id=self.gpu_id,
                 embedding_pool=self.embedding_pool,
             )
+        if self.background_worker is not None:
+            return self._process_waiting_requests(
+                recv_reqs, BackgroundWaitingRequest, worker=self.background_worker,
+            )
         return self._process_waiting_requests(
             recv_reqs,
             WaitingZmqRequest,
@@ -2815,10 +2918,12 @@ class MMReceiverHTTP(MMReceiverBase):
                 cum_num_items += assigned_num
             part_idx_offset += num_parts
 
+        endpoints = self._background_endpoint_snapshot() if self.background_ready else []
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=envs.SGLANG_ENCODER_HTTP_TIMEOUT.get())
         ) as session:
-            # Send encode requests
+            # Register all receive destinations concurrently with /encode;
+            # neither request waits for the scheduler's current forward.
 
             tasks = [
                 session.post(
@@ -2828,7 +2933,23 @@ class MMReceiverHTTP(MMReceiverBase):
                 for encode_request in encode_requests
             ]
 
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            registration_tasks = [
+                session.post(f"{req['encoder_url']}/scheduler_receive_url", json={
+                    "req_id": req["req_id"], "receive_count": len(endpoints),
+                    "receive_url": NetworkAddress(ep.host, ep.embedding_port).to_host_port_str(),
+                    "modality": req["modality"],
+                })
+                for req in encode_requests for ep in endpoints
+            ]
+            all_responses = await asyncio.gather(*tasks, *registration_tasks, return_exceptions=True)
+            responses = all_responses[:len(tasks)]
+            for response in all_responses[len(tasks):]:
+                if isinstance(response, BaseException):
+                    raise RuntimeError(f"Early visual destination registration failed: {response}")
+                try:
+                    response.raise_for_status()
+                finally:
+                    response.release()
             # Dispatch only. The embedding never comes back through this call:
             # zmq_to_tokenizer is pushed to our PULL socket during /encode,
             # zmq_to_scheduler to the ports its ranks registered, and mooncake
