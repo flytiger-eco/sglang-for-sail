@@ -24,9 +24,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul,
     fused_gate_sigmoid_mul_add,
@@ -89,7 +86,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -109,10 +110,13 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_ppu,
     make_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
+from transformers import PretrainedConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -122,6 +126,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_ppu = is_ppu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -599,6 +604,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._prefill_gate_fusion = (
+            _is_ppu
+            and self._use_mega_moe
+            and get_disagg().disaggregation_mode != "decode"
+        )
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
@@ -709,7 +719,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        apply_gate: bool = True,
+        *,
+        prefill: bool = False,
     ):
         shared_output = None
         if self.shared_expert is not None:
@@ -725,6 +739,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         True,
                         shared_output,
                     )
+                elif _is_ppu and prefill:
+                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                        sigmoid_gate_mul_broadcast_bf16,
+                    )
+
+                    gate = self.shared_expert_gate(hidden_states)
+                    shared_output = sigmoid_gate_mul_broadcast_bf16(shared_output, gate)
                 elif _is_hip:
                     from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
                         sigmoid_gate_mul_broadcast,
@@ -858,7 +879,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_weights = None
         if num_tokens > 0:
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            shared_output = self._forward_shared_experts(
+                hidden_states,
+                prefill=(
+                    self._prefill_gate_fusion
+                    and forward_batch is not None
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and forward_batch._original_forward_mode
+                    in (None, ForwardMode.EXTEND)
+                ),
+            )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
