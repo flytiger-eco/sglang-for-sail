@@ -374,6 +374,11 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_layer_ids(self):
+        """Match get_contiguous_buf_infos(), which exports only owned layers."""
+        start, end = self._owned_local_layer_range()
+        return list(range(self.start_layer + start, self.start_layer + end))
+
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
