@@ -33,6 +33,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
+    PrefillMMReadyOutput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -787,7 +788,10 @@ class WaitingMMRequestStatus(IntEnum):
 
 def _select_mm_processor_prompt(recv_req, mm_processor):
     """Mirror tokenizer-side prompt selection for scheduler-side EPD rebuilds."""
-    if mm_processor.prefer_tokenized_input and recv_req.input_ids is not None:
+    if (
+        mm_processor.prefer_tokenized_input
+        or getattr(recv_req, "epd_prompt_pretokenized", False)
+    ) and recv_req.input_ids is not None:
         return list(recv_req.input_ids)
     return recv_req.input_text or recv_req.input_ids
 
@@ -2449,7 +2453,29 @@ class MMReceiverBase(ABC):
         for i, waiting_req in enumerate(self.waiting_list):
             status_value = local_status[i].item()
             if status_value == WaitingMMRequestStatus.SUCCESS:
-                new_recv_reqs.append(waiting_req.recv_req)
+                req = waiting_req.recv_req
+                # Expanded-input D must receive the authoritative length and
+                # M-RoPE delta even when visual assembly moved to Scheduler.
+                # Emit once, only after every TP rank agrees readiness. The
+                # tokenizer owns HTTP retries, cancellation and pair identity.
+                if (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+                    and req.bootstrap_room is not None
+                    and len(req.input_ids) < self.scheduler.max_req_input_len
+                    and self.tp_rank == 0
+                ):
+                    delta = req.mm_inputs.mrope_position_delta
+                    self.scheduler.ipc_channels.send_to_tokenizer.send_output(
+                        PrefillMMReadyOutput(
+                            rid=req.rid,
+                            bootstrap_room=req.bootstrap_room,
+                            bootstrap_pair_key=req.bootstrap_pair_key,
+                            expanded_input_len=len(req.input_ids),
+                            mrope_position_delta=int(delta.item()) if delta is not None else 0,
+                        ), req,
+                    )
+                new_recv_reqs.append(req)
             elif status_value == WaitingMMRequestStatus.FAIL:
                 self._sync_fail_info_across_tp(waiting_req)
                 logger.error(

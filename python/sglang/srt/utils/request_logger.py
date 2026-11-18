@@ -297,7 +297,10 @@ def _transform_data_for_logging(
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         return {
-            k: _transform_data_for_logging(v, max_length)
+            # EPD dispatch metadata can contain Modality enum keys. Convert
+            # only unsupported JSON keys, without changing the request itself.
+            (k if isinstance(k, (str, int, float, bool, type(None))) else str(k)):
+                _transform_data_for_logging(v, max_length)
             for k, v in data.items()
             if k not in skip_names
         }

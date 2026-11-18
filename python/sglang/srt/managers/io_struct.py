@@ -1166,6 +1166,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Exact multimodal-expanded prompt length is supplied asynchronously by Prefill.
     needs_expanded_input_len: bool = False
     expanded_input_generation: Optional[str] = None
+    # Raw Qwen image prompt IDs prepared while the independent encoder runs.
+    # Append-only IPC field; these IDs still need visual placeholder expansion.
+    epd_prompt_pretokenized: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2221,6 +2224,15 @@ class EncoderDispatchErrorReq(BaseReq, kw_only=True):
 
     error_msg: str
     error_code: int
+
+
+class PrefillMMReadyOutput(BaseReq, kw_only=True):
+    """Scheduler-to-tokenizer notification after TP-wide visual readiness."""
+
+    bootstrap_room: int
+    bootstrap_pair_key: str
+    expanded_input_len: int
+    mrope_position_delta: int
 
 
 class ExpandedInputLenReq(BaseReq, kw_only=True):
