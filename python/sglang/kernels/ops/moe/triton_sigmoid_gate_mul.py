@@ -125,3 +125,41 @@ def sigmoid_gate_mul_broadcast_bf16(
             (triton.cdiv(x.shape[0], 4), triton.cdiv(x.shape[1], 256))
         ](x, gate, out, x.shape[0], x.shape[1], num_warps=4, enable_fp_fusion=False)
     return out
+
+
+# Flat loads suit the three-tensor shared-add path. Keep BF16 product rounding.
+@triton.jit(do_not_specialize=['M'])
+def _sigmoid_gate_mul_add_bf16_kernel(S, G, Y, M, D: tl.constexpr, B: tl.constexpr):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    mask = i < M * D
+    gate = tl.load(G + i // D, mask, 0).to(tl.float32)
+    gate = tl.sigmoid(gate).to(tl.bfloat16).to(tl.float32)
+    shared = tl.load(S + i, mask, 0).to(tl.float32)
+    product = (shared * gate).to(tl.bfloat16).to(tl.float32)
+    main = tl.load(Y + i, mask, 0).to(tl.float32)
+    tl.store(Y + i, main + product, mask)
+
+
+def sigmoid_gate_mul_add_bf16(
+    main: torch.Tensor, shared: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Gate shared output and add to main in place, retaining BF16 roundings."""
+    supported = (
+        shared.ndim == 2
+        and main.shape == shared.shape
+        and gate.shape == (shared.shape[0], 1)
+        and main.device == shared.device == gate.device
+        and shared.is_cuda
+        and main.dtype == shared.dtype == gate.dtype == torch.bfloat16
+        and main.is_contiguous() and shared.is_contiguous() and gate.is_contiguous()
+    )
+    if not supported:
+        return main.add_(torch.sigmoid(gate) * shared)
+    if shared.numel():
+        _sigmoid_gate_mul_add_bf16_kernel[
+            (triton.cdiv(shared.numel(), 1024),)
+        ](
+            shared, gate, main, shared.shape[0], shared.shape[1], 1024,
+            num_warps=4, enable_fp_fusion=False,
+        )
+    return main

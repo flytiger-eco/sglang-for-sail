@@ -2692,6 +2692,40 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
 
+        from sglang.srt.runtime_context import get_disagg, get_server_args
+        from sglang.srt.utils import is_ppu
+
+        if not (
+            is_ppu()
+            and get_disagg().disaggregation_mode == "prefill"
+            and envs.SGLANG_QSA_ONLY_CP_REPLICATE.get()
+        ):
+            return
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+        indexer = next((m for m in self.modules() if isinstance(m, QSAIndexer)), None)
+        if indexer is None or not (
+            indexer.q_layernorm.weight.dtype == torch.bfloat16
+            and indexer.index_n_heads == 4
+            and indexer.index_head_dim == 128
+            and indexer.rotary_emb.rotary_dim == 64
+            and indexer.rotary_emb.is_neox_style
+        ):
+            return
+        from sglang.kernels.ops.attention.qsa_cp_prefill_warmup import (
+            warmup_qsa_cp_prefill,
+        )
+
+        config = getattr(self.config, "text_config", self.config)
+        warmup_qsa_cp_prefill(
+            indexer.q_layernorm.weight.device,
+            config.num_key_value_heads,
+            config.head_dim,
+            get_server_args().kv_cache_dtype == "fp8_e4m3",
+            config.hidden_size,
+        )
+        logger.info("Precompiled PPU QSA CP Prefill kernels with scratch buffers")
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         text_config = getattr(config, "text_config", config)

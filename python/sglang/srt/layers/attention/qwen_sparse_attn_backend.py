@@ -62,9 +62,10 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_disagg, get_stream
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 logger = logging.getLogger(__name__)
+_is_ppu = is_ppu()
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -1477,6 +1478,60 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    def _can_store_cp_kv_rank_major(self, layer, k, v):
+        if not _is_ppu or self.qsa_backend != "fa3":
+            return False
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        if (
+            full_pool is None
+            or getattr(full_pool, "is_quantized_kv_cache", False)
+            or getattr(full_pool, "use_hnd", False)
+            or getattr(full_pool, "kv_cache_layout", None) == "vectorized_5d"
+            or k.dtype != torch.bfloat16
+            or v.dtype != k.dtype
+            or layer.qk_head_dim != layer.v_head_dim
+            or layer.tp_k_head_num != layer.tp_v_head_num
+        ):
+            return False
+        keys = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        values = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        return (
+            keys.dtype == values.dtype == torch.float8_e4m3fn
+            and keys.ndim == values.ndim == 3
+            and keys.shape == values.shape
+            and keys.is_contiguous()
+            and values.is_contiguous()
+        )
+
+    def _store_cp_kv_rank_major(self, layer, loc_info, k, v, context):
+        from sglang.kernels.ops.attention.qsa_cp_fp8_store import store_cp_kv
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+        from sglang.srt.utils.async_probe import (
+            maybe_detect_kernel_facing_loc,
+            maybe_detect_oob,
+        )
+
+        loc, _, full_loc = unwrap_write_loc(loc_info)
+        loc = full_loc if full_loc is not None else loc
+        loc = loc[: context.total_rows]
+        pool = self.token_to_kv_pool
+        keys = pool.get_key_buffer(layer.layer_id)
+        values = pool.get_value_buffer(layer.layer_id)
+        full_pool = pool.full_kv_pool
+        maybe_detect_oob(loc, 0, keys.shape[0], "QSA CP FP8 cache store")
+        maybe_detect_kernel_facing_loc(
+            loc, full_pool.page_size, full_pool.kernel_page_blocks,
+            "QSA CP FP8 cache store",
+        )
+        k_scale, v_scale = self._kv_descales(layer, keys.dtype)
+        store_cp_kv(
+            k, v, keys, values, loc,
+            total_rows=context.total_rows,
+            cp_size=context.world_size,
+            local_capacity=context.local_capacity,
+            k_scale=k_scale, v_scale=v_scale,
+        )
+
     def prefetch_qsa_only_cp_kv(self, layer, k, v, forward_batch, context):
         """Gather K/V after index-key gather, overlapping indexer compute.
 
@@ -1485,6 +1540,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """
         if self._qsa_only_cp_pending is not None:
             raise RuntimeError("unjoined query-only CP K/V prefetch")
+        rank_major = self._can_store_cp_kv_rank_major(layer, k, v)
         stream = get_stream("qsa_only_cp_kv")
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -1493,10 +1549,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             key = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             value = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
             k_width, v_width = key.shape[-1], value.shape[-1]
-            packed = qsa_only_cp_gather_rows(torch.cat((key, value), dim=-1), context)
-            k_full, v_full = (
-                part.contiguous() for part in packed.split((k_width, v_width), dim=-1)
+            packed = qsa_only_cp_gather_rows(
+                torch.cat((key, value), dim=-1), context, rank_major=rank_major
             )
+            parts = packed.split((k_width, v_width), dim=-1)
+            k_full, v_full = parts if rank_major else (part.contiguous() for part in parts)
         self._qsa_only_cp_pending = (
             layer.layer_id,
             forward_batch,
@@ -1505,6 +1562,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_full,
             k,
             v,
+            rank_major,
         )
 
     def forward_extend(
@@ -1523,8 +1581,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise ValueError("QSA sparse attention requires topk_indices")
         qsa_cp_context = kwargs.get("qsa_cp_context")
         pending = self._qsa_only_cp_pending if qsa_cp_context is not None else None
+        rank_major = False
         if pending is not None:
-            layer_id, batch, context, k_full, v_full, input_k, input_v = pending
+            layer_id, batch, context, k_full, v_full, input_k, input_v, rank_major = pending
             if not (
                 layer_id == layer.layer_id
                 and batch is forward_batch
@@ -1553,13 +1612,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             if qsa_cp_context is not None and pending is None:
                 # Query rows are local, while every CP rank owns the complete KV.
                 k_width, v_width = k.shape[-1], v.shape[-1]
+                rank_major = self._can_store_cp_kv_rank_major(layer, k, v)
                 full = qsa_only_cp_gather_rows(
-                    torch.cat((k, v), dim=-1), qsa_cp_context
+                    torch.cat((k, v), dim=-1), qsa_cp_context, rank_major=rank_major
                 )
-                k, v = (x.contiguous() for x in full.split((k_width, v_width), dim=-1))
-            if qsa_cp_context is not None:
-                cache_locs = cache_locs[: qsa_cp_context.total_rows]
-            self._store_kv(layer, cache_locs, k, v)
+                parts = full.split((k_width, v_width), dim=-1)
+                k, v = parts if rank_major else (x.contiguous() for x in parts)
+            if rank_major:
+                self._store_cp_kv_rank_major(layer, cache_locs, k, v, qsa_cp_context)
+            else:
+                if qsa_cp_context is not None:
+                    cache_locs = cache_locs[: qsa_cp_context.total_rows]
+                self._store_kv(layer, cache_locs, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]

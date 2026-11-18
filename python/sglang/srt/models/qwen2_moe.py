@@ -874,6 +874,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
 
         num_tokens = hidden_states.shape[0]
+        defer_shared_gate = (
+            self._prefill_gate_fusion
+            and self.shared_expert_gate is not None
+            and hidden_states.dtype == torch.bfloat16
+            and forward_batch is not None
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch._original_forward_mode in (None, ForwardMode.EXTEND)
+        )
+        shared_gate = None
         shared_output = None
         topk_ids = None
         topk_weights = None
@@ -881,6 +890,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits, _ = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(
                 hidden_states,
+                apply_gate=not defer_shared_gate,
                 prefill=(
                     self._prefill_gate_fusion
                     and forward_batch is not None
@@ -889,6 +899,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     in (None, ForwardMode.EXTEND)
                 ),
             )
+            if defer_shared_gate and shared_output is not None:
+                # Keep the original GEMV and its BF16 output; defer only the
+                # elementwise gate so its rounded product can join shared-add.
+                shared_gate = self.shared_expert_gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -925,7 +939,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             num_tokens=num_tokens,
         )
         if shared_output is not None:
-            final_hidden_states.add_(shared_output)
+            if shared_gate is not None:
+                from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                    sigmoid_gate_mul_add_bf16,
+                )
+
+                sigmoid_gate_mul_add_bf16(final_hidden_states, shared_output, shared_gate)
+            else:
+                final_hidden_states.add_(shared_output)
         return final_hidden_states
 
     @property

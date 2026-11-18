@@ -27,7 +27,9 @@ class QSAOnlyCPContext:
         return tensor[self.rank :: self.world_size][: self.local_rows].contiguous()
 
 
-def qsa_only_cp_gather_rows(tensor: torch.Tensor, context: QSAOnlyCPContext):
+def qsa_only_cp_gather_rows(
+    tensor: torch.Tensor, context: QSAOnlyCPContext, *, rank_major: bool = False
+):
     """聚合本地行并恢复全局顺序；不暴露 scheduler 的 padding 行。"""
     if tensor.shape[0] > context.local_capacity:
         raise ValueError("QSA-only CP tensor exceeds its local capacity")
@@ -40,6 +42,8 @@ def qsa_only_cp_gather_rows(tensor: torch.Tensor, context: QSAOnlyCPContext):
         (context.world_size * context.local_capacity, *tensor.shape[1:])
     )
     get_parallel().attn_tp_group.all_gather_into_tensor(gathered, padded)
+    if rank_major:
+        return gathered
     return (
         gathered.reshape(context.world_size, context.local_capacity, *tensor.shape[1:])
         .transpose(0, 1)
