@@ -36,7 +36,16 @@ class RunCiWorkflowContractTest(unittest.TestCase):
             )
             self.assertFalse(job["strategy"]["fail-fast"])
         self.assertEqual(text.count("node_selector: ${{ matrix.board.selector }}"), 4)
-        self.assertEqual(text.count("check_nightly_board.py"), 4)
+        # Each shard mentions the checker twice: once to prove the workflow
+        # revision carries it, which a source-mode dispatch needs, and once to run
+        # it. The contract is the invocation -- every shard fingerprints its board
+        # -- so count that instead of every mention of the file name.
+        self.assertEqual(
+            text.count('python3 "$checker/scripts/ci/ppu/check_nightly_board.py"'), 4
+        )
+        self.assertEqual(
+            text.count('-f "$checker/scripts/ci/ppu/check_nightly_board.py"'), 4
+        )
         self.assertNotIn('${{ github.job }}"', text)
         self.assertIn('nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 5700', text)
         self.assertIn('nightly-1-ppu 1 "$PPU_EVIDENCE_DIR" 6600', text)
