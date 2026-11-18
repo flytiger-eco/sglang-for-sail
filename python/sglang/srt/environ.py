@@ -304,6 +304,8 @@ class Envs:
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     # Select the Qwen query-sparse attention implementation (triton or fa3).
     SGLANG_QSA_BACKEND = EnvStr("triton")
+    # Preserve state updates; bypass selection only for bounded plain prefill.
+    SGLANG_QSA_SHORT_CTX_DENSE = EnvBool(True)
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
     SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)

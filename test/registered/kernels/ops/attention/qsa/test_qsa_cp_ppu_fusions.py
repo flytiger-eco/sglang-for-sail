@@ -53,6 +53,7 @@ def test_backend_cp_store(monkeypatch, prefetch, save):
     pool = NS(dtype=keys.dtype, full_kv_pool=NS(is_quantized_kv_cache=False, use_hnd=False, kv_cache_layout='NHD', page_size=64, kernel_page_blocks=1), get_key_buffer=lambda _: keys, get_value_buffer=lambda _: values)
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     backend.qsa_backend = 'fa3'
+    backend.qsa_profile = None  # This fixture isolates the CP cache writer.
     backend._qsa_only_cp_pending = None
     backend.token_to_kv_pool = pool
     backend._logical_to_physical = lambda *args: torch.zeros((4, 1), device='cuda', dtype=torch.int32)

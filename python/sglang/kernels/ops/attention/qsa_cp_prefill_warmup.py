@@ -30,8 +30,14 @@ def warmup_qsa_cp_prefill(device, kv_heads, kv_head_dim, warm_fp8_store, hidden_
         for dtype in (torch.int32, torch.int64):
             loc = torch.arange(2, device=device, dtype=dtype)
             store_cp_kv(
-                k, v, keys, values, loc,
-                total_rows=2, cp_size=2, local_capacity=1,
+                k,
+                v,
+                keys,
+                values,
+                loc,
+                total_rows=2,
+                cp_size=2,
+                local_capacity=1,
             )
 
     from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul_add_bf16
@@ -42,3 +48,19 @@ def warmup_qsa_cp_prefill(device, kv_heads, kv_head_dim, warm_fp8_store, hidden_
     shared = torch.zeros_like(main)
     gate = torch.zeros((2, 1), device=device, dtype=x.dtype)
     sigmoid_gate_mul_add_bf16(main, shared, gate)
+
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_QSA_SHORT_CTX_DENSE.get():
+        from sglang.srt.layers.attention.qsa.short_dense import pack_short_dense_kv
+
+        dtype = torch.float8_e4m3fn if warm_fp8_store else torch.bfloat16
+        keys = torch.zeros((2, kv_heads, kv_head_dim), dtype=dtype, device=device)
+        values = torch.zeros_like(keys)
+        slots = torch.tensor([[0, 0, 0], [0, 1, 0]], dtype=torch.int32, device=device)
+        lengths = torch.tensor([1, 2], dtype=torch.int32, device=device)
+        packed_k = torch.empty(
+            (2, 64, kv_heads, kv_head_dim), dtype=dtype, device=device
+        )
+        packed_v = torch.empty_like(packed_k)
+        pack_short_dense_kv(keys, values, slots, lengths, packed_k, packed_v)
