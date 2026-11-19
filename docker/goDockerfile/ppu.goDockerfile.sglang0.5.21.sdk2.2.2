@@ -9,7 +9,7 @@
 #   flashinfer-cubin/jit-cache, sgl-deep-ep/sgl-deep-gemm, kernels-community cubins.
 #
 # Global ARGs: redeclare `ARG NAME` (without a value) inside a stage to use them.
-ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-20261001
+ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:gotag.sdk2.2.2-2.13.0-ubuntu24.04-cuda13.0-py312
 # "all" also pulls sglang[diffusion], whose st_attn/vsa sdists compile CUDA code.
 # "ray" is needed at runtime: the PPU deep_gemm tuner imports ray at module load.
 ARG BUILD_TYPE=http2,tracing,ray
@@ -25,26 +25,6 @@ ARG MAX_JOBS=16
 # sglang-router is built from this repository in gateway_builder instead.
 # sglang-kernel is fetched from flytiger when available, with an AOT source
 # build fallback in ppu_kernels_builder.
-# acext==1.1.0+v0.2.0.gotagppu2.2.2, gotag
-# cpm-kernels==1.0.11+v0.1.0.gotagppu2.2.2, gotag
-# cuda-bindings==13.0.0+v0.1.0.gotagppu2.2.2, gotag
-# cuda-python==13.0.0+v0.1.0.gotagppu2.2.2, gotag
-# deep_ep==2.2.1+v0.1.0.gotagppu2.2.2, gotag
-# deep_gemm==1.1.0+v1.0.1.gotagppu2.2.2, gotag
-# fast-hadamard-transform==1.0.4.post1+v0.1.0.gotagppu2.2.2, gotag
-# flash-attn==2.7.4.post1+v0.2.0.gotagppu2.2.2, gotag
-# flash_attn_3==3.0.0+v0.2.0.gotagppu2.2.2, gotag
-# flash_mla==2.0.0+v0.2.0.gotagppu2.2.2, gotag
-# flashinfer_python==0.6.18+v0.2.0.gotagppu2.2.2, gotag
-# mooncake==0.3.12.post1+v0.1.0.gotagppu2.2.2, gotag
-# msa_for_sail==0.1.1+v0.1.0.gotagppu2.2.2, gotag
-# nvidia-dali-cuda130==1.53.0+v0.1.0.gotagppu2.2.2, gotag
-# pla==1.0.1+v0.1.0.gotagppu2.2.2, gotag
-# tilelang==0.1.12+v0.1.0.gotagppu2.2.2, gotag
-# torch_memory_saver==0.0.9+v0.1.0.gotagppu2.2.2, gotag
-# torchao==0.17.0+v0.1.0.gotagppu2.2.2, gotag
-# torchcodec==0.15.0+v0.1.0.gotagppu2.2.2, gotag
-# triton==3.7.1+v0.1.0.gotagppu2.2.2, gotag
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
@@ -70,7 +50,6 @@ ARG PPU_PACKAGES="\
 # list the ones the base image lacks; the default base image ships torch and
 # torchvision but not torchaudio. A full list would be e.g.
 #   "torchvision==0.28.0+v0.1.0.ppu2.2.0 torchaudio==2.11.0+v0.1.0.ppu2.2.0"
-# torchaudio==2.11.0+v0.1.0.gotagppu2.2.2, gotag
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
 # Must match version in python/sglang/kernels/aot/pyproject_ppu.toml and the
 # sglang-kernel pin in python/pyproject_ppu.toml.
