@@ -39,6 +39,12 @@ def _jit_topk_v2_module():
     args = make_cpp_args(is_arch_support_pdl())
     # Enable each cluster path only when its occupancy probe reports capacity.
     extra_cuda_cflags = []
+    # Cache key args; a no-SIMT build must not collide with the default module
+    # (the JIT cache key does not include compile flags).
+    module_args = list(args)
+    if envs.SGLANG_DSA_TOPK_NO_SIMT.get() and is_ppu():
+        module_args.append("nosimt")
+        extra_cuda_cflags.append("--no-simt")
     if is_arch_support_pdl():  # set the persistent cluster size after hopper
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
@@ -61,7 +67,7 @@ def _jit_topk_v2_module():
         wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
-        *args,
+        *module_args,
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,

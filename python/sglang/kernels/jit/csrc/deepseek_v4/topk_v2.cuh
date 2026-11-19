@@ -102,22 +102,23 @@ struct TopKPagedParams {
         page_bits,
         raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk)};
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
+  SGL_DEVICE TopKProblem<> problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
-    return TopKProblem{
+    return TopKProblem<>{
         .in = scores + batch_id * score_stride,
         .out = page_indices + batch_id * k,
         .topk = topk,
         .seq_len = seq_len,
     };
   }
-  SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
+  SGL_DEVICE TopKProblem<> problem(uint32_t batch_id) const {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
   }
 };
 
+template <typename InT>
 struct TopKRaggedParams {
-  float* __restrict__ scores;  // NOTE: may write
+  InT* __restrict__ scores;  // NOTE: may write
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ row_starts;
   const int32_t* __restrict__ out_offsets;
@@ -140,7 +141,7 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
 }
 
 template <bool kPDL, TopKMode kMode>
-SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransform& transform) {
+SGL_DEVICE void trivial_transform(const TopKProblem<>& problem, const PageTransform& transform) {
   device::PDLWaitPrimary<kPDL>();
   device::PDLTriggerSecondary<kPDL>();
   for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
@@ -156,7 +157,7 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
 }
 
 template <TopKMode kMode>
-SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
+SGL_DEVICE void paged_transform(const TopKProblem<>& problem, int32_t* out, const PageTransform& transform) {
   static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
   static_assert(kMaxTopK % kBlockSize == 0);
   constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
@@ -199,8 +200,8 @@ SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const 
  *     reordering.
  * It must however land after the PDL wait, or the indexer overwrites it.
  */
-template <bool kPDL>
-TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams params) {
+template <bool kPDL, typename InT>
+TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams<InT> params) {
   device::enable_smem_spilling();
   constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   const auto bx = blockIdx.x;
@@ -227,11 +228,11 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     device::PDLWaitPrimary<kPDL>();
     static_assert(kVecSize <= kBlockSize, "not enough threads ");
     if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
+      score[row_start - rem + tx] = device::cast<InT>(impl::padding_value());
     }
   }
   using device::topk::broadcast;
-  const auto problem = TopKProblem{
+  const auto problem = TopKProblem<InT>{
       .in = score + (row_start - rem),
       .out = out,
       .topk = topk,
@@ -305,7 +306,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
   const auto out = params.page_indices + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
 
-  auto problem = TopKProblem{
+  auto problem = TopKProblem<>{
       .in = score + row_start,
       .out = out,
       .topk = topk,
@@ -840,11 +841,28 @@ struct TopKKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
 
-    TensorMatcher({B, L})  // score
-        .with_strides({S, 1})
-        .with_dtype<float>()
-        .with_device(device_)
-        .verify(scores);
+    // scores may be fp32 (legacy) or bf16 (the fp8-KV ragged prefill path, where
+    // the indexer emits bf16 and the fp32 copy is what we want to avoid).
+    const bool scores_bf16 =
+        scores.dtype().code == kDLBfloat && scores.dtype().bits == 16;
+    const bool scores_f32 =
+        scores.dtype().code == kDLFloat && scores.dtype().bits == 32;
+    RuntimeCheck(scores_bf16 || scores_f32, "scores must be float32 or bfloat16");
+    // Bind B/L/S with the score tensor's real dtype before any unwrap below.
+    if (scores_bf16) {
+      TensorMatcher({B, L})
+          .with_strides({S, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device_)
+          .verify(scores);
+    } else {
+      TensorMatcher({B, L})
+          .with_strides({S, 1})
+          .with_dtype<float>()
+          .with_device(device_)
+          .verify(scores);
+    }
+
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -870,18 +888,26 @@ struct TopKKernel {
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
-    const auto params = TopKRaggedParams{
-        .scores = static_cast<float*>(scores.data_ptr()),
-        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
-        .row_starts = row_starts_ptr,
-        .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
-        .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
-        .score_stride = S.unwrap(),
-        .topk = topk,
+    auto launch = [&](auto tag) {
+      using InT = decltype(tag);
+      const auto params = TopKRaggedParams<InT>{
+          .scores = static_cast<InT*>(scores.data_ptr()),
+          .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+          .row_starts = row_starts_ptr,
+          .out_offsets = static_cast<const int32_t*>(out_offsets.data_ptr()),
+          .topk_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+          .score_stride = S.unwrap(),
+          .topk = topk,
+      };
+      LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_ragged_kernel<kUsePDL, InT>, params);
     };
-    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kBlockSize, device_.unwrap())
-        .config({.use_pdl = kUsePDL})
-        .launch(topk_ragged_kernel<kUsePDL>, params);
+    if (scores_bf16) {
+      launch(bf16_t{});
+    } else {
+      launch(float{});
+    }
   }
 
 #ifdef USE_ROCM  // see the packed kernel above

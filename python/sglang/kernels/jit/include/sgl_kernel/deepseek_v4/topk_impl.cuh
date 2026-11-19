@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <type_traits>
 #include <limits>
 
 #if !defined(USE_ROCM)
@@ -170,8 +171,9 @@ struct alignas(8) TieValue {
 // Per-batch problem description + page-table transform sink
 // ---------------------------------------------------------------------------
 
+template <typename InT = float>
 struct TopKProblem {
-  const float* __restrict__ in;
+  const InT* __restrict__ in;
   int32_t* __restrict__ out;  // page_indices [topk]
   uint32_t topk;
   uint32_t seq_len;
@@ -221,9 +223,10 @@ struct TopKConfig {
   /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
   /// "above" elements already emitted (final output starts at slot `base`);
   /// `topk` here is the number of remaining slots to fill (== global_topk - base).
+  template <typename InT>
   SGL_DEVICE static void handle_tie(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const TopKProblem<InT>& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -311,10 +314,10 @@ struct TopKConfig {
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
-  template <uint32_t kItems>
+  template <uint32_t kItems, typename InT>
   SGL_DEVICE static void radix_tie_select(  //
       const TieValue* tie_buffer,
-      const TopKProblem& problem,
+      const TopKProblem<InT>& problem,
       const uint32_t base,
       const uint32_t num_ties,
       const uint32_t topk,
@@ -438,8 +441,9 @@ struct TopKRadixBase : TopKConfig {
   };
 
  protected:
-  template <uint32_t N = 1, typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  template <uint32_t N = 1, typename InT, typename F>
+  SGL_DEVICE static void for_each_input(const InT* __restrict__ in, uint32_t seq_len, F&& fn) {
+    using vec_in_t = AlignedVector<InT, kVecSize>;
     constexpr auto kStride = N * kBlockSize;
     const auto tx = threadIdx.x;
     const auto num_full = seq_len / kVecSize;  // fully-in-bounds vectors
@@ -447,7 +451,7 @@ struct TopKRadixBase : TopKConfig {
     // lane | rank | warp
     auto vi = N == 1 ? tx : (tx % kChunk) + blockIdx.y * kChunk + (tx / kChunk) * (N * kChunk);
     if (vi < num_full) {
-      vec_t next_vec;
+      vec_in_t next_vec;
       next_vec.load(in, vi);
 #pragma unroll 1
       do {
@@ -457,7 +461,7 @@ struct TopKRadixBase : TopKConfig {
         const auto base = (vi - kStride) * kVecSize;
 #pragma unroll
         for (uint32_t j = 0; j < kVecSize; ++j) {
-          fn(cur[j], base + j);
+          fn(cast<float>(cur[j]), base + j);
         }
       } while (vi < num_full);
     }
@@ -465,11 +469,11 @@ struct TopKRadixBase : TopKConfig {
     if (vi == num_full) {
       const auto base = vi * kVecSize;
       if (base == seq_len) return;
-      vec_t cur;
+      vec_in_t cur;
       cur.load(in, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
-        if (base + j < seq_len) fn(cur[j], base + j);
+        if (base + j < seq_len) fn(cast<float>(cur[j]), base + j);
       }
     }
   }
@@ -539,8 +543,8 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
   using Smem = typename TopKRadixBase<12>::Smem;
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(const TopKProblem& problem, void* _smem) {
+  template <bool kUsePDL, typename InT>
+  SGL_DEVICE static void forward(const TopKProblem<InT>& problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -556,10 +560,20 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 1: load full vectors + build histogram
     vec_t local_vecs[kLocalVecs];
+    using vec_in_t = AlignedVector<InT, kVecSize>;
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      if (vi < num_full) local_vecs[i].load(problem.in, vi);
+      if (vi < num_full) {
+        if constexpr (std::is_same_v<InT, float>) {
+          local_vecs[i].load(problem.in, vi);
+        } else {
+          vec_in_t v;
+          v.load(problem.in, vi);
+#pragma unroll
+          for (uint32_t j = 0; j < kVecSize; ++j) local_vecs[i][j] = cast<float>(v[j]);
+        }
+      }
     }
 
     const auto tail_start = (problem.seq_len - 1) % kVecSize + 1;
@@ -640,8 +654,8 @@ struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename InT>
+  SGL_DEVICE static void forward(TopKProblem<InT> problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -752,8 +766,8 @@ struct TopKCluster : TopKRadixBase<10> {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
   }
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, typename InT>
+  SGL_DEVICE static void forward(TopKProblem<InT> problem, void* _smem) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cooperative_groups::this_cluster();
