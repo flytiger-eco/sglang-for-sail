@@ -2481,6 +2481,8 @@ class Scheduler(
                 self.total_prefill_uncached_tokens
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_prefill_gpu_pending_tokens=self.get_prefill_gpu_pending_tokens,
+            get_prefill_scheduled_chunk_end=self.get_prefill_scheduled_chunk_end,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
 
