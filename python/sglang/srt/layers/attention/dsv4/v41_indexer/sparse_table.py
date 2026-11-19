@@ -10,8 +10,8 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
-    amax8_varlen,
     amax_topk_blocks,
+    candidate_block_ids,
     candidate_row_lens,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
@@ -24,10 +24,12 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
+    topk_transform_candidates,
     topk_transform_paged,
     topk_transform_ragged_v2,
     topk_transform_sparse,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 
 from .scoring import (
@@ -385,29 +387,33 @@ def publish_prefill_table(
     device = data.q_fp4.device
     nblocks, valid_lens = candidate_row_lens(data.compress_lens, topk_blocks)
     blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=device)
-    zero_offsets = torch.zeros(rows, dtype=torch.int32, device=device)
+    # Two levels instead of one full-width pass: the block maxima cost one read
+    # of the scores, and the selection then reads only the kept blocks (the
+    # block keys are needed for the published table either way). Exact while
+    # index_topk < topk_blocks, see `topk_transform_candidates`.
+    two_level = (
+        envs.SGLANG_OPT_DSV41_TOPK_CANDIDATES.get()
+        and 0 < out_positions.shape[1] < topk_blocks
+    )
     # the block keys read the score rows through 32-byte vectors
     for tile, logits in score_tiles(data, kv, width_align=8):
         lens = data.compress_lens[tile]
-        topk_transform_ragged_v2(
-            logits,
-            lens,
-            out_offsets=data.request_starts[tile],
-            out_indices=out_positions[tile],
-        )
-        # keys past a row's block count stay unset; the top-k reads a row
-        # up to its block count only (v2 wants the stride a multiple of 4)
-        width_blocks = (
-            logits.shape[1] + CANDIDATE_BLOCK_SIZE - 1
-        ) // CANDIDATE_BLOCK_SIZE
-        keys = logits.new_empty(logits.shape[0], (width_blocks + 3) // 4 * 4)
-        amax8_varlen(logits, lens, out=keys)
-        topk_transform_ragged_v2(
-            keys,
-            nblocks[tile],
-            out_offsets=zero_offsets[: logits.shape[0]],
-            out_indices=blocks[tile],
-        )
+        candidate_block_ids(logits, lens, nblocks[tile], topk_blocks, out=blocks[tile])
+        if two_level:
+            topk_transform_candidates(
+                logits,
+                lens,
+                blocks[tile],
+                out_offsets=data.request_starts[tile],
+                out_indices=out_positions[tile],
+            )
+        else:
+            topk_transform_ragged_v2(
+                logits,
+                lens,
+                out_offsets=data.request_starts[tile],
+                out_indices=out_positions[tile],
+            )
         del logits  # release this tile before the next one is scored
     request_ids = torch.repeat_interleave(
         torch.arange(len(data.rows_per_request), dtype=torch.int32, device=device),
