@@ -42,7 +42,6 @@ ARG PPU_PACKAGES="\
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
     torchao==0.17.0+v0.1.0.ppu2.2.0 \
     torchcodec==0.15.0+v0.1.0.ppu2.2.0 \
-    transformer-engine==2.5+v0.1.0.ppu2.2.0 \
     triton==3.7.1+v0.1.0.ppu2.2.0"
 # The base image provides torch/torchvision; only add torchaudio.
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
@@ -233,12 +232,9 @@ print("\n".join(f"{n}=={version(n)}" for n in sorted(names)))' > /sgl-workspace/
 
 # Resolve extras from the actual SGLang wheel, never a local source stub.
 # Keep all PPU wheels available to the resolver to prevent index replacement.
-# uv needs a constraint for transformer-engine's transitive URL dependency.
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/uv \
     python3 -m pip install uv \
-    && echo "nvdlfw-inspect @ git+https://github.com/NVIDIA/nvidia-dlfw-inspect.git@v0.1" \
-        >> /sgl-workspace/ppu_constraints.txt \
     && echo "pyarrow<26" >> /sgl-workspace/ppu_constraints.txt \
     && echo "transformers==${TRANSFORMERS_VERSION}" >> /sgl-workspace/ppu_constraints.txt \
     && echo "deepseek-recipe==${DEEPSEEK_RECIPE_VERSION}" >> /sgl-workspace/ppu_constraints.txt \
