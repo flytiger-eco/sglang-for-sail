@@ -293,7 +293,11 @@ class GDNKernelDispatcher:
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
-        if prefill_backend.is_triton():
+        if prefill_backend.is_pla():
+            from sglang.srt.layers.attention.linear.kernels.gdn_pla import PlaGDNKernel
+
+            self.extend_kernel = PlaGDNKernel()
+        elif prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_intel_xpu():
             if not is_xpu():
@@ -543,6 +547,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        self._pla_prefill_plan = None
 
     def init_forward_metadata_out_graph(
         self,
@@ -551,6 +556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
+        self._pla_prefill_plan = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -578,6 +584,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 maybe_build_flashinfer_checkpoint_plan(
                     forward_batch, self.forward_metadata, self.device
                 )
+
+        self._pla_prefill_plan = None
+        kernel = getattr(self.kernel_dispatcher, "extend_kernel", None)
+        if not hasattr(kernel, "prepare_plan"):
+            return
+        mode = forward_batch.forward_mode
+        lengths = forward_batch.extend_seq_lens_cpu
+        if (
+            hasattr(kernel, "prepare_plan")
+            and self.mis_metadata is None
+            and mode.is_extend()
+            and not mode.is_target_verify()
+            and lengths is not None
+            and len(lengths) == forward_batch.batch_size
+        ):
+            chunks = [-1] * len(lengths)
+            if self.forward_metadata.has_mamba_track_mask:
+                if not self._has_cpu_prefill_track_metadata(forward_batch):
+                    return  # Keep Triton's full intermediate-state contract.
+                from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
+                    build_prefill_track_plan,
+                )
+
+                chunks = build_prefill_track_plan(
+                    forward_batch.mamba_prefill_track_mask_cpu,
+                    forward_batch.mamba_track_seqlens_cpu,
+                    lengths,
+                    forward_batch.extend_prefix_lens_cpu,
+                    self.mamba_chunk_size,
+                    mamba2=False,
+                ).chunk_indices
+            self._pla_prefill_plan = kernel.prepare_plan(
+                lengths, chunks, self.mamba_chunk_size, self.device
+            )
 
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
         # CUDA-graph metadata leaves mode and draft count at their defaults.
@@ -1011,6 +1051,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
+
+        kernel = getattr(self.kernel_dispatcher, "extend_kernel", None)
+        plan = getattr(self, "_pla_prefill_plan", None)
+        if (
+            not is_target_verify
+            and plan is not None
+            and kernel.can_use_packed_prefill(
+                mixed_qkv,
+                ssm_states_contig,
+                layer.num_q_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                plan,
+            )
+        ):
+            core_attn_out, snapshots = kernel.packed_extend(
+                mixed_qkv,
+                a,
+                b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                num_qk_heads=layer.num_q_heads,
+                num_v_heads=layer.num_v_heads,
+                plan=plan,
+            )
+            if needs_state_gather:
+                conv_states[cache_indices] = conv_states_contig
+                ssm_states[cache_indices] = ssm_states_contig
+            if forward_metadata.has_mamba_track_mask:
+                self._track_mamba_state_extend(
+                    forward_batch,
+                    None,
+                    ssm_states,
+                    forward_metadata,
+                    h_track_buf=snapshots,
+                )
+            return core_attn_out
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
