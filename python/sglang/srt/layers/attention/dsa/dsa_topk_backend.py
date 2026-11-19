@@ -295,6 +295,40 @@ class DSATopKBackend(Enum):
                 # bf16 -> fp32 is value preserving, so the selected indices are
                 # unchanged; this restores the pre-fp8 dtype instead of changing
                 # the selection semantics.
+                if (
+                    envs.SGLANG_DSA_RAGGED_BF16_TOPK.get()
+                    and logits.dtype == torch.bfloat16
+                    # The v2 kernel reads scores with 16-byte vector loads and
+                    # requires a unit row stride with a 4-element aligned row
+                    # stride. Layouts outside that contract keep the fp32
+                    # fallback, which has no such requirement.
+                    and logits.stride(1) == 1
+                    and logits.stride(0) % 4 == 0
+                    # The vector load also needs the base address itself aligned
+                    # (AlignedVector<bf16_t, 4> = 8 bytes). A view such as
+                    # ``x[:, 1:4097]`` satisfies the stride checks but starts two
+                    # bytes past an aligned address.
+                    and logits.data_ptr() % (logits.element_size() * 4) == 0
+                ):
+                    # Minimal bf16 path: the dsv4 ragged JIT kernel selects on
+                    # bf16 scores directly, so the fp32 copy above disappears.
+                    # NOTE: like the fused fallback it masks <= 3 columns of the
+                    # score buffer in place; the logits are dead after the top-k.
+                    from sglang.kernels.ops.attention.dsv4.topk import (
+                        topk_transform_ragged_v2,
+                    )
+
+                    out = logits.new_empty(
+                        (logits.shape[0], topk), dtype=torch.int32
+                    )
+                    topk_transform_ragged_v2(
+                        logits,
+                        lengths,
+                        out_offsets=topk_indices_offset,
+                        out_indices=out,
+                        row_starts=row_starts,
+                    )
+                    return out
                 score = logits if logits.dtype == torch.float32 else logits.float()
                 return fast_topk_transform_ragged_fused(
                     score=score,
