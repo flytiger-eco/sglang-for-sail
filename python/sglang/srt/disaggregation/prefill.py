@@ -748,7 +748,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
+                result = self._run_prefill_batch_with_load(batch)
                 self.process_batch_result(batch, result)
             else:
                 self._sched_idled = True
@@ -791,7 +791,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                batch_result = self.run_batch(batch)
+                batch_result = self._run_prefill_batch_with_load(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
@@ -867,6 +867,107 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self._disagg_page_snapshots_logged = True
 
+    def _update_prefill_scheduled_chunk(self, batch):
+        cr = self.chunked_req
+        if cr is not None:
+            for req in batch.reqs:
+                if req.rid == cr.rid and req.extend_range is not None:
+                    rid, end = getattr(self, "_prefill_last_scheduled_chunk", (None, 0))
+                    self._prefill_last_scheduled_chunk = (
+                        req.rid, max(end if rid == req.rid else 0, req.extend_range.end)
+                    )
+
+    def _begin_prefill_gpu_pending(self, batch):
+        if (
+            not envs.SGLANG_PREFILL_GPU_PENDING_LOAD.get()
+            or not batch.forward_mode.is_extend()
+            or batch.is_dllm()
+        ):
+            return None
+        pending = getattr(self, "_prefill_active_token_batches", None)
+        if pending is None:
+            pending = self._prefill_active_token_batches = {}
+        ticket = SimpleNamespace(
+            key=object(),
+            result_key=None,
+            previous_chunk=getattr(self, "_prefill_last_scheduled_chunk", (None, 0)),
+        )
+        # Batch admission is already committed. Before run_batch returns there
+        # is no CUDA completion event yet, but its CPU launch / preparation is
+        # also outstanding work. Advance the planned end in the same update so
+        # the chunk is not simultaneously counted in the unlaunched tail.
+        self._update_prefill_scheduled_chunk(batch)
+        pending[ticket.key] = (int(batch.extend_num_tokens), None)
+        try:
+            self.publish_load_snapshot(force=True)
+        except BaseException:
+            pending.pop(ticket.key, None)
+            self._prefill_last_scheduled_chunk = ticket.previous_chunk
+            raise
+        return ticket
+
+    def _record_prefill_gpu_pending(self, batch, result, load_ticket=None):
+        if not envs.SGLANG_PREFILL_GPU_PENDING_LOAD.get():
+            return
+        if not batch.forward_mode.is_extend() or batch.is_dllm():
+            return
+        pending = getattr(self, "_prefill_active_token_batches", None)
+        if pending is None:
+            pending = self._prefill_active_token_batches = {}
+        if load_ticket is not None:
+            pending.pop(load_ticket.key, None)
+            load_ticket.result_key = id(result)
+        else:
+            self._update_prefill_scheduled_chunk(batch)
+        # Rebind the same reservation to the result, rather than charging it
+        # again. No load snapshot is published between removing and rebinding.
+        pending[id(result)] = (int(batch.extend_num_tokens), result.copy_done)
+        self.publish_load_snapshot(force=True)
+
+    def _cancel_prefill_load_ticket(self, ticket):
+        if ticket is None:
+            return
+        pending = getattr(self, "_prefill_active_token_batches", {})
+        pending.pop(ticket.key, None)
+        if ticket.result_key is not None:
+            pending.pop(ticket.result_key, None)
+        self._prefill_last_scheduled_chunk = ticket.previous_chunk
+        self.publish_load_snapshot(force=True)
+
+    def _run_prefill_batch_with_load(self, batch):
+        # This wrapper is called after selection / prepare_for_forward, at the
+        # actual launch boundary, never from speculative admission attempts.
+        ticket = self._begin_prefill_gpu_pending(batch)
+        try:
+            result = self.run_batch(batch)
+            self._record_prefill_gpu_pending(batch, result, ticket)
+        except BaseException:
+            try:
+                self._cancel_prefill_load_ticket(ticket)
+            except Exception:
+                logger.exception("Failed to clear Prefill load after launch failure")
+            raise
+        return result
+
+    def get_prefill_gpu_pending_tokens(self):
+        if not envs.SGLANG_PREFILL_GPU_PENDING_LOAD.get():
+            return 0
+        # query() never synchronizes the GPU. Finished results can still be in
+        # the overlap queue, so do not count them solely because CPU retirement
+        # has not reached them yet.
+        return sum(
+            tokens
+            for tokens, event in getattr(self, "_prefill_active_token_batches", {}).values()
+            if event is None or not event.query()
+        )
+
+    def get_prefill_scheduled_chunk_end(self):
+        if not envs.SGLANG_PREFILL_GPU_PENDING_LOAD.get():
+            return 0
+        cr = self.chunked_req
+        rid, end = getattr(self, "_prefill_last_scheduled_chunk", (None, 0))
+        return end if cr is not None and cr.rid == rid else 0
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -892,6 +993,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        if envs.SGLANG_PREFILL_GPU_PENDING_LOAD.get():
+            getattr(self, "_prefill_active_token_batches", {}).pop(id(result), None)
+            self.publish_load_snapshot(force=True)
         mamba_indices = (
             result.disagg_mamba_indices.numpy()
             if result.disagg_mamba_indices is not None

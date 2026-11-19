@@ -744,6 +744,8 @@ class Envs:
     # Admit Prefill during bootstrap without spending optimistic-prefill attempts.
     # The same PP and hierarchical-cache compatibility restrictions apply.
     SGLANG_DISAGG_BOOTSTRAP_OVERLAP = EnvBool(False)
+    # Include committed Prefill batches in external routing-load snapshots.
+    SGLANG_PREFILL_GPU_PENDING_LOAD = EnvBool(False)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     # Enable on both P and D with the same --sampling-mask-max-tokens value.
     SGLANG_ENABLE_DISAGG_SAMPLING_MASK = EnvBool(False)

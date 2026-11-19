@@ -54,6 +54,8 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_prefill_gpu_pending_tokens: Callable[[], int] = lambda: 0
+    get_prefill_scheduled_chunk_end: Callable[[], int] = lambda: 0
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -212,6 +214,22 @@ class SchedulerLoadInquirer:
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
+        waiting_uncached_tokens = self.get_num_waiting_uncached_tokens()
+        unscheduled_uncached_tokens = 0
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            unscheduled_uncached_tokens = waiting_uncached_tokens
+            cr = self.get_chunked_req()
+            if cr is not None:
+                # A launch-time snapshot precedes cache_unfinished_req in the
+                # next scheduling round. The legacy waiting gauge can still
+                # include the launched chunk, even though it is also in the
+                # GPU-pending gauge. Deduct only that request's planned span.
+                scheduled_end = min(cr.seqlen, self.get_prefill_scheduled_chunk_end())
+                launched_in_waiting = max(0, scheduled_end - len(cr.prefix_indices))
+                unscheduled_uncached_tokens = max(
+                    0, unscheduled_uncached_tokens - launched_in_waiting
+                )
+
         return LoadSnapshot(
             dp_rank=int(get_parallel().dp_rank)
             if get_parallel().dp_rank is not None
@@ -219,7 +237,13 @@ class SchedulerLoadInquirer:
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
-            num_waiting_uncached_tokens=self.get_num_waiting_uncached_tokens(),
+            num_waiting_uncached_tokens=waiting_uncached_tokens,
+            num_prefill_gpu_pending_tokens=(
+                self.get_prefill_gpu_pending_tokens()
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else 0
+            ),
+            num_prefill_unscheduled_uncached_tokens=unscheduled_uncached_tokens,
             num_used_tokens=num_used_tokens,
             num_total_tokens=num_total_tokens,
             num_active_tokens=num_active_tokens,

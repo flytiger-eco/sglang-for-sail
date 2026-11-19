@@ -197,6 +197,13 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_running_reqs: int = 0
     num_waiting_reqs: int = 0
     num_waiting_uncached_tokens: int = 0
+    # Already launched Prefill chunks whose GPU result is still pending.
+    # Excludes waiting requests and the unlaunched tail of a chunked request.
+    num_prefill_gpu_pending_tokens: int = 0
+    # Waiting work after excluding launched chunks not yet reflected in the
+    # chunked request's cached-prefix bookkeeping. Kept separate so existing
+    # consumers of num_waiting_uncached_tokens retain their original semantics.
+    num_prefill_unscheduled_uncached_tokens: int = 0
     num_used_tokens: int = 0
     num_total_tokens: int = 0
     # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
