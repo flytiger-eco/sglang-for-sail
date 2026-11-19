@@ -23,6 +23,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
         super().setUp()
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+        self.original_max_num_sms = mega_moe._mega_moe_max_num_sms
         self.deep_gemm = ModuleType("deep_gemm")
         self.deep_gemm.num_sms = 132
         self.deep_gemm.get_num_sms = MagicMock(
@@ -38,6 +39,33 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
+
+    def test_mma_type_follows_resolved_w4a4_mode(self):
+        config = SimpleNamespace(moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=False))
+        with (
+            patch.object(mega_moe, "get_exec", return_value=config) as get_exec,
+        ):
+            self.assertEqual(mega_moe._mega_moe_mma_type(), "fp8xfp4")
+            config.moe.enable_w4a4_mxfp4_megamoe = True
+            self.assertEqual(mega_moe._mega_moe_mma_type(), "mxf4xmxf4")
+            self.assertEqual(get_exec.call_count, 2)
+
+    def test_ppu_mma_type_follows_transformed_weights(self):
+        config = SimpleNamespace(moe=SimpleNamespace(enable_w4a4_mxfp4_megamoe=False))
+        experts = SimpleNamespace(_mega_moe_nvfp4=False, _mega_moe_mma_type="mxf4xmxf4")
+        with (
+            patch.object(mega_moe, "_is_ppu", True),
+            patch.object(mega_moe, "get_exec", return_value=config) as get_exec,
+        ):
+            self.assertEqual(mega_moe._mega_moe_mma_type(experts), "mxf4xmxf4")
+            experts._mega_moe_mma_type = "fp8xfp4"
+            self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp4")
+            get_exec.assert_not_called()
+        with (
+            patch.object(mega_moe, "_is_ppu", False),
+            patch.object(mega_moe, "get_exec", return_value=config),
+        ):
+            self.assertEqual(mega_moe._mega_moe_mma_type(experts), "fp8xfp4")
 
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm
@@ -67,6 +95,93 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         call = deep_gemm.get_symm_buffer_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
         self.assertNotIn("use_fp8_dispatch", call.kwargs)
+
+    def test_ppu_buffer_uses_mma_type_without_legacy_dispatch_flag(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=(object(), object())
+        )
+        group = object()
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_ppu", True),
+        ):
+            buffers = [
+                mega_moe._get_mega_moe_symm_buffer(
+                    group, 8, 64, 2, 128, 256, mma_type=mma_type
+                )
+                for mma_type in ("fp8xfp4", "mxf4xmxf4", "fp8xfp4")
+            ]
+
+        self.assertIs(buffers[0], buffers[2])
+        self.assertIsNot(buffers[0], buffers[1])
+        self.assertEqual(
+            [
+                call.kwargs["mma_type"]
+                for call in deep_gemm.get_symm_buffer_for_mega_moe.call_args_list
+            ],
+            ["fp8xfp4", "mxf4xmxf4"],
+        )
+        for call in deep_gemm.get_symm_buffer_for_mega_moe.call_args_list:
+            self.assertNotIn("use_fp8_dispatch", call.kwargs)
+        deep_gemm.get_num_sms.assert_called()
+        self.assertEqual(deep_gemm.num_sms, 132)
+
+    def test_ppu_buffer_cache_separates_situ_activation(self):
+        deep_gemm = self.deep_gemm
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=(object(), object())
+        )
+        group = object()
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_ppu", True),
+        ):
+            buffers = [
+                mega_moe._get_mega_moe_symm_buffer(
+                    group,
+                    8,
+                    64,
+                    2,
+                    128,
+                    256,
+                    mma_type="mxf4xmxf4",
+                    activation=activation,
+                )
+                for activation in ("swiglu", "situ", "swiglu")
+            ]
+        self.assertIs(buffers[0], buffers[2])
+        self.assertIsNot(buffers[0], buffers[1])
+        self.assertEqual(
+            [
+                call.kwargs["activation"]
+                for call in deep_gemm.get_symm_buffer_for_mega_moe.call_args_list
+            ],
+            ["swiglu", "situ"],
+        )
+
+    def test_ppu_sm89_and_newer_use_physical_sm_budget(self):
+        with (
+            patch.object(mega_moe, "_is_ppu", True),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=140),
+            ),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS,
+                "get",
+                return_value=8,
+            ),
+        ):
+            for sm in (89, 90):
+                with patch.object(mega_moe, "_device_sm", sm):
+                    self.assertEqual(self.original_max_num_sms.__wrapped__(), 132)
+        with patch.object(mega_moe, "_is_ppu", False), patch.object(
+            mega_moe, "_device_sm", 89
+        ):
+            self.assertIsNone(self.original_max_num_sms.__wrapped__())
 
     def test_buffer_cache_separates_mma_types(self):
         deep_gemm = self.deep_gemm
@@ -194,6 +309,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch("sglang.srt.layers.quantization.mxfp4._is_ppu", False),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
             # Toy shapes.
             patch.object(mega_moe, "check_mega_moe_shapes"),
@@ -202,6 +318,91 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         call = deep_gemm.transform_weights_for_mega_moe.call_args
         self.assertEqual(call.kwargs.get("mma_type"), "mxf4xmxf4")
+
+    def test_ppu_mxf4_transform_releases_legacy_layout(self):
+        from sglang.srt.layers.quantization import mxfp4
+
+        deep_gemm = ModuleType("deep_gemm")
+
+        def transform(l1, l2):
+            return (
+                (l1[0].clone(), l1[1].to(torch.uint16)),
+                (l2[0], l2[1].to(torch.uint16)),
+            )
+
+        deep_gemm.transform_weights_for_mega_moe = MagicMock(
+            side_effect=transform
+        )
+        method = object.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_marlin = False
+        method.use_deep_gemm = False
+        method.use_mega_moe = True
+        method.use_deepgemm_mxfp4_w4a16_valu = False
+        method.use_deepgemm_mxfp4_w4a16_mma = False
+        method.with_bias = False
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(
+                torch.zeros((1, 32, 16), dtype=torch.uint8), requires_grad=False
+            ),
+            w13_weight_scale=torch.nn.Parameter(
+                torch.full((1, 32, 1), 127, dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight=torch.nn.Parameter(
+                torch.zeros((1, 32, 16), dtype=torch.uint8), requires_grad=False
+            ),
+            w2_weight_scale=torch.nn.Parameter(
+                torch.full((1, 32, 1), 126, dtype=torch.uint8), requires_grad=False
+            ),
+        )
+        original_weight_ptr = layer.w13_weight.data_ptr()
+
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mxfp4, "_is_ppu", True),
+            patch.object(mxfp4, "preprocess_mxfp4_scales") as preprocess,
+            patch.object(torch.cuda, "empty_cache"),
+        ):
+            method.process_weights_after_loading(layer)
+            method.process_weights_after_loading(layer)
+
+        self.assertEqual(deep_gemm.transform_weights_for_mega_moe.call_count, 1)
+        l1, l2 = deep_gemm.transform_weights_for_mega_moe.call_args.args
+        self.assertEqual(l1[1].dtype, torch.uint8)
+        self.assertEqual(l2[1].dtype, torch.uint8)
+        self.assertTrue(torch.all(l1[1] == 127))
+        self.assertTrue(torch.all(l2[1] == 126))
+        self.assertNotEqual(layer.w13_weight.data_ptr(), original_weight_ptr)
+        self.assertEqual(
+            layer.w13_weight.data_ptr(), layer.mega_l1_weights[0].data_ptr()
+        )
+        self.assertEqual(
+            layer.w13_weight_scale.data_ptr(), layer.mega_l1_weights[1].data_ptr()
+        )
+        self.assertEqual(
+            layer.w2_weight.data_ptr(), layer.mega_l2_weights[0].data_ptr()
+        )
+        self.assertEqual(
+            layer.w2_weight_scale.data_ptr(), layer.mega_l2_weights[1].data_ptr()
+        )
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.uint16)
+        preprocess.assert_not_called()
+        self.assertEqual(layer._mxfp4_backend, "deep_gemm")
+        self.assertEqual(layer._mega_moe_mma_type, "mxf4xmxf4")
+        self.assertTrue(layer._mega_moe_weights_built)
+
+    def test_ppu_mxf4_rejects_expert_bias_before_conversion(self):
+        from sglang.srt.layers.quantization import mxfp4
+
+        method = object.__new__(mxfp4.Mxfp4MoEMethod)
+        method.use_marlin = False
+        method.use_deep_gemm = False
+        method.use_mega_moe = True
+        method.use_deepgemm_mxfp4_w4a16_valu = False
+        method.use_deepgemm_mxfp4_w4a16_mma = False
+        method.with_bias = True
+        with patch.object(mxfp4, "_is_ppu", True):
+            with self.assertRaisesRegex(ValueError, "expert bias"):
+                method.process_weights_after_loading(SimpleNamespace())
 
     def test_mxf4_pre_dispatch_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")
@@ -244,6 +445,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_ppu", False),
             patch.object(mega_moe, "_device_sm", 100),
             patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
             patch.object(
@@ -349,6 +551,180 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(mega_call.args[1], experts.mega_l1_weights)
         self.assertIs(mega_call.args[2], experts.mega_l2_weights)
         self.assertEqual(mega_call.kwargs.get("activation_clamp"), 7.0)
+
+    def test_ppu_mxf4_uses_typed_pre_dispatch_and_fp4_compute(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch = MagicMock()
+        deep_gemm.fp4_fp4_mega_moe = MagicMock()
+        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        buffer = SimpleNamespace(
+            x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            _mega_moe_nvfp4=False,
+        )
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "_is_ppu", True),
+            patch.object(mega_moe, "_device_sm", 89),
+            patch.object(mega_moe, "_mega_moe_mma_type", return_value="mxf4xmxf4"),
+            patch.object(mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer),
+            patch.object(
+                mega_moe, "_configure_mega_moe_deep_gemm_num_sms",
+                return_value=nullcontext(),
+            ),
+            patch.object(mega_moe, "check_mega_moe_shapes"),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_group=SimpleNamespace(device_group=object())
+                ),
+            ),
+        ):
+            out = mega_moe.run_mega_routed_experts(
+                experts,
+                torch.zeros((1, 4)),
+                torch.tensor([[0, 1]]),
+                torch.tensor([[0.5, 0.5]]),
+                hidden_size=4,
+                intermediate_size=8,
+                top_k=2,
+                num_tokens=1,
+            )
+
+        self.assertEqual(out.shape, (1, 4))
+        self.assertEqual(
+            deep_gemm.mega_moe_pre_dispatch.call_args.kwargs["mma_type"],
+            "mxf4xmxf4",
+        )
+        self.assertNotIn(
+            "use_fp4_acts", deep_gemm.mega_moe_pre_dispatch.call_args.kwargs
+        )
+        deep_gemm.fp4_fp4_mega_moe.assert_called_once()
+        deep_gemm.fp8_fp4_mega_moe.assert_not_called()
+
+    def test_ppu_experts_ready_from_sm89(self):
+        with patch.object(mega_moe, "_is_ppu", True):
+            for sm in (88, 89, 90):
+                with patch.object(mega_moe, "_device_sm", sm):
+                    self.assertEqual(
+                        mega_moe.is_mega_moe_experts_ready(
+                            SimpleNamespace(_mega_moe_weights_built=True)
+                        ),
+                        sm >= 89,
+                    )
+                    self.assertFalse(
+                        mega_moe.is_mega_moe_experts_ready(
+                            SimpleNamespace(_mega_moe_weights_built=False)
+                        )
+                    )
+
+    def test_kimi_k3_situ_selects_ppu_mma_api_without_changing_cuda_path(self):
+        from sglang.srt.models.kimi_k3 import KimiK3MoE
+
+        buffer = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+            mma_type="mxf4xmxf4",
+        )
+        experts = SimpleNamespace(
+            num_experts=8,
+            mega_l1_weights=object(),
+            mega_l2_weights=object(),
+            moe_runner_config=SimpleNamespace(
+                gemm1_alpha=3.0,
+                gemm1_clamp_limit=17.0,
+            ),
+            should_fuse_routed_scaling_factor_in_topk=True,
+        )
+        owner = SimpleNamespace(
+            experts=experts,
+            _mega_top_k=2,
+            moe_hidden_size=4,
+            _mega_intermediate_size=8,
+        )
+        topk_output = SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1]]),
+            topk_weights=torch.tensor([[0.6, 0.4]]),
+        )
+
+        for ppu, mma_type in (
+            (True, "mxf4xmxf4"),
+            (True, "fp8xfp4"),
+            (False, "mxf4xmxf4"),
+        ):
+            with self.subTest(ppu=ppu, mma_type=mma_type):
+                buffer.mma_type = mma_type
+                deep_gemm = ModuleType("deep_gemm")
+                deep_gemm.mega_moe_pre_dispatch = MagicMock()
+                deep_gemm.fp4_fp4_mega_moe = MagicMock()
+                deep_gemm.fp8_fp4_mega_moe = MagicMock()
+                with (
+                    patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+                    patch("sglang.srt.models.kimi_k3.is_ppu", return_value=ppu),
+                    patch.object(
+                        mega_moe, "_mega_moe_mma_type", return_value=mma_type
+                    ) as select_type,
+                    patch.object(
+                        mega_moe, "_get_mega_moe_symm_buffer", return_value=buffer
+                    ) as get_buffer,
+                    patch.object(
+                        mega_moe, "_configure_mega_moe_deep_gemm_num_sms",
+                        return_value=nullcontext(),
+                    ),
+                    patch(
+                        "sglang.srt.runtime_context.get_parallel",
+                        return_value=SimpleNamespace(
+                            moe_ep_group=SimpleNamespace(device_group=object())
+                        ),
+                    ),
+                    patch(
+                        "sglang.kernels.ops.moe.dsv4.mega_moe_pre_dispatch"
+                    ) as triton_dispatch,
+                ):
+                    result = KimiK3MoE._forward_mega_experts(
+                        owner, torch.zeros((1, 4), dtype=torch.bfloat16), topk_output
+                    )
+
+                self.assertEqual(result.shape, (1, 4))
+                select_type.assert_called_once_with(experts)
+                self.assertEqual(get_buffer.call_args.kwargs["mma_type"], mma_type)
+                self.assertEqual(get_buffer.call_args.kwargs["activation"], "situ")
+                if ppu:
+                    self.assertEqual(
+                        deep_gemm.mega_moe_pre_dispatch.call_args.kwargs["mma_type"],
+                        mma_type,
+                    )
+                    self.assertEqual(
+                        deep_gemm.mega_moe_pre_dispatch.call_args.kwargs["group_size"],
+                        32,
+                    )
+                    triton_dispatch.assert_not_called()
+                    kernel = (
+                        deep_gemm.fp4_fp4_mega_moe
+                        if mma_type == "mxf4xmxf4"
+                        else deep_gemm.fp8_fp4_mega_moe
+                    )
+                    kernel.assert_called_once()
+                    self.assertEqual(
+                        kernel.call_args.kwargs["situ_beta"], 3.0
+                    )
+                    self.assertEqual(
+                        kernel.call_args.kwargs["situ_linear_beta"],
+                        17.0,
+                    )
+                else:
+                    triton_dispatch.assert_called_once()
+                    self.assertEqual(
+                        triton_dispatch.call_args.kwargs["quant_group_size"], 32
+                    )
+                    deep_gemm.fp8_fp4_mega_moe.assert_called_once()
+                    deep_gemm.fp4_fp4_mega_moe.assert_not_called()
 
     def test_shape_check_rejects_unaligned_intermediate(self):
         # Qwen3-30B-A3B: intermediate 768 leaves a 24-byte scale row.
