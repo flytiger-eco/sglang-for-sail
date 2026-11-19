@@ -1333,6 +1333,8 @@ class Envs:
     )
     # Opt into the PPU-only compiler mode for BF16 prefill TopK.
     SGLANG_DSA_TOPK_NO_SIMT = EnvBool(False)
+    # Route DSA ragged top-k to the PPU(sail) deep_select wheel kernel.
+    SGLANG_DSA_DEEPSELECT = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
