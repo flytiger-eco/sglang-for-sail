@@ -50,11 +50,24 @@ jobs:
           owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           date_tag=$(date -u +%Y%m%d)
           short_sha="${GITHUB_SHA::7}"
+          # Derive SDK/CUDA versions from the same base image used by the build.
+          base_image=$(sed -n 's/^ARG PPU_BASE_IMAGE=//p' docker/ppu.Dockerfile)
+          if [[ ! "$base_image" =~ ^[^[:space:]]+:sdk([0-9]+\.[0-9]+\.[0-9]+)-[^[:space:]]*-cuda([0-9]+\.[0-9]+(\.[0-9]+)?)-[^[:space:]]+$ ]]; then
+            echo "::error::Cannot parse SDK/CUDA versions from Dockerfile PPU_BASE_IMAGE: ${base_image}"
+            exit 1
+          fi
+          sdk_version="${BASH_REMATCH[1]}"
+          cuda_version="${BASH_REMATCH[2]}"
+          # Preserve the existing three-component CUDA tag format.
+          if [[ "$cuda_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            cuda_version="${cuda_version}.0"
+          fi
+          echo "base_image=${base_image}" >> "$GITHUB_OUTPUT"
           # Docker tags forbid "/" and some git-allowed chars, so sanitize the
           # branch name (e.g. feat/foo -> feat-foo) before embedding it.
           branch=$(echo "${{ github.ref_name }}" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
           echo "image=ghcr.io/${owner_lc}/sglang-ppu-nightly" >> "$GITHUB_OUTPUT"
-          echo "tag=${branch}-${date_tag}-cuda13.0.0-sdk2.2.0-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "tag=${branch}-${date_tag}-cuda${cuda_version}-sdk${sdk_version}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "rolling=nightly" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Packages
@@ -76,6 +89,7 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
           build-args: |
+            PPU_BASE_IMAGE=${{ steps.meta.outputs.base_image }}
             SGLANG_BUILD_COMMIT=${{ github.sha }}
             SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
