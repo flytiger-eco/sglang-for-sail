@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 class LinearAttnKernelBackend(Enum):
     TRITON = "triton"
+    PLA = "pla"
     CUTEDSL = "cutedsl"
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
@@ -30,6 +31,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
+
+    def is_pla(self):
+        return self == LinearAttnKernelBackend.PLA
 
     def is_cutedsl(self):
         return self == LinearAttnKernelBackend.CUTEDSL
@@ -92,6 +96,11 @@ def resolve_linear_attn_backends(
     verify = mamba.linear_attn_verify_backend
     if verify is None:
         verify = decode.value if decode.is_flashinfer() else "triton"
+
+    if decode.is_pla() or verify == "pla":
+        raise ValueError(
+            "PLA is a prefill-only backend; use --linear-attn-prefill-backend pla"
+        )
 
     backends = LinearAttnBackends(
         decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
