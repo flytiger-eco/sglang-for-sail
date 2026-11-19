@@ -85,3 +85,23 @@ def _supports_paged_sparse_mqa_logits() -> bool:
 
 
 DEEPGEMM_PAGED_SPARSE_MQA_LOGITS = _supports_paged_sparse_mqa_logits()
+
+
+def _supports_sparse_mqa_logits() -> bool:
+    if _is_ppu:
+        if not ENABLE_JIT_DEEPGEMM or get_device_sm() < 89:
+            return False
+    elif not DEEPGEMM_BLACKWELL:
+        return False
+    import deep_gemm
+
+    return all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "get_sparse_mqa_logits_metadata",
+            "fp8_fp4_sparse_mqa_logits",
+        )
+    )
+
+
+DEEPGEMM_SPARSE_MQA_LOGITS = _supports_sparse_mqa_logits()
