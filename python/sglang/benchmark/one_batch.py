@@ -808,6 +808,17 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise.
+    # A spawned child is a fresh interpreter: the parent's load_plugins() /
+    # apply_hooks() does NOT carry over, so PPU hooks (fa3, flashmla
+    # get_mla_metadata, dsa, ...) would never be applied. Re-load here — before
+    # any attention backend module is imported in load_model() — so the REPLACE
+    # hooks patch the source modules before flashmla_backend/flashattention_backend
+    # bind their `from ... import` names. Mirrors run_scheduler_process().
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     publish(
         server_args,
         role="scheduler",
@@ -1028,6 +1039,17 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
+    # A spawned child (tp_size > 1) is a fresh interpreter: the parent's
+    # load_plugins() / apply_hooks() does NOT carry over, so PPU hooks (fa3,
+    # flashmla get_mla_metadata, dsa, ...) would never be applied and the
+    # decode/prefill capture falls through to the un-patched sgl_kernel paths
+    # (e.g. ImportError: sgl_kernel.flashmla_ops). Re-load here — before any
+    # attention backend module is imported in load_model() — so the REPLACE
+    # hooks patch the source modules first. Mirrors run_scheduler_process().
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     cfg = resolving_view(server_args)
     # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
     # a spawned child arrives with nothing published.
@@ -1144,6 +1166,12 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    # Ensure plugins are loaded in this process (and in spawned tp workers)
+    # before the model runner's init_attention_backends() consumes the hooks.
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     # The decode phase has to capture the batch sizes this run benchmarks, and
     # the per-phase convenience knob loses to an explicit --cuda-graph-config
     # JSON (resolution applies that last), so the size is merged into that JSON.
@@ -1220,6 +1248,12 @@ def main(server_args, bench_args):
 
 
 def cli_main():
+    # Ensure plugins are loaded before ServerArgs construction, so hooks on
+    # ServerArgs.__post_init__ fire correctly (mirrors the engine/serve entry).
+    from sglang.srt.plugins import load_plugins
+
+    load_plugins()
+
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
