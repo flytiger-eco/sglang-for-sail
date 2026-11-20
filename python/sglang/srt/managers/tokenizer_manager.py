@@ -88,6 +88,8 @@ from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     ExpandedInputLenReleaseReq,
     ExpandedInputLenReq,
+    PrefillMMReadyOutput,
+    EncoderReceiveEndpointOutput,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -872,6 +874,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (PrefillMMReadyOutput, self._handle_prefill_mm_ready),
+                (EncoderReceiveEndpointOutput, self._handle_encoder_receive_endpoint),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1100,6 +1104,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         token_type_ids = None
         preloaded_images = None
         mm_input_validated = False
+        epd_prompt_pretokenized = False
         contains_mm_input = obj.contains_mm_input()
         if (
             isinstance(obj, GenerateReqInput)
@@ -1153,6 +1158,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             ):
                 input_ids = None
+                # The encoder request is already in flight. Preserve the same
+                # image-only tokenizer used by zmq_to_tokenizer, but dispatch
+                # the raw IDs without waiting for E. Scheduler expands them
+                # only after all TP ranks have received the visual metadata.
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and get_disagg().language_only
+                    and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
+                    and obj.need_wait_for_mm_inputs
+                    and not obj.audio_data
+                    and not obj.video_data
+                ):
+                    from sglang.srt.disaggregation.encoder.text_overlap import prepare_text
+
+                    images = obj.image_data if isinstance(obj.image_data, list) else [obj.image_data]
+                    text_task = prepare_text(
+                        self.mm_processor, input_text,
+                        [{"modality": "image"} for _ in images],
+                    )
+                    if text_task is not None:
+                        input_ids = await text_task
+                        epd_prompt_pretokenized = True
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
             elif not input_text and self.mm_processor and contains_mm_input:
@@ -1373,6 +1400,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+        if isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            tokenized_obj.epd_prompt_pretokenized = epd_prompt_pretokenized
         # Notify only after multimodal expansion and validation, so Decode
         # never allocates a request that Prefill will reject.
         if (
@@ -1870,6 +1899,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
+            # Hand raw text IDs to the CPU lane before the scheduler can be
+            # delayed by another request's forward. No visual payload goes on
+            # this control connection.
+            if getattr(tokenized_obj, "need_wait_for_mm_inputs", False):
+                await self.mm_receiver.prepare_background(tokenized_obj)
             tokenized_obj.wrap_pickle_fields()
             self._register_expanded_input_owner(tokenized_obj)
             self._dispatch_to_scheduler(tokenized_obj)
@@ -1925,6 +1959,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
+                if getattr(tokenized_obj, "need_wait_for_mm_inputs", False):
+                    await self.mm_receiver.prepare_background(tokenized_obj)
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -4084,6 +4120,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 child.need_wait_for_mm_inputs = bool(
                     obj.need_wait_for_mm_inputs and child.contains_mm_input()
                 )
+
+    def _handle_encoder_receive_endpoint(self, endpoint: EncoderReceiveEndpointOutput):
+        self.mm_receiver.background_endpoints[endpoint.tp_rank] = endpoint
+
+    def _handle_prefill_mm_ready(self, notification: PrefillMMReadyOutput):
+        # Ignore late completion for a retired/reused HTTP owner. Use the
+        # original pair identity and the existing bounded, authenticated D
+        # control path; no HTTP request runs in the scheduler thread.
+        state = self.rid_to_state.get(notification.rid)
+        if (
+            state is None or state.finished
+            or self.disaggregation_mode != DisaggregationMode.PREFILL
+            or not envs.SGLANG_DISAGG_EXPANDED_INPUT_LEN.get()
+            or state.obj.bootstrap_room != notification.bootstrap_room
+            or state.obj.bootstrap_pair_key != notification.bootstrap_pair_key
+        ):
+            return
+        self._track_expanded_len_task(
+            self._notify_decode_expanded_len(
+                str(notification.bootstrap_room), notification.expanded_input_len,
+                str(notification.rid), notification.mrope_position_delta,
+                notification.bootstrap_pair_key,
+            ), str(notification.rid),
+        )
 
     def notify_expanded_input_len(
         self,

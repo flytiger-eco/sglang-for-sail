@@ -4,12 +4,17 @@ import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.hc_mix_up_triton import (
     hc_mix_up,
     hc_mix_up_shape_ok,
     hc_mix_up_supported,
+)
+from sglang.srt.layers.hc_small_batch_triton import (
+    hc_combine_norm_small,
+    hc_combine_norm_supported,
+    hc_mix_down,
+    hc_mix_down_supported,
 )
 from sglang.srt.utils import is_ppu
 
@@ -143,6 +148,15 @@ class GatedResidual(HyperConnectionBase):
         )
         self.hc_norm = GroupedGemmaRMSNorm(
             norm_dim, eps=self.config.rms_norm_eps, group_size=norm_group_size
+        )
+
+        self._ppu_small_hc = (
+            _is_ppu
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and config.hc_lowrank == 320
+            and config.params_dtype == torch.bfloat16
+            and config.hc_per_branch_norm
         )
 
         if use_mix:
@@ -443,11 +457,16 @@ class GatedResidual(HyperConnectionBase):
                 )
             mixed_input = mixed_input.to(self.params_dtype)
         elif self._use_fused_mix_up(hyper_input_normed):
-            act = self._mix_down_compute(
-                hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.hc_count,
-            )
+            if self._ppu_small_hc and hc_mix_down_supported(
+                hyper_input_normed, self.input_mix_weight_down.weight
+            ):
+                act = hc_mix_down(hyper_input_normed, self.input_mix_weight_down.weight)
+            else:
+                act = self._mix_down_compute(
+                    hyper_input_normed,
+                    self.input_mix_weight_down.weight,
+                    self.hc_count,
+                )
             mixed_input = hc_mix_up(
                 act,
                 self.input_mix_weight_up.weight,
@@ -534,6 +553,27 @@ class GatedResidual(HyperConnectionBase):
         hyper_input, hyper_input_normed, gates = residuals
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype), None
+
+        if (
+            self._ppu_small_hc
+            and gates is None
+            and self._use_split_combine(block_output.shape[0])
+            and hc_combine_norm_supported(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                next_norm_weight,
+            )
+        ):
+            return hc_combine_norm_small(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                next_norm_weight,
+                next_norm_eps,
+            )
 
         inputs_ok = (
             self._jit_combine_ok

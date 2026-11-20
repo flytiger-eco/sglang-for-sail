@@ -96,10 +96,21 @@ def validate_expanded_input_config(cfg, architecture):
     if (
         cfg.disaggregation_mode == "prefill"
         and cfg.language_only
-        and cfg.encoder_transfer_backend != "zmq_to_tokenizer"
+        and not (
+            cfg.encoder_transfer_backend == "zmq_to_tokenizer"
+            or (
+                # Scheduler-side readiness now relays exact metadata back to
+                # the HTTP owner. Qualify the new path narrowly for this model
+                # and TP-only layout; keep PP/CP and other backends guarded.
+                cfg.encoder_transfer_backend == "zmq_to_scheduler"
+                and architecture == "Qwen4ExpForConditionalGeneration"
+                and cfg.pp_size == 1
+                and cfg.attn_cp_size == 1
+            )
+        )
     ):
         raise ValueError(
-            "Expanded-input PD requires the zmq_to_tokenizer encoder backend"
+            "Expanded-input PD requires zmq_to_tokenizer, or Qwen4Exp PP1/CP1 zmq_to_scheduler"
         )
     if cfg.disaggregation_mode == "prefill" and not cfg.disagg_decode_urls:
         raise ValueError("Expanded-input Prefill requires --disagg-decode-urls")

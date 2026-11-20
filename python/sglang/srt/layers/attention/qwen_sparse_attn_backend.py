@@ -62,9 +62,10 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_disagg, get_stream
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_ppu
 
 logger = logging.getLogger(__name__)
+_is_ppu = is_ppu()
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
@@ -266,6 +267,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
         self._qsa_only_cp_pending = None
+        self._short_dense_cache = None
+        self._short_dense_checked_metadata = None
+        self._short_dense_decision = False
+        self._short_dense_query_metadata = None
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
         ] = {}
@@ -329,6 +334,145 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_mode is None:
             return False
         return forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+
+    def should_use_short_ctx_dense(self, forward_batch) -> bool:
+        metadata = getattr(self, "forward_metadata", None)
+        if (
+            metadata is not None
+            and getattr(self, "_short_dense_checked_metadata", None) is metadata
+        ):
+            if not self._short_dense_decision:
+                return False
+            from sglang.srt.model_executor.runner import get_is_capture_mode
+
+            return not get_is_capture_mode()
+        return self._compute_short_ctx_dense(forward_batch)
+
+    def _compute_short_ctx_dense(self, forward_batch) -> bool:
+        # Whole visible contexts, never just the new chunk's token count.
+        if not _is_ppu or self.qsa_backend != "fa3":
+            return False
+        if not envs.SGLANG_QSA_SHORT_CTX_DENSE.get() or self.qsa_profile is None:
+            return False
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        mode = forward_batch.forward_mode
+        original = getattr(forward_batch, "_original_forward_mode", None)
+        if (
+            mode != ForwardMode.EXTEND
+            or (original is not None and original != ForwardMode.EXTEND)
+            or get_is_capture_mode()
+            or self.should_capture_mtp_sparse_indices(forward_batch)
+        ):
+            return False
+        lengths = forward_batch.seq_lens_cpu
+        extend = forward_batch.extend_seq_lens_cpu
+        positions = getattr(forward_batch, "positions", None)
+        if (
+            lengths is None
+            or lengths.numel() == 0
+            or lengths.device.type != "cpu"
+            or extend is None
+            or len(extend) != lengths.numel()
+            or positions is None
+            or positions.ndim != 1
+        ):
+            return False
+        maximum = int(lengths.max())
+        if maximum <= 0 or maximum > self.qsa_profile.budget:
+            return False
+        # At most 32K padded KV rows (32 MiB at this model's FP8 layout).
+        return lengths.numel() * ((maximum + 63) // 64 * 64) <= 32768
+
+    def _forward_short_ctx_dense(self, q, layer, forward_batch, context):
+        from sglang.srt.layers.attention.qsa.fa3 import quantize_q_fp8
+        from sglang.srt.layers.attention.qsa.short_dense import pack_short_dense_kv
+
+        metadata = self._resolve_metadata(forward_batch)
+        context_key = (
+            None
+            if context is None
+            else (
+                context.total_rows,
+                context.local_capacity,
+                context.rank,
+                context.world_size,
+            )
+        )
+        descriptors = getattr(self, "_short_dense_query_metadata", None)
+        if (
+            descriptors is None
+            or descriptors[0] is not metadata
+            or descriptors[1] != context_key
+        ):
+            sequence_ids = metadata.token_to_batch_idx
+            positions = forward_batch.positions[: sequence_ids.numel()]
+            if context is not None:
+                sequence_ids = context.shard(sequence_ids)
+                positions = context.shard(positions)
+            descriptors = (
+                metadata,
+                context_key,
+                sequence_ids.to(torch.int32).contiguous(),
+                (positions + 1).to(torch.int32).contiguous(),
+            )
+            self._short_dense_query_metadata = descriptors
+        _, _, sequence_ids, cache_lengths = descriptors
+        num_rows = q.shape[0]
+        if sequence_ids.numel() > num_rows:
+            raise ValueError("Dense query descriptors exceed local query rows")
+        q = q[: sequence_ids.numel()]
+        if q.shape[0] == 0:
+            return self._pad_extend_output(torch.empty_like(q), num_rows)
+        keys = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        values = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        max_len = metadata.token_slot_table.shape[1]
+        width = (max_len + 63) // 64 * 64
+        shape = (metadata.sequence_lengths.numel(), width, *keys.shape[1:])
+        owner = (
+            shape,
+            keys.dtype,
+            keys.device,
+            torch.cuda.current_stream().cuda_stream,
+        )
+        if self._short_dense_cache is None or self._short_dense_cache[0] != owner:
+            self._short_dense_cache = (
+                owner,
+                keys.new_empty(shape),
+                values.new_empty(shape),
+            )
+        _, packed_k, packed_v = self._short_dense_cache
+        pack_short_dense_kv(
+            keys,
+            values,
+            metadata.token_slot_table,
+            metadata.sequence_lengths,
+            packed_k,
+            packed_v,
+        )
+        k_scale, v_scale = self._kv_descales(layer, keys.dtype)
+        descales = {}
+        if is_fp8_kv_dtype(keys.dtype):
+            # Same per-query/GQA-group Q quantization and KV scales as QSA.
+            q, q_scale = quantize_q_fp8(q, keys.shape[1])
+            descales = dict(
+                q_descale=q_scale,
+                k_descale=torch.full_like(q_scale, k_scale),
+                v_descale=torch.full_like(q_scale, v_scale),
+            )
+        output = resolve_fa3_qsa()(
+            q.unsqueeze(1).contiguous(),
+            packed_k,
+            packed_v,
+            cache_batch_idx=sequence_ids,
+            cache_seqlens=cache_lengths,
+            causal=True,
+            softmax_scale=layer.scaling,
+            num_splits=0,
+            pack_gqa=True,
+            **descales,
+        ).squeeze(1)
+        return self._pad_extend_output(output, num_rows)
 
     def _require_chain_speculation(self, forward_mode, spec_info) -> None:
         if forward_mode is None or not forward_mode.is_target_verify():
@@ -844,6 +988,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
+        self._short_dense_checked_metadata = None
+        self._short_dense_decision = False
+        self._short_dense_query_metadata = None
         if self._qsa_only_cp_pending is not None:
             torch.cuda.current_stream().wait_stream(get_stream("qsa_only_cp_kv"))
             self._qsa_only_cp_pending = None
@@ -851,6 +998,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             self.forward_metadata = None
             return
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            self._short_dense_decision = self._compute_short_ctx_dense(forward_batch)
+        self._short_dense_checked_metadata = self.forward_metadata
 
     def _prefill_mqa_plan(
         self,
@@ -943,6 +1093,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         forward_batch,
         in_capture: bool = False,
     ):
+        self._short_dense_checked_metadata = None
+        self._short_dense_decision = False
+        self._short_dense_query_metadata = None
         if in_capture:
             num_tokens = (
                 forward_batch.input_ids.shape[0]
@@ -968,6 +1121,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 num_padding=num_padding if num_padding is not None else 0,
             )
+        self._short_dense_checked_metadata = self.forward_metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         if self.device is None:
@@ -1477,6 +1631,60 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    def _can_store_cp_kv_rank_major(self, layer, k, v):
+        if not _is_ppu or self.qsa_backend != "fa3":
+            return False
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", None)
+        if (
+            full_pool is None
+            or getattr(full_pool, "is_quantized_kv_cache", False)
+            or getattr(full_pool, "use_hnd", False)
+            or getattr(full_pool, "kv_cache_layout", None) == "vectorized_5d"
+            or k.dtype != torch.bfloat16
+            or v.dtype != k.dtype
+            or layer.qk_head_dim != layer.v_head_dim
+            or layer.tp_k_head_num != layer.tp_v_head_num
+        ):
+            return False
+        keys = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        values = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        return (
+            keys.dtype == values.dtype == torch.float8_e4m3fn
+            and keys.ndim == values.ndim == 3
+            and keys.shape == values.shape
+            and keys.is_contiguous()
+            and values.is_contiguous()
+        )
+
+    def _store_cp_kv_rank_major(self, layer, loc_info, k, v, context):
+        from sglang.kernels.ops.attention.qsa_cp_fp8_store import store_cp_kv
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+        from sglang.srt.utils.async_probe import (
+            maybe_detect_kernel_facing_loc,
+            maybe_detect_oob,
+        )
+
+        loc, _, full_loc = unwrap_write_loc(loc_info)
+        loc = full_loc if full_loc is not None else loc
+        loc = loc[: context.total_rows]
+        pool = self.token_to_kv_pool
+        keys = pool.get_key_buffer(layer.layer_id)
+        values = pool.get_value_buffer(layer.layer_id)
+        full_pool = pool.full_kv_pool
+        maybe_detect_oob(loc, 0, keys.shape[0], "QSA CP FP8 cache store")
+        maybe_detect_kernel_facing_loc(
+            loc, full_pool.page_size, full_pool.kernel_page_blocks,
+            "QSA CP FP8 cache store",
+        )
+        k_scale, v_scale = self._kv_descales(layer, keys.dtype)
+        store_cp_kv(
+            k, v, keys, values, loc,
+            total_rows=context.total_rows,
+            cp_size=context.world_size,
+            local_capacity=context.local_capacity,
+            k_scale=k_scale, v_scale=v_scale,
+        )
+
     def prefetch_qsa_only_cp_kv(self, layer, k, v, forward_batch, context):
         """Gather K/V after index-key gather, overlapping indexer compute.
 
@@ -1485,6 +1693,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         """
         if self._qsa_only_cp_pending is not None:
             raise RuntimeError("unjoined query-only CP K/V prefetch")
+        rank_major = self._can_store_cp_kv_rank_major(layer, k, v)
         stream = get_stream("qsa_only_cp_kv")
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -1493,10 +1702,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             key = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
             value = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
             k_width, v_width = key.shape[-1], value.shape[-1]
-            packed = qsa_only_cp_gather_rows(torch.cat((key, value), dim=-1), context)
-            k_full, v_full = (
-                part.contiguous() for part in packed.split((k_width, v_width), dim=-1)
+            packed = qsa_only_cp_gather_rows(
+                torch.cat((key, value), dim=-1), context, rank_major=rank_major
             )
+            parts = packed.split((k_width, v_width), dim=-1)
+            k_full, v_full = parts if rank_major else (part.contiguous() for part in parts)
         self._qsa_only_cp_pending = (
             layer.layer_id,
             forward_batch,
@@ -1505,6 +1715,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             v_full,
             k,
             v,
+            rank_major,
         )
 
     def forward_extend(
@@ -1519,12 +1730,16 @@ class QwenSparseAttnBackend(AttentionBackend):
         qsa_indexer_stream: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if topk_indices is None:
+        short_dense = q.is_cuda and self.should_use_short_ctx_dense(forward_batch)
+        if topk_indices is None and not short_dense:
             raise ValueError("QSA sparse attention requires topk_indices")
         qsa_cp_context = kwargs.get("qsa_cp_context")
         pending = self._qsa_only_cp_pending if qsa_cp_context is not None else None
+        rank_major = False
         if pending is not None:
-            layer_id, batch, context, k_full, v_full, input_k, input_v = pending
+            layer_id, batch, context, k_full, v_full, input_k, input_v, rank_major = (
+                pending
+            )
             if not (
                 layer_id == layer.layer_id
                 and batch is forward_batch
@@ -1553,15 +1768,24 @@ class QwenSparseAttnBackend(AttentionBackend):
             if qsa_cp_context is not None and pending is None:
                 # Query rows are local, while every CP rank owns the complete KV.
                 k_width, v_width = k.shape[-1], v.shape[-1]
+                rank_major = self._can_store_cp_kv_rank_major(layer, k, v)
                 full = qsa_only_cp_gather_rows(
-                    torch.cat((k, v), dim=-1), qsa_cp_context
+                    torch.cat((k, v), dim=-1), qsa_cp_context, rank_major=rank_major
                 )
-                k, v = (x.contiguous() for x in full.split((k_width, v_width), dim=-1))
-            if qsa_cp_context is not None:
-                cache_locs = cache_locs[: qsa_cp_context.total_rows]
-            self._store_kv(layer, cache_locs, k, v)
+                parts = full.split((k_width, v_width), dim=-1)
+                k, v = parts if rank_major else (x.contiguous() for x in parts)
+            if rank_major:
+                self._store_cp_kv_rank_major(layer, cache_locs, k, v, qsa_cp_context)
+            else:
+                if qsa_cp_context is not None:
+                    cache_locs = cache_locs[: qsa_cp_context.total_rows]
+                self._store_kv(layer, cache_locs, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
+        if short_dense:
+            return self._forward_short_ctx_dense(
+                q, layer, forward_batch, qsa_cp_context
+            )
         num_valid_rows = topk_indices.shape[0]
         if num_valid_rows > num_output_rows:
             raise ValueError(

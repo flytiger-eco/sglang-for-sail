@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_rope_position_matrix,
 )
 from sglang.srt.layers.attention.qsa.mqa import (
+    HAS_TILELANG,
     qsa_mqa_decode,
     qsa_mqa_padded_heads,
     qsa_mqa_prefill,
@@ -31,17 +32,20 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.common import is_ppu
 
-# Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
+# Cap on the stored [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 
 
-def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
+def _qsa_prefill_row_chunk_size(
+    rows: int, keys: int, heads: int, logits_dtype: torch.dtype = torch.float32
+) -> int:
     if rows <= 0 or keys <= 0:
         return max(rows, 1)
     block_q = max(1, 128 // heads)
-    bytes_per_row = keys * torch.float32.itemsize
+    bytes_per_row = keys * logits_dtype.itemsize
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
@@ -173,11 +177,17 @@ class QSAIndexer(MultiPlatformOp):
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
+        key_state_buffer = (
+            pool.get_qsa_key_state_buffer(self.layer_id)
+            if pool is not None and self._use_fused_prep(qk)
+            else None
+        )
         if (
-            pool is not None
-            and cache_loc is not None
+            key_state_buffer is not None
             and qk.shape[0] > 0
-            and self._use_fused_prep(qk)
+            and qk.dtype == self.q_layernorm.weight.dtype == key_state_buffer.dtype
+            and pool.get_qsa_compressed_k_buffer(self.layer_id).dtype
+            in (qk.dtype, torch.float8_e4m3fn)
         ):
             from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
@@ -192,14 +202,13 @@ class QSAIndexer(MultiPlatformOp):
                 if rope_max_position is None:
                     rope_max_position = int(positions.max().item())
                 self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
-            key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
                 positions.long(),
                 self.rotary_emb.cos_sin_cache,
                 self._rope_axis_map(qk.device),
                 self.q_layernorm.weight.data,
-                cache_loc[: qk.shape[0]].long(),
+                cache_loc[: qk.shape[0]].long() if cache_loc is not None else None,
                 key_state_buffer.view(key_state_buffer.shape[0], -1),
                 pool.qsa_rope_position_buffer,
                 self.index_n_heads,
@@ -209,7 +218,7 @@ class QSAIndexer(MultiPlatformOp):
                 q_heads_padded=q_heads_padded,
                 out_dtype=pool.get_qsa_compressed_k_buffer(self.layer_id).dtype,
             )
-            return q, token_k, True
+            return q, token_k, cache_loc is not None
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
@@ -477,9 +486,18 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return QSAPrefillPhysicalSelection(output) if physical else output
 
+        ppu_prefill = is_ppu() and q.is_cuda
+        bf16_logits = HAS_TILELANG and envs.SGLANG_QSA_PREFILL_BF16_LOGITS.get()
+        logits_dtype = torch.bfloat16 if bf16_logits else torch.float32
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
+            rows,
+            compressed_keys.shape[0],
+            q.shape[1],
+            logits_dtype if ppu_prefill else torch.float32,
         )
+        # Only the PPU BF16 native TopK contract reads [start,end), so invalid
+        # logits need no materialization. Other consumers keep masked logits.
+        skip_mask = ppu_prefill and bf16_logits and self.block_topk in (512, 2048)
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
             chunk_slice = slice(row_start, row_end)
@@ -497,6 +515,7 @@ class QSAIndexer(MultiPlatformOp):
                     compressed_keys,
                     row_starts[chunk_slice],
                     row_ends[chunk_slice],
+                    mask_logits=not skip_mask,
                 )
                 block_indices = qsa_fast_topk(
                     logits,
@@ -504,6 +523,9 @@ class QSAIndexer(MultiPlatformOp):
                     row_ends[chunk_slice],
                     topk=self.block_topk,
                 )
+            # Expand directly into the final row slice, avoiding a second
+            # selection allocation and copy for every logits chunk.
+            chunk_output = output[chunk_slice] if ppu_prefill else None
             if physical:
                 selected = expand_map_qsa_physical_slots(
                     block_indices,
@@ -513,6 +535,7 @@ class QSAIndexer(MultiPlatformOp):
                     token_slot_table,
                     compress_ratio=self.compress_ratio,
                     token_topk=self.token_topk,
+                    out=chunk_output,
                 )
             else:
                 selected = expand_qsa_block_indices(
@@ -521,8 +544,10 @@ class QSAIndexer(MultiPlatformOp):
                     sequence_lengths_for_rows[chunk_slice],
                     compress_ratio=self.compress_ratio,
                     token_topk=self.token_topk,
+                    out=chunk_output,
                 )
-            output[chunk_slice].copy_(selected)
+            if chunk_output is None:
+                output[chunk_slice].copy_(selected)
             del logits, block_indices, selected
         return QSAPrefillPhysicalSelection(output) if physical else output
 
@@ -575,10 +600,18 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
         qsa_cp_context: QSAOnlyCPContext | None = None,
         on_index_keys_gathered: Callable[[], None] | None = None,
-    ) -> torch.Tensor | QSAPrefillPhysicalSelection:
+        skip_selection: bool = False,
+    ) -> torch.Tensor | QSAPrefillPhysicalSelection | None:
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
+        if skip_selection and (
+            not forward_mode.is_extend()
+            or forward_mode.is_decode()
+            or is_target_verify
+            or is_draft_extend
+        ):
+            raise ValueError("Dense QSA bypass requires ordinary prompt prefill")
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             # EAGLE/MTP may advance the model's RoPE coordinate independently
             # from the physical paged-KV position.  Compression and sparse
@@ -650,7 +683,9 @@ class QSAIndexer(MultiPlatformOp):
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
-            pool=indexer_metadata.token_to_kv_pool if qsa_cp_context is None else None,
+            # CP still uses the fused Q norm/RoPE/cast; raw-K stores wait until
+            # the local index keys have been gathered into global token order.
+            pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             rope_max_position=getattr(indexer_metadata, "rope_max_position", None),
             ensure_cos_sin_cache=not (
@@ -690,6 +725,11 @@ class QSAIndexer(MultiPlatformOp):
             state_slots=state_slots,
             state_stored=state_stored,
         )
+        if skip_selection:
+            # Compression and pending-ring stores above remain mandatory: the
+            # next chunk or Decode can exceed the dense attention budget.
+            return None
+
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

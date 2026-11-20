@@ -72,7 +72,7 @@ def qsa_index_q_norm_rope_store(
     cos_sin_cache: torch.Tensor,
     axis_map: torch.Tensor,
     weight: torch.Tensor,
-    cache_loc: torch.Tensor,
+    cache_loc: Optional[torch.Tensor],
     key_state_buffer: torch.Tensor,
     rope_position_buffer: torch.Tensor,
     num_q_heads: int,
@@ -94,7 +94,7 @@ def qsa_index_q_norm_rope_store(
     cos_sin_cache   : CUDA fp32 [capacity, rotary_dim] RoPE cache
     axis_map        : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight          : [head_dim] gemma norm weight (kernel applies 1 + w)
-    cache_loc       : CUDA int64 [tokens] state slots of each token
+    cache_loc       : CUDA int64 [tokens] state slots; None defers both stores
     key_state_buffer : CUDA [slots, head_dim] raw-K state buffer (written)
     rope_position_buffer : CUDA int64 [slots, 3] position buffer (written)
     num_q_heads     : number of index query heads
@@ -111,16 +111,41 @@ def qsa_index_q_norm_rope_store(
     CUDA tensor [tokens, q_heads_padded, head_dim]: normed + rotated index Q.
     """
     num_tokens = qk.shape[0]
+    if cache_loc is not None and (cache_loc.ndim != 1 or cache_loc.numel() != num_tokens):
+        raise ValueError("cache_loc must have one slot per token, or be None")
     head_dim = weight.shape[0]
     if q_heads_padded is None:
         q_heads_padded = num_q_heads
     if positions.ndim == 1:
         positions = positions.unsqueeze(0)
+    if cache_loc is None:
+        cache_loc = positions[0, :0]
     if out_dtype is None:
         out_dtype = qk.dtype
     q_out = torch.empty(
         (num_tokens, q_heads_padded, head_dim), dtype=out_dtype, device=qk.device
     )
+    if num_tokens == 0:
+        return q_out
+    if cache_loc.numel() == 0:
+        from sglang.srt.utils.common import is_ppu
+
+        if (
+            is_ppu()
+            and qk.dtype == weight.dtype == out_dtype == torch.bfloat16
+            and qk.is_contiguous()
+            and weight.is_contiguous()
+            and num_q_heads == q_heads_padded == 4
+            and head_dim == 128
+            and rotary_dim == 64
+            and is_neox_style
+        ):
+            from sglang.kernels.ops.attention.qsa_cp_q_prep import qprep
+
+            return qprep(
+                qk, positions, cos_sin_cache, axis_map, weight,
+                heads=num_q_heads, rotary_dim=rotary_dim, eps=eps, out=q_out,
+            )
     module = _jit_qsa_indexer_module(qk.dtype, out_dtype, head_dim, is_neox_style)
     module.q_prep(
         qk,

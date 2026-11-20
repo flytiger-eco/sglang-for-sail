@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from torch import nn
-
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
@@ -93,7 +91,10 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_hip, is_ppu, logger
+from torch import nn
+
+_is_ppu = is_ppu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -155,6 +156,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    query_start_loc: Optional[torch.Tensor] = None
 
 
 def _prepare_ple_batch(
@@ -192,6 +194,7 @@ def _prepare_ple_batch(
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
+    query_start_loc = None
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
@@ -318,6 +321,7 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        query_start_loc=query_start_loc,
     )
 
 
@@ -1177,12 +1181,33 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
 
-        state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
-        padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+        from sglang.kernels.ops.mamba.qwen4_ple_prefill import (
+            can_pack_ple_prefill,
+            pack_ple_prefill,
         )
-        padded_seq[batch.req_indices, batch.token_offsets] = x
-        conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
+
+        pack_args = (
+            x,
+            conv_state,
+            batch.state_indices,
+            batch.lengths,
+            batch.query_start_loc,
+            batch.row_width,
+        )
+        if (
+            _is_ppu
+            and self.ple_embedding.enable_ple_fusion
+            and batch.mode == ForwardMode.EXTEND
+            and can_pack_ple_prefill(*pack_args)
+        ):
+            conv_input = pack_ple_prefill(*pack_args)
+        else:
+            state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+            padded_seq = x.new_zeros(
+                (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            )
+            padded_seq[batch.req_indices, batch.token_offsets] = x
+            conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
             self.conv1d.weight.to(dtype=x.dtype),
@@ -1387,7 +1412,18 @@ class Qwen4ExpPLELayer(nn.Module):
             else:
                 gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
                 gate = torch.sigmoid(gate)
-                gated_value = gate * value.unsqueeze(-2)
+                if (
+                    _is_ppu
+                    and self.ple_embedding.enable_ple_fusion
+                    and batch.mode == ForwardMode.EXTEND
+                ):
+                    from sglang.kernels.ops.mamba.qwen4_ple_prefill import (
+                        apply_ple_prefill_gate,
+                    )
+
+                    gated_value = apply_ple_prefill_gate(gate, value)
+                else:
+                    gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
@@ -1785,7 +1821,7 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         qsa_cp_context: Optional[QSAOnlyCPContext] = None,
         on_index_keys_gathered=None,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         from sglang.srt.layers.attention.qsa.glue import (
             get_qsa_indexer_metadata,
             resolve_qsa_sparse_backend,
@@ -1803,9 +1839,17 @@ class Qwen4ExpAttentionDecoderLayer(
         indexer_metadata = get_qsa_indexer_metadata(
             backend, self.layer_id, forward_batch
         )
+        use_dense = getattr(sparse_backend, "should_use_short_ctx_dense", None)
+        indexer_kwargs = {}
+        if hidden_states.is_cuda and use_dense is not None and use_dense(forward_batch):
+            indexer_kwargs["skip_selection"] = True
         if qsa_cp_context is None:
             topk_indices = self.indexer(
-                hidden_states, positions, forward_batch, indexer_metadata
+                hidden_states,
+                positions,
+                forward_batch,
+                indexer_metadata,
+                **indexer_kwargs,
             )
         else:
             topk_indices = self.indexer.forward_cuda(
@@ -1815,11 +1859,16 @@ class Qwen4ExpAttentionDecoderLayer(
                 indexer_metadata,
                 qsa_cp_context=qsa_cp_context,
                 on_index_keys_gathered=on_index_keys_gathered,
+                **indexer_kwargs,
             )
         should_capture = getattr(
             sparse_backend, "should_capture_mtp_sparse_indices", None
         )
-        if should_capture is not None and should_capture(forward_batch):
+        if (
+            topk_indices is not None
+            and should_capture is not None
+            and should_capture(forward_batch)
+        ):
             sparse_backend.capture_mtp_sparse_indices(
                 topk_indices, forward_batch, self.layer_id, metadata=indexer_metadata
             )
@@ -2655,6 +2704,40 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         if precompile_splitk_tactics():
             logger.info("Precompiled BF16 split-K GEMM tactics for Qwen4-Exp")
+
+        from sglang.srt.runtime_context import get_disagg, get_server_args
+        from sglang.srt.utils import is_ppu
+
+        if not (
+            is_ppu()
+            and get_disagg().disaggregation_mode == "prefill"
+            and envs.SGLANG_QSA_ONLY_CP_REPLICATE.get()
+        ):
+            return
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+        indexer = next((m for m in self.modules() if isinstance(m, QSAIndexer)), None)
+        if indexer is None or not (
+            indexer.q_layernorm.weight.dtype == torch.bfloat16
+            and indexer.index_n_heads == 4
+            and indexer.index_head_dim == 128
+            and indexer.rotary_emb.rotary_dim == 64
+            and indexer.rotary_emb.is_neox_style
+        ):
+            return
+        from sglang.kernels.ops.attention.qsa_cp_prefill_warmup import (
+            warmup_qsa_cp_prefill,
+        )
+
+        config = getattr(self.config, "text_config", self.config)
+        warmup_qsa_cp_prefill(
+            indexer.q_layernorm.weight.device,
+            config.num_key_value_heads,
+            config.head_dim,
+            get_server_args().kv_cache_dtype == "fp8_e4m3",
+            config.hidden_size,
+        )
+        logger.info("Precompiled PPU QSA CP Prefill kernels with scratch buffers")
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
