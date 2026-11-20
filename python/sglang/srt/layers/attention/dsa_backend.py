@@ -2280,19 +2280,78 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if topk_indices is not None:
-                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
-                mask = topk_indices != -1
-                topk_indices_offset = (
-                    topk_indices_offset.unsqueeze(1)
-                    if topk_indices_offset.ndim == 1
-                    else topk_indices_offset
-                )
-                topk_indices = torch.where(
-                    mask, topk_indices + topk_indices_offset, topk_indices
-                )
+                if topk_indices is not None:
+                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+                    # topk_indices carries one row per physical (aligned/padded) q row,
+                    # while topk_indices_offset is built per logical EXTEND token
+                    # (repeat_interleave over extend_seq_lens). Pad the offset to the
+                    # same row caliber: padded rows hold -1 in topk_indices, so the
+                    # mask below keeps them untouched whatever the pad value is.
+                    _offset_rows = topk_indices_offset.shape[0]
+                    if _offset_rows != topk_indices.shape[0]:
+
+                        def _row_caliber_diag():
+                            # Reached only when a guard below fails. Layout knobs
+                            # come from the published parallel namespace, so the
+                            # diagnostics report resolved configuration.
+                            _par = get_parallel()
+                            return (
+                                f"topk_rows={topk_indices.shape[0]} "
+                                f"offset_rows={_offset_rows} offset_shape="
+                                f"{tuple(topk_indices_offset.shape)} "
+                                f"q_rows={q_nope.shape[0]} sum_extend_seq_lens="
+                                f"{sum(metadata.dsa_extend_seq_lens_list or [])} "
+                                f"forward_mode={forward_batch.forward_mode} "
+                                f"pad_delta={topk_indices.shape[0] - _offset_rows} "
+                                f"attn_cp_size={_par.attn_cp_size} "
+                                f"cp_strategy={_par.cp_strategy} "
+                                f"dp_size={_par.dp_size}"
+                            )
+
+                        assert topk_indices_offset.ndim == 1, (
+                            "RAGGED DSA topk row-caliber mismatch on a multi-dimensional "
+                            "offset cannot be padded safely: " + _row_caliber_diag()
+                        )
+                        assert _offset_rows < topk_indices.shape[0], (
+                            "RAGGED DSA topk offset has more rows than topk_indices: "
+                            + _row_caliber_diag()
+                        )
+                        # Tail-padding premise, made explicit: rows past the logical
+                        # count must be the -1 placeholders; otherwise a zero-filled
+                        # offset tail would silently rebase real rows. Checked on
+                        # device with an asynchronous assertion -- this runs once per
+                        # attention layer of every padded prefill, so a .item() here
+                        # would add a host synchronization to each of them. A
+                        # violation still fails the run; it surfaces from the
+                        # accelerator runtime at the next synchronization rather than
+                        # as an AssertionError here. Single-argument form, as in the
+                        # existing precedent in qwen_sparse_attn_backend.py: the
+                        # message overload is not available on every torch release
+                        # this package supports (torch>=2.11.0), and a guard must not
+                        # raise TypeError.
+                        torch._assert_async((topk_indices[_offset_rows:] == -1).all())
+                        topk_indices_offset = torch.cat(
+                            [
+                                topk_indices_offset,
+                                torch.zeros(
+                                    topk_indices.shape[0] - _offset_rows,
+                                    dtype=topk_indices_offset.dtype,
+                                    device=topk_indices_offset.device,
+                                ),
+                            ],
+                            dim=0,
+                        )
+                    mask = topk_indices != -1
+                    topk_indices_offset = (
+                        topk_indices_offset.unsqueeze(1)
+                        if topk_indices_offset.ndim == 1
+                        else topk_indices_offset
+                    )
+                    topk_indices = torch.where(
+                        mask, topk_indices + topk_indices_offset, topk_indices
+                    )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(

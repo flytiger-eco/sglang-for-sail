@@ -440,6 +440,17 @@ class Envs:
     SGLANG_TEST_TOPK_RACE_ITERS = EnvInt(60)
     SGLANG_TEST_TOPK_RACE_SEQ = EnvInt(100000)
     SGLANG_TEST_TOPK_RACE_BATCH = EnvInt(576)
+    # DSA RAGGED top-k row-caliber end-to-end test
+    # (test/manual/attention/test_dsa_fp8_kv_ragged_topk_rowcaliber_e2e.py):
+    # checkpoint path, server port and start-up budget, load shape, and the
+    # Megamoe toggle -- Megamoe's per-rank token alignment is what produces the
+    # padded query rows this guard covers.
+    SGLANG_TEST_MODEL_PATH = EnvStr(None)
+    SGLANG_TEST_PORT = EnvInt(31010)
+    SGLANG_TEST_SERVER_TIMEOUT = EnvInt(1800)
+    SGLANG_TEST_E2E_PROMPTS = EnvInt(4)
+    SGLANG_TEST_E2E_INPUT_LEN = EnvInt(4096)
+    SGLANG_TEST_DISABLE_MEGAMOE = EnvBool(False)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
