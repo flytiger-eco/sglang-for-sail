@@ -14,6 +14,7 @@ from sglang.kernels.ops.moe.mega_gate import bf16_mega_gate
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import glm53_sail_gate
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
@@ -150,6 +151,23 @@ class TestGlm53SailGate(CustomTestCase):
                 self.assertEqual(
                     glm53_sail_gate.can_route(moe, self.hidden, None),
                     output_format == TopKOutputFormat.STANDARD,
+                )
+
+        moe.topk.topk_config.output_format = None
+        for runner, eligible in (
+            (MoeRunnerBackend.DEEP_GEMM, True),
+            (MoeRunnerBackend.TRITON_KERNELS, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, False),
+        ):
+            with (
+                self.subTest(runner=runner),
+                patch(
+                    "sglang.srt.layers.moe.topk.get_moe_runner_backend",
+                    return_value=runner,
+                ),
+            ):
+                self.assertEqual(
+                    glm53_sail_gate.can_route(moe, self.hidden, None), eligible
                 )
 
     def test_deterministic_and_simulated_routes_are_preserved(self):

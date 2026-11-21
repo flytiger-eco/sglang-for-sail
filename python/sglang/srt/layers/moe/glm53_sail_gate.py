@@ -73,7 +73,7 @@ def can_route(
         and bias.shape == (256,)
         and bias.is_contiguous()
         and moe.gate.e_score_correction_bias_vl is None
-        and cfg.output_format in (None, TopKOutputFormat.STANDARD)
+        and moe.topk.resolve_output_format() == TopKOutputFormat.STANDARD
         and cfg.scoring_func == "sigmoid"
         and cfg.top_k == 8
         and cfg.renormalize
