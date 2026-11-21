@@ -60,6 +60,7 @@ class PpuRegistryTest(unittest.TestCase):
             [
                 "stage-a-test-1-gpu-ppu",
                 "stage-b-test-1-gpu-ppu",
+                "stage-b-test-1-gpu-ppu-m890",
                 "stage-c-test-2-gpu-ppu",
             ],
         )

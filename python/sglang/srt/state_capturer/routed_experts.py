@@ -107,7 +107,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         if _is_scattered_a2a_backend():
-            local_topk = topk_indices
+            local_topk = topk_indices.to(self.gather_buffer.dtype)
             topk_indices = self.gather_buffer[
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]

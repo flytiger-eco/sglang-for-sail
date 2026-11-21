@@ -666,23 +666,8 @@ class TopK(BaseFusedOp):
         )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
-    def forward_cuda(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        *,
-        num_token_non_padded: Optional[torch.Tensor] = None,
-        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-        dynamic_expert_bias: Optional[torch.Tensor] = None,
-    ) -> TopKOutput:
-
-        updater = get_global_expert_location_updater()
-        if updater is not None:
-            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
-
-        if dynamic_expert_bias is not None:
-            output_format = TopKOutputFormat.STANDARD
-        elif self.topk_config.output_format is not None:
+    def resolve_output_format(self) -> TopKOutputFormat:
+        if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
@@ -704,6 +689,27 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.BYPASSED
         else:
             output_format = TopKOutputFormat.STANDARD
+        return output_format
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+        dynamic_expert_bias: Optional[torch.Tensor] = None,
+    ) -> TopKOutput:
+
+        updater = get_global_expert_location_updater()
+        if updater is not None:
+            updater.set_current_layer_id(self.layer_id, is_nextn=self.is_nextn)
+
+        output_format = (
+            TopKOutputFormat.STANDARD
+            if dynamic_expert_bias is not None
+            else self.resolve_output_format()
+        )
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
