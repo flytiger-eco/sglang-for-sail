@@ -32,10 +32,12 @@ ARG PPU_PACKAGES="\
     cuda-bindings==13.0.0+v0.1.0.ppu2.2.0 \
     cuda-python==13.0.0+v0.1.0.ppu2.2.0 \
     deep_ep==2.2.1+v0.1.0.ppu2.2.0 \
+    deep_gemm==1.1.0+v1.1.0.ppu2.2.1 \
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
     flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
-    sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
+    msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
+    pla==1.1.0+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
     tilelang==0.1.12+v0.1.0.ppu2.2.0 \
@@ -49,14 +51,11 @@ ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
 # These projects are excluded from PPU_PACKAGES so old index versions cannot
 # replace the requested wheels.
 ARG PPU_WHEEL_URLS="\
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-19-1223/deep_gemm-1.1.0.dev320+v1.1.0.ppu2.2.1.g0f9756f2-cp312-cp312-linux_x86_64.whl \
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1628/flash_mla-2.1.0.dev9+v1.0.0.ppu2.2.1.g2b70d8d-cp312-cp312-linux_x86_64.whl \
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn-2.8.2-cp312-cp312-linux_x86_64.whl \
     https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1607/pla-1.1.0-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1535/msa_for_sail-0.1.1+v0.1.0.ppu2.2.1-py3-none-any.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-19-1846/sglang-0.5.23-1ge5b1a4ab2b14-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-19-1846/sglang_kernel-0.4.10-1ge5b1a4ab2b14-cp310-abi3-linux_x86_64.whl"
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-22-1124/sglang-0.5.23-1g651bc4dd03ae-cp312-cp312-linux_x86_64.whl \
+    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-22-1124/sglang_kernel-0.4.10-1g651bc4dd03ae-cp310-abi3-linux_x86_64.whl"
 
 FROM ${PPU_BASE_IMAGE} AS base
 
