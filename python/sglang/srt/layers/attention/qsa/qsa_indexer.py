@@ -314,6 +314,7 @@ class QSAIndexer(MultiPlatformOp):
         metadata,
         state_slots: torch.Tensor | None = None,
         state_stored: bool = False,
+        cp_pending_tail_only: bool = False,
     ) -> None:
         """Store the pending-group ring and compress each completed group."""
 
@@ -324,12 +325,27 @@ class QSAIndexer(MultiPlatformOp):
                 state_slots = self._pending_ring_slots(
                     metadata, logical_positions, is_extend
                 )
-            pool.set_qsa_key_state_buffer(
-                self.layer_id, state_slots[: token_k.shape[0]], token_k
-            )
-            pool.set_qsa_rope_position_buffer(
-                state_slots[: token_k.shape[0]], rope_positions
-            )
+            if (
+                cp_pending_tail_only
+                and is_extend
+                and not metadata.is_cuda_graph
+                and metadata.extend_seq_lens is not None
+                and metadata.extend_start_loc is not None
+                and metadata.extend_seq_lens.numel() >= metadata.sequence_lengths.numel()
+                and metadata.extend_start_loc.numel() >= metadata.sequence_lengths.numel()
+            ):
+                from sglang.srt.layers.attention.qsa.pending_state import (
+                    store_qsa_pending_tail,
+                )
+
+                store_qsa_pending_tail(token_k, rope_positions, metadata, self.layer_id)
+            else:
+                pool.set_qsa_key_state_buffer(
+                    self.layer_id, state_slots[: token_k.shape[0]], token_k
+                )
+                pool.set_qsa_rope_position_buffer(
+                    state_slots[: token_k.shape[0]], rope_positions
+                )
 
         if metadata.is_cuda_graph:
             self._compress_decode_cuda_graph(metadata)
@@ -724,6 +740,7 @@ class QSAIndexer(MultiPlatformOp):
             indexer_metadata,
             state_slots=state_slots,
             state_stored=state_stored,
+            cp_pending_tail_only=qsa_cp_context is not None,
         )
         if skip_selection:
             # Compression and pending-ring stores above remain mandatory: the

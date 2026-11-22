@@ -970,6 +970,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
             prefill_mqa_plan=prefill_mqa_plan,
+            extend_seq_lens=(
+                None if decode_like else getattr(forward_batch, "extend_seq_lens", None)
+            ),
+            extend_start_loc=(
+                None if decode_like else getattr(forward_batch, "extend_start_loc", None)
+            ),
             rope_max_position=self._rope_max_position(
                 forward_batch, speculative_paged=speculative_paged
             ),
