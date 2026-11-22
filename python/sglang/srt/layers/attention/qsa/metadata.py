@@ -158,6 +158,9 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     # Upper bound of this forward's RoPE coordinates for the cos/sin cache
     # length check; None makes the indexer read it off the device per layer.
     rope_max_position: Optional[int] = None
+    # Existing packed-extend layout; used only by CP's post-gather tail store.
+    extend_seq_lens: Optional[torch.Tensor] = None
+    extend_start_loc: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
