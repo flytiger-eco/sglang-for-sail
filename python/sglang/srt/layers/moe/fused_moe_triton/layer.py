@@ -661,6 +661,16 @@ class FusedMoE(torch.nn.Module):
         if not _is_ppu:
             return self.dispatcher.quant_config
 
+        # W4A8-Int8 experts served by DeepGEMM consume int8 activations, so
+        # DeepEP must dispatch int8/per-channel-quantized tokens for them.
+        from sglang.srt.layers.quantization.mixed_precision_w4 import (
+            W4AInt8MoEMethod,
+        )
+
+        w4a8_int8_gemm = isinstance(self.quant_method, W4AInt8MoEMethod) and (
+            self.quant_method.use_deep_gemm
+        )
+
         quant_config_dict: dict = {}
 
         # On PPU the DeepEP dispatcher needs to know the concrete dispatch dtype.
@@ -676,7 +686,7 @@ class FusedMoE(torch.nn.Module):
             )
         ):
             quant_config_dict["dispatcher_output_dtype"] = "fp8"
-        elif isinstance(self.quant_method, W8A8Int8MoEMethod):
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod) or w4a8_int8_gemm:
             quant_config_dict["dispatcher_output_dtype"] = "int8"
         elif isinstance(self.quant_method, Mxfp4MoEMethod):
             if getattr(self.quant_method, "use_deepgemm_mxfp4_w4a8", False):
@@ -702,7 +712,7 @@ class FusedMoE(torch.nn.Module):
             ):
                 is_channel_quant = True
 
-        if isinstance(self.quant_method, W8A8Int8MoEMethod):
+        if isinstance(self.quant_method, W8A8Int8MoEMethod) or w4a8_int8_gemm:
             is_channel_quant = True
         if isinstance(self.quant_method, Mxfp4MoEMethod) and getattr(
             self.quant_method, "use_deepgemm_mxfp4_w4a8", False

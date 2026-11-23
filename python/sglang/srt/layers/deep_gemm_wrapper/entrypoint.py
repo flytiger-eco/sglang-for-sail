@@ -609,6 +609,96 @@ def grouped_gemm_nt_i8i8bf16_nopad(
         )
 
 
+def grouped_gemm_nt_i8i4bf16_nopad(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor = None,
+    configs=None,
+):
+    # lhs[0]: shape [m, k], dtype int8 (per-token quantized activations)
+    # lhs[1]: shape [m, 1], dtype float32 (per-token scales)
+    # rhs[0]: shape [e, n, k//2], dtype uint8 (packed int4 weights, nt layout)
+    # rhs[1]: shape [e, n, 1], dtype float32 (per-channel scales)
+    # out: shape [m, n], dtype bf16
+
+    assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_i8i4bf16_nopad"
+
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+
+    # The tuner does not cover int4 weights; pass None so the kernel uses its
+    # default config (same behavior as the bf16i4 path).
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            m, n, k, num_groups=num_groups, nopad=True, dtype="int4"
+        )
+    )
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_NOPAD
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(
+            lhs, rhs, out, m_indices, m_rows, configs=best_config
+        )
+
+
+def grouped_gemm_nt_i8i4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+    configs=None,
+):
+    # lhs[0]: shape [num_groups, m, k], dtype int8 (per-token quantized activations)
+    # lhs[1]: shape [num_groups, m, 1], dtype float32 (per-token scales)
+    # rhs[0]: shape [e, n, k//2], dtype uint8 (packed int4 weights, nt layout)
+    # rhs[1]: shape [e, n, 1], dtype float32 (per-channel scales)
+    # out: shape [num_groups, m, n], dtype bf16
+
+    assert _is_ppu, f"only ppu deepgemm support grouped_gemm_nt_i8i4bf16_masked"
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+
+    # The tuner does not cover int4 weights; pass None so the kernel uses its
+    # default config (same behavior as the bf16i4 path).
+    best_config = (
+        configs
+        if configs is not None
+        else tuner.get_deep_gemm_config(
+            expected_m, n, k, num_groups=num_groups, dtype="int4"
+        )
+    )
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            configs=best_config,
+            **(
+                dict(
+                    enable_sbo_overlap=True,
+                    max_block_n=max_block_n,
+                    signal=overlap_args.signal,
+                )
+                if overlap_args is not None
+                else {}
+            ),
+        )
+
+
 def grouped_gemm_nt_bf16_nopad(
     lhs: torch.Tensor,
     rhs: torch.Tensor,

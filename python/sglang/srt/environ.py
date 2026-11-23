@@ -2001,6 +2001,12 @@ class Envs:
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A16_MMA = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MXFP4_W4A8 = EnvBool(False)
     SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED = EnvBool(False)
+    # Serve W4A8-Int8 MoE experts (int4-packed weights x dynamic int8
+    # activations, "mixed_precision_w4" checkpoints) with the PPU DeepGEMM
+    # i8i4 grouped-GEMM kernels instead of the acext fused wrapper.
+    # Requires DeepGEMM >= 1.1.0+v1.0.0 (preprocess_a8w4_weight +
+    # m_grouped_gemm_int8_int4_bf16_nt_nopad/masked).
+    SGLANG_MIXED_PRECISION_W4_MOE_DEEPGEMM = EnvBool(False)
     # Fused SiLU+Mul + per-token fp8 quant JIT kernel in the channel-wise
     # masked DeepGEMM path. Set =0 to fall back to the Triton implementation.
     SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA = EnvBool(True)
