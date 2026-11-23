@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import acext
@@ -13,6 +14,9 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -22,6 +26,9 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
+)
+from sglang.srt.layers.quantization.w4a8_layout import (
+    repack_a8w4_ckpt_to_deepgemm,
 )
 from sglang.srt.utils import is_ppu, set_weight_attrs
 
@@ -34,6 +41,34 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.models.utils import WeightsMapper
+
+
+# ---------------------------------------------------------------------------
+# DeepGEMM dependency gate for the W4A8-Int8 i8i4 kernels
+# ---------------------------------------------------------------------------
+
+_A8W4_DEEPGEMM_SYMBOLS = (
+    # Not called at load time: the checkpoint already sits past this function's
+    # first step, so the conversion mirrors its remaining steps locally. The
+    # symbol is required as the version marker for that layout contract.
+    "preprocess_a8w4_weight",
+    "m_grouped_gemm_int8_int4_bf16_nt_nopad",
+    "m_grouped_gemm_int8_int4_bf16_nt_masked",
+)
+
+
+def _require_deep_gemm_a8w4_symbols() -> None:
+    import deep_gemm
+
+    missing = [s for s in _A8W4_DEEPGEMM_SYMBOLS if not hasattr(deep_gemm, s)]
+    if missing:
+        raise RuntimeError(
+            "SGLANG_MIXED_PRECISION_W4_MOE_DEEPGEMM=1 requires DeepGEMM >= "
+            "1.1.0+v1.0.0 (A8W4 INT8 x packed INT4 grouped GEMM); installed "
+            f"deep_gemm ({getattr(deep_gemm, '__version__', 'unknown')}) is "
+            f"missing {missing}. Install DeepGEMM 1.1.0+v1.0.0 in the "
+            "container, or unset the switch to keep the acext path."
+        )
 
 
 class MixedPrecisionW4Config(QuantizationConfig):
@@ -165,11 +200,20 @@ class MixedPrecisionW4Config(QuantizationConfig):
 class W4AInt8MoEMethod(FusedMoEMethodBase):
     """MoE method for W4 quantization.
     Supports INT4 weights for expert layers with TensorRT-LLM unpacking.
+
+    Two interchangeable MoE backends are served from the same checkpoint:
+    the default acext fused wrapper, and (with
+    ``SGLANG_MIXED_PRECISION_W4_MOE_DEEPGEMM=1``) the PPU DeepGEMM i8i4
+    grouped GEMM. The switch is read once per layer at construction, so a
+    rollback is a pure env change with no code or weight rewrite.
     """
 
     def __init__(self, quant_config):
         assert is_ppu(), f"W4AInt8 MoE only supported on ppu now"
         self.quant_config = quant_config
+        self.use_deep_gemm = envs.SGLANG_MIXED_PRECISION_W4_MOE_DEEPGEMM.get()
+        if self.use_deep_gemm:
+            _require_deep_gemm_a8w4_symbols()
 
     def create_weights(
         self,
@@ -235,6 +279,11 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         """for quant model with acext a8w4 preprocessing"""
+        if self.use_deep_gemm:
+            self._process_weights_after_loading_deep_gemm(layer)
+            return
+
+        # Default path: pure view to the acext a8w4 layout [E, K, N // 2].
         w13_weight = layer.w13_weight
         w13_weight_shape = w13_weight.shape
         w13_weight = w13_weight.view(
@@ -255,16 +304,77 @@ class W4AInt8MoEMethod(FusedMoEMethodBase):
         # [E, intermediate, hidden_size // 2]
         layer.w2_weight = Parameter(w2_weight, requires_grad=False)
 
+    def _process_weights_after_loading_deep_gemm(self, layer: Module) -> None:
+        """Convert the packed int4 expert weights to the DeepGEMM rhs layout.
+
+        A ``mixed_precision_w4`` checkpoint already stores its K32 groups in the
+        byte order that ``preprocess_a8w4_weight`` produces in its first step,
+        so only the converter-group repack and the sign-bit flip are applied
+        here. Running the full preprocess would transpose the K32 groups a
+        second time, and that rotation has order three, which would silently
+        scramble every group. See ``w4a8_layout`` for the byte-level derivation.
+        """
+        for name, weight_name, scale_name in (
+            ("w13", "w13_weight", "w13_weight_scale"),
+            ("w2", "w2_weight", "w2_weight_scale"),
+        ):
+            weight = getattr(layer, weight_name)
+            scale = getattr(layer, scale_name).data
+            if scale.dtype != torch.float32:
+                raise RuntimeError(
+                    f"{name}: DeepGEMM A8W4 requires fp32 per-channel scales, "
+                    f"got {scale.dtype}"
+                )
+            if scale.dim() != 3 or scale.shape[2] != 1:
+                raise RuntimeError(
+                    f"{name}: DeepGEMM A8W4 requires scales [E, N, 1], got "
+                    f"{tuple(scale.shape)}"
+                )
+
+            start = time.perf_counter()
+            converted = repack_a8w4_ckpt_to_deepgemm(weight.data)
+            setattr(layer, weight_name, Parameter(converted, requires_grad=False))
+            setattr(layer, scale_name, Parameter(scale, requires_grad=False))
+            logger.info(
+                "[w4a8-dg] %s: [E, N, K/2] %s -> DeepGEMM rhs %s in %.1fs",
+                name,
+                tuple(weight.shape),
+                tuple(converted.shape),
+                time.perf_counter() - start,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if not self.use_deep_gemm:
+            return
+
+        assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, (
+            "SGLANG_MIXED_PRECISION_W4_MOE_DEEPGEMM=1 requires JIT DeepGEMM"
+        )
+        # Register the i8i4 nopad custom op used by the a2a=none fused path.
+        import sglang.srt.layers.moe.moe_runner.ppu_deepgemm_moe  # noqa: F401
+
+        self.runner = MoeRunner(MoeRunnerBackend.DEEP_GEMM, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if self.use_deep_gemm:
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_int4_w4a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=None,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
         from sglang.srt.layers.moe.moe_runner.acext import (
             _acext_supports_silu_after_clamp,
         )

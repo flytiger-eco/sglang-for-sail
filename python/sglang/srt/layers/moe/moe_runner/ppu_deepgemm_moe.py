@@ -84,6 +84,33 @@ def grouped_gemm_nt_i8i8bf16_nopad(
     )
 
 
+def grouped_gemm_nt_i8i4bf16_nopad_fake(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor,
+) -> None:
+    return
+
+
+@register_custom_op(mutates_args=["C"], fake_impl=grouped_gemm_nt_i8i4bf16_nopad_fake)
+def grouped_gemm_nt_i8i4bf16_nopad(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.grouped_gemm_nt_i8i4bf16_nopad(
+        (A, As), (B, Bs), C, m_indices, m_rows
+    )
+
+
 def grouped_gemm_nt_f8f8bf16_nopad_fake(
     A: torch.Tensor,
     As: torch.Tensor,
@@ -688,6 +715,7 @@ def deep_moe_impl_fused(
     use_mxfp4: bool = False,
     use_int4_w4a16: bool = False,
     use_mxfp4_w4a16: bool = False,
+    use_int4_w4a8: bool = False,
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     gemm1_alpha: Optional[float] = None,
@@ -723,7 +751,8 @@ def deep_moe_impl_fused(
         w2_scale = w2_scale.unsqueeze(-1) if w2_scale.ndim != w2.ndim else w2_scale
 
     # Hybrid fused path: requires DeepGemm commit 53ea8ff (refactor fused MoE API)
-    use_fused_path = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get()
+    # W4A8-Int8 has no fused variant yet; always take the nopad path.
+    use_fused_path = envs.SGLANG_SAIL_DEEPGEMM_MOE_TP_FUSED.get() and not use_int4_w4a8
 
     # Only the FP8 block-wise path emits column-major activation scales.
     act_scale_col_major = False
@@ -733,7 +762,7 @@ def deep_moe_impl_fused(
             hidden_states, scale_multiplier=w1_inv_scale
         )
         block_k = K
-    elif use_int8:
+    elif use_int8 or use_int4_w4a8:
         assert per_channel_quant and block_shape is None, (
             "int8 quantization only supports per-channel quant."
         )
@@ -883,6 +912,10 @@ def deep_moe_impl_fused(
             grouped_gemm_nt_i8i8bf16_nopad(
                 a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
             )
+        elif use_int4_w4a8:
+            grouped_gemm_nt_i8i4bf16_nopad(
+                a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
+            )
         elif use_fp8:
             grouped_gemm_nt_f8f8bf16_nopad(
                 a, a_scale, w1, w1_scale, out1, expert_ids, num_recv_tokens_per_expert
@@ -973,7 +1006,7 @@ def deep_moe_impl_fused(
             )
             silu_and_mul(out1, out2)
 
-        if use_int8:
+        if use_int8 or use_int4_w4a8:
             a, a_scale = per_token_quant_int8(out2)
         elif use_fp8:
             if per_channel_quant:
@@ -1005,6 +1038,10 @@ def deep_moe_impl_fused(
         )
     elif use_int8:
         grouped_gemm_nt_i8i8bf16_nopad(
+            a, a_scale, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
+        )
+    elif use_int4_w4a8:
+        grouped_gemm_nt_i8i4bf16_nopad(
             a, a_scale, w2, w2_scale, out3, expert_ids, num_recv_tokens_per_expert
         )
     elif use_fp8:
@@ -1059,6 +1096,7 @@ def fused_experts_none_to_deep_gemm(
     use_int4_w4a16 = quant_info.use_int4_w4a16
     use_mxfp4_w4a16 = quant_info.use_mxfp4_w4a16
     use_mxfp4_w4a8 = quant_info.use_mxfp4_w4a8
+    use_int4_w4a8 = quant_info.use_int4_w4a8
     per_channel_quant = quant_info.per_channel_quant
     w1_scale = quant_info.w13_scale
     w2_scale = quant_info.w2_scale
@@ -1087,6 +1125,7 @@ def fused_experts_none_to_deep_gemm(
         use_mxfp4_w4a8=use_mxfp4_w4a8,
         w1_inv_scale=quant_info.w13_inv_scale,
         w2_inv_scale=quant_info.w2_inv_scale,
+        use_int4_w4a8=use_int4_w4a8,
         b1=b1,
         b2=b2,
         gemm1_alpha=moe_runner_config.gemm1_alpha,

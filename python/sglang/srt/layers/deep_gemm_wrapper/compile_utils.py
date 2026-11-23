@@ -134,6 +134,10 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_I8I8BF16_NOPAD = auto()
     GEMM_NT_I8I8BF16 = auto()
 
+    # W4A8-Int8: INT8 activations x packed INT4 weights -> BF16 output.
+    GROUPED_GEMM_NT_I8I4BF16_MASKED = auto()
+    GROUPED_GEMM_NT_I8I4BF16_NOPAD = auto()
+
     GROUPED_GEMM_NT_BF16_NOPAD = auto()
 
     GROUPED_GEMM_NT_F4F4BF16_MASKED = auto()
@@ -387,6 +391,12 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED: _GroupedMaskedWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG: _GroupedContWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD: _GroupedNopadWarmupExecutor_int8,
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_MASKED: (
+                _GroupedMaskedWarmupExecutor_int8_int4
+            ),
+            DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_NOPAD: (
+                _GroupedNopadWarmupExecutor_int8_int4
+            ),
             DeepGemmKernelType.GEMM_NT_I8I8BF16: _NormalWarmupExecutor_int8,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD: _GroupedNopadWarmupExecutor_bf16,
             DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED: _GroupedMaskedWarmupExecutor_fp4,
@@ -465,6 +475,24 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 num_groups * max_m * k
                 + num_groups * n * k
                 + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_NOPAD]:
+            # lhs int8 + fp32 per-token scale, rhs packed int4 + fp32
+            # per-channel scale, out bf16
+            return (
+                max_m * k
+                + max_m * 4
+                + num_groups * n * (k // 2)
+                + num_groups * n * 4
+                + max_m * n * 2
+            ) / _GB
+        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_I8I4BF16_MASKED]:
+            return (
+                num_groups * max_m * k
+                + num_groups * 4
+                + num_groups * n * (k // 2)
+                + num_groups * n * 4
                 + num_groups * max_m * n * 2
             ) / _GB
         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
@@ -962,6 +990,16 @@ def _empty_block_int8(size):
     )
 
 
+def _empty_block_int4_packed(size):
+    # packed int4 weights: k is the logical (unpacked) size, storage is
+    # [.., n, k // 2] uint8 with [.., n, 1] fp32 per-channel scales
+    *dims, n, k = size
+    return (
+        torch.empty((*dims, n, k // 2), device="cuda", dtype=torch.uint8),
+        torch.empty((*dims, n, 1), device="cuda", dtype=torch.float32),
+    )
+
+
 def _empty_token_fp8_channel(size):
     *dims, k = size
     return (
@@ -1212,6 +1250,52 @@ class _GroupedNopadWarmupExecutor_int8(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedNopadWarmupExecutor_int8_int4(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_I8I4BF16_NOPAD (W4A8-Int8)."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int4_packed((num_groups, n, k))
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_nopad(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedMaskedWarmupExecutor_int8_int4(_BaseWarmupExecutor):
+    """Warmup executor for GROUPED_GEMM_NT_I8I4BF16_MASKED (W4A8-Int8)."""
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_int8((num_groups, max_m, k))
+        self.rhs_q, self.rhs_s = _empty_block_int4_packed((num_groups, n, k))
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_gemm_int8_int4_bf16_nt_masked(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
+            expected_m=m,
         )
 
 
