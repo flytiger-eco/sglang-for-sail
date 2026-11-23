@@ -65,7 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
+      repo: ${{ steps.source.outputs.repo }}
       commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
     steps:
       - name: Validate board matrix
         shell: bash
@@ -91,11 +94,12 @@ jobs:
         id: source
         shell: bash
         env:
+          SOURCE_REPO: t-head/sglang-for-sail
           SOURCE_BRANCH: ${{ inputs.branch || 'release/v0.5.23' }}
         run: |
           set -euo pipefail
           git check-ref-format "refs/heads/$SOURCE_BRANCH"
-          git clone --branch "$SOURCE_BRANCH" --single-branch --depth 1 https://github.com/t-head/sglang-for-sail.git sglang-source
+          git clone --branch "$SOURCE_BRANCH" --single-branch --depth 1 "https://github.com/$SOURCE_REPO.git" sglang-source
           cd sglang-source
           commit=$(git rev-parse HEAD)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
@@ -106,7 +110,11 @@ jobs:
                       python/sglang/kernels/aot/pyproject_sail.toml; do
             test -f "$file" || { printf '::error::Selected source is missing %s\n' "$file" >&2; exit 1; }
           done
+          printf 'repo=%s\n' "$SOURCE_REPO" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          # Record provenance before build jobs detach HEAD at the pinned commit; never default an unknown branch.
+          printf 'branch=%s\n' "$(git symbolic-ref --quiet --short HEAD || true)" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$(git tag --points-at HEAD | paste -sd ',' -)" >> "$GITHUB_OUTPUT"
           printf 'sglang-for-sail source: %s -> %s\n' "$SOURCE_BRANCH" "$commit" \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -154,7 +162,7 @@ jobs:
             TARGET_ROOT=/workspace/target
             TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
             PACKAGE='${{ matrix.package }}'
-            git clone --no-checkout https://github.com/t-head/sglang-for-sail.git "$TARGET_ROOT"
+            git clone --no-checkout 'https://github.com/${{ needs.resolve.outputs.repo }}.git' "$TARGET_ROOT"
             git -C "$TARGET_ROOT" fetch --no-tags origin "$TARGET_COMMIT"
             git -C "$TARGET_ROOT" checkout --detach "$TARGET_COMMIT"
             git -C "$TARGET_ROOT" submodule update --init --recursive
@@ -246,10 +254,14 @@ jobs:
 
   push:
     name: Upload to temporary directory
-    needs: merge
+    needs: [resolve, merge]
     uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
     with:
       artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      branch: ${{ needs.resolve.outputs.branch }}
+      tag: ${{ needs.resolve.outputs.tag }}
       template_repository: flytiger-eco/shared-workflows
       template_ref: main
     secrets:
