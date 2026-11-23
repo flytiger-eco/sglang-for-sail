@@ -66,6 +66,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -81,12 +82,55 @@ jobs:
             SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
 
+      # The tag this build pushed is not a name for *this* build: a second build
+      # on the same day overwrites it, and one that crosses UTC midnight can
+      # stamp tomorrow's date, so nightly-test-ppu.yml cannot recover the
+      # intended image by resolving tags. The digest is the only value that
+      # names the artifact, and this is the only place that knows it, so publish
+      # it. Named after the run *attempt*, because a re-run pushes its own image
+      # under the same tags and the same run id.
+      #
+      # Only this job publishes. nightly-test-ppu.yml follows a scheduled run on
+      # the default branch, and upload-artifact@v4 fails a run that uploads two
+      # artifacts under one name -- so the branch jobs below keep their tags.
+      # Should one of them ever become testable this way, its artifact needs the
+      # job name appended and prepare needs to ask for it by that name.
+      - name: Publish the digest this build produced
+        if: ${{ steps.build.outputs.digest != '' && (github.event_name != 'workflow_dispatch' || inputs.push) }}
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p ppu-nightly-image
+          printf '{"image":"%s","tag":"%s","digest":"%s","commit":"%s","run_id":"%s","run_attempt":"%s"}\n' \
+            "${IMAGE}" "${TAG}" "${DIGEST}" "${COMMIT}" \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" \
+            > ppu-nightly-image/image.json
+          cat ppu-nightly-image/image.json
+
+      - name: Upload the digest for the matching test run
+        if: ${{ steps.build.outputs.digest != '' && (github.event_name != 'workflow_dispatch' || inputs.push) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-nightly-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ppu-nightly-image
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Write image address to job summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           printf 'PPU image: `%s:%s` (rolling `%s:%s`)\n' \
             "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.tag }}" \
             "${{ steps.meta.outputs.image }}" "${{ steps.meta.outputs.rolling }}" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "${DIGEST}" ]; then
+            printf 'Digest the test line pins: `%s`\n' "${DIGEST}" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   build-v0-5-21:
     # Same flow as the build job, but always builds the v0.5.21 branch.

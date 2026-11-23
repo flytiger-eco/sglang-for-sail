@@ -22,6 +22,49 @@ if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
     git config --global --add safe.directory "${REPO_ROOT}"
 fi
 
+# ==================== No source install when the artifact is the image ==================== #
+# nightly-test-ppu.yml tests the image release-docker-ppu-nightly.yml built.
+# sglang and sgl-kernel are already installed in it, so installing from source
+# again would quietly swap out the object under test -- exactly what this change
+# removes. With PPU_TEST_MODE=image only the test framework is added (the runtime
+# target of ppu.Dockerfile carries no pytest), and the source install, the kernel
+# rebuild and the wheel corrections below are skipped.
+#
+# The same logic runs one level further down: replacing a wheel the image ships
+# (uvicorn, dill, mooncake) would leave the health check and every suite
+# measuring a runtime no nightly ever builds. That hides a broken shipped
+# dependency and invents failures that exist only on this line. What the image
+# carries is reported instead, and a package the bench genuinely needs belongs in
+# docker/ppu.Dockerfile rather than here.
+#
+# Still common to both modes: the pip/wheel upgrade (neither is part of the
+# tested runtime) and the EIC device packages, which the pod needs to start.
+PPU_TEST_MODE="${PPU_TEST_MODE:-source}"
+case "$PPU_TEST_MODE" in
+    source|image) ;;
+    *) echo "Unknown PPU_TEST_MODE: ${PPU_TEST_MODE}" >&2; exit 1 ;;
+esac
+
+# Print the version of a package the image under test carries, and say so when it
+# is older than the bench needs. Never fatal: the artifact is the subject here,
+# so an old wheel is a finding about the image, not an install to be repaired.
+report_image_version() {
+    local name="$1" floor="$2" version
+    # `|| true`: set -e must not turn "not installed" into a failure of the whole
+    # setup, and head closing the pipe makes sed exit non-zero under pipefail.
+    version="$(python3 -m pip show "${name}" 2>/dev/null | sed -n 's/^Version: *//p' | head -1)" || true
+    if [[ -z "${version}" ]]; then
+        echo "::warning::[image-runtime] ${name} is not installed in the image under test"
+        return 0
+    fi
+    echo "[image-runtime] ${name} ${version}"
+    # sort -V so 0.3.6 < 0.3.12, which a string comparison gets wrong.
+    if [[ -n "${floor}" ]] &&
+        [[ "$(printf '%s\n%s\n' "${floor}" "${version%%+*}" | sort -V | head -1)" != "${floor}" ]]; then
+        echo "::warning::[image-runtime] ${name} ${version} is older than the bench's ${floor}; a case that needs it fails against the image, not against the commit"
+    fi
+}
+
 # Only pip/wheel. Deliberately NOT setuptools or dill: the v2.1.1 image pins them
 # to satisfy constraints that an --upgrade breaks (observed in run 31663500015):
 #   setuptools 84.0.0 -> torch 2.11.0 requires setuptools<82
@@ -55,14 +98,25 @@ ${PIP_INSTALL} --upgrade pip wheel
 #   sglang-router 0.3.2+v0.1.0.ppu2.1.1     (PPU build; the guide's bare ==0.3.2
 #                                            could replace it with a generic one)
 #
-# uvicorn is the one real gap: image ships 0.29.0, sglang's multi-worker path needs
-# timeout_worker_healthcheck (added in 0.37.0).
-${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --force-reinstall --no-deps
-
-# dill: image ships 0.3.6, but Python 3.12's ABC implementation makes
+# uvicorn is the one real gap in the base image: it ships 0.29.0, while sglang's
+# multi-worker path needs timeout_worker_healthcheck (added in 0.37.0). The
+# ppu.Dockerfile image resolves uvicorn unpinned, so this is only the pre-image
+# correction.
+#
+# dill: the base image ships 0.3.6, but Python 3.12's ABC implementation makes
 # _abc._abc_data unpicklable with dill<0.3.8, crashing custom_logit_processor
-# tests. Upgrade to 0.3.8 (still satisfies datasets' dill<0.3.9 constraint).
-${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
+# tests. 0.3.8 still satisfies datasets' dill<0.3.9 constraint.
+#
+# Both are corrections to the *base* image, so image mode leaves the shipped
+# versions alone and reports them instead (see the image-mode block below).
+if [[ "$PPU_TEST_MODE" != "image" ]]; then
+    ${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --force-reinstall --no-deps
+    ${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
+fi
+
+if [[ "$PPU_TEST_MODE" == "image" ]]; then
+    echo "PPU_TEST_MODE=image: sglang and sgl-kernel ship in the image under test; skipping the source install and the kernel rebuild"
+else
 
 # ==================== Install SGLang from source ==================== #
 # The version this install reports for itself, settled before pyproject.toml is
@@ -147,6 +201,26 @@ if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
     printf '{"aot_seconds":%s}\n' "$((SECONDS-_kernel_start))" > "${PPU_INSTALL_EVIDENCE_DIR:-${PPU_EVIDENCE_DIR:?}}/aot.json"
 fi
 
+fi # PPU_TEST_MODE != image
+
+# The runtime target of ppu.Dockerfile carries no test framework, so add it here
+# in image mode. These packages never touch the sglang under test; they are only
+# what run_suite.py needs in order to start.
+if [[ "$PPU_TEST_MODE" == "image" ]]; then
+    # PyYAML is left unpinned: the image ships it and sglang.srt imports it at
+    # runtime, so pinning a version here would replace the shipped one before the
+    # checks look at it. The image's own constraints keep the rest from moving
+    # either -- it is the same file docker/ppu.Dockerfile installs its tools with.
+    ${PIP_INSTALL} -c /sgl-workspace/constraints.txt \
+        pytest==8.3.5 PyYAML jsonschema tabulate
+    # What the artifact actually carries. Source mode repairs these above; here
+    # they are only looked at, so a case that dies on an old one is attributable
+    # to the image.
+    report_image_version uvicorn 0.37.0
+    report_image_version dill 0.3.8
+    report_image_version mooncake-transfer-engine ""
+fi
+
 # PR suites need pytest but never PD/EIC installation; nightly keeps its defaults.
 if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
     ${PIP_INSTALL} pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate
@@ -170,8 +244,14 @@ if [[ -d "${EIC_PKG_DIR}" ]]; then
         echo "/usr/lib64" > /etc/ld.so.conf.d/usr-lib64.conf
     fi
     ldconfig
-    ${PIP_INSTALL} --no-deps --force-reinstall \
-        "${EIC_PKG_DIR}"/mooncake_transfer_engine-0.3.6.post1-*.whl
+    # The wheel is older than what the image under test ships (0.3.12.post1 in
+    # ppu.Dockerfile), so it is a correction to the base image only. Applying it
+    # in image mode would silently downgrade the artifact's transfer engine before
+    # the disaggregation cases run.
+    if [[ "$PPU_TEST_MODE" != "image" ]]; then
+        ${PIP_INSTALL} --no-deps --force-reinstall \
+            "${EIC_PKG_DIR}"/mooncake_transfer_engine-0.3.6.post1-*.whl
+    fi
     echo "EIC SDK installation complete."
 else
     echo "WARNING: EIC SDK not found at ${EIC_PKG_DIR}, disaggregation tests may fail."

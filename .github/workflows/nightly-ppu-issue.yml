@@ -1,0 +1,368 @@
+name: Nightly PPU Issue Tracker
+
+# Issues only: no Slack, no mail (as requested). The optional DingTalk step at
+# the end is a no-op unless the two secrets below are configured.
+#
+# Why a separate workflow instead of an if: always() job at the end of the test
+# file: when the build fails, needs holds the whole test line back, so that job
+# never exists -- and "the build failed" is exactly the red most worth recording.
+# Sitting outside both lines, workflow_run sees all four outcomes.
+on:
+  workflow_run:
+    workflows:
+      - "Release Docker Images Nightly (PPU)"
+      - "Nightly Test (PPU K8s)"
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  # Read only, to ask whether the test run's finish job actually executed: an
+  # all-skipped run still reports success.
+  actions: read
+
+# Serialise updates per tracked workflow and event: one group for scheduled
+# completions, one for manual ones. Only one pending run per group is ever kept,
+# so sharing a group would let a manual completion replace the pending run of a
+# scheduled failure, and that failure would never be recorded.
+concurrency:
+  group: nightly-ppu-issue-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.event }}
+  cancel-in-progress: false
+
+jobs:
+  track:
+    # Only the scheduled build and the test run it scheduled leave a trace: a
+    # manual dispatch may push nothing at all, and a manual source-mode test would
+    # close the issue about the artifact without ever touching one. Debugging on a
+    # feature branch would open an issue per attempt, fill everyone's list, and
+    # then nobody reads the label any more.
+    if: >-
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      contains(fromJSON('["schedule", "workflow_run"]'), github.event.workflow_run.event)
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      WF_NAME: ${{ github.event.workflow_run.name }}
+      WF_EVENT: ${{ github.event.workflow_run.event }}
+      WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Ensure the label exists
+        run: |
+          gh label create nightly-red --repo "$REPO" --color B60205 \
+            --description "nightly red tracking (maintained automatically, closed on recovery)" || true
+
+      # Incidents are ordered by the build that was tested, not by this run: a
+      # rerun of yesterday's build after this morning's failure creates a test run
+      # with a larger id, and its green would close an incident that is still open.
+      # The test workflow publishes the build it tested whatever the gate decided,
+      # so a build that published nothing can be ordered too.
+      #
+      # The attempt travels with it: two attempts of one build are two images, and
+      # their tests can finish in either order. It is the attempt whose build job
+      # produced the image, not the attempt this event was delivered for -- a
+      # "Re-run failed jobs" attempt that skipped the build reuses the earlier one.
+      - name: Resolve the build under test
+        id: build
+        run: |
+          set -uo pipefail
+          build=''
+          attempt=''
+          if [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+            rm -rf /tmp/tested-build
+            if gh run download "$RUN_ID" --repo "$REPO" \
+                -n ppu-nightly-tested-build -D /tmp/tested-build 2>/dev/null; then
+              build="$(sed -n 's/^build_run=//p' /tmp/tested-build/tested_build.txt 2>/dev/null | head -1)"
+              attempt="$(sed -n 's/^build_attempt=//p' /tmp/tested-build/tested_build.txt 2>/dev/null | head -1)"
+            fi
+          else
+            # The build workflow itself: its own run is the generation.
+            build="$RUN_ID"
+            attempt="$RUN_ATTEMPT"
+          fi
+          printf 'id=%s\nattempt=%s\n' "$build" "$attempt" >> "$GITHUB_OUTPUT"
+          echo "build under test: ${build:-unknown}${attempt:+ (attempt ${attempt})}"
+
+      - name: Upsert the tracking issue
+        id: upsert
+        env:
+          BUILD: ${{ steps.build.outputs.id }}
+          BUILD_ATTEMPT: ${{ steps.build.outputs.attempt }}
+        run: |
+          set -euo pipefail
+
+          # Cancelled and skipped are not accounted for: someone stopped it on
+          # purpose, that is not a regression.
+          case "$WF_CONCLUSION" in
+            success) outcome=green ;;
+            cancelled|skipped) echo "conclusion=${WF_CONCLUSION}, not tracked"; exit 0 ;;
+            *) outcome=red ;;
+          esac
+          printf 'outcome=%s\n' "$outcome" >> "$GITHUB_OUTPUT"
+          # Only a new failure, and a recovery that actually closed something, are
+          # worth a message; a green run that leaves the issue open announces nothing.
+          printf 'announce=false\n' >> "$GITHUB_OUTPUT"
+
+          # A test run whose every job was skipped can still conclude success:
+          # prepare is skipped when the build failed or was not scheduled, every
+          # job depends on it, and nothing runs. Reading that as recovery would
+          # close an open test-failure issue on a run that executed no test at all,
+          # so check that the finish job really ran before calling a test run green.
+          if [ "$outcome" = green ] && [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+            # Only the run the build scheduled proves the artifact was recovered.
+            # A manual dispatch defaults to source mode and also ends green, and
+            # closing on that would retire the issue while nothing tested the
+            # image.
+            if [ "$WF_EVENT" != "workflow_run" ]; then
+              echo "this test was a '${WF_EVENT}' run, not the one the build scheduled; leaving the issue open"
+              exit 0
+            fi
+            finish="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.name == "nightly-test-ppu-finish")]
+                    | if length == 0 then "absent" else (.[0].conclusion // "null") end')"
+            if [ "$finish" != "success" ]; then
+              echo "run concluded ${WF_CONCLUSION} but nightly-test-ppu-finish is '${finish}'; no test ran, not tracking"
+              exit 0
+            fi
+          fi
+
+          # Claim the issue by a marker in the body rather than by title: the title
+          # may change later while the marker stays put, and a title change would
+          # otherwise leave a second, duplicate issue behind. Closed issues are
+          # searched too: the newest generation that recovered an incident is
+          # recorded there, and that record is what tells a late failure of an old
+          # build apart from a failure nobody has recovered yet.
+          marker="<!-- nightly-ppu-issue:${WF_NAME} -->"
+          title="[nightly-red] ${WF_NAME}"
+
+          gh issue list --repo "$REPO" --label nightly-red --state all --limit 100 \
+            --json number,body \
+            --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .number" \
+            | sort -rn > /tmp/nightly_issues.txt
+          number="$(head -1 /tmp/nightly_issues.txt)"
+
+          # A generation is "<build run>.<attempt that produced the image>". The run
+          # alone cannot order two attempts of one build, whose tests may finish in
+          # either order. Empty means the artifact is gone; it never orders above
+          # anything, because guessing there would retire an incident on no evidence.
+          generation=''
+          if [ -n "$BUILD" ]; then
+            generation="$BUILD"
+            [ -n "${BUILD_ATTEMPT:-}" ] && generation="${BUILD}.${BUILD_ATTEMPT}"
+          fi
+
+          # Reads one generation out of an issue body, printing nothing when absent.
+          read_gen() { # $1 body, $2 field
+            printf '%s\n' "$1" | awk -v tag="<!-- nightly-ppu-$2: " '
+              { i = index($0, tag) }
+              i {
+                v = substr($0, i + length(tag))
+                sub(/ -->.*/, "", v)
+                if (v ~ /^[0-9]+(\.[0-9]+)?$/) { print v; exit }
+              }'
+          }
+
+          # Writes it back in place, appending the marker the first time.
+          write_gen() { # $1 body, $2 field, $3 generation
+            case "$1" in
+              *"nightly-ppu-$2:"*)
+                printf '%s' "$1" | sed -E "s|<!-- nightly-ppu-$2: [0-9]+(\.[0-9]+)? -->|<!-- nightly-ppu-$2: $3 -->|" ;;
+              *)
+                printf '%s\n\n<!-- nightly-ppu-%s: %s -->' "$1" "$2" "$3" ;;
+            esac
+          }
+
+          # $1 >= $2, either may be empty. The attempt is optional, so a marker
+          # written by an older revision of this workflow still parses.
+          gen_ge() {
+            [ -z "$1" ] && return 1
+            [ -z "$2" ] && return 0
+            local b1="${1%%.*}" a1=0 b2="${2%%.*}" a2=0
+            [ "$1" != "${1#*.}" ] && a1="${1#*.}"
+            [ "$2" != "${2#*.}" ] && a2="${2#*.}"
+            [ "$b1" -gt "$b2" ] && return 0
+            [ "$b1" -lt "$b2" ] && return 1
+            [ "$a1" -ge "$a2" ]
+          }
+
+          if [ "$outcome" = red ]; then
+            # For a test run, head_sha is the revision the harness ran at -- the
+            # default branch, which can move while the image builds. What the run
+            # actually tested is the commit it published.
+            commit="$RUN_SHA"
+            if [ "$WF_NAME" = "Nightly Test (PPU K8s)" ]; then
+              rm -rf /tmp/tested-ref
+              if gh run download "$RUN_ID" --repo "$REPO" \
+                  -n ppu-nightly-tested-ref -D /tmp/tested-ref 2>/dev/null; then
+                published="$(sed -n 's/^tested_sha=//p' /tmp/tested-ref/tested_sha.txt 2>/dev/null | head -1)"
+                if [ -n "$published" ]; then
+                  commit="$published"
+                fi
+              fi
+            fi
+            printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+            body=''
+            state=''
+            if [ -n "$number" ]; then
+              body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
+              state="$(gh issue view "$number" --repo "$REPO" --json state --jq '.state')"
+            fi
+            last_red="$(read_gen "$body" last-red)"
+            last_green="$(read_gen "$body" last-green)"
+
+            # A failure of a build that something newer has already recovered is
+            # not an incident, only a test that finished late. Filing it would mean
+            # a fresh issue for a generation nobody waits on any more, because the
+            # recovery closed the very issue this would otherwise have reopened.
+            if [ -n "$number" ] && ! gen_ge "$generation" "$last_green"; then
+              echo "build ${generation} is not newer than the recovery on record in #${number} (${last_green}); not tracking it"
+              exit 0
+            fi
+            printf 'announce=true\n' >> "$GITHUB_OUTPUT"
+
+            red_marker=''
+            [ -n "$generation" ] && red_marker="<!-- nightly-ppu-last-red: ${generation} -->"
+            if [ -z "$number" ]; then
+              gh issue create --repo "$REPO" --title "$title" --label nightly-red \
+                --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n\n%s\n' \
+                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${commit:0:12}" "$red_marker")"
+              exit 0
+            fi
+
+            # Retrying the same run delivers the same URL again; keying on the URL
+            # keeps the thread from filling up. The body counts too: the first
+            # failure was recorded there, not in a comment. The lookup is not piped
+            # into grep: its early exit closes the pipe, and pipefail would read
+            # that as a miss and post the duplicate this is meant to prevent.
+            recorded="$(gh issue view "$number" --repo "$REPO" --json body,comments \
+              --jq '.body, .comments[].body')"
+            case "$recorded" in
+              *"$RUN_URL"*)
+                echo "run already recorded in #${number}, not commenting again" ;;
+              *)
+                gh issue comment "$number" --repo "$REPO" \
+                  --body "$(printf 'Failed again: **%s** (attempt %s)\n\n- run: %s' \
+                    "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")" ;;
+            esac
+
+            # The issue keeps the *generation* it is about, so a later green run can
+            # tell whether it is recovering this incident or merely finishing an
+            # older one. The marker lives in the body, which is always fetched, so
+            # there is one place to update instead of "whichever comment was last".
+            if [ -z "$generation" ]; then
+              # Nothing to order against; the comment above still records what failed.
+              echo "::warning::the build under test is unknown; leaving the recorded build of #${number} untouched"
+            elif gen_ge "$generation" "$last_red"; then
+              # The marker only moves forward. A failed rerun of an older build
+              # would otherwise lower it, and a green rerun newer than that -- but
+              # older than the newest failure -- would then close an incident
+              # nothing has fixed.
+              updated="$(write_gen "$body" last-red "$generation")"
+              if [ "$updated" != "$body" ]; then
+                gh issue edit "$number" --repo "$REPO" --body "$updated" > /dev/null
+              fi
+              # A failure newer than the recorded one reopens the issue: it was
+              # closed by a recovery of an older build, which says nothing about
+              # this one.
+              if [ "$state" != OPEN ]; then
+                echo "#${number} was closed by an older recovery; reopening it for build ${generation}"
+                gh issue reopen "$number" --repo "$REPO"
+              fi
+            else
+              echo "build ${generation} predates the failure recorded in #${number} (${last_red}); leaving that marker as it is"
+            fi
+          elif [ -n "$number" ]; then
+            # A green run that predates the failure on record does not clear it:
+            # rerunning last night's build after this morning's failure would
+            # otherwise close an incident nothing has fixed yet. Comparing the
+            # generation still lets a successful rerun of the failing build recover
+            # its own. Unknown only happens when the artifact is gone, and guessing
+            # there would retire an incident on no evidence.
+            body="$(gh issue view "$number" --repo "$REPO" --json body --jq '.body')"
+            state="$(gh issue view "$number" --repo "$REPO" --json state --jq '.state')"
+            last_red="$(read_gen "$body" last-red)"
+            last_green="$(read_gen "$body" last-green)"
+            if [ -n "$last_red" ] && ! gen_ge "$generation" "$last_red"; then
+              if [ -z "$generation" ]; then
+                echo "the build tested by run ${RUN_ID} is unknown; leaving #${number} open"
+              else
+                echo "build ${generation} predates the failure recorded in #${number} (${last_red}); leaving it open"
+              fi
+              exit 0
+            fi
+            if [ "$state" = OPEN ]; then
+              gh issue comment "$number" --repo "$REPO" \
+                --body "$(printf 'Recovered (%s)\n\n- run: %s' "$WF_NAME" "$RUN_URL")"
+              gh issue close "$number" --repo "$REPO"
+              printf 'announce=true\n' >> "$GITHUB_OUTPUT"
+            fi
+            # The recovery is recorded even now that the issue is closed, and only
+            # moves forward: a late failure of an older build must not be filed as
+            # a new incident just because no issue is open any more.
+            if gen_ge "$generation" "$last_green"; then
+              updated="$(write_gen "$body" last-green "$generation")"
+              if [ "$updated" != "$body" ]; then
+                gh issue edit "$number" --repo "$REPO" --body "$updated" > /dev/null
+              fi
+            fi
+          else
+            echo "green and nothing tracked"
+          fi
+
+      # A new failure, and the recovery of an issue that is still open, are the two
+      # things a group is worth waking up for; a green night that had nothing to
+      # retract stays silent. With no webhook configured this step is a no-op, which
+      # is what forks and repos that do not want the messages get.
+      - name: Notify the DingTalk group
+        if: ${{ always() && steps.upsert.outputs.announce == 'true' }}
+        env:
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          OUTCOME: ${{ steps.upsert.outputs.outcome }}
+          COMMIT: ${{ steps.upsert.outputs.commit }}
+        run: |
+          set -uo pipefail
+          if [ -z "${DINGTALK_WEBHOOK}" ]; then
+            echo 'DINGTALK_WEBHOOK is not set, skipping the notification'
+            exit 0
+          fi
+
+          if [ "${OUTCOME}" = green ]; then
+            headline='Nightly PPU recovered'
+          else
+            headline="Nightly PPU red: ${WF_NAME}"
+          fi
+          text="$(printf '%s\n\n- conclusion: **%s** (attempt %s)\n- commit: `%s`\n- run: %s\n' \
+            "${headline}" "${WF_CONCLUSION}" "${RUN_ATTEMPT}" "${COMMIT:-${RUN_SHA}}" "${RUN_URL}")"
+
+          url="${DINGTALK_WEBHOOK}"
+          # A robot with signing enabled rejects unsigned posts. The sign is
+          # base64(HMAC-SHA256(secret, "<ms timestamp>\n<secret>")), urlencoded.
+          if [ -n "${DINGTALK_SECRET:-}" ]; then
+            ts="$(date +%s000)"
+            sign="$(printf '%s\n%s' "${ts}" "${DINGTALK_SECRET}" \
+              | openssl dgst -sha256 -hmac "${DINGTALK_SECRET}" -binary \
+              | base64 | tr -d '\n')"
+            sign="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote_plus(sys.argv[1]))' "${sign}")"
+            url="${url}&timestamp=${ts}&sign=${sign}"
+          fi
+
+          body="$(python3 -c 'import json,sys; print(json.dumps({"msgtype": "markdown", "markdown": {"title": sys.argv[1], "text": sys.argv[2]}}))' \
+            "${headline}" "${text}")"
+          # The robot answers 200 with a non-zero errcode on a bad token or a
+          # missing keyword, so the body, not the status, decides whether it landed.
+          response="$(curl -sS -m 20 -X POST -H 'Content-Type: application/json' -d "${body}" "${url}")" || response=''
+          echo "${response}"
+          # The spacing inside the JSON is not contractual -- {"errcode": 0} answers
+          # the same as {"errcode":0} -- so compare against a copy with the
+          # whitespace removed rather than against one exact spelling.
+          compact="$(printf '%s' "${response}" | tr -d '[:space:]')"
+          case "${compact}" in
+            *'"errcode":0'*) ;;
+            *) echo "::error::the DingTalk robot did not accept the message"; exit 1 ;;
+          esac
