@@ -22,10 +22,8 @@ ARG UBUNTU_MIRROR
 ARG MAX_JOBS=16
 ARG FFMPEG_VERSION=7.1.3
 ARG FFMPEG_SHA256=e0b04c4b43d7e6d67cb6710334fb513adf13ac860532f30e1d0ac4c231f232fb
-# Download the pinned sailify wheel directly instead of building from Git.
-ARG SAILIFY_WHEEL_URL=https://download.t-head.cn/artifactory/pypi_tmp/2026-11-03-0938/sailify-1.0.0-py3-none-any.whl
-# Keep explicit PPU local-version pins for dependencies without temporary wheels
-# to prevent upstream CUDA package selection. Retain sailify for JIT compilation.
+# Pin published PPU package versions to prevent upstream CUDA package selection.
+# Retain sailify for JIT compilation.
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
@@ -34,11 +32,17 @@ ARG PPU_PACKAGES="\
     deep_ep==2.2.1+v0.1.0.ppu2.2.0 \
     deep_gemm==1.1.0+v1.1.0.ppu2.2.1 \
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
+    flash_mla==2.1.0+v1.1.0.ppu2.2.1 \
+    flash_attn==2.8.2+v1.0.0.ppu2.2.1 \
+    flash_attn_3==3.0.0+v1.0.0.ppu2.2.1 \
     flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
     pla==1.1.0+v0.1.0.ppu2.2.0 \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
+    sailify==1.0.0+ppu2.2.1 \
+    sglang==0.5.23+v0.1.0.ppu2.2.1 \
+    sglang_kernel==0.4.10+v0.1.0.ppu2.2.1 \
     sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
     tilelang==0.1.12+v0.1.0.ppu2.2.0 \
     torch_memory_saver==0.0.9+v0.1.0.ppu2.2.0 \
@@ -47,15 +51,6 @@ ARG PPU_PACKAGES="\
     triton==3.7.1+v0.1.0.ppu2.2.0"
 # The base image provides torch/torchvision; only add torchaudio.
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
-# Pin flash_attn and flash_attn_3 separately to their requested wheel URLs.
-# These projects are excluded from PPU_PACKAGES so old index versions cannot
-# replace the requested wheels.
-ARG PPU_WHEEL_URLS="\
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1628/flash_mla-2.1.0.dev9+v1.0.0.ppu2.2.1.g2b70d8d-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn-2.8.2-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-18-1805/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-22-1124/sglang-0.5.23-1g651bc4dd03ae-cp312-cp312-linux_x86_64.whl \
-    https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-22-1124/sglang_kernel-0.4.10-1g651bc4dd03ae-cp310-abi3-linux_x86_64.whl"
 
 FROM ${PPU_BASE_IMAGE} AS base
 
@@ -165,10 +160,8 @@ FROM base AS ppu_wheels_builder
 
 ARG PPU_PIP_INDEX
 ARG MAX_JOBS
-ARG SAILIFY_WHEEL_URL
 ARG PPU_PACKAGES
 ARG PPU_TORCH_PACKAGES
-ARG PPU_WHEEL_URLS
 
 WORKDIR /build
 
@@ -177,9 +170,7 @@ WORKDIR /build
 # and output on the same filesystem and avoid EXDEV.
 RUN source "${PPU_SDK}/envsetup.sh" ppu \
     && mkdir -p /wheels \
-    && wget --tries=3 --timeout=60 \
-        -O /wheels/sailify-1.0.0-py3-none-any.whl "${SAILIFY_WHEEL_URL}" \
-    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES} ${PPU_WHEEL_URLS}; do \
+    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES}; do \
         echo "==> Building ${spec}" \
         && MAX_JOBS=${MAX_JOBS} python3 -m pip wheel \
             --no-cache-dir --no-deps --no-build-isolation \
