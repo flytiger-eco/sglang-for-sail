@@ -92,6 +92,17 @@ class SchedulerLoadInquirer:
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Bootstrap requests already consume future prefill capacity. Their
+            # cache prefix has not been matched by the scheduling policy yet,
+            # so use the full input until they enter the matched waiting queue.
+            seen = {id(req) for req in self.get_waiting_queue()}
+            if cr is not None:
+                seen.add(id(cr))
+            for req in self.get_disagg_prefill_bootstrap_queue().queue:
+                if id(req) not in seen:
+                    seen.add(id(req))
+                    num_tokens += max(0, req.seqlen)
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:
