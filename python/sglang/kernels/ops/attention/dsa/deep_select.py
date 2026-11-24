@@ -367,9 +367,11 @@ def _pack_kpool_group_scores(
     The kpool producer hands over float32 logits while the wheel accepts BF16 only,
     and the wheel has no ``begin`` argument. One launch therefore does both jobs the
     replacement needs: convert the dtype, and move ``[start, start + length)`` to
-    column 0. The window start is added back through ``output_idx_offset``, so the
-    indices this route returns are absolute pooled columns -- exactly what the
-    existing group-expansion helpers expect.
+    column 0. Selection results stay window-relative on purpose -- the fused kpool
+    kernel stores ``index[pos] = idx`` with ``idx`` already relative to ``row_start``
+    (``kpool_topk_transform.cuh``, ``fast_topk_cuda_tl_impl``) and the group
+    expansion, tail append and page/offset transform downstream consume that same
+    relative convention, so adding the start back here would double-count it.
 
     Rows at or below ``topk`` still get their window copied; the incumbent fused
     kernel reads them too, and skipping the copy would make the two routes differ in
@@ -426,10 +428,10 @@ def topk_kpool_groups(
 ) -> torch.Tensor:
     """Pool-level top-k of every pooled-score row on the PPU DeepSelect kernel.
 
-    Returns int32 ``[rows, group_topk]`` absolute pooled-column ids, valid entries
-    first and ``-1`` past each row's length -- the same convention the fused kpool
-    kernel's group selection produces. Only the selection happens here; expanding
-    each chosen group into its ``pool_size`` tokens, appending the forced tail and
+    Returns int32 ``[rows, group_topk]`` pooled-column ids inside each row's own
+    window (relative to ``row_starts``), valid entries first and ``-1`` past each
+    row's length -- the same convention the fused kpool kernel's group selection
+    produces. Only the selection happens here; expanding each chosen group into its ``pool_size`` tokens, appending the forced tail and
     the page-table or buffer-offset transform stay in the caller's existing
     ``expand_pooled_groups_to_topk`` / ``append_kpool_tail_to_topk`` helpers.
 
@@ -458,11 +460,8 @@ def topk_kpool_groups(
         starts is not None,
         block,
     )
-    # A packed window starts at column 0, so the wheel's per-row offset has to carry
-    # the original window start back in to keep the columns absolute.
-    offsets = torch.zeros(rows, dtype=torch.int32, device=scores.device)
-    if starts is not None:
-        offsets = starts
+    # No per-row offset: the incumbent kernel's indices are already window-relative,
+    # and passing None also keeps an int32 [rows] allocation off the hot path.
     _, groups = deep_select.topk(
         packed,
         group_topk,
@@ -472,7 +471,7 @@ def topk_kpool_groups(
         indices_type=torch.int32,
         sorted_index=False,
         output_idx=None,
-        output_idx_offset=offsets,
+        output_idx_offset=None,
         idx_oob_fill_value=-1,
         # Never let a stray NaN abort the device context inside the server.
         abort_when_nan_found=False,

@@ -795,10 +795,11 @@ def deepselect_kpool_group_ids(
     """Serve one kpool group-level top-k from the PPU(sail) deep_select wheel.
 
     ``logits`` are the pooled (one score per ``index_kpool`` tokens) float32 rows the
-    Flash indexer produces; this returns int32 absolute pooled-column ids, valid
-    entries first and -1 past each row's length, so the caller can run them through
-    the same group-expansion, tail-append and page/offset transform it already uses
-    for the fused kernel. Only the selection is replaced.
+    Flash indexer produces; this returns int32 pooled-column ids inside each row's own
+    window -- valid entries first and -1 past each row's length -- which is the same
+    convention the fused kpool kernel's selection uses, so the caller can run them
+    through the existing group-expansion, tail-append and page/offset transform
+    helpers. Only the selection is replaced.
 
     Returns None -- leaving the caller on the fused kpool kernel -- when the switch is
     off or a precondition is unmet. A precondition missed while the switch is on is
