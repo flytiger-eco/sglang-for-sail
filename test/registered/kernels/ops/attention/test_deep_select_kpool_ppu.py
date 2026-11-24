@@ -2,10 +2,13 @@
 
 The Flash weights select pool-level top-k inside ``fast_kpool_topk_transform_fused``.
 The DeepSelect route replaces only that selection, so every test here compares the two
-routes on the same float32 pooled logits and asserts the downstream token set -- after
-the shared group expansion, tail append and page/offset transform -- still matches.
+routes on the same pooled logits -- float32, and bfloat16 for the direct-output width the
+producer asks for once the route is predicted to serve -- and asserts the downstream token
+set, after the shared group expansion, tail append and page/offset transform, still
+matches.
 """
 
+import logging
 from unittest import mock
 
 import pytest
@@ -66,6 +69,18 @@ def _set_agreement(a, b):
         inter += len(sa & sb)
         total += len(sa)
     return inter / max(total, 1), worst
+
+
+def _selected_score_values(scores, out):
+    """Per-row multiset of the score values a top-k output picked, padding as -inf.
+
+    Page ids are ``row * TABLE_BASE + token_column`` (see TABLE_BASE), so the pooled
+    column decodes back with a remainder and a division. Comparing values instead of
+    columns is the invariant that survives a tied selection boundary.
+    """
+    cols = torch.remainder(out.clamp(min=0), TABLE_BASE) // POOL
+    vals = torch.gather(scores.cpu(), 1, cols.clamp(min=0).to(torch.int64))
+    return vals.masked_fill(out.cpu() < 0, float("-inf")).sort(dim=1).values
 
 
 @pytest.mark.parametrize(
@@ -297,6 +312,170 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
         "page row index lost in gather"
     )
     assert bool((on[:, TOPK:] == -1).all()) and bool((off[:, TOPK:] == -1).all())
+
+
+@torch.inference_mode()
+def test_bf16_logits_select_the_same_pools_as_fp32():
+    """The bf16 direct producer changes the score width, so the picks must not move.
+
+    This is the band-internal consistency gate for the bf16 route: the same values
+    handed over at float32 (today's route) and at bfloat16 (what the scoring kernel
+    will emit after the change) have to agree on the pooled top-k, with the
+    boundary churn measured and reported row by row.
+    """
+    device = "cuda"
+    rows, width = 2048, 8192
+    torch.manual_seed(23)
+    scores = torch.randn(rows, width, dtype=torch.float32, device=device)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+
+    fp32 = topk_kpool_groups(scores, lengths, GROUP_TOPK).cpu()
+    bf16 = topk_kpool_groups(
+        scores.to(torch.bfloat16), lengths, GROUP_TOPK
+    ).cpu()
+
+    mean, worst = _set_agreement(fp32, bf16)
+    print(f"[kpool bf16] rows={rows} cols={width} mean={mean:.4f} worst={worst:.4f}")
+    assert mean >= 0.99, f"bf16-vs-fp32 pool agreement {mean:.4f} < 0.99"
+    assert int((bf16[0] >= 0).sum()) == GROUP_TOPK, "padding must sit past the picks"
+    # A tight distribution is where bf16 rounding can actually reorder candidates.
+    tight = scores * 0.02
+    tight_mean, tight_worst = _set_agreement(
+        topk_kpool_groups(tight, lengths, GROUP_TOPK).cpu(),
+        topk_kpool_groups(
+            tight.to(torch.bfloat16), lengths, GROUP_TOPK
+        ).cpu(),
+    )
+    print(
+        f"[kpool bf16] tight mean={tight_mean:.4f} worst={tight_worst:.4f}"
+    )
+    assert tight_mean >= 0.99, f"tight bf16 agreement {tight_mean:.4f} < 0.99"
+
+
+@torch.inference_mode()
+def test_bf16_logits_end_to_end_match_the_fp32_served_route():
+    """Token columns out of the public entry point must move no more than the picks."""
+    from sglang.srt.layers.attention.dsa import kpool_fp8_index as kpi
+
+    device = "cuda"
+    rows, pool_cols = 2048, 8192
+    torch.manual_seed(29)
+    logits = torch.randn(rows, pool_cols, dtype=torch.float32, device=device)
+    group_lengths = torch.full((rows,), pool_cols, dtype=torch.int32, device=device)
+    seq_lens = torch.full((rows,), pool_cols * POOL, dtype=torch.int32, device=device)
+    page_table = (
+        torch.arange(rows, device=device, dtype=torch.int64).unsqueeze(1) * TABLE_BASE
+        + torch.arange(pool_cols * POOL, device=device, dtype=torch.int64).unsqueeze(0)
+    ).to(torch.int32)
+
+    with mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True):
+        fp32 = kpi.topk_from_pooled_history_logits(
+            logits, group_lengths, POOL, TOPK, page_table=page_table, seq_lens=seq_lens
+        ).cpu()
+        bf16 = kpi.topk_from_pooled_history_logits(
+            logits.to(torch.bfloat16),
+            group_lengths,
+            POOL,
+            TOPK,
+            page_table=page_table,
+            seq_lens=seq_lens,
+        ).cpu()
+
+    assert bf16.shape == fp32.shape == (rows, TOPK + POOL - 1)
+    mean, worst = _set_agreement(
+        torch.remainder(fp32.clamp(min=0), TABLE_BASE),
+        torch.remainder(bf16.clamp(min=0), TABLE_BASE),
+    )
+    print(f"[kpool bf16] end-to-end mean={mean:.4f} worst={worst:.4f}")
+    assert mean >= 0.99, f"bf16 end-to-end token agreement {mean:.4f} < 0.99"
+    assert bool((bf16[:, TOPK:] == -1).all())
+
+
+@torch.inference_mode()
+def test_bf16_hit_marker_reports_the_emitted_width(caplog):
+    """The served log line is the A/B evidence gate, so it must name the width."""
+    from sglang.srt.layers.attention.dsa import dsa_topk_backend as tb
+
+    device = "cuda"
+    rows, width = 2048, 8192
+    scores = torch.randn(rows, width, dtype=torch.bfloat16, device=device)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+    tb._DEEPSELECT_LOGGED.discard(tb._DEEPSELECT_KPOOL_HIT)
+    with caplog.at_level(logging.INFO), mock.patch.object(
+        envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True
+    ):
+        assert tb.deepselect_kpool_group_ids(scores, lengths, GROUP_TOPK) is not None
+    hit = [
+        r.getMessage()
+        for r in caplog.records
+        if "kpool top-k served by PPU deep_select" in r.getMessage()
+    ]
+    assert hit, "a served call must leave a greppable marker"
+    assert "logits=torch.bfloat16" in hit[0], hit[0]
+
+
+@torch.inference_mode()
+def test_bf16_scores_outside_the_band_run_the_fused_kernel_in_fp32(caplog):
+    """Band-out calls cannot reach the wheel, so the bf16 width must be upcast first."""
+    from sglang.srt.layers.attention.dsa import kpool_fp8_index as kpi
+
+    device = "cuda"
+    rows, pool_cols = 8, 4096
+    torch.manual_seed(31)
+    logits = torch.randn(rows, pool_cols, dtype=torch.float32, device=device)
+    group_lengths = torch.full((rows,), pool_cols, dtype=torch.int32, device=device)
+    seq_lens = torch.full((rows,), pool_cols * POOL, dtype=torch.int32, device=device)
+    page_table = (
+        torch.arange(rows, device=device, dtype=torch.int64).unsqueeze(1) * TABLE_BASE
+        + torch.arange(pool_cols * POOL, device=device, dtype=torch.int64).unsqueeze(0)
+    ).to(torch.int32)
+    kwargs = dict(page_table=page_table, seq_lens=seq_lens)
+
+    with caplog.at_level(logging.INFO), mock.patch.object(
+        envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True
+    ):
+        kpi._KPOOL_ROUTE_LOGGED.clear()
+        via_fp32 = kpi.topk_from_pooled_history_logits(
+            logits, group_lengths, POOL, TOPK, **kwargs
+        ).cpu()
+        caplog.clear()
+        kpi._KPOOL_ROUTE_LOGGED.clear()
+        via_bf16 = kpi.topk_from_pooled_history_logits(
+            logits.to(torch.bfloat16), group_lengths, POOL, TOPK, **kwargs
+        ).cpu()
+    fallback = [
+        r.getMessage()
+        for r in caplog.records
+        if "fell back to the fp32 selection path" in r.getMessage()
+    ]
+    assert fallback, "an unserved bfloat16 call must say that it upcast"
+    # The fallback is a plain width change, not a second numeric path: the selected
+    # score *values* must be identical to a call that was handed the same rounded
+    # values at float32. Column identity is not required, because a bf16-rounded row
+    # has ties at the selection boundary and the incumbent kernel is free to answer
+    # any member of the tied boundary group (the same churn the ties case of
+    # test_kpool_group_ids_match_fused_kernel already allows for).
+    rounded = logits.to(torch.bfloat16).to(torch.float32)
+    same_as_fp32 = kpi.topk_from_pooled_history_logits(
+        rounded.clone(), group_lengths, POOL, TOPK, **kwargs
+    ).cpu()
+    again = kpi.topk_from_pooled_history_logits(
+        rounded.clone(), group_lengths, POOL, TOPK, **kwargs
+    ).cpu()
+    print(
+        "[kpool bf16] fused route bit-reproducible on identical input: "
+        f"{torch.equal(same_as_fp32, again)}"
+    )
+    assert torch.equal(
+        _selected_score_values(rounded, via_bf16),
+        _selected_score_values(rounded, same_as_fp32),
+    ), "the fp32 upcast changed which scores were selected"
+    # bf16 rounding churns boundary pools; that is the whole difference from fp32.
+    mean, _ = _set_agreement(
+        torch.remainder(via_fp32.clamp(min=0), TABLE_BASE),
+        torch.remainder(via_bf16.cpu().clamp(min=0), TABLE_BASE),
+    )
+    assert mean >= 0.99, f"band-out bf16 fallback agreement {mean:.4f} < 0.99"
 
 
 @torch.inference_mode()

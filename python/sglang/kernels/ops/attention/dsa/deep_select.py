@@ -366,14 +366,16 @@ def _pack_kpool_group_scores(
 ):
     """Copy each row's pooled score window into the BF16 staging buffer.
 
-    The kpool producer hands over float32 logits while the wheel accepts BF16 only,
-    and the wheel has no ``begin`` argument. One launch therefore does both jobs the
-    replacement needs: convert the dtype, and move ``[start, start + length)`` to
-    column 0. Selection results stay window-relative on purpose -- the fused kpool
-    kernel stores ``index[pos] = idx`` with ``idx`` already relative to ``row_start``
-    (``kpool_topk_transform.cuh``, ``fast_topk_cuda_tl_impl``) and the group
-    expansion, tail append and page/offset transform downstream consume that same
-    relative convention, so adding the start back here would double-count it.
+    The wheel accepts BF16 only and has no ``begin`` argument. One launch therefore does
+    both jobs the replacement needs: convert the dtype, and move
+    ``[start, start + length)`` to column 0. The conversion is a no-op read when the kpool
+    producer already handed over bfloat16, which happens exactly when the DeepSelect route
+    was predicted to serve that call and the scoring kernel was asked for that width.
+    Selection results stay window-relative on purpose -- the fused kpool kernel stores
+    ``index[pos] = idx`` with ``idx`` already relative to ``row_start``
+    (``kpool_topk_transform.cuh``, ``fast_topk_cuda_tl_impl``) and the group expansion,
+    tail append and page/offset transform downstream consume that same relative
+    convention, so adding the start back here would double-count it.
 
     Rows at or below ``topk`` still get their window copied; the incumbent fused
     kernel reads them too, and skipping the copy would make the two routes differ in

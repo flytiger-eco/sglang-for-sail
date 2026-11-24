@@ -705,6 +705,24 @@ def _pad_kpool_topk_rows(result: torch.Tensor, out_rows: Optional[int]) -> torch
     return padded
 
 
+def _kpool_scores_for_fallback(logits: torch.Tensor) -> torch.Tensor:
+    """Hand the incumbent selection the float32 rows it is built for.
+
+    The producer may now emit bfloat16 when ``kpool_deepselect_will_serve`` predicted a
+    DeepSelect takeover, but both incumbents -- the fused CUDA kernel (its matcher pins
+    ``float`` scores) and ``fast_topk_v2`` -- read float32. Returning a fp32 copy keeps
+    correctness when the prediction misses; it is logged once so a workload that keeps
+    paying the extra conversion is visible instead of silent.
+    """
+    if logits.dtype is torch.float32:
+        return logits
+    _log_kpool_route_once(
+        f"bfloat16 pooled scores fell back to the fp32 selection path "
+        f"(rows={logits.shape[0]} cols={logits.shape[1]})"
+    )
+    return logits.to(torch.float32)
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -737,10 +755,10 @@ def topk_from_pooled_history_logits(
             f"(128, 160, 192, 224, 256, 512, 2048), got {group_topk} "
             f"(topk={topk}, pool_size={pool_size})."
         )
-    if not logits.is_cuda or logits.dtype != torch.float32:
+    if not logits.is_cuda or logits.dtype not in (torch.float32, torch.bfloat16):
         raise NotImplementedError(
-            "index_kpool topk requires CUDA float32 logits; PyTorch topk fallback "
-            f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+            "index_kpool topk requires CUDA float32 or bfloat16 logits; PyTorch topk "
+            f"fallback is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
@@ -793,7 +811,7 @@ def topk_from_pooled_history_logits(
         )
 
         result = fast_kpool_topk_transform_fused(
-            score=logits,
+            score=_kpool_scores_for_fallback(logits),
             lengths=group_lengths.to(torch.int32),
             pool_size=pool_size,
             topk=topk,
