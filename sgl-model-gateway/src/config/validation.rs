@@ -5,8 +5,9 @@ pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
-        Self::validate_mode(&config.mode)?;
+        Self::validate_mode(&config.mode, config.request_timeout_secs)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_prefill_aware_ttl(&config.policy, config.request_timeout_secs)?;
         Self::validate_server_settings(config)?;
 
         if let Some(discovery) = &config.discovery {
@@ -41,6 +42,30 @@ impl ConfigValidator {
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
+        Ok(())
+    }
+
+    /// The `prefill_aware` ledger prunes entries older than its TTL. Pruning a
+    /// request that is still running makes that request's completion drain
+    /// another request's entry, so the TTL must outlive the request timeout.
+    fn validate_prefill_aware_ttl(
+        policy: &PolicyConfig,
+        request_timeout_secs: u64,
+    ) -> ConfigResult<()> {
+        if let PolicyConfig::PrefillAware {
+            pending_ttl_secs, ..
+        } = policy
+        {
+            if *pending_ttl_secs < request_timeout_secs {
+                return Err(ConfigError::InvalidValue {
+                    field: "pending_ttl_secs".to_string(),
+                    value: pending_ttl_secs.to_string(),
+                    reason: format!(
+                        "prefill_aware requires pending_ttl_secs >= request_timeout_secs ({request_timeout_secs})"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -90,7 +115,7 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
+    fn validate_mode(mode: &RoutingMode, request_timeout_secs: u64) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
                 if !worker_urls.is_empty() {
@@ -129,9 +154,11 @@ impl ConfigValidator {
 
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
+                    Self::validate_prefill_aware_ttl(p_policy, request_timeout_secs)?;
                 }
                 if let Some(d_policy) = decode_policy {
                     Self::validate_policy(d_policy)?;
+                    Self::validate_prefill_aware_ttl(d_policy, request_timeout_secs)?;
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
@@ -186,6 +213,50 @@ impl ConfigValidator {
                     return Err(ConfigError::InvalidValue {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::PrefillAware {
+                prefill_weight,
+                eviction_interval_secs,
+                max_tree_size,
+                pending_ttl_secs,
+                tie_tolerance_ratio,
+                ..
+            } => {
+                if !prefill_weight.is_finite() || *prefill_weight < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "prefill_weight".to_string(),
+                        value: prefill_weight.to_string(),
+                        reason: "Must be a finite value >= 0.0".to_string(),
+                    });
+                }
+                if *eviction_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "eviction_interval_secs".to_string(),
+                        value: eviction_interval_secs.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *max_tree_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "max_tree_size".to_string(),
+                        value: max_tree_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if !tie_tolerance_ratio.is_finite() || !(0.0..=1.0).contains(tie_tolerance_ratio) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "tie_tolerance_ratio".to_string(),
+                        value: tie_tolerance_ratio.to_string(),
+                        reason: "Must be between 0.0 and 1.0".to_string(),
+                    });
+                }
+                if *pending_ttl_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "pending_ttl_secs".to_string(),
+                        value: pending_ttl_secs.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }
@@ -653,6 +724,7 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PrefillSelection;
     use crate::core::ConnectionMode;
 
     #[test]
@@ -665,6 +737,60 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_prefill_aware_ttl_must_outlive_request_timeout() {
+        let policy = PolicyConfig::PrefillAware {
+            prefill_weight: 1.0,
+            eviction_interval_secs: 30,
+            max_tree_size: 10_000_000,
+            pending_ttl_secs: 600,
+            tie_tolerance_ratio: 0.02,
+            selection: PrefillSelection::Lexicographic,
+            backlog_epsilon_tokens: 0,
+        };
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            policy.clone(),
+        );
+        config.request_timeout_secs = 1800;
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        config.request_timeout_secs = 600;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_pd_policy_overrides_check_ttl() {
+        let bad = PolicyConfig::PrefillAware {
+            prefill_weight: 1.0,
+            eviction_interval_secs: 30,
+            max_tree_size: 10_000_000,
+            pending_ttl_secs: 600,
+            tie_tolerance_ratio: 0.02,
+            selection: PrefillSelection::Lexicographic,
+            backlog_epsilon_tokens: 0,
+        };
+        let pd = |prefill: Option<PolicyConfig>, decode: Option<PolicyConfig>| {
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://p:8000".to_string(), None)],
+                decode_urls: vec!["http://d:8000".to_string()],
+                prefill_policy: prefill,
+                decode_policy: decode,
+            }
+        };
+
+        // The main policy is valid; only the PD overrides are wrong.
+        let mut config = RouterConfig::new(pd(Some(bad.clone()), None), PolicyConfig::RoundRobin);
+        config.request_timeout_secs = 1800;
+        assert!(ConfigValidator::validate(&config).is_err());
+
+        let mut config = RouterConfig::new(pd(None, Some(bad)), PolicyConfig::RoundRobin);
+        config.request_timeout_secs = 1800;
+        assert!(ConfigValidator::validate(&config).is_err());
     }
 
     #[test]

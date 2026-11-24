@@ -31,6 +31,7 @@ _POLICY_CHOICES = (
     "manual",
     "consistent_hashing",
     "prefix_hash",
+    "prefill_aware",
 )
 
 
@@ -61,6 +62,11 @@ class RouterArgs:
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
+    prefill_weight: float = 1.0
+    prefill_pending_ttl_secs: int = 3600
+    prefill_tie_tolerance_ratio: float = 0.02
+    prefill_selection: str = "lexicographic"
+    prefill_backlog_epsilon_tokens: int = 0
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -336,6 +342,39 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum size of the approximation tree for cache-aware routing",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-weight",
+            type=float,
+            default=RouterArgs.prefill_weight,
+            help="Weight of one not-yet-prefilled character vs one queued character "
+            "for prefill_aware routing (default 1.0)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-pending-ttl-secs",
+            type=int,
+            default=RouterArgs.prefill_pending_ttl_secs,
+            help="TTL of prefill_aware pending entries; must be >= request-timeout-secs",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-tie-tolerance-ratio",
+            type=float,
+            default=RouterArgs.prefill_tie_tolerance_ratio,
+            help="Relative tolerance for randomising among near-equal prefill_aware scores",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-selection",
+            type=str,
+            choices=["lexicographic", "weighted"],
+            default=RouterArgs.prefill_selection,
+            help="prefill_aware selection rule: 'lexicographic' (least pending prefill, "
+            "then least decoding) or 'weighted' (outstanding + weight*new chars)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-backlog-epsilon-tokens",
+            type=int,
+            default=RouterArgs.prefill_backlog_epsilon_tokens,
+            help="Tolerance in tokens for the prefill backlog tier in lexicographic mode",
         )
         routing_group.add_argument(
             f"--{prefix}max-idle-secs",

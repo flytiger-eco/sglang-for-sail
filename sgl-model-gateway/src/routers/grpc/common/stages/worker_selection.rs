@@ -13,7 +13,7 @@ use crate::{
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
         error,
-        grpc::context::{RequestContext, WorkerSelection},
+        grpc::context::{LoadGuards, RequestContext, WorkerSelection},
     },
 };
 
@@ -76,13 +76,13 @@ impl PipelineStage for WorkerSelectionStage {
 
         let headers = ctx.input.headers.as_ref();
 
-        let workers = match self.mode {
+        let (workers, dispatch_tokens) = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self
                     .select_single_worker(ctx.input.model_id.as_deref(), text, tokens, headers)
                     .await
                 {
-                    Some(w) => WorkerSelection::Single { worker: w },
+                    Some((w, token)) => (WorkerSelection::Single { worker: w }, (token, None)),
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
@@ -103,7 +103,10 @@ impl PipelineStage for WorkerSelectionStage {
                     .select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers)
                     .await
                 {
-                    Some((prefill, decode)) => WorkerSelection::Dual { prefill, decode },
+                    Some((prefill, decode, p_token, d_token)) => (
+                        WorkerSelection::Dual { prefill, decode },
+                        (p_token, d_token),
+                    ),
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
@@ -121,6 +124,23 @@ impl PipelineStage for WorkerSelectionStage {
             }
         };
 
+        // Keep the policy that made this selection: `prefill_aware` closes its
+        // per-worker ledger from the load guard's on-drop hook.
+        let policy = match ctx.input.model_id.as_deref() {
+            Some(model) => self.policy_registry.get_policy_or_default(model),
+            None => self.policy_registry.get_default_policy(),
+        };
+        // Take the guards here, immediately after selection charged the ledger:
+        // a later stage failing (client acquisition, request building) would
+        // otherwise drop the context without a completion hook and leave a
+        // phantom backlog until the policy's TTL expires.
+        ctx.state.load_guards = Some(LoadGuards::new(
+            &workers,
+            ctx.input.headers.as_ref(),
+            Some(&policy),
+            dispatch_tokens,
+        ));
+        ctx.state.selected_policy = Some(policy);
         ctx.state.workers = Some(workers);
         Ok(None)
     }
@@ -137,7 +157,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<u64>)> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -167,8 +187,8 @@ impl WorkerSelectionStage {
             .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
         // Select worker using the policy
-        let idx = policy
-            .select_worker(
+        let (idx, dispatch_id) = policy
+            .select_worker_with_token(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
@@ -188,7 +208,7 @@ impl WorkerSelectionStage {
             policy.name(),
         );
 
-        Some(selected)
+        Some((selected, dispatch_id))
     }
 
     async fn select_pd_pair(
@@ -197,7 +217,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>)> {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, Option<u64>, Option<u64>)> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
             None,
@@ -247,8 +267,12 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
-        let decode_idx = policy.select_worker(&available_decode, &info).await?;
+        let (prefill_idx, prefill_token) = policy
+            .select_worker_with_token(&available_prefill, &info)
+            .await?;
+        let (decode_idx, decode_token) = policy
+            .select_worker_with_token(&available_decode, &info)
+            .await?;
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
@@ -270,6 +294,8 @@ impl WorkerSelectionStage {
         Some((
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
+            prefill_token,
+            decode_token,
         ))
     }
 }

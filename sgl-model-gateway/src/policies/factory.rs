@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefillAwarePolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -59,6 +59,26 @@ impl PolicyFactory {
                 };
                 Arc::new(ManualPolicy::with_config(config))
             }
+            PolicyConfig::PrefillAware {
+                prefill_weight,
+                eviction_interval_secs,
+                max_tree_size,
+                pending_ttl_secs,
+                tie_tolerance_ratio,
+                selection,
+                backlog_epsilon_tokens,
+            } => {
+                let config = super::PrefillAwareConfig {
+                    prefill_weight: *prefill_weight,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                    pending_ttl_secs: *pending_ttl_secs,
+                    tie_tolerance_ratio: *tie_tolerance_ratio,
+                    selection: *selection,
+                    backlog_epsilon_tokens: *backlog_epsilon_tokens,
+                };
+                Arc::new(PrefillAwarePolicy::with_config(config))
+            }
             PolicyConfig::ConsistentHashing => Arc::new(ConsistentHashingPolicy::new()),
             PolicyConfig::PrefixHash {
                 prefix_token_count,
@@ -86,6 +106,7 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "prefill_aware" | "prefillaware" => Some(Arc::new(PrefillAwarePolicy::new())),
             _ => None,
         }
     }

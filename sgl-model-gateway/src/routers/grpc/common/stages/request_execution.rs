@@ -8,7 +8,7 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
+        context::{ClientSelection, ExecutionResult, RequestContext, WorkerSelection},
         proto_wrapper::{
             ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
             ProtoStream,
@@ -59,8 +59,9 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        // Create load guards for worker load tracking (increment load when created)
-        // They will be automatically dropped (and decrement load) when RequestContext is dropped
+        // Load guards are taken by the selection stage, right after it charged
+        // the policy ledger; a context that dies before execution still closes
+        // its dispatch because the guards live in `ctx.state`.
         let workers = ctx.state.workers.as_ref().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
@@ -71,8 +72,6 @@ impl PipelineStage for RequestExecutionStage {
                 "Worker selection not completed",
             )
         })?;
-
-        ctx.state.load_guards = Some(LoadGuards::new(workers, ctx.input.headers.as_ref()));
 
         // Extract dispatch metadata for tracing span
         let request_id = ctx

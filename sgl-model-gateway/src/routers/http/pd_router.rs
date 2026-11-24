@@ -30,7 +30,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    policies::{completion_hook, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -531,8 +531,9 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
+        _prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         let status = res.status();
 
@@ -573,8 +574,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
-                decode,
+                decode.clone(),
+                guards,
             )
         } else {
             // Handle non-streaming error response
@@ -658,12 +659,26 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
+        // Guards are taken before dispatch for streaming too: a prefill failure
+        // or a cancellation while awaiting upstream would otherwise leave the
+        // selected workers' ledger entries charged until the policy TTL.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        // PD selection happens in `pick_workers`, which hands back only the
+        // workers, so the dispatch token cannot be carried to the guards yet;
+        // the ledger falls back to releasing the oldest reservation.
+        let guards = vec![
+            WorkerLoadGuard::with_on_drop(
+                prefill.clone(),
+                headers,
+                completion_hook(&prefill_policy, prefill.as_ref(), None),
+            ),
+            WorkerLoadGuard::with_on_drop(
+                decode.clone(),
+                headers,
+                completion_hook(&decode_policy, decode.as_ref(), None),
+            ),
+        ];
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -740,6 +755,9 @@ impl PDRouter {
             Ok(resp) => !resp.status().is_success(),
             Err(_) => true,
         };
+        if let Some(guard) = guards.first() {
+            guard.set_success(!prefill_failed);
+        }
 
         if prefill_failed {
             warn!(
@@ -785,6 +803,9 @@ impl PDRouter {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                if let Some(guard) = guards.get(1) {
+                    guard.set_success(status.is_success());
+                }
                 debug!("Decode response status: {}", status);
 
                 if !status.is_success() {
@@ -823,7 +844,7 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, prefill, decode, guards)
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -874,8 +895,8 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        guards,
                     )
                 } else {
                     // Non-streaming response
@@ -1114,8 +1135,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        guards: Vec<WorkerLoadGuard>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1204,10 +1225,11 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
+        // Both workers are settled by the decode response status: a prefill
+        // failure aborts the paired decode, so it surfaces here as non-2xx.
+        for guard in &guards {
+            guard.set_success(status.is_success());
+        }
 
         let mut response = Response::new(body);
         *response.status_mut() = status;
@@ -2040,14 +2062,18 @@ mod tests {
         let stream = UnboundedReceiverStream::new(rx);
 
         {
+            let guards = vec![
+                WorkerLoadGuard::with_on_drop(prefill_ref.clone(), None, None),
+                WorkerLoadGuard::with_on_drop(decode_ref.clone(), None, None),
+            ];
             let response = router.create_streaming_response(
                 stream.map(Ok),
                 StatusCode::OK,
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
+                guards,
             );
 
             // Guards are now attached to response body, so load should be 1

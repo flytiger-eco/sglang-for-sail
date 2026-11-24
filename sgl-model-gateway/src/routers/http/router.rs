@@ -23,7 +23,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{completion_hook, first_token_hook, PolicyRegistry, SelectWorkerInfo},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -136,7 +136,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Option<u64>)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -168,8 +168,8 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy
-            .select_worker(
+        let (idx, dispatch_id) = policy
+            .select_worker_with_token(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
@@ -188,7 +188,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((available[idx].clone(), dispatch_id))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -279,11 +279,11 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
+        let (worker, dispatch_id) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
         {
-            Some(w) => w,
+            Some((w, token)) => (w, token),
             None => {
                 return error::service_unavailable(
                     "no_available_workers",
@@ -297,9 +297,23 @@ impl Router {
             None => self.policy_registry.get_default_policy(),
         };
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+        let load_guard = match policy.name() {
+            "cache_aware" | "manual" => Some(WorkerLoadGuard::new(worker.clone(), headers)),
+            "prefill_aware" => Some(WorkerLoadGuard::with_on_drop(
+                worker.clone(),
+                headers,
+                completion_hook(&policy, worker.as_ref(), dispatch_id),
+            )),
+            _ => None,
+        };
+        // Streaming only: the first chunk marks the end of this dispatch's
+        // prefill, which the policy needs to split prefill from decode load.
+        // Non-streaming bodies arrive in one piece, so they settle at the end.
+        let first_token = if is_stream {
+            first_token_hook(&policy, worker.as_ref(), dispatch_id)
+        } else {
+            None
+        };
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -308,7 +322,15 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                &worker,
+                is_stream,
+                load_guard,
+                first_token,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -484,6 +506,7 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -492,6 +515,7 @@ impl Router {
         worker: &Arc<dyn Worker>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        first_token: Option<Box<dyn FnOnce() + Send + Sync>>,
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
@@ -591,6 +615,13 @@ impl Router {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
+        // Settle the request outcome before the guard is consumed: streaming
+        // guards outlive this function, so they must not see the optimistic
+        // default. (Mid-stream failures are tracked by the circuit breaker.)
+        if let Some(ref guard) = load_guard {
+            guard.set_success(status.is_success());
+        }
+
         if !is_stream {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -635,7 +666,19 @@ impl Router {
             if !status.is_success() {
                 tracked.mark_errored();
             }
-            let body = Body::from_stream(tracked);
+            let body = match first_token {
+                Some(hook) => {
+                    let mut armed = Some(hook);
+                    let body = tracked.map(move |item| {
+                        if let Some(fire) = armed.take() {
+                            fire();
+                        }
+                        item
+                    });
+                    Body::from_stream(body)
+                }
+                None => Body::from_stream(tracked),
+            };
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
