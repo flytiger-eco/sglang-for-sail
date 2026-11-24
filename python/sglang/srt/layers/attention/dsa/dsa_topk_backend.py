@@ -171,7 +171,38 @@ class DSATopKBackend(Enum):
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
-            return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+            # PD IndexShare requires request-local IDs, not fused physical
+            # indices. Keep that contract while permitting BF16 selection.
+            if (
+                self.is_sgl_kernel()
+                and topk_transform_method == TopkTransformMethod.RAGGED
+                and logits.dtype == torch.bfloat16
+                and 0 < topk <= 2048
+                and lengths.shape[0] == logits.shape[0]
+            ):
+                raw_offsets = torch.zeros_like(lengths, dtype=torch.int32)
+                deepselect = _deepselect_ragged_topk(
+                    logits, lengths, topk, raw_offsets, row_starts, attn_metadata
+                )
+                if deepselect is not None:
+                    return deepselect
+                if (
+                    envs.SGLANG_DSA_RAGGED_BF16_TOPK.get()
+                    and logits.stride(1) == 1
+                    and logits.stride(0) % 4 == 0
+                    and logits.data_ptr() % (logits.element_size() * 4) == 0
+                ):
+                    from sglang.kernels.ops.attention.dsv4.topk import (
+                        topk_transform_ragged_v2,
+                    )
+                    out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+                    topk_transform_ragged_v2(
+                        logits, lengths, out_offsets=raw_offsets,
+                        out_indices=out, row_starts=row_starts,
+                    )
+                    return out
+            score = logits if logits.dtype == torch.float32 else logits.float()
+            return self.topk_func(score, lengths, topk, row_starts=row_starts)
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
