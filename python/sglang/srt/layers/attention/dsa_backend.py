@@ -836,7 +836,9 @@ class DeepseekSparseAttnBackend(
             return _to_2d_context_lens(seqlens_expanded, batch_size)
         return _to_2d_context_lens(cache_seqlens_int32, batch_size)
 
-    def _paged_mqa_schedule_metadata_extra(self) -> Tuple[int, int, int, int]:
+    def _paged_mqa_schedule_metadata_extra(
+        self, next_n: int = 1
+    ) -> Tuple[int, int, int, int | torch.dtype]:
         query_head_dim = self.indexer_head_dim
         pool = self.token_to_kv_pool
         if hasattr(pool, "use_fp4_indexer"):
@@ -849,8 +851,8 @@ class DeepseekSparseAttnBackend(
             # unpacked width and faults inside the paged FP4 MQA kernel.
             use_fp4 = _fp4_indexer_cache_active()
         if use_fp4:
-            # The PPU planner expects two FP4 values packed into each byte.
-            query_head_dim //= 2
+            # Native metadata uses logical D; int8 identifies MXFP4 on M890.
+            return (next_n, self.indexer_n_heads, query_head_dim, torch.int8)
         return (
             1,  # next_n
             self.indexer_n_heads,  # indexer heads, independent of MLA/attention TP
@@ -867,7 +869,11 @@ class DeepseekSparseAttnBackend(
             64,
             deep_gemm.get_num_sms(),
             **(
-                dict(metadata_extra=self._paged_mqa_schedule_metadata_extra())
+                dict(
+                    metadata_extra=self._paged_mqa_schedule_metadata_extra(
+                        next_n=seqlens_32_2d.shape[1]
+                    )
+                )
                 if _is_ppu
                 else {}
             ),

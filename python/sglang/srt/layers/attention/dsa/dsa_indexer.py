@@ -905,6 +905,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
+                logits_dtype=torch.float32,
             )
 
         if self.bf16_indexer:
@@ -2235,6 +2236,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
 
+        pool = get_token_to_kv_pool()
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
         # FP4 path: the norm+rope fallback produces bf16 key here; this store
         # kernel performs MXFP4 block quantization and writes the FP4 cache layout.
         if self.use_fp4:
@@ -2253,12 +2260,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out_cache_loc,
                 get_token_to_kv_pool().page_size,
             )
-            return
-
-        pool = get_token_to_kv_pool()
-        if hasattr(pool, "invalidate_index_buffer_for_layer"):
-            pool.invalidate_index_buffer_for_layer(layer_id)
-        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
         # int8 path: per-token int8 quantization + store (no fused FP8 store kernel).
