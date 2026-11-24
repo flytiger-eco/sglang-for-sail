@@ -2280,10 +2280,12 @@ class DeepseekSparseAttnBackend(
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                if topk_indices is not None:
-                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
+                # Offsets describe real queries; CP padding has no KV offsets.
+                real_topk_rows = topk_indices_offset.shape[0]
+                assert real_topk_rows <= topk_indices.shape[0] <= q_nope.shape[0]
+                topk_indices = topk_indices[:real_topk_rows]
                 mask = topk_indices != -1
                 topk_indices_offset = (
                     topk_indices_offset.unsqueeze(1)
@@ -2293,6 +2295,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices = torch.where(
                     mask, topk_indices + topk_indices_offset, topk_indices
                 )
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
