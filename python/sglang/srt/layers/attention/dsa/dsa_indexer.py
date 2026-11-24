@@ -910,7 +910,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 schedule_meta,
                 max_context_len,
                 clean_logits=clean_logits,
-                logits_dtype=torch.float32,
             )
 
         if self.bf16_indexer:
