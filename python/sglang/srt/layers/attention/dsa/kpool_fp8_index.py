@@ -1,6 +1,8 @@
 from functools import lru_cache
 from typing import Optional, Tuple
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +17,22 @@ from sglang.srt.utils import get_device_sm, is_ppu
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+logger = logging.getLogger(__name__)
+_KPOOL_ROUTE_LOGGED: set = set()
+
+
+def _log_kpool_route_once(reason: str) -> None:
+    """Report one kpool selection call that could not be handed to PPU DeepSelect.
+
+    Every non-serving decision has to say why, once: a silent skip previously read as
+    "no such call exists". No file is touched and the set is consulted before logging,
+    so a hot decode step pays a set lookup and nothing else.
+    """
+    if reason in _KPOOL_ROUTE_LOGGED:
+        return
+    _KPOOL_ROUTE_LOGGED.add(reason)
+    logger.warning("index_kpool top-k handed to the fused kernel: %s", reason)
 
 
 @lru_cache(maxsize=1)
@@ -693,32 +711,46 @@ def topk_from_pooled_history_logits(
 
     if group_topk in (128, 160, 192, 224, 256, 512):
         # ``page_table_row_index`` addresses the page table through the request pool,
-        # which the group-expansion helper does not take; those calls stay on the
-        # fused kernel (they are the MTP-replay shape, never the served band anyway).
-        if page_table_row_index is None:
-            from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
-                deepselect_kpool_group_ids,
-            )
+        # which the group-expansion helper does not take. Instead of leaving those
+        # calls -- the prefill majority, since the ragged PAGED plan always supplies a
+        # row index -- silently on the fused kernel, resolve the per-query page row
+        # first and hand the expansion the same per-row table it already understands.
+        page_table_for_groups = page_table
+        if page_table_row_index is not None:
+            index_rows = page_table_row_index.shape[0]
+            if index_rows != logits.shape[0]:
+                _log_kpool_route_once(
+                    "page_table_row_index rows "
+                    f"{index_rows} != logits rows {logits.shape[0]}"
+                )
+            else:
+                page_table_for_groups = page_table.index_select(
+                    0, page_table_row_index.to(torch.long)
+                )
 
-            group_ids = deepselect_kpool_group_ids(
-                logits=logits,
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+            deepselect_kpool_group_ids,
+        )
+
+        group_ids = deepselect_kpool_group_ids(
+            logits=logits,
+            group_lengths=group_lengths,
+            group_topk=group_topk,
+            row_starts=row_starts,
+        )
+        if group_ids is not None:
+            return _finish_kpool_group_selection(
+                group_ids,
+                cols=cols,
                 group_lengths=group_lengths,
                 group_topk=group_topk,
-                row_starts=row_starts,
+                topk=topk,
+                pool_size=pool_size,
+                page_table=page_table_for_groups,
+                topk_offsets=topk_offsets,
+                seq_lens=seq_lens,
+                out_rows=out_rows,
             )
-            if group_ids is not None:
-                return _finish_kpool_group_selection(
-                    group_ids,
-                    cols=cols,
-                    group_lengths=group_lengths,
-                    group_topk=group_topk,
-                    topk=topk,
-                    pool_size=pool_size,
-                    page_table=page_table,
-                    topk_offsets=topk_offsets,
-                    seq_lens=seq_lens,
-                    out_rows=out_rows,
-                )
 
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,

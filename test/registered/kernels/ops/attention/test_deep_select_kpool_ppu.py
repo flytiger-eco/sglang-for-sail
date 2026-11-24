@@ -208,6 +208,70 @@ def test_pooled_topk_end_to_end_matches_fused_route():
 
 
 @torch.inference_mode()
+def test_pooled_topk_matches_fused_route_with_page_table_row_index():
+    """Prefill calls address the page table through the request pool, not by query row.
+
+    The entry used to refuse those calls outright, which is exactly the shape the
+    served band exists for, so the row-index gather has to reproduce the fused
+    kernel's per-query page row -- including which request row a column came from.
+    """
+    from sglang.srt.layers.attention.dsa import kpool_fp8_index as kpi
+
+    device = "cuda"
+    rows, pool_cols, req_rows = 2048, 8192, 8
+    token_cols = pool_cols * POOL
+    seq_len = token_cols
+    torch.manual_seed(17)
+    logits = torch.randn(rows, pool_cols, dtype=torch.float32, device=device)
+    group_lengths = torch.full((rows,), pool_cols, dtype=torch.int32, device=device)
+    seq_lens = torch.full((rows,), seq_len, dtype=torch.int32, device=device)
+    # Request-pool table: the high part names the request row, the low part the column.
+    page_table = (
+        torch.arange(req_rows, device=device, dtype=torch.int64).unsqueeze(1) * TABLE_BASE
+        + torch.arange(token_cols, device=device, dtype=torch.int64).unsqueeze(0)
+    ).to(torch.int32)
+    row_index = torch.arange(rows, device=device, dtype=torch.int32) % req_rows
+
+    served_rows, served_cols = ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS
+    ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS = 4, 64
+    try:
+        with mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True):
+            on = kpi.topk_from_pooled_history_logits(
+                logits,
+                group_lengths,
+                POOL,
+                TOPK,
+                page_table=page_table,
+                seq_lens=seq_lens,
+                page_table_row_index=row_index,
+            ).cpu()
+        off = kpi.topk_from_pooled_history_logits(
+            logits,
+            group_lengths,
+            POOL,
+            TOPK,
+            page_table=page_table,
+            seq_lens=seq_lens,
+            page_table_row_index=row_index,
+        ).cpu()
+    finally:
+        ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS = served_rows, served_cols
+
+    assert on.shape == off.shape == (rows, TOPK + POOL - 1)
+    on_cols = torch.remainder(on.clamp(min=0), TABLE_BASE)
+    off_cols = torch.remainder(off.clamp(min=0), TABLE_BASE)
+    mean, _worst = _set_agreement(off_cols, on_cols)
+    assert mean >= 0.99, f"row-index end-to-end token-set agreement {mean:.4f} < 0.99"
+    # The request row must survive the gather: every served column came from the pool
+    # row this query is mapped to. A missing or misaligned gather fails here.
+    on_req = torch.div(on.clamp(min=0), TABLE_BASE, rounding_mode="floor")
+    expected = row_index.cpu().unsqueeze(1).expand_as(on_req)
+    valid = on >= 0
+    assert bool((on_req[valid] == expected[valid]).all()), "page row index lost in gather"
+    assert bool((on[:, TOPK:] == -1).all()) and bool((off[:, TOPK:] == -1).all())
+
+
+@torch.inference_mode()
 def test_bf16_staging_buffer_is_reused_not_reallocated(monkeypatch):
     """The staging block is allocated once per device and only grown, never per call."""
     device = torch.device("cuda")
