@@ -141,6 +141,7 @@ def _fake_native(calls, expected, logits):
 
     module.topk_transform_ragged = topk_transform_ragged
     module.paged_topk_skip_reason = paged_topk_skip_reason
+    module.paged_topk_shape_reason = paged_topk_shape_reason
     module.topk_transform_paged = topk_transform_paged
     return module
 
