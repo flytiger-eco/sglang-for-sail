@@ -848,7 +848,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.bf16_indexer:
             kv_cache = kv[0].view(torch.bfloat16)
-            # bf16 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
+            # bf16 backend always emits fp32 logits here (the width is left at the
+            # library default), safe for both topk paths.
             return deep_gemm.bf16_mqa_logits(
                 q,
                 kv_cache,
@@ -859,7 +860,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif self.use_fp8:
             kv_cache = (kv[0].view(torch.float8_e4m3fn), kv[1])
-            # fp8 backend always emits fp32 logits (no logits_dtype param), safe for both topk paths.
+            # fp8 backend always emits fp32 logits here (the width is left at the
+            # library default), safe for both topk paths.
             return deep_gemm.fp8_mqa_logits(
                 q,
                 kv_cache,

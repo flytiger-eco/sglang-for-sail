@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib.util
+import inspect
 import logging
 from enum import Enum, IntEnum, auto
+from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -16,6 +19,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _DEEPSELECT_HIT = "__deepselect_hit__"
 _DEEPSELECT_PAGED_HIT = "__deepselect_paged_hit__"
+_DEEPSELECT_KPOOL_HIT = "__deepselect_kpool_hit__"
 _DEEPSELECT_LOGGED: set = set()
 logger = logging.getLogger(__name__)
 
@@ -787,6 +791,142 @@ def _deepselect_paged_bf16_topk(
             page_table_per_query.shape[1],
         )
     return out
+
+
+@lru_cache(maxsize=None)
+def _deep_select_importable() -> bool:
+    """Whether the PPU deep_select wheel is present, without importing it here."""
+    return importlib.util.find_spec("deep_select") is not None
+
+
+@lru_cache(maxsize=None)
+def _emits_bf16_logits(fn: object) -> bool:
+    """Whether this DeepGEMM build accepts ``logits_dtype``.
+
+    Older images expose only float32 output; asking a build that has no such keyword
+    for bf16 would raise inside the scored hot path, so the capability is probed once
+    per function object and a missing keyword permanently keeps the fp32 route.
+    """
+    try:
+        return "logits_dtype" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return "logits_dtype" in (getattr(fn, "__doc__", "") or "")
+
+
+def kpool_bf16_scoring_supported(fn: object) -> bool:
+    """Public form of the DeepGEMM bf16-output probe."""
+    return _emits_bf16_logits(fn)
+
+
+def kpool_deepselect_will_serve(
+    rows: int, cols: int, group_topk: int, *, logits_dtype: torch.dtype = torch.float32
+) -> bool:
+    """Host-side mirror of what :func:`deepselect_kpool_group_ids` will decide.
+
+    Used one level up -- by the pooled-score producer -- so a call that is certain to
+    be served can ask DeepGEMM for bf16 output directly and skip the fp32 round trip.
+    Every condition is the same test the serving path applies, so a ``True`` here can
+    only be refused later by facts this function cannot see (an unexpected row/window
+    mismatch), and the consumer keeps a fallback for that. Reads host-side values only:
+    no device synchronisation, which is what keeps this cheap enough for the hot path.
+    """
+    if not envs.SGLANG_DSA_DEEPSELECT.get() or not is_ppu():
+        return False
+    if not _deep_select_importable():
+        return False
+    from sglang.kernels.ops.attention.dsa.deep_select import (
+        KPOOL_SUPPORTED_GROUP_TOPK,
+        kpool_group_topk_shape_reason,
+    )
+
+    if group_topk not in KPOOL_SUPPORTED_GROUP_TOPK:
+        return False
+    if logits_dtype not in (torch.float32, torch.bfloat16):
+        return False
+    return kpool_group_topk_shape_reason(rows, cols, group_topk) is None
+
+
+def _deepselect_kpool_skip_reason(
+    logits: torch.Tensor, group_topk: int
+) -> Optional[str]:
+    """Return why a kpool group-level call cannot use the PPU DeepSelect kernel, else None."""
+    from sglang.kernels.ops.attention.dsa.deep_select import (
+        KPOOL_SUPPORTED_GROUP_TOPK,
+        kpool_group_topk_shape_reason,
+    )
+
+    if not is_ppu():
+        return "not a PPU device"
+    if logits.dim() != 2:
+        return f"kpool logits rank {logits.dim()} != 2"
+    # The producer may hand over float32 (the historical route) or bfloat16 (asked for
+    # when ``kpool_deepselect_will_serve`` predicted this call would be served); the
+    # staging pack converts either, so both are servable.
+    if logits.dtype not in (torch.float32, torch.bfloat16):
+        return f"kpool logits dtype {logits.dtype} is neither float32 nor bfloat16"
+    reason = kpool_group_topk_shape_reason(logits.shape[0], logits.shape[1], group_topk)
+    if reason is not None:
+        return reason
+    if group_topk not in KPOOL_SUPPORTED_GROUP_TOPK:
+        # Unreachable through the shape reason above; kept so a widened bucket list
+        # in one module cannot silently ship an unserved bucket.
+        return f"pool-level topk {group_topk} is not a served kpool bucket"
+    return None
+
+
+def deepselect_kpool_group_ids(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    group_topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Serve one kpool group-level top-k from the PPU(sail) deep_select wheel.
+
+    ``logits`` are the pooled (one score per ``index_kpool`` tokens) float32 or bfloat16
+    rows the Flash indexer produces; this returns int32 pooled-column ids inside each row's
+    own window -- valid entries first and -1 past each row's length -- which is the same
+    convention the fused kpool kernel's selection uses, so the caller can run them
+    through the existing group-expansion, tail-append and page/offset transform
+    helpers. Only the selection is replaced.
+
+    Returns None -- leaving the caller on the fused kpool kernel -- when the switch is
+    off or a precondition is unmet. A precondition missed while the switch is on is
+    logged once, so a run that never reached DeepSelect fails a gate instead of being
+    measured as if it had.
+    """
+    if not envs.SGLANG_DSA_DEEPSELECT.get():
+        return None
+    reason = _deepselect_kpool_skip_reason(logits, group_topk)
+    if reason is not None:
+        if reason not in _DEEPSELECT_LOGGED:
+            _DEEPSELECT_LOGGED.add(reason)
+            logger.warning("SGLANG_DSA_DEEPSELECT is on but skipped: %s", reason)
+        return None
+
+    from sglang.kernels.ops.attention.dsa.deep_select import topk_kpool_groups
+
+    try:
+        group_ids = topk_kpool_groups(
+            logits, group_lengths, group_topk, row_starts=row_starts
+        )
+    except ImportError:
+        reason = "the deep_select wheel is not importable on this device"
+        if reason not in _DEEPSELECT_LOGGED:
+            _DEEPSELECT_LOGGED.add(reason)
+            logger.warning("SGLANG_DSA_DEEPSELECT is on but skipped: %s", reason)
+        return None
+
+    if _DEEPSELECT_KPOOL_HIT not in _DEEPSELECT_LOGGED:
+        _DEEPSELECT_LOGGED.add(_DEEPSELECT_KPOOL_HIT)
+        logger.info(
+            "DSA kpool top-k served by PPU deep_select "
+            "(rows=%d cols=%d group_topk=%d logits=%s)",
+            logits.shape[0],
+            logits.shape[1],
+            group_topk,
+            logits.dtype,
+        )
+    return group_ids
 
 
 def _topk_transform_v2_ragged(

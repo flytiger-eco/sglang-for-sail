@@ -87,6 +87,59 @@ def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
     )
 
 
+def _kpool_scoring_dtype(rows: int, cols: int, group_topk: int) -> torch.dtype:
+    """Pick the pooled-score output width for one scoring call.
+
+    Returns bfloat16 only when the DeepSelect route is predicted to take this exact call
+    over, so the fp32 logits buffer and the dtype conversion inside the staging pack
+    disappear from the served path. Everything else -- switch off, non-PPU, small shape,
+    missing wheel -- keeps today's float32, byte for byte.
+    """
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        kpool_deepselect_will_serve,
+    )
+
+    if kpool_deepselect_will_serve(rows, cols, group_topk, logits_dtype=torch.bfloat16):
+        return torch.bfloat16
+    return torch.float32
+
+
+def _kpool_bf16_scoring_supported(fn: object) -> bool:
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        kpool_bf16_scoring_supported,
+    )
+
+    return kpool_bf16_scoring_supported(fn)
+
+
+def _kpool_bf16_request(
+    fn: object, logits_dtype: torch.dtype
+) -> Tuple[torch.dtype, Dict[str, torch.dtype]]:
+    """Resolve a bfloat16 request against the kernel that would have to honour it.
+
+    Returns the width that kernel will really emit together with the keywords to pass it.
+    A build without the ``logits_dtype`` parameter always returns float32 and gets no
+    keyword at all, so an unavailable library feature degrades to today's behaviour instead
+    of raising.
+    """
+    if logits_dtype is not torch.bfloat16 or not _kpool_bf16_scoring_supported(fn):
+        return torch.float32, {}
+    return torch.bfloat16, {"logits_dtype": torch.bfloat16}
+
+
+def _kpool_weights_for_logits(
+    weights: torch.Tensor, logits_dtype: torch.dtype
+) -> torch.Tensor:
+    """Match the gate width the library requires for the logits width it emits.
+
+    bfloat16 logits require bfloat16 gates and float32 logits require float32 gates. The
+    tensor is one gate value per head per query, so the cast is negligible next to the
+    rows-by-cols logits buffer whose width it decides.
+    """
+    required = torch.bfloat16 if logits_dtype is torch.bfloat16 else torch.float32
+    return weights if weights.dtype is required else weights.to(required)
+
+
 def _slice_rows(
     *, tensor: Optional[torch.Tensor], rows: slice
 ) -> Optional[torch.Tensor]:
@@ -997,11 +1050,22 @@ class IndexerKPool(MultiPlatformOp):
         ends: torch.Tensor,
         *,
         clean_logits: bool,
+        logits_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm.
+
+        ``logits_dtype=bfloat16`` is only a request: the ROCm/AITER and tilelang routes
+        have no such parameter, and an older DeepGEMM build may lack the keyword, so the
+        returned tensor can still be float32. Callers must therefore feed whatever came
+        back into the shared entry point, which accepts both widths.
+        """
         # PPU int8: PPU 1.0/1.1 (SM80) cannot run DeepGEMM's fp8 MQA logits; use
         # the int8 shim instead. Instance method now, to read self.use_int8.
         if self.use_int8:
+            logits_dtype, dtype_kwargs = _kpool_bf16_request(
+                deep_gemm.int8_mqa_logits, logits_dtype
+            )
+            weights = _kpool_weights_for_logits(weights, logits_dtype)
             return deep_gemm.int8_mqa_logits(
                 q_fp8,
                 (k_fp8, k_scale),
@@ -1009,6 +1073,7 @@ class IndexerKPool(MultiPlatformOp):
                 starts,
                 ends,
                 clean_logits=clean_logits,
+                **dtype_kwargs,
             )
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
@@ -1047,8 +1112,18 @@ class IndexerKPool(MultiPlatformOp):
                 )
             return logits
 
+        logits_dtype, dtype_kwargs = _kpool_bf16_request(
+            deep_gemm.fp8_mqa_logits, logits_dtype
+        )
+        weights = _kpool_weights_for_logits(weights, logits_dtype)
         return deep_gemm.fp8_mqa_logits(
-            q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
+            q_fp8,
+            (k_fp8, k_scale),
+            weights,
+            starts,
+            ends,
+            clean_logits=clean_logits,
+            **dtype_kwargs,
         )
 
     @staticmethod
@@ -1166,6 +1241,18 @@ class IndexerKPool(MultiPlatformOp):
                 if self.use_int8
                 else deep_gemm.fp8_paged_mqa_logits
             )
+            # This is the only producer branch that can emit bfloat16 (tilelang and AITER
+            # have no such parameter), and the emitted width is exactly
+            # ``pool_max_seq_len``, so the takeover prediction uses that number.
+            logits_dtype, dtype_kwargs = _kpool_bf16_request(
+                paged_mqa_logits,
+                _kpool_scoring_dtype(
+                    q_fp8.shape[0],
+                    pool_max_seq_len,
+                    self.index_topk // self.index_kpool,
+                ),
+            )
+            weights = _kpool_weights_for_logits(weights, logits_dtype)
             logits = paged_mqa_logits(
                 q_fp8.unsqueeze(1),
                 kv_cache_fp8,
@@ -1175,6 +1262,7 @@ class IndexerKPool(MultiPlatformOp):
                 pool_schedule_metadata,
                 pool_max_seq_len,
                 clean_logits=False,
+                **dtype_kwargs,
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
@@ -1228,6 +1316,13 @@ class IndexerKPool(MultiPlatformOp):
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
                     clean_logits=True,
+                    # Width of the emitted logits is the pooled k rows of this chunk, so
+                    # the takeover prediction below uses exactly that column count.
+                    logits_dtype=_kpool_scoring_dtype(
+                        rows.stop - rows.start,
+                        k_fp8.shape[0],
+                        self.index_topk // self.index_kpool,
+                    ),
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
