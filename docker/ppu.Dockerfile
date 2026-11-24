@@ -13,7 +13,7 @@ ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-u
 # Avoid CUDA diffusion dependencies from all and torch-for-sail/triton-for-sail
 # wrapper distributions from all_sail.
 ARG BUILD_TYPE=runtime_common,tracing
-# Match the community v0.5.23 Python dependency pins.
+# Match the community v1.0.0 Python dependency pins.
 ARG TRANSFORMERS_VERSION=5.19.0
 ARG DEEPSEEK_RECIPE_VERSION=0.2.0
 ARG PIP_DEFAULT_INDEX
@@ -61,6 +61,7 @@ ARG UBUNTU_MIRROR
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     PIP_ROOT_USER_ACTION=ignore \
+    PIP_EXTRA_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
     PPU_SDK=/usr/local/PPU_SDK \
     PPU_HOME=/usr/local/PPU_SDK
 # Preserve the base image's CUDA_HOME/CUDA_PATH for its actual compiler mode.
@@ -256,6 +257,11 @@ RUN mkdir -p /sgl-workspace/sglang /root/.cache/huggingface /root/.cache/sglang 
     && python3 -c "import sglang, sglang_router, torch, deepseek_recipe; from importlib.metadata import version; assert version('transformers') == '${TRANSFORMERS_VERSION}'; assert version('deepseek-recipe') == '${DEEPSEEK_RECIPE_VERSION}'; print('sglang:', sglang.__version__, 'sglang-kernel:', version('sglang-kernel'), 'sglang-router:', version('sglang-router'), 'torch:', torch.__version__, 'transformers:', version('transformers'), 'deepseek-recipe:', version('deepseek-recipe'))"
 
 RUN python3 -c "from torchcodec.decoders import AudioDecoder, VideoDecoder; from importlib.metadata import version; print('TorchCodec 音视频解码器加载成功:', version('torchcodec'))"
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    blake3 evalscope==1.14.0 \
+    && python3 -c "import blake3, evalscope; from importlib.metadata import version; print('blake3:', version('blake3'), 'evalscope:', version('evalscope'))"
 
 ENV SGLANG_RUST_BUILD_MODE=never
 
