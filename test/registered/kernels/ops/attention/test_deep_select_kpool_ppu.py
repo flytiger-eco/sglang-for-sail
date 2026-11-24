@@ -234,6 +234,8 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
 
     served_rows, served_cols = ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS
     ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS = 4, 64
+    torch.cuda.reset_peak_memory_stats()
+    base_bytes = torch.cuda.memory_allocated()
     try:
         with mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True):
             on = kpi.topk_from_pooled_history_logits(
@@ -245,6 +247,9 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
                 seq_lens=seq_lens,
                 page_table_row_index=row_index,
             ).cpu()
+        peak_bytes = torch.cuda.max_memory_allocated() - base_bytes
+        torch.cuda.reset_peak_memory_stats()
+        base_off = torch.cuda.memory_allocated()
         off = kpi.topk_from_pooled_history_logits(
             logits,
             group_lengths,
@@ -254,8 +259,28 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
             seq_lens=seq_lens,
             page_table_row_index=row_index,
         ).cpu()
+        peak_off = torch.cuda.max_memory_allocated() - base_off
     finally:
         ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS = served_rows, served_cols
+
+    # Materialising one page-table row per query would cost rows x token_cols x 4 bytes
+    # (256 MiB at this shape) on top of everything else; the indexed route must not.
+    # Its peak is also required to stay in the same order as the fused route it mirrors,
+    # so the shared expansion chain is not quietly copying the table either.
+    copy_cost = rows * token_cols * page_table.element_size()
+    result_cost = rows * (TOPK + POOL - 1) * 4
+    assert peak_bytes < copy_cost, (
+        f"row-index route allocated {peak_bytes / 2**20:.1f} MiB peak, a full per-query "
+        f"table copy alone would be {copy_cost / 2**20:.1f} MiB"
+    )
+    assert peak_bytes <= peak_off * 2 + result_cost, (
+        f"indexed peak {peak_bytes / 2**20:.1f} MiB vs fused route "
+        f"{peak_off / 2**20:.1f} MiB"
+    )
+    assert peak_off >= result_cost, (
+        f"fused-route peak {peak_off / 2**20:.1f} MiB below the "
+        f"{result_cost / 2**20:.1f} MiB result -- measurement not meaningful"
+    )
 
     assert on.shape == off.shape == (rows, TOPK + POOL - 1)
     on_cols = torch.remainder(on.clamp(min=0), TABLE_BASE)

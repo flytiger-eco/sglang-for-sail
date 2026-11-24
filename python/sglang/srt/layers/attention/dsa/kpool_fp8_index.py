@@ -445,6 +445,7 @@ def expand_pooled_groups_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert group_ids.ndim == 2
     assert group_valid.shape == group_ids.shape
@@ -464,9 +465,20 @@ def expand_pooled_groups_to_topk(
 
     if page_table is not None:
         assert page_table.ndim == 2
-        assert page_table.shape[0] == group_ids.shape[0]
         safe_ids = token_ids.clamp(min=0, max=page_table.shape[1] - 1)
-        output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        if page_table_row_index is None:
+            assert page_table.shape[0] == group_ids.shape[0]
+            output = torch.gather(page_table, dim=1, index=safe_ids).to(torch.int32)
+        else:
+            # Prefill shares one request-pool row across many query rows. Indexing the
+            # table with the row vector writes only the rows x topk result, instead of
+            # materializing a per-query copy of the full context table.
+            assert page_table_row_index.ndim == 1
+            assert page_table_row_index.shape[0] == group_ids.shape[0]
+            row_ids = page_table_row_index.to(torch.long).unsqueeze(1).expand_as(
+                safe_ids
+            )
+            output = page_table[row_ids, safe_ids].to(torch.int32)
     elif topk_offsets is not None:
         if topk_offsets.ndim == 2:
             assert topk_offsets.shape[1] == 1
@@ -486,6 +498,7 @@ def append_kpool_tail_to_topk(
     pool_size: int,
     page_table: torch.Tensor | None = None,
     topk_offsets: torch.Tensor | None = None,
+    page_table_row_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert topk_result.dtype == torch.int32
     assert seq_lens.ndim == 1
@@ -522,6 +535,16 @@ def append_kpool_tail_to_topk(
         assert topk_offsets.ndim == 1
         has_topk_offsets = True
 
+    has_row_index = page_table_row_index is not None
+    if has_row_index:
+        assert page_table is not None
+        assert page_table_row_index.ndim == 1
+        assert page_table_row_index.shape[0] == topk_result.shape[0]
+        row_index = page_table_row_index.to(torch.int32)
+    else:
+        # Unused by the kernel; keeps the argument list fixed-shape.
+        row_index = seq_lens
+
     block_cols = triton.next_power_of_2(out_cols)
     _append_kpool_tail_to_topk_kernel[(rows,)](
         topk_result,
@@ -529,6 +552,7 @@ def append_kpool_tail_to_topk(
         pool_lens,
         page_table,
         topk_offsets,
+        row_index,
         out,
         topk_result.stride(0),
         topk_result.stride(1),
@@ -542,6 +566,7 @@ def append_kpool_tail_to_topk(
         POOL_SIZE=pool_size,
         HAS_PAGE_TABLE=has_page_table,
         HAS_TOPK_OFFSETS=has_topk_offsets,
+        HAS_ROW_INDEX=has_row_index,
         BLOCK_COLS=block_cols,
     )
     return out
@@ -554,6 +579,7 @@ def _append_kpool_tail_to_topk_kernel(
     pool_lens_ptr,
     page_table_ptr,
     topk_offsets_ptr,
+    row_index_ptr,
     out_ptr,
     topk_stride_0,
     topk_stride_1,
@@ -567,6 +593,7 @@ def _append_kpool_tail_to_topk_kernel(
     POOL_SIZE: tl.constexpr,
     HAS_PAGE_TABLE: tl.constexpr,
     HAS_TOPK_OFFSETS: tl.constexpr,
+    HAS_ROW_INDEX: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -593,11 +620,16 @@ def _append_kpool_tail_to_topk_kernel(
     tail_value = tail_raw
     if HAS_PAGE_TABLE:
         safe_tail = tl.minimum(tl.maximum(tail_raw, 0), PAGE_TABLE_COLS - 1)
+        # Prefill addresses the pool table by request-pool row, not query row; reading
+        # the row number here avoids materializing a per-query copy of the whole table.
+        pt_row = row
+        if HAS_ROW_INDEX:
+            pt_row = tl.load(row_index_ptr + row).to(tl.int32)
         # Promote the row term before multiplication; 1M-context strides
         # overflow int32 around row 2048.
         tail_value = tl.load(
             page_table_ptr
-            + row.to(tl.int64) * page_table_stride_0
+            + pt_row.to(tl.int64) * page_table_stride_0
             + safe_tail * page_table_stride_1,
             mask=mask & is_tail,
             other=-1,
@@ -623,6 +655,7 @@ def _finish_kpool_group_selection(
     topk_offsets: Optional[torch.Tensor],
     seq_lens: Optional[torch.Tensor],
     out_rows: Optional[int],
+    page_table_row_index: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Turn chosen pool ids into the final top-k rows.
 
@@ -644,6 +677,7 @@ def _finish_kpool_group_selection(
         pool_size=pool_size,
         page_table=page_table,
         topk_offsets=topk_offsets,
+        page_table_row_index=page_table_row_index,
     )
     if seq_lens is None:
         result = expanded
@@ -655,6 +689,7 @@ def _finish_kpool_group_selection(
             pool_size=pool_size,
             page_table=page_table,
             topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
         )
     return _pad_kpool_topk_rows(result, out_rows)
 
@@ -710,33 +745,34 @@ def topk_from_pooled_history_logits(
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
-        # ``page_table_row_index`` addresses the page table through the request pool,
-        # which the group-expansion helper does not take. Instead of leaving those
-        # calls -- the prefill majority, since the ragged PAGED plan always supplies a
-        # row index -- silently on the fused kernel, resolve the per-query page row
-        # first and hand the expansion the same per-row table it already understands.
-        page_table_for_groups = page_table
-        if page_table_row_index is not None:
-            index_rows = page_table_row_index.shape[0]
-            if index_rows != logits.shape[0]:
-                _log_kpool_route_once(
-                    "page_table_row_index rows "
-                    f"{index_rows} != logits rows {logits.shape[0]}"
-                )
-            else:
-                page_table_for_groups = page_table.index_select(
-                    0, page_table_row_index.to(torch.long)
-                )
+        # ``page_table_row_index`` addresses the page table through the request pool.
+        # The expansion helpers take it directly, so those calls -- the prefill
+        # majority, since the ragged PAGED plan always supplies a row index -- are
+        # served too instead of silently staying on the fused kernel.
+        row_index_for_groups = page_table_row_index
+        serve_this_call = True
+        if row_index_for_groups is not None and (
+            row_index_for_groups.shape[0] != logits.shape[0]
+        ):
+            _log_kpool_route_once(
+                "page_table_row_index rows "
+                f"{row_index_for_groups.shape[0]} != logits rows {logits.shape[0]}"
+            )
+            serve_this_call = False
 
         from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
             deepselect_kpool_group_ids,
         )
 
-        group_ids = deepselect_kpool_group_ids(
-            logits=logits,
-            group_lengths=group_lengths,
-            group_topk=group_topk,
-            row_starts=row_starts,
+        group_ids = (
+            None
+            if not serve_this_call
+            else deepselect_kpool_group_ids(
+                logits=logits,
+                group_lengths=group_lengths,
+                group_topk=group_topk,
+                row_starts=row_starts,
+            )
         )
         if group_ids is not None:
             return _finish_kpool_group_selection(
@@ -746,10 +782,11 @@ def topk_from_pooled_history_logits(
                 group_topk=group_topk,
                 topk=topk,
                 pool_size=pool_size,
-                page_table=page_table_for_groups,
+                page_table=page_table,
                 topk_offsets=topk_offsets,
                 seq_lens=seq_lens,
                 out_rows=out_rows,
+                page_table_row_index=row_index_for_groups,
             )
 
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
