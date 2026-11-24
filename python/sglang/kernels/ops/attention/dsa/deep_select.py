@@ -447,6 +447,11 @@ def topk_kpool_groups(
     lengths = lengths.to(torch.int32).contiguous()
     starts = None if row_starts is None else row_starts.to(torch.int32).contiguous()
     packed_cols = cols if max_seq_len is None else min(cols, max_seq_len)
+    # A short-history row (fewer pooled columns than the selection budget) must still
+    # hand the wheel a view at least ``group_topk`` wide. Columns past a row's ``end``
+    # are never read, and rows at or below the budget are answered index-only, so the
+    # extra width costs nothing beyond the aligned allocation.
+    packed_cols = max(packed_cols, group_topk)
     packed = _kpool_pack_buffer(rows, packed_cols, scores.device)
     block = 4096 if packed_cols >= 4096 else 1024
     _pack_kpool_group_scores[(rows, triton.cdiv(packed_cols, block))](
