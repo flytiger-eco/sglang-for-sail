@@ -830,7 +830,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 cu_seq_len_k_end,
                 clean_logits=clean_logits,
                 # Unfused topk (fast_topk_v2) requires fp32; the fused bf16 kernel consumes bf16 directly.
-                logits_dtype=torch.float32 if force_unfused_topk else torch.bfloat16,
+                logits_dtype=(
+                    torch.bfloat16
+                    if (envs.SGLANG_DSA_RAGGED_BF16_TOPK.get()
+                        or envs.SGLANG_DSA_DEEPSELECT.get())
+                    else (torch.float32 if force_unfused_topk else torch.bfloat16)
+                ),
             )
 
         assert isinstance(q, torch.Tensor)
