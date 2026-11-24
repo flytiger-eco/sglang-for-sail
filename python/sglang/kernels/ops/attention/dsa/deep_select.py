@@ -35,6 +35,70 @@ def _pack_ragged_scores(
         tl.store(packed + row * PACKED_ROW_STRIDE + cols, values, mask=cols < length)
 
 
+
+@triton.jit(do_not_specialize=["SCORE_ROW_STRIDE", "PACKED_ROW_STRIDE"])
+def _pack_ragged_scores_runtime(
+    scores,
+    lengths,
+    row_starts,
+    packed,
+    SCORE_ROW_STRIDE,
+    SCORE_COL_STRIDE: tl.constexpr,
+    PACKED_ROW_STRIDE,
+    HAS_STARTS: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ALIGNED_SCORE_ROWS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    length = tl.load(lengths + row)
+    if length > TOPK:
+        start = tl.load(row_starts + row) if HAS_STARTS else 0
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        score_stride = SCORE_ROW_STRIDE
+        if ALIGNED_SCORE_ROWS:
+            score_stride = tl.multiple_of(score_stride, 512)
+        packed_stride = tl.multiple_of(PACKED_ROW_STRIDE, 512)
+        values = tl.load(
+            scores + row * score_stride + (start + cols) * SCORE_COL_STRIDE,
+            mask=cols < length,
+            other=0,
+        )
+        tl.store(packed + row * packed_stride + cols, values, mask=cols < length)
+
+
+_WARMED_RAGGED_PACKERS: set[tuple[torch.device, int]] = set()
+
+
+def _warm_ragged_packers(scores: torch.Tensor, topk: int) -> None:
+    key = (scores.device, topk)
+    if key in _WARMED_RAGGED_PACKERS:
+        return
+    # Seed the finite generic variants before the first dynamic business shape.
+    # Run normal warmup before CUDA Graph capture, as for the selector itself.
+    source = scores.new_zeros((4, 8192))
+    destination = torch.empty_like(source)
+    lengths = torch.full((4,), 8192, device=scores.device, dtype=torch.int32)
+    starts = torch.zeros((4,), device=scores.device, dtype=torch.int32)
+    for block in (1024, 2048):
+        for has_starts in (False, True):
+            _pack_ragged_scores_runtime[(4, triton.cdiv(8192, block))](
+                source,
+                lengths,
+                starts if has_starts else None,
+                destination,
+                8192,
+                1,
+                8192,
+                has_starts,
+                topk,
+                block,
+                True,
+                num_warps=4,
+            )
+    _WARMED_RAGGED_PACKERS.add(key)
+
+
 def topk_transform_ragged(
     scores: torch.Tensor,
     lengths: torch.Tensor,
@@ -58,6 +122,7 @@ def topk_transform_ragged(
     if rows == 0:
         return scores.new_empty((0, topk), dtype=torch.int32)
 
+    _warm_ragged_packers(scores, topk)
     lengths = lengths.contiguous()
     out_offsets = out_offsets.contiguous()
     alignment = deep_select.get_stride_requirement()[0]
@@ -65,7 +130,7 @@ def topk_transform_ragged(
         (row_starts is not None and cols > topk)
         or scores.stride(1) != 1
         or scores.stride(0) * scores.element_size() % alignment != 0
-        or scores.data_ptr() % alignment != 0
+        or scores.data_ptr() % 16 != 0
     )
     if needs_pack:
         packed_cols = cols if max_seq_len is None else min(cols, max_seq_len)
@@ -75,19 +140,37 @@ def topk_transform_ragged(
         packed = scores.new_empty((rows, aligned_cols))
         if packed_cols > topk:
             starts = row_starts.contiguous() if row_starts is not None else None
-            block = 4096 if max_seq_len is not None and packed_cols >= 4096 else 1024
-            _pack_ragged_scores[(rows, triton.cdiv(packed_cols, block))](
-                scores,
-                lengths,
-                starts,
-                packed,
-                scores.stride(0),
-                scores.stride(1),
-                packed.stride(0),
-                starts is not None,
-                topk,
-                block,
-            )
+            block = 2048 if max_seq_len is not None and packed_cols >= 4096 else 1024
+            if packed.stride(0) % 512 == 0:
+                _pack_ragged_scores_runtime[(rows, triton.cdiv(packed_cols, block))](
+                    scores,
+                    lengths,
+                    starts,
+                    packed,
+                    scores.stride(0),
+                    scores.stride(1),
+                    packed.stride(0),
+                    starts is not None,
+                    topk,
+                    block,
+                    scores.stride(0) % 512 == 0,
+                    num_warps=4,
+                )
+            else:
+                # Keep the general layout path if a future wheel changes alignment.
+                _pack_ragged_scores[(rows, triton.cdiv(packed_cols, block))](
+                    scores,
+                    lengths,
+                    starts,
+                    packed,
+                    scores.stride(0),
+                    scores.stride(1),
+                    packed.stride(0),
+                    starts is not None,
+                    topk,
+                    block,
+                    num_warps=4,
+                )
         scores = packed[:, :packed_cols]
 
     _, indices = deep_select.topk(
