@@ -95,7 +95,11 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
-        return self.get_broadcastable_buffer(layer_id)
+        buf = self.get_broadcastable_buffer(layer_id)
+        # FP4 access bypasses get_k_and_scale; preserve MLA KV prefetch overlap.
+        if self.pool.use_fp4_indexer:
+            self.pool.prefetch_kv_buffer(layer_id)
+        return buf
 
     def get_k_and_scale(
         self,
