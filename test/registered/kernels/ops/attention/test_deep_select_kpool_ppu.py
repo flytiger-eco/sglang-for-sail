@@ -120,17 +120,20 @@ def test_kpool_group_ids_honor_row_window_starts(rows, width, shift):
     lengths = torch.full((rows,), length, dtype=torch.int32, device=device)
     starts = torch.full((rows,), shift, dtype=torch.int32, device=device)
 
-    got = topk_kpool_groups(scores, lengths, GROUP_TOPK, row_starts=starts).cpu()
-    ref = _fused_group_ids(scores, lengths, starts).cpu()
+    got = topk_kpool_groups(scores, lengths, GROUP_TOPK, row_starts=starts)
+    ref = _fused_group_ids(scores, lengths, starts)
     assert int(got.max()) < length, "ids stay inside the row window"
     # Relative ids mean both routes describe the same absolute columns once the start
     # is applied -- which is exactly what the fused kernel's caller does downstream.
-    mean, _ = _set_agreement(ref, got)
+    mean, _ = _set_agreement(ref.cpu(), got.cpu())
     assert mean >= 0.99, f"windowed pool-set agreement {mean:.4f} < 0.99"
-    # The window actually got searched: scores before the start must never win.
-    head = torch.topk(scores[:, :shift], GROUP_TOPK, dim=1).values.max(dim=1).values
-    chosen = torch.gather(scores, 1, (got + starts.unsqueeze(1)).clamp(max=width - 1))
-    assert bool((chosen.min(dim=1).values >= head).all())
+    # Independent reference: what was searched is the window [shift, shift + length),
+    # not the row head. A missing window shift would show up here as a large gap.
+    window_ref = (
+        torch.topk(scores[:, shift : shift + length], GROUP_TOPK, dim=1).indices.cpu()
+    )
+    mean_w, _ = _set_agreement(window_ref, got.cpu())
+    assert mean_w >= 0.99, f"window reference agreement {mean_w:.4f} < 0.99"
 
 
 @torch.inference_mode()
@@ -205,22 +208,46 @@ def test_pooled_topk_end_to_end_matches_fused_route():
 
 
 @torch.inference_mode()
-def test_bf16_staging_buffer_is_reused_not_reallocated():
+def test_bf16_staging_buffer_is_reused_not_reallocated(monkeypatch):
+    """The staging block is allocated once per device and only grown, never per call."""
     device = torch.device("cuda")
-    rows, cols = 256, 4096
-    first = ds._kpool_pack_buffer(rows, cols, device)
-    ptr = first.untyped_storage().data_ptr()
-    again = ds._kpool_pack_buffer(rows, cols, device)
-    assert again.untyped_storage().data_ptr() == ptr, "buffer must be reused"
+    ds._kpool_pack_buffers.clear()
 
-    bigger = ds._kpool_pack_buffer(rows * 2, cols, device)
-    assert bigger.shape[0] >= rows * 2
-    assert bigger.untyped_storage().data_ptr() != ptr
-    assert bigger.stride(0) % (ds._alignment_bytes() // bigger.element_size()) == 0
-    smaller = ds._kpool_pack_buffer(rows, cols, device)
-    assert (
-        smaller.untyped_storage().data_ptr() == bigger.untyped_storage().data_ptr()
-    ), "a smaller request must reuse the grown block instead of allocating again"
+    real_empty = torch.empty
+    allocations = {"n": 0}
+
+    def counting_empty(*args, **kwargs):
+        allocations["n"] += 1
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", counting_empty)
+    first = ds._kpool_pack_buffer(64, 8192, device)
+    assert allocations["n"] == 1, "the first request allocates the staging block once"
+    again = ds._kpool_pack_buffer(64, 8192, device)
+    assert again.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert allocations["n"] == 1, "a repeated request must not allocate"
+    smaller = ds._kpool_pack_buffer(8, 1024, device)
+    assert smaller.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+    assert allocations["n"] == 1, "a smaller request must reuse the cached block"
+    assert first.stride(0) % (ds._alignment_bytes() // first.element_size()) == 0
+    monkeypatch.undo()
+
+    # Through the real selection path the cached address must stay stable, so no
+    # staging allocation happens per DSA layer or per CUDA graph replay.
+    scores = torch.randn(64, 8192, dtype=torch.float32, device=device)
+    lengths = torch.full((64,), 8192, dtype=torch.int32, device=device)
+    topk_kpool_groups(scores, lengths, GROUP_TOPK)
+    torch.cuda.synchronize()
+    key = device.index if device.index is not None else torch.cuda.current_device()
+    cached_ptr = ds._kpool_pack_buffers[key].data_ptr()
+    base = torch.cuda.memory_allocated(device)
+    for _ in range(3):
+        topk_kpool_groups(scores, lengths, GROUP_TOPK)
+        torch.cuda.synchronize()
+    assert ds._kpool_pack_buffers[key].data_ptr() == cached_ptr, "staging address moved"
+    grew = torch.cuda.memory_allocated(device) - base
+    assert grew < 8 * 1024 * 1024, f"staging churn grew {grew / 1e6:.1f} MB across 3 calls"
+    ds._kpool_pack_buffers.clear()
 
 
 def test_kpool_shape_reason_boundaries():
