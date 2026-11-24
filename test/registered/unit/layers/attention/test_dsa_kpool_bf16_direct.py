@@ -29,13 +29,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from sglang.kernels.ops.attention.dsa import deep_select as ds  # noqa: E402
-from sglang.srt.layers.attention.dsa import (  # noqa: E402
-    dsa_indexer_kpool as ikp,
-)
-from sglang.srt.layers.attention.dsa import (  # noqa: E402
-    dsa_topk_backend as tb,
-)
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as ikp  # noqa: E402
+from sglang.srt.layers.attention.dsa import dsa_topk_backend as tb  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -109,8 +105,7 @@ def test_missing_wheel_stops_the_request_but_never_the_run():
             BAND_ROWS, BAND_COLS, GROUP_TOPK, logits_dtype=torch.bfloat16
         )
         assert (
-            ikp._kpool_scoring_dtype(BAND_ROWS, BAND_COLS, GROUP_TOPK)
-            is torch.float32
+            ikp._kpool_scoring_dtype(BAND_ROWS, BAND_COLS, GROUP_TOPK) is torch.float32
         )
 
 
@@ -193,8 +188,9 @@ def _call_fp8_mqa_logits(*, modern, logits_dtype, weights_dtype):
     scoring, calls = _kernel_pair(modern=modern)
     fake = SimpleNamespace(fp8_mqa_logits=scoring, int8_mqa_logits=scoring)
     rows, cols = BAND_ROWS, BAND_COLS
-    with mock.patch.object(ikp, "deep_gemm", fake), mock.patch.object(
-        ikp, "is_hip", return_value=False
+    with (
+        mock.patch.object(ikp, "deep_gemm", fake),
+        mock.patch.object(ikp, "is_hip", return_value=False),
     ):
         out = ikp.IndexerKPool._fp8_mqa_logits(
             SimpleNamespace(use_int8=False),
@@ -260,9 +256,9 @@ def test_bf16_capability_probe_reads_the_signature_or_the_docstring():
             "an extension whose signature cannot be inspected may still advertise "
             "the parameter in its docstring"
         )
-        assert not tb.kpool_bf16_scoring_supported(
-            lambda *a, **kw: None
-        ), "and a docstring without the parameter must not enable bf16"
+        assert not tb.kpool_bf16_scoring_supported(lambda *a, **kw: None), (
+            "and a docstring without the parameter must not enable bf16"
+        )
 
 
 def test_kpool_weights_follow_the_emitted_logits_width():

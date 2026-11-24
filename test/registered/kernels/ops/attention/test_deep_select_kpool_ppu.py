@@ -330,9 +330,7 @@ def test_bf16_logits_select_the_same_pools_as_fp32():
     lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
 
     fp32 = topk_kpool_groups(scores, lengths, GROUP_TOPK).cpu()
-    bf16 = topk_kpool_groups(
-        scores.to(torch.bfloat16), lengths, GROUP_TOPK
-    ).cpu()
+    bf16 = topk_kpool_groups(scores.to(torch.bfloat16), lengths, GROUP_TOPK).cpu()
 
     mean, worst = _set_agreement(fp32, bf16)
     print(f"[kpool bf16] rows={rows} cols={width} mean={mean:.4f} worst={worst:.4f}")
@@ -342,13 +340,9 @@ def test_bf16_logits_select_the_same_pools_as_fp32():
     tight = scores * 0.02
     tight_mean, tight_worst = _set_agreement(
         topk_kpool_groups(tight, lengths, GROUP_TOPK).cpu(),
-        topk_kpool_groups(
-            tight.to(torch.bfloat16), lengths, GROUP_TOPK
-        ).cpu(),
+        topk_kpool_groups(tight.to(torch.bfloat16), lengths, GROUP_TOPK).cpu(),
     )
-    print(
-        f"[kpool bf16] tight mean={tight_mean:.4f} worst={tight_worst:.4f}"
-    )
+    print(f"[kpool bf16] tight mean={tight_mean:.4f} worst={tight_worst:.4f}")
     assert tight_mean >= 0.99, f"tight bf16 agreement {tight_mean:.4f} < 0.99"
 
 
@@ -401,8 +395,9 @@ def test_bf16_hit_marker_reports_the_emitted_width(caplog):
     scores = torch.randn(rows, width, dtype=torch.bfloat16, device=device)
     lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
     tb._DEEPSELECT_LOGGED.discard(tb._DEEPSELECT_KPOOL_HIT)
-    with caplog.at_level(logging.INFO), mock.patch.object(
-        envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True
+    with (
+        caplog.at_level(logging.INFO),
+        mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True),
     ):
         assert tb.deepselect_kpool_group_ids(scores, lengths, GROUP_TOPK) is not None
     hit = [
@@ -431,8 +426,9 @@ def test_bf16_scores_outside_the_band_run_the_fused_kernel_in_fp32(caplog):
     ).to(torch.int32)
     kwargs = dict(page_table=page_table, seq_lens=seq_lens)
 
-    with caplog.at_level(logging.INFO), mock.patch.object(
-        envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True
+    with (
+        caplog.at_level(logging.INFO),
+        mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True),
     ):
         kpi._KPOOL_ROUTE_LOGGED.clear()
         via_fp32 = kpi.topk_from_pooled_history_logits(

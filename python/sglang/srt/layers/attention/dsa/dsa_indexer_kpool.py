@@ -99,9 +99,7 @@ def _kpool_scoring_dtype(rows: int, cols: int, group_topk: int) -> torch.dtype:
         kpool_deepselect_will_serve,
     )
 
-    if kpool_deepselect_will_serve(
-        rows, cols, group_topk, logits_dtype=torch.bfloat16
-    ):
+    if kpool_deepselect_will_serve(rows, cols, group_topk, logits_dtype=torch.bfloat16):
         return torch.bfloat16
     return torch.float32
 
