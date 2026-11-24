@@ -69,6 +69,11 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    @property
+    def input_embeds_hidden_size(self) -> int:
+        """Width of the fused stack input this wrapper computes for the body."""
+        return self.hc_count * self.hidden_size
+
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
