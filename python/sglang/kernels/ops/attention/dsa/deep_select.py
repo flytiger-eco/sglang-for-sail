@@ -341,7 +341,9 @@ def kpool_group_topk_shape_reason(rows: int, cols: int, group_topk: int) -> str 
             f"{KPOOL_SUPPORTED_GROUP_TOPK}"
         )
     if not 0 < group_topk <= MAX_TOPK:
-        return f"group_topk {group_topk} outside the deep_select contract (1..{MAX_TOPK})"
+        return (
+            f"group_topk {group_topk} outside the deep_select contract (1..{MAX_TOPK})"
+        )
     if rows < KPOOL_SERVE_MIN_ROWS or cols < KPOOL_SERVE_MIN_COLS:
         return (
             f"rows={rows} cols={cols} below the kpool served band "
@@ -387,7 +389,9 @@ def _pack_kpool_group_scores(
         other=0.0,
     )
     tl.store(
-        packed + row * PACKED_ROW_STRIDE + cols, values.to(tl.bfloat16), mask=cols < length
+        packed + row * PACKED_ROW_STRIDE + cols,
+        values.to(tl.bfloat16),
+        mask=cols < length,
     )
 
 
@@ -403,11 +407,17 @@ def _kpool_pack_buffer(rows: int, cols: int, device: torch.device) -> torch.Tens
     alignment = _alignment_bytes() // torch.bfloat16.itemsize
     aligned_cols = triton.cdiv(cols, alignment) * alignment
     cached = _kpool_pack_buffers.get(key)
-    if cached is not None and cached.shape[0] >= rows and cached.stride(0) >= aligned_cols:
+    if (
+        cached is not None
+        and cached.shape[0] >= rows
+        and cached.stride(0) >= aligned_cols
+    ):
         return cached[:rows, :cols]
     rows_alloc = max(rows, cached.shape[0] if cached is not None else 0, 1)
     cols_alloc = max(aligned_cols, cached.stride(0) if cached is not None else 0)
-    allocated = torch.empty((rows_alloc, cols_alloc), dtype=torch.bfloat16, device=device)
+    allocated = torch.empty(
+        (rows_alloc, cols_alloc), dtype=torch.bfloat16, device=device
+    )
     if allocated.data_ptr() % _alignment_bytes():
         # The wheel documents an aligned base address; a buffer that cannot honour
         # it must never be cached, or every later call would fail on it.

@@ -98,7 +98,9 @@ def test_kpool_group_ids_match_fused_kernel(rows, width, distribution):
         mean, _ = _set_agreement(ref, got)
         ref_scores = torch.gather(scores.cpu(), 1, ref.clamp(min=0))
         got_scores = torch.gather(scores.cpu(), 1, got.clamp(min=0))
-        assert torch.equal(ref_scores.sort(dim=1).values, got_scores.sort(dim=1).values), (
+        assert torch.equal(
+            ref_scores.sort(dim=1).values, got_scores.sort(dim=1).values
+        ), (
             f"tie groups differ in score values (rows={rows} width={width}); "
             f"index agreement was {mean:.4f}"
         )
@@ -129,9 +131,9 @@ def test_kpool_group_ids_honor_row_window_starts(rows, width, shift):
     assert mean >= 0.99, f"windowed pool-set agreement {mean:.4f} < 0.99"
     # Independent reference: what was searched is the window [shift, shift + length),
     # not the row head. A missing window shift would show up here as a large gap.
-    window_ref = (
-        torch.topk(scores[:, shift : shift + length], GROUP_TOPK, dim=1).indices.cpu()
-    )
+    window_ref = torch.topk(
+        scores[:, shift : shift + length], GROUP_TOPK, dim=1
+    ).indices.cpu()
     mean_w, _ = _set_agreement(window_ref, got.cpu())
     assert mean_w >= 0.99, f"window reference agreement {mean_w:.4f} < 0.99"
 
@@ -174,9 +176,7 @@ def test_pooled_topk_end_to_end_matches_fused_route():
     served_rows, served_cols = ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS
     ds.KPOOL_SERVE_MIN_ROWS, ds.KPOOL_SERVE_MIN_COLS = 4, 64
     try:
-        with mock.patch.object(
-            envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True
-        ):
+        with mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=True):
             on = kpi.topk_from_pooled_history_logits(
                 logits,
                 group_lengths,
@@ -227,7 +227,8 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
     seq_lens = torch.full((rows,), seq_len, dtype=torch.int32, device=device)
     # Request-pool table: the high part names the request row, the low part the column.
     page_table = (
-        torch.arange(req_rows, device=device, dtype=torch.int64).unsqueeze(1) * TABLE_BASE
+        torch.arange(req_rows, device=device, dtype=torch.int64).unsqueeze(1)
+        * TABLE_BASE
         + torch.arange(token_cols, device=device, dtype=torch.int64).unsqueeze(0)
     ).to(torch.int32)
     row_index = torch.arange(rows, device=device, dtype=torch.int32) % req_rows
@@ -292,7 +293,9 @@ def test_pooled_topk_matches_fused_route_with_page_table_row_index():
     on_req = torch.div(on.clamp(min=0), TABLE_BASE, rounding_mode="floor")
     expected = row_index.cpu().unsqueeze(1).expand_as(on_req)
     valid = on >= 0
-    assert bool((on_req[valid] == expected[valid]).all()), "page row index lost in gather"
+    assert bool((on_req[valid] == expected[valid]).all()), (
+        "page row index lost in gather"
+    )
     assert bool((on[:, TOPK:] == -1).all()) and bool((off[:, TOPK:] == -1).all())
 
 
@@ -335,7 +338,9 @@ def test_bf16_staging_buffer_is_reused_not_reallocated(monkeypatch):
         torch.cuda.synchronize()
     assert ds._kpool_pack_buffers[key].data_ptr() == cached_ptr, "staging address moved"
     grew = torch.cuda.memory_allocated(device) - base
-    assert grew < 8 * 1024 * 1024, f"staging churn grew {grew / 1e6:.1f} MB across 3 calls"
+    assert grew < 8 * 1024 * 1024, (
+        f"staging churn grew {grew / 1e6:.1f} MB across 3 calls"
+    )
     ds._kpool_pack_buffers.clear()
 
 
@@ -347,9 +352,7 @@ def test_kpool_shape_reason_boundaries():
     assert "below the kpool served band" in kpool_group_topk_shape_reason(
         2048, 4096, GROUP_TOPK
     )
-    assert "not a served kpool bucket" in kpool_group_topk_shape_reason(
-        4096, 40960, 96
-    )
+    assert "not a served kpool bucket" in kpool_group_topk_shape_reason(4096, 40960, 96)
 
 
 def test_disabled_switch_never_touches_the_wheel():
@@ -358,11 +361,12 @@ def test_disabled_switch_never_touches_the_wheel():
     def _boom(*args, **kwargs):
         raise AssertionError("must not be reached while the switch is off")
 
-    with mock.patch.object(
-        envs.SGLANG_DSA_DEEPSELECT, "get", return_value=False
-    ), mock.patch.object(ds, "topk_kpool_groups", _boom):
+    with (
+        mock.patch.object(envs.SGLANG_DSA_DEEPSELECT, "get", return_value=False),
+        mock.patch.object(ds, "topk_kpool_groups", _boom),
+    ):
         logits = torch.randn(4096, 16384, dtype=torch.float32)
         lengths = torch.full((4096,), 16384, dtype=torch.int32)
-        assert (
-            tb.deepselect_kpool_group_ids(logits, lengths, GROUP_TOPK) is None
-        ), "the switch off must short-circuit before any wheel call"
+        assert tb.deepselect_kpool_group_ids(logits, lengths, GROUP_TOPK) is None, (
+            "the switch off must short-circuit before any wheel call"
+        )

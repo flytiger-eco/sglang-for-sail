@@ -1,7 +1,6 @@
+import logging
 from functools import lru_cache
 from typing import Optional, Tuple
-
-import logging
 
 import torch
 import triton
@@ -475,8 +474,8 @@ def expand_pooled_groups_to_topk(
             # materializing a per-query copy of the full context table.
             assert page_table_row_index.ndim == 1
             assert page_table_row_index.shape[0] == group_ids.shape[0]
-            row_ids = page_table_row_index.to(torch.long).unsqueeze(1).expand_as(
-                safe_ids
+            row_ids = (
+                page_table_row_index.to(torch.long).unsqueeze(1).expand_as(safe_ids)
             )
             output = page_table[row_ids, safe_ids].to(torch.int32)
     elif topk_offsets is not None:
@@ -668,7 +667,9 @@ def _finish_kpool_group_selection(
     rank = torch.arange(group_topk, device=selected_groups.device, dtype=torch.int32)
     lengths32 = group_lengths.to(torch.int32)
     max_valid_groups = min(cols, group_topk)
-    valid_counts = torch.minimum(lengths32, torch.full_like(lengths32, max_valid_groups))
+    valid_counts = torch.minimum(
+        lengths32, torch.full_like(lengths32, max_valid_groups)
+    )
     group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
     expanded = expand_pooled_groups_to_topk(
         selected_groups.contiguous(),
@@ -694,9 +695,7 @@ def _finish_kpool_group_selection(
     return _pad_kpool_topk_rows(result, out_rows)
 
 
-def _pad_kpool_topk_rows(
-    result: torch.Tensor, out_rows: Optional[int]
-) -> torch.Tensor:
+def _pad_kpool_topk_rows(result: torch.Tensor, out_rows: Optional[int]) -> torch.Tensor:
     if out_rows is None or out_rows == result.shape[0]:
         return result
     padded = torch.full(

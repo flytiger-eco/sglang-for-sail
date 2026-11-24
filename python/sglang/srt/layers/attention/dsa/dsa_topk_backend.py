@@ -774,9 +774,7 @@ def _deepselect_kpool_skip_reason(
         return f"kpool logits rank {logits.dim()} != 2"
     if logits.dtype != torch.float32:
         return f"kpool logits dtype {logits.dtype} != float32"
-    reason = kpool_group_topk_shape_reason(
-        logits.shape[0], logits.shape[1], group_topk
-    )
+    reason = kpool_group_topk_shape_reason(logits.shape[0], logits.shape[1], group_topk)
     if reason is not None:
         return reason
     if group_topk not in KPOOL_SUPPORTED_GROUP_TOPK:
@@ -831,8 +829,7 @@ def deepselect_kpool_group_ids(
     if _DEEPSELECT_KPOOL_HIT not in _DEEPSELECT_LOGGED:
         _DEEPSELECT_LOGGED.add(_DEEPSELECT_KPOOL_HIT)
         logger.info(
-            "DSA kpool top-k served by PPU deep_select "
-            "(rows=%d cols=%d group_topk=%d)",
+            "DSA kpool top-k served by PPU deep_select (rows=%d cols=%d group_topk=%d)",
             logits.shape[0],
             logits.shape[1],
             group_topk,
