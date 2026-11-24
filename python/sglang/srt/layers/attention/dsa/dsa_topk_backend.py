@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _DEEPSELECT_HIT = "__deepselect_hit__"
 _DEEPSELECT_PAGED_HIT = "__deepselect_paged_hit__"
+_DEEPSELECT_KPOOL_HIT = "__deepselect_kpool_hit__"
 _DEEPSELECT_LOGGED: set = set()
 logger = logging.getLogger(__name__)
 
@@ -756,6 +757,86 @@ def _deepselect_paged_bf16_topk(
             page_table_per_query.shape[1],
         )
     return out
+
+
+def _deepselect_kpool_skip_reason(
+    logits: torch.Tensor, group_topk: int
+) -> Optional[str]:
+    """Return why a kpool group-level call cannot use the PPU DeepSelect kernel, else None."""
+    from sglang.kernels.ops.attention.dsa.deep_select import (
+        KPOOL_SUPPORTED_GROUP_TOPK,
+        kpool_group_topk_shape_reason,
+    )
+
+    if not is_ppu():
+        return "not a PPU device"
+    if logits.dim() != 2:
+        return f"kpool logits rank {logits.dim()} != 2"
+    if logits.dtype != torch.float32:
+        return f"kpool logits dtype {logits.dtype} != float32"
+    reason = kpool_group_topk_shape_reason(
+        logits.shape[0], logits.shape[1], group_topk
+    )
+    if reason is not None:
+        return reason
+    if group_topk not in KPOOL_SUPPORTED_GROUP_TOPK:
+        # Unreachable through the shape reason above; kept so a widened bucket list
+        # in one module cannot silently ship an unserved bucket.
+        return f"pool-level topk {group_topk} is not a served kpool bucket"
+    return None
+
+
+def deepselect_kpool_group_ids(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    group_topk: int,
+    row_starts: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Serve one kpool group-level top-k from the PPU(sail) deep_select wheel.
+
+    ``logits`` are the pooled (one score per ``index_kpool`` tokens) float32 rows the
+    Flash indexer produces; this returns int32 absolute pooled-column ids, valid
+    entries first and -1 past each row's length, so the caller can run them through
+    the same group-expansion, tail-append and page/offset transform it already uses
+    for the fused kernel. Only the selection is replaced.
+
+    Returns None -- leaving the caller on the fused kpool kernel -- when the switch is
+    off or a precondition is unmet. A precondition missed while the switch is on is
+    logged once, so a run that never reached DeepSelect fails a gate instead of being
+    measured as if it had.
+    """
+    if not envs.SGLANG_DSA_DEEPSELECT.get():
+        return None
+    reason = _deepselect_kpool_skip_reason(logits, group_topk)
+    if reason is not None:
+        if reason not in _DEEPSELECT_LOGGED:
+            _DEEPSELECT_LOGGED.add(reason)
+            logger.warning("SGLANG_DSA_DEEPSELECT is on but skipped: %s", reason)
+        return None
+
+    from sglang.kernels.ops.attention.dsa.deep_select import topk_kpool_groups
+
+    try:
+        group_ids = topk_kpool_groups(
+            logits, group_lengths, group_topk, row_starts=row_starts
+        )
+    except ImportError:
+        reason = "the deep_select wheel is not importable on this device"
+        if reason not in _DEEPSELECT_LOGGED:
+            _DEEPSELECT_LOGGED.add(reason)
+            logger.warning("SGLANG_DSA_DEEPSELECT is on but skipped: %s", reason)
+        return None
+
+    if _DEEPSELECT_KPOOL_HIT not in _DEEPSELECT_LOGGED:
+        _DEEPSELECT_LOGGED.add(_DEEPSELECT_KPOOL_HIT)
+        logger.info(
+            "DSA kpool top-k served by PPU deep_select "
+            "(rows=%d cols=%d group_topk=%d)",
+            logits.shape[0],
+            logits.shape[1],
+            group_topk,
+        )
+    return group_ids
 
 
 def _topk_transform_v2_ragged(

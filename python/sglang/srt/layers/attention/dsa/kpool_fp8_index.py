@@ -593,6 +593,66 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def _finish_kpool_group_selection(
+    selected_groups: torch.Tensor,
+    *,
+    cols: int,
+    group_lengths: torch.Tensor,
+    group_topk: int,
+    topk: int,
+    pool_size: int,
+    page_table: Optional[torch.Tensor],
+    topk_offsets: Optional[torch.Tensor],
+    seq_lens: Optional[torch.Tensor],
+    out_rows: Optional[int],
+) -> torch.Tensor:
+    """Turn chosen pool ids into the final top-k rows.
+
+    Shared by the ``fast_topk_v2`` path and the PPU DeepSelect route so both leave the
+    function through identical downstream work: every pool expands to its
+    ``pool_size`` consecutive tokens, the residual tail of an unclosed pool is
+    force-appended, the pool-space token is mapped through the page table or the
+    buffer offset, and unused columns stay ``-1``.
+    """
+    rank = torch.arange(group_topk, device=selected_groups.device, dtype=torch.int32)
+    lengths32 = group_lengths.to(torch.int32)
+    max_valid_groups = min(cols, group_topk)
+    valid_counts = torch.minimum(lengths32, torch.full_like(lengths32, max_valid_groups))
+    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+    expanded = expand_pooled_groups_to_topk(
+        selected_groups.contiguous(),
+        group_valid,
+        topk=topk,
+        pool_size=pool_size,
+        page_table=page_table,
+        topk_offsets=topk_offsets,
+    )
+    if seq_lens is None:
+        result = expanded
+    else:
+        result = append_kpool_tail_to_topk(
+            expanded,
+            seq_lens=seq_lens,
+            pool_lens=group_lengths,
+            pool_size=pool_size,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+        )
+    return _pad_kpool_topk_rows(result, out_rows)
+
+
+def _pad_kpool_topk_rows(
+    result: torch.Tensor, out_rows: Optional[int]
+) -> torch.Tensor:
+    if out_rows is None or out_rows == result.shape[0]:
+        return result
+    padded = torch.full(
+        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+    )
+    padded[: result.shape[0]] = result
+    return padded
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -632,6 +692,34 @@ def topk_from_pooled_history_logits(
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
+        # ``page_table_row_index`` addresses the page table through the request pool,
+        # which the group-expansion helper does not take; those calls stay on the
+        # fused kernel (they are the MTP-replay shape, never the served band anyway).
+        if page_table_row_index is None:
+            from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+                deepselect_kpool_group_ids,
+            )
+
+            group_ids = deepselect_kpool_group_ids(
+                logits=logits,
+                group_lengths=group_lengths,
+                group_topk=group_topk,
+                row_starts=row_starts,
+            )
+            if group_ids is not None:
+                return _finish_kpool_group_selection(
+                    group_ids,
+                    cols=cols,
+                    group_lengths=group_lengths,
+                    group_topk=group_topk,
+                    topk=topk,
+                    pool_size=pool_size,
+                    page_table=page_table,
+                    topk_offsets=topk_offsets,
+                    seq_lens=seq_lens,
+                    out_rows=out_rows,
+                )
+
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
             fast_kpool_topk_transform_fused,
         )
@@ -647,13 +735,7 @@ def topk_from_pooled_history_logits(
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             page_table_row_index=page_table_row_index,
         )
-        if out_rows is None or out_rows == result.shape[0]:
-            return result
-        padded = torch.full(
-            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-        )
-        padded[: result.shape[0]] = result
-        return padded
+        return _pad_kpool_topk_rows(result, out_rows)
 
     assert page_table_row_index is None, (
         "page_table_row_index requires the fused fast_kpool group_topk path"
@@ -668,39 +750,18 @@ def topk_from_pooled_history_logits(
         row_starts=row_starts,
     )
 
-    rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
-    max_valid_groups = min(cols, group_topk)
-    valid_counts = torch.minimum(
-        group_lengths.to(torch.int32),
-        torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
-    )
-    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
-    expanded = expand_pooled_groups_to_topk(
-        selected_groups.contiguous(),
-        group_valid,
+    return _finish_kpool_group_selection(
+        selected_groups,
+        cols=cols,
+        group_lengths=group_lengths,
+        group_topk=group_topk,
         topk=topk,
         pool_size=pool_size,
         page_table=page_table,
         topk_offsets=topk_offsets,
+        seq_lens=seq_lens,
+        out_rows=out_rows,
     )
-    if seq_lens is None:
-        result = expanded
-    else:
-        result = append_kpool_tail_to_topk(
-            expanded,
-            seq_lens=seq_lens,
-            pool_lens=group_lengths,
-            pool_size=pool_size,
-            page_table=page_table,
-            topk_offsets=topk_offsets,
-        )
-    if out_rows is None or out_rows == result.shape[0]:
-        return result
-    padded = torch.full(
-        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-    )
-    padded[: result.shape[0]] = result
-    return padded
 
 
 def kpool_softmax_rotate_write_cache(
