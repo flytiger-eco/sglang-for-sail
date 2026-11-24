@@ -217,6 +217,15 @@ def forward_mega_moe(
             moe, hidden_states, forward_batch, input_ids_global
         )
 
+    # MegaMoE's fused kernels require whole-grid progress. Complete the
+    # pending LayerSplit KV prefetch before they compete with PCCL Broadcast
+    # for CTA residency. This orders GPU streams without synchronizing the CPU.
+    from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+    kv_pool = get_token_to_kv_pool()
+    if getattr(kv_pool, "pending_remote_kv_broadcast", False):
+        torch.cuda.current_stream().wait_stream(kv_pool.kv_broadcast_stream)
+
     num_tokens = hidden_states.shape[0]
 
     sbo_overlap_flag = (
