@@ -144,9 +144,15 @@ def _qsa_graph_row_metadata_kernel(
     table_row = page_table_ptr + row.to(tl.int64) * max_pages
     offs = tl.arange(0, PAGE_BLOCK)
     row_width_pages = req_to_token_row_stride // FULL_PAGE
-    for p0 in range(0, max_pages, PAGE_BLOCK):
+    # MQA reads only the pages covered by compressed_lens. Reused graph rows
+    # may retain arbitrary entries past that bound; they are never consumed.
+    used_pages = tl.minimum(
+        tl.cdiv(compressed, FULL_PAGE // RATIO),
+        tl.minimum(max_pages, row_width_pages),
+    )
+    for p0 in range(0, used_pages, PAGE_BLOCK):
         idx = p0 + offs
-        valid = idx < tl.minimum(max_pages, row_width_pages)
+        valid = idx < used_pages
         loc = tl.load(
             req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0
         )

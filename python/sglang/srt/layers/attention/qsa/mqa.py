@@ -388,6 +388,89 @@ if HAS_TILELANG:
         return kernel
 
 
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        }
+    )
+    def _tilelang_qsa_mqa_verify_kernel_ppu(
+        page_size: int = 16,
+        group_ctas: int = 16,
+        threads: int = 128,
+    ):
+        """Score three chain-verify queries together, sharing each K tile.
+
+        The caller supplies three adjacent queries from the same request.
+        Their four real heads occupy 12 of the MMA's 16 columns; columns
+        12..15 are zero. Each query retains its own causal compressed length.
+        """
+        GROUP, HEADS, PACK, PADDED_HEADS, DIM = 64, 4, 3, 16, 128
+        assert GROUP % page_size == 0
+        sub_pages = GROUP // page_size
+        rows = T.dynamic("rows")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        width = T.dynamic("width")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([rows, PADDED_HEADS, DIM], T.bfloat16),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, DIM], T.bfloat16),  # type: ignore
+            PageTable: T.Tensor([rows, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([rows], T.int32),  # type: ignore
+            Logits: T.Tensor([rows, width], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(rows, PACK), group_ctas, threads=threads) as (bx, gx):
+                q_shared = T.alloc_shared([PADDED_HEADS, DIM], T.bfloat16)
+                k_shared = T.alloc_shared([GROUP, DIM], T.bfloat16)
+                scores = T.alloc_fragment([GROUP, PADDED_HEADS], T.float32)
+                scores_3d = T.reshape(scores, (GROUP, 4, HEADS))
+                reduced = T.alloc_fragment([GROUP, 4], T.float32)
+                row_base = bx * PACK
+                max_len = T.alloc_var(T.int32)
+                page_row = T.alloc_var(T.int32)
+                max_len = 0
+                page_row = row_base
+                for j in T.serial(PACK):
+                    if row_base + j < rows:
+                        if ContextLens[row_base + j] > max_len:
+                            max_len = ContextLens[row_base + j]
+                            page_row = row_base + j
+                for h, d in T.Parallel(PADDED_HEADS, DIM):
+                    if h < PACK * HEADS and row_base + h // HEADS < rows:
+                        q_shared[h, d] = Q[row_base + h // HEADS, h % HEADS, d]
+                    else:
+                        q_shared[h, d] = 0
+                num_groups = T.ceildiv(max_len, GROUP)
+                # Match the validated PPU path: conditional sub-page copies
+                # and GEMM are serial, avoiding the pipeliner's shared race.
+                for gi in T.serial(T.ceildiv(T.max(num_groups - gx, 0), group_ctas)):
+                    group = gx + gi * group_ctas
+                    for sp in range(sub_pages):
+                        if (group * sub_pages + sp) * page_size < max_len:
+                            T.copy(
+                                KCache[PageTable[page_row, group * sub_pages + sp], :, 0, :],
+                                k_shared[sp * page_size : (sp + 1) * page_size, :],
+                            )
+                    T.gemm(
+                        k_shared, q_shared, scores, transpose_B=True,
+                        clear_accum=True, policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    for n, j, h in T.Parallel(GROUP, 4, HEADS):
+                        scores_3d[n, j, h] = T.max(scores_3d[n, j, h], 0.0)
+                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+                    for n, j in T.Parallel(GROUP, PACK):
+                        pos = group * GROUP + n
+                        if row_base + j < rows:
+                            if pos < ContextLens[row_base + j]:
+                                Logits[row_base + j, pos] = reduced[n, j] / Scale
+
+        return kernel
+
+
+
 def _prefill_mqa_block_n(keys: int, heads: int, head_dim: int) -> int:
     """按真实 K 长度选择 prefill tile，不改变 logits 的计算语义。"""
     from sglang.srt.utils import is_ppu
@@ -503,6 +586,9 @@ def tilelang_qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    mask_logits: bool = True,
+    verify_query_group_size: int = 1,
 ) -> torch.Tensor:
     """Validated TileLang paged decode kernel with weights removed."""
 
@@ -515,11 +601,13 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    logits = torch.full(
-        (q.shape[0], max_model_len),
-        -float("inf"),
-        dtype=torch.float32,
-        device=q.device,
+    shape = (q.shape[0], max_model_len)
+    # Only bounded TopK callers may leave positions >= context_lens unwritten.
+    # Keep the public score operator's masked-output contract by default.
+    logits = (
+        torch.full(shape, -float("inf"), dtype=torch.float32, device=q.device)
+        if mask_logits
+        else torch.empty(shape, dtype=torch.float32, device=q.device)
     )
     if not q.shape[0] or not max_model_len:
         return logits
@@ -538,6 +626,22 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
+    if (
+        ppu_kernel
+        and verify_query_group_size == 3
+        and q_kernel.shape[1:] == (16, 128)
+        and q_kernel.shape[0] % 3 == 0
+    ):
+        # More CTAs expose parallelism when only a few requests are live;
+        # larger batches already provide enough independent request tiles.
+        group_ctas = 64 if q_kernel.shape[0] <= 12 else 32 if q_kernel.shape[0] <= 24 else 16
+        _tilelang_qsa_mqa_verify_kernel_ppu(page_size=page_size, group_ctas=group_ctas)(
+            q_kernel, k_cache.to(scoring_dtype).contiguous(),
+            page_table.to(device=q.device, dtype=torch.int32).contiguous(),
+            context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+            logits, float(score_scale or math.sqrt(head_dim)),
+        )
+        return logits
     factory = (
         _tilelang_qsa_mqa_decode_kernel_ppu
         if ppu_kernel
@@ -580,10 +684,14 @@ def qsa_mqa_decode(
     context_lens: torch.Tensor,
     max_model_len: int,
     score_scale: Optional[float] = None,
+    *,
+    mask_logits: bool = True,
+    verify_query_group_size: int = 1,
 ) -> torch.Tensor:
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
-            q, k_cache, page_table, context_lens, max_model_len, score_scale
+            q, k_cache, page_table, context_lens, max_model_len, score_scale,
+            mask_logits=mask_logits, verify_query_group_size=verify_query_group_size,
         )
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
