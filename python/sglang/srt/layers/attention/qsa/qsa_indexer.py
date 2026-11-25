@@ -576,6 +576,7 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        verify_query_group_size: int = 1,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -583,6 +584,8 @@ class QSAIndexer(MultiPlatformOp):
             compressed_page_table,
             compressed_lengths,
             max_model_len,
+            mask_logits=not (q.is_cuda and is_ppu()),
+            verify_query_group_size=verify_query_group_size,
         )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
@@ -759,6 +762,16 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                verify_query_group_size=(
+                    3
+                    if is_target_verify
+                    and self.index_n_heads == 4
+                    and self.index_head_dim == 128
+                    and getattr(
+                        getattr(forward_batch, "spec_info", None), "draft_token_num", 0
+                    ) == 3
+                    else 1
+                ),
             )
 
         compressed_keys, row_starts, row_ends, row_sequence_lengths = (
