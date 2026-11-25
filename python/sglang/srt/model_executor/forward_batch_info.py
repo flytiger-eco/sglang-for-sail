@@ -1372,15 +1372,60 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (batch_size, 1), dtype=torch.int64, device=device
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+            # Deltas are request metadata, unchanged across draft, verify and
+            # draft-extend rounds. Keep an immutable device copy for the current
+            # ordered delta tuple instead of a pageable H2D copy every round.
+            # Value keys also handle batch reordering, row reuse and PD metadata
+            # replacement without coupling this cache to request-pool lifetimes.
+            cpu_deltas = all(
+                mm is None
+                or (
+                    mm.mrope_position_delta.device.type == "cpu"
+                    and mm.mrope_position_delta.dtype == torch.int64
+                    and mm.mrope_position_delta.numel() == 1
                 )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+                for mm in mm_inputs
+            )
+            if cpu_deltas:
+                deltas = tuple(
+                    0 if mm is None else int(mm.mrope_position_delta.item())
+                    for mm in mm_inputs
+                )
+                cache = getattr(model_runner, "_spec_mrope_delta_cache", None)
+                if cache is None or cache[0] != deltas:
+                    host = torch.tensor(
+                        deltas,
+                        dtype=torch.int64,
+                        pin_memory=is_pin_memory_available(device),
+                    )
+                    value = host.to(device=device, non_blocking=True).view(-1, 1)
+                    ready = stream = None
+                    if value.device.type != "cpu":
+                        module = torch.get_device_module(device)
+                        stream = module.current_stream()
+                        ready = module.Event()
+                        ready.record(stream)
+                    cache = (deltas, value, ready, stream)
+                    model_runner._spec_mrope_delta_cache = cache
+                mrope_delta_tensor = cache[1]
+                if cache[2] is not None:
+                    stream = torch.get_device_module(device).current_stream()
+                    if stream != cache[3]:
+                        stream.wait_event(cache[2])
+                    # A changed batch replaces the single cache entry. Keep its
+                    # old allocation alive until every consuming stream is done.
+                    mrope_delta_tensor.record_stream(stream)
+            else:
+                # Preserve the existing path for non-scalar or device metadata.
+                mrope_deltas = [
+                    torch.zeros(1, dtype=torch.int64)
+                    if mm is None
+                    else mm.mrope_position_delta.squeeze(0)
+                    for mm in mm_inputs
+                ]
+                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(
+                    device=device
+                )
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
