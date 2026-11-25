@@ -851,6 +851,7 @@ class UnifiedMambaPool(MambaPool):
         self.replayssm_is_kda = False
         self.enable_linear_replayssm_spec = False
         self.replayssm_spec_fold = False
+        self.slot_indirection = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None
         self.debug_memory_pool = False
@@ -1051,6 +1052,8 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
     """`HybridReqToTokenPool` whose `mamba_pool` is a `UnifiedMambaPool`. The inherited
     mamba-id state now holds VIRTUAL ids; adds `translate_mamba_indices` for v->p."""
 
+    supports_mamba_slot_indirection = False
+
     def __init__(
         self,
         *,
@@ -1112,6 +1115,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         short_conv_state_shape=None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        enable_slot_indirection: bool = False,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
@@ -1159,12 +1163,17 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
         self.mamba_ckpt_pool = None  # int8 ckpt pool unused; None = feature off
         self.device = device
+        self.mamba_mapping_stream = None
         # Sized by req_to_token's first dim (size + 1; row 0 is padding); self.size
         # would under-size by one row.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+        # PLE side states are rejected above for the unified pool; keep the
+        # attribute defined so the inherited get_ple_state_indices falls back to
+        # the mamba mapping instead of raising AttributeError.
+        self.req_index_to_ple_index_mapping = None
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(

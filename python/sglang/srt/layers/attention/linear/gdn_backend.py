@@ -966,7 +966,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = self.verify_intermediate_state_indices
+            intermediate_state_indices = (
+                forward_metadata.mamba_intermediate_indices
+                if forward_metadata.mamba_intermediate_indices is not None
+                else self.verify_intermediate_state_indices
+            )
             mamba_pool = self.req_to_token_pool.mamba_pool
             use_replayssm_fold = (
                 mamba_cache_params.replayssm_rawv is not None

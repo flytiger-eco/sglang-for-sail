@@ -657,9 +657,16 @@ class MambaMixer2(torch.nn.Module):
                     "layer_cache must be SpeculativeState for speculative decoding"
                 )
                 draft_token_num = metadata.draft_token_num
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
-                )
+                if metadata.mamba_intermediate_indices is not None:
+                    self.intermediate_state_indices = (
+                        metadata.mamba_intermediate_indices[:num_decodes]
+                    )
+                else:
+                    self.intermediate_state_indices = torch.arange(
+                        num_decodes,
+                        dtype=torch.int32,
+                        device=state_indices_tensor_d.device,
+                    )
 
                 # Reshape for batch processing
                 hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(

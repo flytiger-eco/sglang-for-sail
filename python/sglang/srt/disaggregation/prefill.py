@@ -1645,11 +1645,12 @@ class SchedulerDisaggregationPrefillMixin:
             def _mamba_payload():
                 if mamba_index is not None:
                     return [np.asarray(mamba_index)]
+                # RDMA transfers the request's persistent slot. The live mapping
+                # may already point to an accepted speculative row; unified pools
+                # still need virtual-to-physical translation for that slot.
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.kv.req_pool_idx
-                        ]
+                        req.kv.mamba_pool_idx.to(torch.int32)
                     )
                     .cpu()
                     .numpy()

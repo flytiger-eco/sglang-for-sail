@@ -6,6 +6,8 @@ This kernel replaces the expensive advanced indexing operations in
 avoiding multiple `index_elementwise_kernel` launches.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -153,6 +155,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Raw index arrays (before index_select)
     dst_indices_raw_ptr,  # [total_requests] - state_indices_tensor
     step_indices_raw_ptr,  # [total_requests] - last_correct_step_indices or mamba_steps_to_track
+    src_indices_raw_ptr,  # [total_requests] - optional source entry
     elem_per_entry: tl.constexpr,
     src_layer_stride,
     src_req_stride,
@@ -163,6 +166,7 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     src_step_size,
     dst_req_size,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SRC_INDICES: tl.constexpr,
 ):
     """
     Fused gather-scatter kernel with built-in masking.
@@ -189,8 +193,10 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Load destination index
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
 
-    # Source index is just the request index itself
-    src_idx = pid_req
+    if HAS_SRC_INDICES:
+        src_idx = tl.load(src_indices_raw_ptr + pid_req).to(tl.int64)
+    else:
+        src_idx = pid_req.to(tl.int64)
 
     # Bounds check to avoid illegal memory access (sequential early-return
     # is safer than a combined & expression on some Triton backends).
@@ -226,6 +232,7 @@ def fused_mamba_state_scatter_with_mask(
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
     dst_indices_raw: torch.Tensor,  # [total_requests] - raw indices (e.g., state_indices_tensor)
     step_indices_raw: torch.Tensor,  # [total_requests] - raw step indices (step >= 0 means valid)
+    src_indices_raw: Optional[torch.Tensor] = None,
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
@@ -292,15 +299,19 @@ def fused_mamba_state_scatter_with_mask(
     # Ensure indices are int32 and contiguous
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    if src_indices_raw is not None:
+        if src_indices_raw.shape[0] != total_requests:
+            raise ValueError(
+                f"src index length mismatch: {src_indices_raw.shape[0]=} vs {total_requests=}"
+            )
+        src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
 
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
-    if not src.is_contiguous():
-        raise ValueError("src tensor must be contiguous")
+    if src.stride(2) != elem_per_entry or src.stride(-1) != 1:
+        raise ValueError("src entries must be contiguous step rows")
 
-    # Block size for copying elements
     BLOCK_SIZE = 1024
 
-    # Grid over all requests - invalid ones will early-exit in the kernel
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
 
     _fused_mamba_state_scatter_with_mask_kernel[grid](
@@ -308,6 +319,7 @@ def fused_mamba_state_scatter_with_mask(
         dst,
         dst_indices_raw,
         step_indices_raw,
+        src_indices_raw,
         elem_per_entry,
         src_layer_stride,
         src_req_stride,
@@ -318,6 +330,7 @@ def fused_mamba_state_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_SRC_INDICES=src_indices_raw is not None,
     )
 
 
@@ -327,6 +340,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     dst_ptr,
     dst_indices_raw_ptr,  # [total_requests]
     step_indices_raw_ptr,  # [total_requests], entry >= 0 means valid
+    src_indices_raw_ptr,  # [total_requests] - optional source entry
     elem_per_entry: tl.constexpr,  # dim * (K-1)
     KM1: tl.constexpr,  # K-1 (conv window width)
     src_layer_stride,
@@ -340,6 +354,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     src_step_size,
     dst_req_size,
     BLOCK_SIZE: tl.constexpr,
+    HAS_SRC_INDICES: tl.constexpr,
 ):
     """Scatter accepted conv windows from the deduplicated sliding-window source.
 
@@ -360,7 +375,10 @@ def _fused_conv_window_scatter_with_mask_kernel(
         return
 
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
-    src_idx = pid_req
+    if HAS_SRC_INDICES:
+        src_idx = tl.load(src_indices_raw_ptr + pid_req).to(tl.int64)
+    else:
+        src_idx = pid_req.to(tl.int64)
 
     # Sequential early-return is safer than combined & on some backends.
     if dst_idx < 0 or dst_idx >= dst_req_size:
@@ -397,6 +415,7 @@ def fused_conv_window_scatter_with_mask(
     src: torch.Tensor,  # deduped conv-window view [num_layers, spec_size, draft_tokens, dim, K-1]
     dst_indices_raw: torch.Tensor,  # [total_requests]
     step_indices_raw: torch.Tensor,  # [total_requests], entry >= 0 means valid
+    src_indices_raw: Optional[torch.Tensor] = None,
 ):
     """Conv-window variant of :func:`fused_mamba_state_scatter_with_mask`.
 
@@ -411,10 +430,10 @@ def fused_conv_window_scatter_with_mask(
     if total_requests == 0:
         return
 
-    if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
+    if not (dst.is_cuda and src.is_cuda and dst.device == src.device):
         raise ValueError(
-            "fused_conv_window_scatter_with_mask requires dst and src to be "
-            f"CUDA/XPU tensors on the same device ({dst.device=}, {src.device=})."
+            "fused_conv_window_scatter_with_mask requires dst and src to be CUDA "
+            f"tensors on the same device ({dst.device=}, {src.device=})."
         )
     if dst.ndim != 4 or src.ndim != 5:
         raise ValueError(f"Unexpected ranks: {dst.ndim=} (want 4) {src.ndim=} (want 5)")
@@ -447,6 +466,12 @@ def fused_conv_window_scatter_with_mask(
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    if src_indices_raw is not None:
+        if src_indices_raw.shape[0] != total_requests:
+            raise ValueError(
+                f"src index length mismatch: {src_indices_raw.shape[0]=} vs {total_requests=}"
+            )
+        src_indices_raw = src_indices_raw.to(torch.int32).contiguous()
 
     BLOCK_SIZE = 1024
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
@@ -456,6 +481,7 @@ def fused_conv_window_scatter_with_mask(
         dst,
         dst_indices_raw,
         step_indices_raw,
+        src_indices_raw,
         elem_per_entry,
         km1,
         src.stride(0),
@@ -469,6 +495,7 @@ def fused_conv_window_scatter_with_mask(
         src_step_size,
         dst_req_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_SRC_INDICES=src_indices_raw is not None,
     )
 
 
@@ -682,26 +709,32 @@ def scatter_mamba_states_after_mtp_verify(
     last_correct_step_indices: torch.Tensor,
     mamba_track_indices: torch.Tensor | None,
     mamba_steps_to_track: torch.Tensor | None,
+    intermediate_src_indices: torch.Tensor | None = None,
+    commit_persistent_state: bool = True,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
     persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
-    if ssm_states.numel() > 0:
-        fused_mamba_state_scatter_with_mask(
-            ssm_states,
-            intermediate_state_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
-        if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
+    if commit_persistent_state:
+        if ssm_states.numel() > 0:
+            fused_mamba_state_scatter_with_mask(
+                ssm_states,
+                intermediate_state_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+        if ssm_states.numel() > 0:
             fused_mamba_state_scatter_with_mask(
                 ssm_states,
                 intermediate_state_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+                intermediate_src_indices,
             )
 
     pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
@@ -709,22 +742,30 @@ def scatter_mamba_states_after_mtp_verify(
         return
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
-    if _conv_multi_eligible(pairs):
-        fused_conv_window_scatter_multi(
-            pairs,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-        )
+    if _conv_multi_eligible(pairs) and intermediate_src_indices is None:
+        if commit_persistent_state:
+            fused_conv_window_scatter_multi(
+                pairs,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+        elif mamba_track_indices is not None:
+            fused_conv_window_scatter_multi(
+                pairs,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
         return
-    for conv_states, intermediate_conv_window_cache in pairs:
-        fused_conv_window_scatter_with_mask(
-            conv_states,
-            intermediate_conv_window_cache,
-            state_indices_tensor,
-            last_correct_step_indices,
-        )
+    if commit_persistent_state:
+        for conv_states, intermediate_conv_window_cache in pairs:
+            fused_conv_window_scatter_with_mask(
+                conv_states,
+                intermediate_conv_window_cache,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
     if mamba_track_indices is not None:
         for conv_states, intermediate_conv_window_cache in pairs:
             fused_conv_window_scatter_with_mask(
@@ -732,6 +773,7 @@ def scatter_mamba_states_after_mtp_verify(
                 intermediate_conv_window_cache,
                 mamba_track_indices,
                 mamba_steps_to_track,
+                intermediate_src_indices,
             )
 
 

@@ -546,6 +546,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        enable_slot_indirection: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -573,6 +574,32 @@ class MambaPool:
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
 
+        # With slot indirection, speculative rows share the main state tensors.
+        # Committing an accepted step then becomes a mapping update instead of a
+        # full-state copy. Keep newer layouts with independent indexing/rings on
+        # their existing paths.
+        self.slot_indirection = bool(
+            enable_slot_indirection
+            and speculative_num_draft_tokens is not None
+            and not _is_npu
+            and not _is_cpu
+            and not envelope_layout
+            and not _replayssm_on
+        )
+        self.persistent_rows = size + 1
+        if self.slot_indirection:
+            self.draft_rows_per_group = speculative_num_draft_tokens
+            self.spec_num_groups = spec_state_size + 1
+            self.spec_row_base = self.persistent_rows
+            num_rows = self.persistent_rows + (
+                self.spec_num_groups * self.draft_rows_per_group
+            )
+        else:
+            self.draft_rows_per_group = 0
+            self.spec_num_groups = 0
+            self.spec_row_base = 0
+            num_rows = self.persistent_rows
+
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
@@ -594,7 +621,7 @@ class MambaPool:
                 assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
                     "envelope_layout mamba is only supported on the CUDA path"
                 )
-                max_slots = size + 1
+                max_slots = self.persistent_rows
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
                     conv_state_shapes=conv_state_shape,
@@ -617,7 +644,7 @@ class MambaPool:
             else:
                 conv_state = [
                     torch.zeros(
-                        size=(num_mamba_layers, size + 1) + conv_shape,
+                        size=(num_mamba_layers, num_rows) + conv_shape,
                         dtype=conv_dtype,
                         device=device,
                     )
@@ -643,7 +670,7 @@ class MambaPool:
                     conv_state = _init_amx_conv_state(conv_state)
 
                 temporal_state = torch.zeros(
-                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                    size=(num_mamba_layers, num_rows) + temporal_state_shape,
                     dtype=ssm_dtype,
                     device=device,
                 )
@@ -773,7 +800,11 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if self.slot_indirection:
+                    intermediate_ssm_state_cache = self._spec_group_view(
+                        temporal_state
+                    )
+                elif enable_linear_replayssm_spec:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -810,13 +841,21 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = (
-                    not cache_params.shape.disable_conv_window_dedup
+                    not self.slot_indirection
+                    and not cache_params.shape.disable_conv_window_dedup
                     and conv_window_dedup_enabled(
                         _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                     )
                 )
                 self._intermediate_conv_window_phys = []
-                if dedup_conv_window:
+                if self.slot_indirection:
+                    intermediate_conv_window_cache = [
+                        self._spec_group_view(conv) for conv in conv_state
+                    ]
+                    self._intermediate_conv_window_phys = (
+                        intermediate_conv_window_cache
+                    )
+                elif dedup_conv_window:
                     win_len = cache_params.shape.conv_kernel - 1
                     self.conv_window_axis = self._detect_conv_window_axis(
                         conv_state_shape, win_len
@@ -879,12 +918,13 @@ class MambaPool:
                 logger.info(
                     f"Mamba Cache is allocated. "
                     f"max_mamba_cache_size: {size}, "
+                    f"slot_indirection: {self.slot_indirection}, "
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {intermediate_ssm_gb:.2f}GB "
+                    f"intermediate_ssm_state_cache size: {0.0 if self.slot_indirection else intermediate_ssm_gb:.2f}GB "
                     # Report the deduplicated PHYSICAL conv-window buffers (the view
                     # over-reports its logical, un-deduplicated size).
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                    f"intermediate_conv_window_cache size: {0.0 if self.slot_indirection else get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
                 )
             else:
                 self.mamba_cache = self.State(
@@ -947,8 +987,10 @@ class MambaPool:
                 if enable_linear_replayssm_spec and not self.replayssm_spec_fold
                 else None
             )
-            mem_usage_bytes = self.mamba_cache.mem_usage_bytes()
-            if isinstance(self.mamba_cache, self.SpeculativeState):
+            mem_usage_bytes = self.mem_usage_bytes_unique()
+            if not self.slot_indirection and isinstance(
+                self.mamba_cache, self.SpeculativeState
+            ):
                 # `intermediate_conv_window` is an as_strided view whose logical
                 # shape over-reports its real footprint; charge the physical buffers
                 # instead. No-op for the dense layout, where the view and the
@@ -968,6 +1010,31 @@ class MambaPool:
         self.state_shard_on_attn_cp = getattr(
             cache_params, "state_shard_on_attn_cp", False
         )
+
+    def _spec_group_view(self, state: torch.Tensor) -> torch.Tensor:
+        """View the speculative tail as [layers, groups, draft, ...]."""
+        assert state.is_contiguous(), "slot indirection needs contiguous state tensors"
+        view = state[:, self.spec_row_base :].unflatten(
+            1, (self.spec_num_groups, self.draft_rows_per_group)
+        )
+        assert (
+            view.untyped_storage().data_ptr() == state.untyped_storage().data_ptr()
+        ), "speculative group view must alias the state pool"
+        return view
+
+    def mem_usage_bytes_unique(self) -> int:
+        """Return allocated bytes without double-counting aliased spec views."""
+        if not self.slot_indirection:
+            return self.mamba_cache.mem_usage_bytes()
+        return get_tensor_size_bytes(self.mamba_cache.conv) + get_tensor_size_bytes(
+            self.mamba_cache.temporal
+        )
+
+    def spec_group_row(
+        self, group_indices: torch.Tensor, steps: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.slot_indirection
+        return self.spec_row_base + group_indices * self.draft_rows_per_group + steps
 
     def get_speculative_mamba2_params_all_layers(self) -> SpeculativeState:
         assert isinstance(self.mamba_cache, self.SpeculativeState)
@@ -1079,7 +1146,7 @@ class MambaPool:
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, *, sibling_indices=None):
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1088,7 +1155,9 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
-        siblings_cpu = [s.get_cpu_slots(indices) for s in self._slot_siblings]
+        if sibling_indices is None:
+            sibling_indices = indices
+        siblings_cpu = [s.get_cpu_slots(sibling_indices) for s in self._slot_siblings]
         current_platform.synchronize()
         if self._slot_siblings:
             return conv_cpu, temporal_cpu, siblings_cpu
@@ -1154,6 +1223,8 @@ class MambaPool:
         data_ptrs, data_lens, item_lens = [], [], []
 
         for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            if self.slot_indirection:
+                state_tensor = state_tensor[: self.persistent_rows]
             data_ptrs.append(state_tensor.data_ptr())
             data_lens.append(state_tensor.nbytes)
             item_lens.append(state_tensor[0].nbytes)
@@ -1230,6 +1301,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    supports_mamba_slot_indirection = True
 
     def __init__(
         self,
@@ -1288,6 +1360,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            enable_slot_indirection=(
+                envs.SGLANG_MAMBA_SLOT_INDIRECTION.get()
+                and self.supports_mamba_slot_indirection
+            ),
         )
 
     def _init_mamba_pool(
@@ -1308,6 +1384,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        enable_slot_indirection: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1322,6 +1399,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            enable_slot_indirection=enable_slot_indirection,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1331,7 +1409,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,
         # so every hybrid model has both attributes.
-        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+        from sglang.srt.mem_cache.ple_state_pool import (
+            NGramPool, ShortConvPool, assert_slot_indirection_compatible,
+        )
 
         self.short_conv_pool = ShortConvPool(
             size=mamba_size,
@@ -1354,6 +1434,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         # Disabled pools stay off the sibling list so the host-offload payload
         # keeps its legacy shape for every non-PLE hybrid model.
+        assert_slot_indirection_compatible(
+            self.mamba_pool,
+            self.short_conv_pool,
+            self.ngram_pool,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        )
         if self.short_conv_pool.enabled:
             self.mamba_pool.register_slot_state(self.short_conv_pool)
         if self.ngram_pool.enabled:
@@ -1384,9 +1470,28 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
+        self.mamba_mapping_stream = None
+        if self.mamba_pool.slot_indirection:
+            assert req_pool_size <= self.mamba_pool.spec_num_groups, (
+                "mamba slot indirection needs one speculative group per request "
+                f"pool slot: {req_pool_size=} > {self.mamba_pool.spec_num_groups=}"
+            )
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+        # Qwen4-Exp PLE side states are addressed by a *persistent* slot id that
+        # must never move. Under slot indirection the mamba mapping is rewritten
+        # to speculative rows on commit, so PLE gets its own table written only at
+        # alloc and never on commit. When this is None (no indirection, or no PLE)
+        # the accessors fall back to the mamba mapping, keeping every other model
+        # byte-identical.
+        self.req_index_to_ple_index_mapping: Optional[torch.Tensor] = None
+        if self.mamba_pool.slot_indirection and (
+            self.short_conv_pool.enabled or self.ngram_pool.enabled
+        ):
+            self.req_index_to_ple_index_mapping = torch.zeros(
+                req_pool_size, dtype=torch.int32, device=self.device
+            )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
@@ -1423,6 +1528,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            enable_slot_indirection=False,
         )
         clone.req_index_to_mamba_index_mapping = self.req_index_to_mamba_index_mapping
         if enable_mamba_extra_buffer:
@@ -1485,7 +1591,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        self._publish_mamba_index_mapping(select_index, mamba_index_tensor)
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
@@ -1495,6 +1601,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
+
+    def get_ple_state_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        """Persistent slot ids for Qwen4-Exp PLE side states. Identical to
+        ``get_mamba_indices`` unless slot indirection is on: there the mamba
+        mapping is rewritten to speculative rows on commit, but PLE only ever has
+        ``size + 1`` persistent rows, so it must keep addressing its own
+        never-moved slot via the dedicated table."""
+        if self.req_index_to_ple_index_mapping is None:
+            return self.get_mamba_indices(req_indices)
+        return self.req_index_to_ple_index_mapping[req_indices]
 
     @property
     def mamba_v2p_table(self) -> Optional[torch.Tensor]:
@@ -1517,6 +1633,89 @@ class HybridReqToTokenPool(ReqToTokenPool):
             type(self).translate_mamba_indices
             is HybridReqToTokenPool.translate_mamba_indices
         )
+
+    def get_mamba_indices_for_backup(self, req_pool_index: int) -> torch.Tensor:
+        if self.mamba_mapping_stream is not None and self.mamba_slot_indirection:
+            device_module = torch.get_device_module(self.device)
+            device_module.current_stream().wait_stream(self.mamba_mapping_stream)
+        rows = torch.tensor([req_pool_index], dtype=torch.int64, device=self.device)
+        return self.get_mamba_indices(rows)
+
+    @property
+    def mamba_slot_indirection(self) -> bool:
+        return self.mamba_pool.slot_indirection
+
+    def register_forward_stream(self, forward_stream) -> None:
+        """Order mapping reuse after any in-flight verify commit."""
+        # Main and full-attention draft runners can share this pool. Retain the
+        # stream of its first owner rather than letting draft init replace it.
+        if getattr(self, "mamba_mapping_stream", None) is None:
+            self.mamba_mapping_stream = forward_stream
+
+    def _write_mamba_index_mapping(
+        self, req_indices: torch.Tensor, mamba_index_tensor: torch.Tensor
+    ) -> None:
+        """Serialize all mamba mapping writers on the dedicated stream."""
+        stream = self.mamba_mapping_stream
+        if stream is None or not self.mamba_slot_indirection:
+            self.req_index_to_mamba_index_mapping[req_indices] = mamba_index_tensor
+            return
+
+        device_module = torch.get_device_module(self.device)
+        current_stream = device_module.current_stream()
+        if stream == current_stream:
+            self.req_index_to_mamba_index_mapping[req_indices] = mamba_index_tensor
+            return
+        stream.wait_stream(current_stream)
+        with device_module.stream(stream):
+            self.req_index_to_mamba_index_mapping[req_indices] = mamba_index_tensor
+        req_indices.record_stream(stream)
+        mamba_index_tensor.record_stream(stream)
+
+    def _write_ple_index_mapping(
+        self, req_indices: torch.Tensor, ple_index_tensor: torch.Tensor
+    ) -> None:
+        """Publish the persistent PLE slot mapping. Unlike the mamba mapping this
+        has a single writer (alloc), never commit, so there is no cross-stream
+        writer race; we still mirror the mamba stream ordering so the alloc write
+        is visible to the forward that reads it."""
+        stream = self.mamba_mapping_stream
+        if stream is None:
+            self.req_index_to_ple_index_mapping[req_indices] = ple_index_tensor
+            return
+        device_module = torch.get_device_module(self.device)
+        stream.wait_stream(device_module.current_stream())
+        with device_module.stream(stream):
+            self.req_index_to_ple_index_mapping[req_indices] = ple_index_tensor
+        req_indices.record_stream(stream)
+        ple_index_tensor.record_stream(stream)
+
+    def _publish_mamba_index_mapping(
+        self, select_index: List[int], mamba_index_tensor: torch.Tensor
+    ) -> None:
+        stream = self.mamba_mapping_stream
+        if stream is None or not self.mamba_slot_indirection:
+            self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+            # PLE keeps the persistent slot id (== the value published here at
+            # alloc); it is never rewritten on commit.
+            if self.req_index_to_ple_index_mapping is not None:
+                self.req_index_to_ple_index_mapping[select_index] = mamba_index_tensor
+            return
+
+        indices = torch.tensor(select_index, dtype=torch.int64, device=self.device)
+        self._write_mamba_index_mapping(indices, mamba_index_tensor)
+        if self.req_index_to_ple_index_mapping is not None:
+            self._write_ple_index_mapping(indices, mamba_index_tensor)
+
+    def commit_mamba_accept_steps(
+        self, req_pool_indices: torch.Tensor, accept_steps: torch.Tensor
+    ) -> None:
+        """Move each request mapping to its accepted speculative state row."""
+        assert self.mamba_slot_indirection
+        rows = self.mamba_pool.spec_group_row(
+            req_pool_indices.to(torch.int64), accept_steps.to(torch.int64)
+        )
+        self._write_mamba_index_mapping(req_pool_indices, rows.to(torch.int32))
 
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
@@ -1573,6 +1772,33 @@ class HybridReqToTokenPool(ReqToTokenPool):
             last_mamba_layer = max(self.mamba_map)
             self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
         self.mamba_pool.copy_from(src_index, dst_index)
+
+    def get_short_conv_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.get_ple_state_indices(req_indices)
+
+    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.short_conv_pool.layer_cache(layer_id)
+
+    def short_conv_layer_intermediate_cache(
+        self, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        return self.short_conv_pool.layer_intermediate_cache(layer_id)
+
+    def get_ngram_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.get_ple_state_indices(req_indices)
+
+    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        return self.ngram_pool.get_context(ngram_indices)
+
+    def set_ngram_context(
+        self, ngram_indices: torch.Tensor, context: torch.Tensor
+    ) -> None:
+        self.ngram_pool.set_context(ngram_indices, context)
+
+    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
+        self.ngram_pool.set_intermediate_context(context)
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
