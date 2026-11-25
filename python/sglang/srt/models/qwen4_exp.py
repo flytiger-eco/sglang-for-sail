@@ -259,7 +259,7 @@ def _prepare_ple_batch(
 
     state_indices = (
         get_req_to_token_pool()
-        .get_mamba_indices(forward_batch.req_pool_indices[:sequence_count])
+        .get_ple_state_indices(forward_batch.req_pool_indices[:sequence_count])
         .long()
     )
 

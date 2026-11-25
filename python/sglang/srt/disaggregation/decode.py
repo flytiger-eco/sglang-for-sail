@@ -266,6 +266,8 @@ class DecodeReqToTokenPool:
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
+    # Decode receives state into the persistent slot before its first verify,
+    # so the standard slot-indirection lifecycle remains safe here.
     def __init__(
         self,
         size: int,
@@ -339,6 +341,10 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            enable_slot_indirection=(
+                envs.SGLANG_MAMBA_SLOT_INDIRECTION.get()
+                and self.supports_mamba_slot_indirection
+            ),
         )
 
     def clear(self):
@@ -1973,9 +1979,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _mamba_payload():
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.kv.req_pool_idx
-                        ]
+                        decode_req.req.kv.mamba_pool_idx.to(torch.int32)
                     )
                     .cpu()
                     .numpy()

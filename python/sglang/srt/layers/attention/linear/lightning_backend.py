@@ -382,15 +382,18 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 metadata,
             )
         elif self.linear_backend == "seg_la":
-            intermediate_state_indices = (
-                torch.arange(
+            if not forward_batch.forward_mode.is_target_verify():
+                intermediate_state_indices = None
+            elif metadata.mamba_intermediate_indices is not None:
+                intermediate_state_indices = metadata.mamba_intermediate_indices[
+                    : cache_indices.shape[0]
+                ]
+            else:
+                intermediate_state_indices = torch.arange(
                     cache_indices.shape[0],
                     dtype=torch.int32,
                     device=cache_indices.device,
                 )
-                if forward_batch.forward_mode.is_target_verify()
-                else None
-            )
             track_lens, track_state_indices = (
                 (None, None)
                 if forward_batch.forward_mode.is_target_verify()

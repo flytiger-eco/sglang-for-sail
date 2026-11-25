@@ -2018,9 +2018,10 @@ class Req(ReqDllmMixin):
             )
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
-        if allocator.get_kvcache().cpu_copy_carries_mamba:
-            return None
         if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return None
+        if (allocator.get_kvcache().cpu_copy_carries_mamba
+            and req_to_token_pool.req_index_to_ple_index_mapping is None):
             return None
         return req_to_token_pool.mamba_pool
 
@@ -2032,14 +2033,26 @@ class Req(ReqDllmMixin):
         mamba_pool = self._mamba_pool_needing_backup(
             req_to_token_pool, token_to_kv_pool_allocator
         )
+        indirect = (isinstance(req_to_token_pool, HybridReqToTokenPool)
+                    and req_to_token_pool.mamba_slot_indirection)
+        separate_ple = indirect and req_to_token_pool.req_index_to_ple_index_mapping is not None
+        mamba_backup_indices = (
+            req_to_token_pool.get_mamba_indices_for_backup(self.kv.req_pool_idx)
+            if indirect and self.kv.holds_mamba
+            else self.kv.mamba_pool_idx.unsqueeze(0) if self.kv.holds_mamba else None
+        )
+        mamba_backup_index = mamba_backup_indices[0] if indirect and self.kv.holds_mamba else self.kv.mamba_pool_idx
         self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
                 token_indices,
-                mamba_indices=self.kv.mamba_pool_idx,
+                mamba_indices=None if separate_ple else mamba_backup_index,
                 req_pool_index=self.kv.req_pool_idx,
             ),
             mamba_cpu=(
-                mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
+                mamba_pool.get_cpu_copy(
+                    mamba_backup_indices,
+                    **({"sibling_indices": self.kv.mamba_pool_idx.reshape(1)} if separate_ple else {}),
+                )
                 if mamba_pool is not None and self.kv.holds_mamba
                 else None
             ),

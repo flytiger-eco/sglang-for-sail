@@ -240,3 +240,35 @@ class NGramPool:
         """Yield replicated request-wide N-gram history for PD transfer."""
         if self.context is not None:
             yield "ple_ngram", self.context, None, PLE_NGRAM_STATE_LAYER_ID
+
+def assert_slot_indirection_compatible(
+    mamba_pool, *side_pools, enable_mamba_extra_buffer: bool = False
+) -> None:
+    """Gate the mamba slot-indirection layout against PLE side states.
+
+    PLE side states are addressed by a *persistent* slot id. Slot indirection
+    moves the mamba mapping to speculative rows on commit
+    (``commit_mamba_accept_steps`` writes ``spec_group_row(...)``, whose floor is
+    ``spec_row_base == persistent_rows == size + 1``), which these ``size + 1``
+    -row pools cannot hold. The two are decoupled by giving PLE its own
+    ``req_index_to_ple_index_mapping`` (written only at alloc, never on commit),
+    so the working-slot read/write path is safe.
+
+    The one path that is NOT decoupled is the radix / extra-buffer track
+    snapshot: ``_ple_track_targets`` still writes the ping-pong track slot handed
+    out via ``mamba_track_indices``, which under indirection would be a moved
+    speculative row. Reject that combination rather than corrupt the radix cache.
+    """
+
+    if not getattr(mamba_pool, "slot_indirection", False):
+        return
+    live = [pool for pool in side_pools if getattr(pool, "enabled", False)]
+    if not live:
+        return
+    if enable_mamba_extra_buffer:
+        raise ValueError(
+            "Qwen4-Exp PLE side states + mamba slot indirection do not support "
+            "the mamba extra-buffer / radix track path (the PLE track snapshot "
+            "is not decoupled from the moved mamba mapping). Disable radix mamba "
+            "caching, or set SGLANG_MAMBA_SLOT_INDIRECTION=0, to serve this model."
+        )

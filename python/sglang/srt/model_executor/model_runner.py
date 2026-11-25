@@ -999,6 +999,8 @@ class ModelRunner:
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
+        if hasattr(self.req_to_token_pool, "register_forward_stream"):
+            self.req_to_token_pool.register_forward_stream(self.forward_stream)
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config

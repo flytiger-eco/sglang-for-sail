@@ -1601,6 +1601,9 @@ class Envs:
     # ===================================================================
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+    # Commit accepted MTP states by repointing the request's Mamba cache index
+    # at the already-populated speculative row instead of copying the full state.
+    SGLANG_MAMBA_SLOT_INDIRECTION = EnvBool(False)
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)

@@ -106,6 +106,7 @@ class MambaAttnBackendBase(AttentionBackend):
         # unless --enable-linear-replayssm is set.
         self.replayssm_write_pos_list = None
         self.replayssm_force_flush_list = None
+        self.intermediate_indices_list = []
         self.query_start_loc_list = []
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
@@ -113,6 +114,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+        self.mamba_slot_indirection = getattr(
+            self.req_to_token_pool, "mamba_slot_indirection", False
+        )
+
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
@@ -124,6 +129,24 @@ class MambaAttnBackendBase(AttentionBackend):
                 self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
             )
         return self._mamba_chunk_size
+
+    def _mamba_intermediate_indices(
+        self,
+        req_pool_indices: torch.Tensor,
+        mamba_cache_indices: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self.mamba_slot_indirection:
+            return None
+        groups = torch.where(
+            mamba_cache_indices < 0,
+            mamba_cache_indices.new_full((), -1),
+            req_pool_indices.to(mamba_cache_indices.dtype),
+        )
+        if out is None:
+            return groups
+        out[: groups.shape[0]].copy_(groups)
+        return out
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -326,6 +349,9 @@ class MambaAttnBackendBase(AttentionBackend):
             logical_num_tokens=logical_num_tokens,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_intermediate_indices=self._mamba_intermediate_indices(
+                forward_batch.req_pool_indices, mamba_cache_indices
+            ),
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -617,6 +643,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.replayssm_force_flush_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
                 )
+            self.intermediate_indices_list.append(
+                torch.full(
+                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
+                )
+            )
             self.query_start_loc_list.append(
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -692,6 +723,16 @@ class MambaAttnBackendBase(AttentionBackend):
         # before copying (no-op for non-unified pool).
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        self._mamba_intermediate_indices(
+            req_pool_indices,
+            mamba_indices,
+            out=self.intermediate_indices_list[bs - 1],
+        )
+        mamba_intermediate_indices = (
+            self.intermediate_indices_list[bs - 1]
+            if self.mamba_slot_indirection
+            else None
+        )
 
         # Capture records the pointer to the static per-bs buffers; their zeros are
         # overwritten in-place by _replay_metadata before each replay. None when off.
@@ -711,6 +752,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_intermediate_indices=mamba_intermediate_indices,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -721,6 +763,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_intermediate_indices=mamba_intermediate_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -773,9 +816,19 @@ class MambaAttnBackendBase(AttentionBackend):
                 mamba_indices.detach().cpu(),
                 valid_bs=valid_bs,
                 total_bs=bs,
-                num_state_slots=self.req_to_token_pool.mamba_pool.size + 1,
+                num_state_slots=self.req_to_token_pool.mamba_pool.mamba_cache.temporal.shape[1],
                 pad_slot_id=self.pad_slot_id,
             )
+        self._mamba_intermediate_indices(
+            req_pool_indices,
+            mamba_indices,
+            out=self.intermediate_indices_list[bs - 1],
+        )
+        mamba_intermediate_indices = (
+            self.intermediate_indices_list[bs - 1]
+            if self.mamba_slot_indirection
+            else None
+        )
         # Refresh the static track-dest buffer in-place (translated); the captured
         # track-save reads it, leaving the handed-in InputBuffer slot read-only.
         # Hand out only the refreshed [:bs] prefix — Mamba2's track-save slices
@@ -907,6 +960,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_intermediate_indices=mamba_intermediate_indices,
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
@@ -918,6 +972,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=qsl_buf,
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_intermediate_indices=mamba_intermediate_indices,
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
@@ -1461,8 +1516,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         slot ids instead of reusing this step's ``forward_metadata``; the scatter
         below reads the metadata it just planned.
         """
-        del req_pool_indices
         request_number = last_correct_step_indices.shape[0]
+        linear_backend = self.linear_attn_backend
+        pool = linear_backend.req_to_token_pool
 
         # `mamba_track_indices` is VIRTUAL; the scatter writes physical views.
         if mamba_track_indices is not None:
@@ -1471,12 +1527,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
         state_indices_tensor = (
-            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                :request_number
-            ]
+            linear_backend.forward_metadata.mamba_cache_indices[:request_number]
         )
 
-        req_pool = self.linear_attn_backend.req_to_token_pool
+        req_pool = pool
+        if linear_backend.mamba_slot_indirection and req_pool_indices is not None:
+            state_indices_tensor = linear_backend._translate_mamba_indices(
+                req_pool.get_mamba_indices(req_pool_indices[:request_number])
+            )
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
         # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
@@ -1527,6 +1585,32 @@ class HybridLinearAttnBackend(AttentionBackend):
                 last_correct_step_indices.to(torch.int32) + 1
             )
             return
+        intermediate_src_indices = None
+        ple_state_indices = state_indices_tensor
+        if linear_backend.mamba_slot_indirection:
+            if req_pool_indices is None:
+                raise ValueError("Mamba slot-indirection commit requires explicit request-pool indices")
+            intermediate_src_indices = req_pool_indices[:request_number].to(torch.int32)
+            pool.commit_mamba_accept_steps(
+                req_pool_indices[:request_number], last_correct_step_indices
+            )
+            # PLE side states are NOT remapped -- they live in persistent slots.
+            # `state_indices_tensor` here is a moved speculative row, out of range
+            # for the size+1 PLE pools, so resolve the persistent slot instead and
+            # carry over the -1 padding sentinel (masked out by the scatter).
+            # Only models with live PLE pools maintain that table; for every other
+            # slot-indirection model (e.g. Qwen3.5 GDN, PD decode) it is None and
+            # the dst stays exactly `state_indices_tensor` -- byte-identical, no
+            # extra gather/where.
+            if getattr(pool, "req_index_to_ple_index_mapping", None) is not None:
+                persistent_ple = pool.get_ple_state_indices(
+                    req_pool_indices[:request_number]
+                ).to(state_indices_tensor.dtype)
+                ple_state_indices = torch.where(
+                    state_indices_tensor >= 0,
+                    persistent_ple,
+                    state_indices_tensor.new_full((), -1),
+                )
 
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
@@ -1534,10 +1618,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
+            intermediate_src_indices=intermediate_src_indices,
+            commit_persistent_state=not linear_backend.mamba_slot_indirection,
         )
 
         self._update_ple_state_after_mtp_verify(
-            state_indices_tensor,
+            ple_state_indices,
             last_correct_step_indices,
             mamba_track_indices,
             mamba_steps_to_track,
