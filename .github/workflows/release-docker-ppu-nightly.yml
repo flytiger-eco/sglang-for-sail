@@ -17,6 +17,11 @@ on:
         required: false
         type: boolean
         default: true
+      source_repo:
+        description: 'SGLang source repository URL; defaults to the SGLANG_SOURCE_REPO repository variable'
+        required: false
+        type: string
+        default: ''
   schedule:
     # 00:00 Beijing Time (UTC+8) every day.
     - cron: '0 16 * * *'
@@ -44,8 +49,14 @@ jobs:
 
       - name: Compute image metadata
         id: meta
+        env:
+          SGLANG_SOURCE_REPO: ${{ inputs.source_repo || vars.SGLANG_SOURCE_REPO }}
         run: |
           set -euo pipefail
+          if [[ -z "${SGLANG_SOURCE_REPO}" ]]; then
+            echo "::error::Set the SGLANG_SOURCE_REPO repository variable or the source_repo workflow input."
+            exit 1
+          fi
           # ghcr.io image paths must be lowercase.
           owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           date_tag=$(date -u +%Y%m%d)
@@ -90,6 +101,7 @@ jobs:
             ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.rolling }}
           build-args: |
             PPU_BASE_IMAGE=${{ steps.meta.outputs.base_image }}
+            SGLANG_SOURCE_REPO=${{ inputs.source_repo || vars.SGLANG_SOURCE_REPO }}
             SGLANG_BUILD_COMMIT=${{ github.sha }}
             SGLANG_BUILD_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             SGLANG_IMAGE_TAG=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
