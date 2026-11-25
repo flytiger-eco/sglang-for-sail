@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe import glm53_sail_gate
 from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
@@ -168,12 +169,22 @@ def is_mega_moe_experts_ready(experts) -> bool:
     return _device_sm // 10 == 10
 
 
-_MEGA_HIT_LOGGED=set()
+_MEGA_HIT_LOGGED = set()
+
+
 def _log_mega_moe_hit(moe):
     import logging
-    if id(moe) in _MEGA_HIT_LOGGED: return
+
+    if id(moe) in _MEGA_HIT_LOGGED:
+        return
     _MEGA_HIT_LOGGED.add(id(moe))
-    logging.getLogger("mega_moe").warning("MEGA_MOE_HIT layer=%s experts=%s mma=%s", getattr(moe,"prefix","?"), moe.experts.num_experts, _mega_moe_mma_type(moe.experts))
+    logging.getLogger("mega_moe").warning(
+        "MEGA_MOE_HIT layer=%s experts=%s mma=%s",
+        getattr(moe, "prefix", "?"),
+        moe.experts.num_experts,
+        _mega_moe_mma_type(moe.experts),
+    )
+
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
     if _use_amd_flydsl_mega_moe():
@@ -267,21 +278,27 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
-        )
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if glm53_sail_gate.can_route(moe, hidden_states, dispatch_info):
+            # Both expert backends consume the same real routing tensors. Keep
+            # pre-dispatch's copy and its existing scale-once contract.
+            topk_output = glm53_sail_gate.route(
+                moe, hidden_states, forward_batch, dispatch_info
+            )
+        else:
+            router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:

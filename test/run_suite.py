@@ -131,6 +131,7 @@ PER_COMMIT_SUITES = {
         # for 2-GPU tests but currently has no registered coverage.
         "stage-a-test-1-gpu-ppu",
         "stage-b-test-1-gpu-ppu",
+        "stage-b-test-1-gpu-ppu-m890",
         "stage-c-test-2-gpu-ppu",
     ],
 }

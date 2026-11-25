@@ -95,6 +95,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    glm53_sail_gate,
     post_experts_all_reduce,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -1505,7 +1506,20 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            dispatch_info = (
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if not self.is_nextn
+                else None
+            )
+            use_glm_gate = (
+                glm53_sail_gate.can_route(self, hidden_states, dispatch_info)
+                and get_moe_a2a_backend().is_deepep()
+            )
+            router_logits = (
+                None
+                if use_glm_gate
+                else self.gate(hidden_states, forward_batch=forward_batch)
+            )
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
@@ -1527,12 +1541,14 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            dispatch_info = (
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            )
-            if self.gate.e_score_correction_bias_vl is not None:
+            if use_glm_gate:
+                topk_output = glm53_sail_gate.route(
+                    self,
+                    hidden_states,
+                    batch=forward_batch,
+                    dispatch_info=dispatch_info,
+                )
+            elif self.gate.e_score_correction_bias_vl is not None:
                 # IDs follow the same local row order as hidden_states, including
                 # CP sharding and the attention-TP scatter before DeepEP.
                 topk_output = vision_topk(
