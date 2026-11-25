@@ -626,8 +626,12 @@ impl Tree {
         (matched_text, result.tenant.to_string())
     }
 
-    #[allow(dead_code)]
-    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+    /// Char count of the longest prefix of `text` owned by `tenant` (no allocation).
+    ///
+    /// `touch = false` leaves the tenant's LRU timestamp untouched, which is what
+    /// candidate scoring needs: probing every worker must not make them all look
+    /// freshly used.
+    pub fn prefix_match_chars_for_tenant(&self, text: &str, tenant: &str, touch: bool) -> usize {
         // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
@@ -679,16 +683,22 @@ impl Tree {
 
         // Only update timestamp if we found a match for the specified tenant.
         // Update matched node only - ancestor propagation is unnecessary.
-        if curr
-            .tenant_last_access_time
-            .contains_key(tenant_id.as_ref())
+        if touch
+            && curr
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
         {
             let epoch = get_epoch();
             curr.tenant_last_access_time
                 .insert(Arc::clone(&tenant_id), epoch);
         }
 
-        // Build result from original input using char count
+        matched_chars
+    }
+
+    #[allow(dead_code)]
+    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        let matched_chars = self.prefix_match_chars_for_tenant(text, tenant, true);
         take_chars(text, matched_chars)
     }
 

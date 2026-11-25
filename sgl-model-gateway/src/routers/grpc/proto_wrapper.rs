@@ -367,12 +367,40 @@ impl ProtoGenerateError {
 pub enum ProtoStream {
     Sglang(SglangStream),
     Vllm(VllmStream),
+    #[cfg(test)]
+    Mock(futures_util::stream::BoxStream<'static, Result<ProtoGenerateResponse, tonic::Status>>),
+    Tracked {
+        stream: Box<ProtoStream>,
+        guard: Option<crate::core::WorkerLoadGuard>,
+    },
 }
 
 impl ProtoStream {
+    pub fn with_guard(self, guard: crate::core::WorkerLoadGuard) -> Self {
+        Self::Tracked {
+            stream: Box::new(self),
+            guard: Some(guard),
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         match self {
+            #[cfg(test)]
+            Self::Mock(stream) => stream.next().await,
+            Self::Tracked { stream, guard } => {
+                let item = Box::pin(stream.next()).await;
+                if let Some(guard) = guard.as_mut() {
+                    guard.on_first_byte();
+                    if matches!(item, Some(Err(_))) {
+                        guard.set_success(false);
+                    }
+                }
+                if item.is_none() || matches!(item, Some(Err(_))) {
+                    guard.take();
+                }
+                item
+            }
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -387,6 +415,12 @@ impl ProtoStream {
     /// Mark stream as completed (no abort needed)
     pub fn mark_completed(&mut self) {
         match self {
+            #[cfg(test)]
+            Self::Mock(_) => {}
+            Self::Tracked { stream, guard } => {
+                stream.mark_completed();
+                guard.take();
+            }
             Self::Sglang(stream) => stream.mark_completed(),
             Self::Vllm(stream) => stream.mark_completed(),
         }
@@ -516,5 +550,129 @@ impl ProtoEmbedError {
         match self {
             Self::Sglang(e) => &e.code,
         }
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::{
+        core::{BasicWorkerBuilder, Worker, WorkerLoadGuard},
+        policies::{LoadBalancingPolicy, PrefillAwarePolicy, SelectWorkerInfo},
+    };
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn grpc_first_chunk_transitions_once_and_each_stream_settles_independently() {
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(PrefillAwarePolicy::new());
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker").build());
+        let pa = policy
+            .as_any()
+            .downcast_ref::<PrefillAwarePolicy>()
+            .unwrap();
+        let mut streams = Vec::new();
+        for text in ["prefill", "decode"] {
+            let (_, id) = policy
+                .select_worker_with_token(
+                    std::slice::from_ref(&worker),
+                    &SelectWorkerInfo {
+                        request_text: Some(text),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let guard = WorkerLoadGuard::with_policy(worker.clone(), None, &policy, id);
+            let items = [11, 22].map(|id| {
+                Ok(ProtoGenerateResponse::Sglang(Box::new(
+                    sglang::GenerateResponse {
+                        request_id: "test".into(),
+                        response: Some(sglang::generate_response::Response::Chunk(
+                            sglang::GenerateStreamChunk {
+                                token_ids: vec![id],
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                )))
+            });
+            streams.push(
+                ProtoStream::Mock(futures_util::stream::iter(items).boxed()).with_guard(guard),
+            );
+        }
+        let mut decode = streams.pop().unwrap();
+        let mut prefill = streams.pop().unwrap();
+        assert_eq!(pa.phase_counts(worker.url()), (2, 0));
+        for id in [11, 22] {
+            let response = prefill.next().await.unwrap().unwrap();
+            let ProtoResponseVariant::Chunk(chunk) = response.into_response() else {
+                panic!("expected chunk")
+            };
+            assert_eq!(chunk.token_ids(), &[id]);
+            assert_eq!(pa.phase_counts(worker.url()), (1, 1));
+        }
+        assert!(prefill.next().await.is_none());
+        assert_eq!(pa.phase_counts(worker.url()), (1, 0));
+        assert_eq!(pa.inflight_chars(worker.url()), 6);
+        decode.next().await.unwrap().unwrap();
+        assert_eq!(pa.phase_counts(worker.url()), (0, 1));
+        drop(decode); // cancellation before EOF
+        assert_eq!(pa.phase_counts(worker.url()), (0, 0));
+        assert_eq!(worker.load(), 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct HookCounts {
+        first: std::sync::atomic::AtomicUsize,
+        completed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LoadBalancingPolicy for HookCounts {
+        async fn select_worker(
+            &self,
+            _: &[Arc<dyn Worker>],
+            _: &SelectWorkerInfo<'_>,
+        ) -> Option<usize> {
+            None
+        }
+        fn name(&self) -> &'static str {
+            "prefill_aware"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn on_first_token(&self, _: &str, id: Option<u64>) {
+            assert_eq!(id, Some(7));
+            self.first.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn on_dispatch_complete(&self, _: &str, id: Option<u64>, success: bool) {
+            assert_eq!(id, Some(7));
+            assert!(!success);
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_error_first_item_signals_once_and_releases_guard() {
+        use std::sync::atomic::Ordering;
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker").build());
+        let counts = Arc::new(HookCounts::default());
+        let policy: Arc<dyn LoadBalancingPolicy> = counts.clone();
+        let guard = WorkerLoadGuard::with_policy(worker.clone(), None, &policy, Some(7));
+        let mut stream = ProtoStream::Mock(
+            futures_util::stream::iter([Err(tonic::Status::internal("upstream error"))]).boxed(),
+        )
+        .with_guard(guard);
+        assert_eq!(
+            stream.next().await.unwrap().err().unwrap().message(),
+            "upstream error"
+        );
+        assert_eq!(worker.load(), 0);
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert_eq!(counts.first.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.completed.load(Ordering::SeqCst), 1);
     }
 }

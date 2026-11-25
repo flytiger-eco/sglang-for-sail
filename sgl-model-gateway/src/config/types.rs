@@ -311,6 +311,36 @@ pub enum PolicyConfig {
     /// - Uses consistent hash ring with bounded load balancing
     /// - Walks ring if worker is overloaded (load > avg * load_factor)
     /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    ///
+    /// Prefill-backlog aware policy: routes by outstanding estimated
+    /// characters plus the part of the prompt that still needs prefilling.
+    #[serde(rename = "prefill_aware")]
+    PrefillAware {
+        /// Weight of one not-yet-prefilled character vs one queued character.
+        #[serde(default = "default_prefill_weight")]
+        prefill_weight: f64,
+        #[serde(default = "default_prefill_eviction_interval_secs")]
+        eviction_interval_secs: u64,
+        /// Maximum characters kept per tenant in one pool/model tree.
+        #[serde(default = "default_prefill_max_tree_size")]
+        max_tree_size: usize,
+        /// Pending entries older than this are pruned defensively; must stay
+        /// above `request_timeout_secs`.
+        #[serde(default = "default_prefill_pending_ttl_secs")]
+        pending_ttl_secs: u64,
+        /// Relative tolerance used by `weighted` to randomise among scores
+        /// within this fraction of the best score.
+        #[serde(default = "default_prefill_tie_tolerance_ratio")]
+        tie_tolerance_ratio: f64,
+        /// Ranking mode (default: `lexicographic`).
+        #[serde(default)]
+        selection: PrefillSelection,
+        /// Backlogs within this many tokens of the smallest count as equal in
+        /// `lexicographic` mode; 0 means strict equality.
+        #[serde(default = "default_prefill_backlog_epsilon_tokens")]
+        backlog_epsilon_tokens: u64,
+    },
+
     #[serde(rename = "prefix_hash")]
     PrefixHash {
         /// Number of prefix tokens to hash (default: 256)
@@ -320,6 +350,30 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+}
+
+fn default_prefill_weight() -> f64 {
+    1.0
+}
+
+fn default_prefill_max_tree_size() -> usize {
+    10_000_000
+}
+
+fn default_prefill_eviction_interval_secs() -> u64 {
+    30
+}
+
+fn default_prefill_pending_ttl_secs() -> u64 {
+    3_600
+}
+
+fn default_prefill_tie_tolerance_ratio() -> f64 {
+    0.02
+}
+
+fn default_prefill_backlog_epsilon_tokens() -> u64 {
+    0
 }
 
 fn default_prefix_token_count() -> usize {
@@ -348,7 +402,41 @@ impl PolicyConfig {
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
+            PolicyConfig::PrefillAware { .. } => "prefill_aware",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+        }
+    }
+}
+
+/// How `prefill_aware` ranks candidate workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillSelection {
+    /// Strict lexicographic order: least pending prefill first, then fewest
+    /// decode dispatches. Requests whose prefix is fully resident skip the
+    /// first level, since prefill backlog is irrelevant to them. This is the
+    /// default.
+    #[default]
+    Lexicographic,
+    /// The original weighted score:
+    /// `outstanding_chars(w) + prefill_weight * new_chars(w)`, randomised
+    /// within `tie_tolerance_ratio` of the best score.
+    Weighted,
+}
+
+impl PrefillSelection {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lexicographic" | "lex" => Some(Self::Lexicographic),
+            "weighted" | "score" => Some(Self::Weighted),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexicographic => "lexicographic",
+            Self::Weighted => "weighted",
         }
     }
 }

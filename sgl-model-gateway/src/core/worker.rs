@@ -1147,10 +1147,26 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    on_drop: Option<Box<dyn FnOnce(bool) + Send + Sync>>,
+    /// Outcome handed to `on_drop`. Optimistic until [`Self::set_success`] runs;
+    /// stream bodies settle it after the guard has been attached.
+    success: Arc<AtomicBool>,
+    first_byte: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        Self::with_on_drop(worker, headers, None)
+    }
+
+    /// Same as [`Self::new`] but runs `on_drop` when the guard is released
+    /// (i.e. when the response body finishes or the client disconnects). The
+    /// callback receives the outcome recorded through [`Self::set_success`].
+    pub fn with_on_drop(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        on_drop: Option<Box<dyn FnOnce(bool) + Send + Sync>>,
+    ) -> Self {
         use crate::routers::header_utils::extract_routing_key;
 
         worker.increment_load();
@@ -1164,7 +1180,42 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            on_drop,
+            success: Arc::new(AtomicBool::new(true)),
+            first_byte: None,
         }
+    }
+
+    /// Own the policy reservation immediately after selection.
+    pub fn with_policy(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        policy: &Arc<dyn crate::policies::LoadBalancingPolicy>,
+        dispatch_id: Option<u64>,
+    ) -> Self {
+        let mut guard = Self::with_on_drop(
+            worker.clone(),
+            headers,
+            crate::policies::completion_hook(policy, worker.as_ref(), dispatch_id),
+        );
+        guard.first_byte = crate::policies::first_token_hook(policy, worker.as_ref(), dispatch_id);
+        guard
+    }
+
+    pub fn take_first_byte_hook(&mut self) -> Option<Box<dyn FnOnce() + Send + Sync>> {
+        self.first_byte.take()
+    }
+
+    pub fn on_first_byte(&mut self) {
+        if let Some(hook) = self.first_byte.take() {
+            hook();
+        }
+    }
+
+    /// Record the request outcome for the `on_drop` callback. Callers that know
+    /// the upstream status should call this; the default is success.
+    pub fn set_success(&self, success: bool) {
+        self.success.store(success, Ordering::Relaxed);
     }
 }
 
@@ -1173,6 +1224,9 @@ impl Drop for WorkerLoadGuard {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
+        }
+        if let Some(callback) = self.on_drop.take() {
+            callback(self.success.load(Ordering::Relaxed));
         }
     }
 }
@@ -2167,6 +2221,62 @@ mod tests {
 
         assert_eq!(worker.load(), 0);
         assert_eq!(worker.worker_routing_key_load().value(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_guard_reports_outcome() {
+        use crate::core::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let seen = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&seen);
+
+        {
+            let guard = WorkerLoadGuard::with_on_drop(
+                worker.clone(),
+                None,
+                Some(Box::new(move |success| {
+                    flag.store(success, Ordering::Relaxed)
+                })),
+            );
+            guard.set_success(false);
+            assert_eq!(worker.load(), 1);
+        }
+
+        assert_eq!(worker.load(), 0);
+        assert!(
+            !seen.load(Ordering::Relaxed),
+            "callback must see the recorded outcome"
+        );
+    }
+
+    #[test]
+    fn test_worker_load_guard_defaults_to_success() {
+        use crate::core::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://test:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let seen = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&seen);
+
+        {
+            let _guard = WorkerLoadGuard::with_on_drop(
+                worker.clone(),
+                None,
+                Some(Box::new(move |success| {
+                    flag.store(success, Ordering::Relaxed)
+                })),
+            );
+        }
+
+        assert!(seen.load(Ordering::Relaxed));
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod consistent_hashing;
 mod factory;
 mod manual;
 mod power_of_two;
+mod prefill_aware;
 mod prefix_hash;
 mod random;
 mod registry;
@@ -28,7 +29,50 @@ pub use consistent_hashing::ConsistentHashingPolicy;
 pub use factory::PolicyFactory;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use power_of_two::PowerOfTwoPolicy;
+pub use prefill_aware::{PrefillAwareConfig, PrefillAwarePolicy};
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
+
+/// Build the load-guard hook that closes a `prefill_aware` dispatch.
+///
+/// `prefill_aware` keeps its own outstanding-character ledger, which is only
+/// decremented through [`LoadBalancingPolicy::on_request_complete`]. Every
+/// router that hands a request to a worker must therefore hand this hook to
+/// `WorkerLoadGuard::with_on_drop` (or `LoadGuards`); skipping a path leaks
+/// its dispatches until the ledger's TTL prunes them.
+///
+/// Returns `None` for every other policy: their completion hook is either a
+/// no-op or already covered by the worker's own load counter.
+/// Build the callback that tells the policy its dispatch started producing
+/// output (first SSE chunk for streaming responses).
+pub fn first_token_hook(
+    policy: &Arc<dyn LoadBalancingPolicy>,
+    worker: &dyn Worker,
+    dispatch_id: Option<u64>,
+) -> Option<Box<dyn FnOnce() + Send + Sync>> {
+    if policy.name() != "prefill_aware" {
+        return None;
+    }
+    let policy = Arc::clone(policy);
+    let worker_url = worker.url().to_string();
+    Some(Box::new(move || {
+        policy.on_first_token(&worker_url, dispatch_id)
+    }))
+}
+
+pub fn completion_hook(
+    policy: &Arc<dyn LoadBalancingPolicy>,
+    worker: &dyn Worker,
+    dispatch_id: Option<u64>,
+) -> Option<Box<dyn FnOnce(bool) + Send + Sync>> {
+    if policy.name() != "prefill_aware" {
+        return None;
+    }
+    let policy = Arc::clone(policy);
+    let worker_url = worker.url().to_string();
+    Some(Box::new(move |success| {
+        policy.on_dispatch_complete(&worker_url, dispatch_id, success)
+    }))
+}
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
@@ -54,12 +98,38 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize>;
 
+    /// Select a worker and, when the policy tracks per-dispatch state, the
+    /// token that must be handed back on completion.
+    ///
+    /// Default: no token, i.e. [`Self::select_worker`] only.
+    async fn select_worker_with_token(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<(usize, Option<u64>)> {
+        Some((self.select_worker(workers, info).await?, None))
+    }
+
     /// Update policy state after request completion
     ///
     /// This is called when a request completes (successfully or not) to allow
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
         // Default: no-op for stateless policies
+    }
+
+    /// The dispatch produced its first response byte, i.e. its prefill is done.
+    ///
+    /// Only policies that split prefill from decode work need this; the default
+    /// is a no-op.
+    fn on_first_token(&self, _worker_url: &str, _dispatch_id: Option<u64>) {}
+
+    /// Completion signal for a dispatch that may carry a policy-issued token.
+    ///
+    /// Default: delegate to [`Self::on_request_complete`], which is what a
+    /// policy that cannot identify the exact dispatch has to do.
+    fn on_dispatch_complete(&self, worker_url: &str, _dispatch_id: Option<u64>, success: bool) {
+        self.on_request_complete(worker_url, success);
     }
 
     /// Get policy name for metrics and debugging

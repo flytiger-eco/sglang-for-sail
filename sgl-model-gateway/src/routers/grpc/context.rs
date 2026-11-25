@@ -14,6 +14,7 @@ use super::{
 };
 use crate::{
     core::{Worker, WorkerLoadGuard},
+    policies::LoadBalancingPolicy,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -75,6 +76,11 @@ pub(crate) struct ProcessingState {
 
     // Stage 2: Worker selection outputs
     pub workers: Option<WorkerSelection>,
+
+    /// Policy instance that produced `workers`. Kept so the execution stage can
+    /// close the dispatch: `prefill_aware` maintains a per-worker ledger that
+    /// only its completion hook decrements.
+    pub selected_policy: Option<Arc<dyn LoadBalancingPolicy>>,
 
     // Stage 3: Client acquisition outputs
     pub clients: Option<ClientSelection>,
@@ -167,15 +173,25 @@ pub(crate) enum LoadGuards {
     },
 }
 
+#[cfg(test)]
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    pub fn new(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        policy: Option<&Arc<dyn LoadBalancingPolicy>>,
+        tokens: (Option<u64>, Option<u64>),
+    ) -> Self {
+        let guard = |worker: &Arc<dyn Worker>, token| match policy {
+            Some(policy) => WorkerLoadGuard::with_policy(worker.clone(), headers, policy, token),
+            None => WorkerLoadGuard::new(worker.clone(), headers),
+        };
         match selection {
-            WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
+            WorkerSelection::Single { worker } => Self::Single {
+                _guard: guard(worker, tokens.0),
             },
-            WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+            WorkerSelection::Dual { prefill, decode } => Self::Dual {
+                _prefill: guard(prefill, tokens.0),
+                _decode: guard(decode, tokens.1),
             },
         }
     }
@@ -483,4 +499,107 @@ pub(crate) enum FinalResponse {
     Embedding(EmbeddingResponse),
     /// Classification response
     Classify(ClassifyResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::policies::{PrefillAwarePolicy, SelectWorkerInfo};
+
+    fn worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        )
+    }
+
+    /// Dropping the guards must close the `prefill_aware` dispatch, otherwise
+    /// the per-worker ledger only shrinks through its TTL.
+    #[tokio::test]
+    async fn guards_close_prefill_aware_dispatches() {
+        let policy: Arc<dyn LoadBalancingPolicy> = Arc::new(PrefillAwarePolicy::new());
+        let prefill = worker("http://prefill:8000");
+        let decode = worker("http://decode:8000");
+        let (prefill_url, decode_url) = (prefill.url().to_string(), decode.url().to_string());
+
+        // Dispatch one request to each worker so both ledgers hold 50 chars.
+        // Distinct prompts: the tree is cluster-wide, so a repeated prompt would
+        // match fully and account nothing.
+        for (w, seed) in [
+            (prefill.clone(), "x".repeat(50)),
+            (decode.clone(), "y".repeat(50)),
+        ] {
+            let info = SelectWorkerInfo {
+                request_text: Some(&seed),
+                ..Default::default()
+            };
+            policy.select_worker(&[w], &info).await.unwrap();
+        }
+        let pa = policy
+            .as_any()
+            .downcast_ref::<PrefillAwarePolicy>()
+            .unwrap();
+        assert_eq!(pa.inflight_chars(&prefill_url), 50);
+        assert_eq!(pa.inflight_chars(&decode_url), 50);
+
+        // Single selection releases only the worker it was attached to.
+        {
+            let _guard = LoadGuards::new(
+                &WorkerSelection::Single {
+                    worker: prefill.clone(),
+                },
+                None,
+                Some(&policy),
+                (None, None),
+            );
+        }
+        assert_eq!(pa.inflight_chars(&prefill_url), 0);
+        assert_eq!(pa.inflight_chars(&decode_url), 50);
+
+        // Re-seed prefill with a prompt nobody has used: the tree is
+        // cluster-wide, so any previously inserted prompt matches fully and
+        // would account zero characters.
+        let fresh = "z".repeat(50);
+        let info = SelectWorkerInfo {
+            request_text: Some(&fresh),
+            ..Default::default()
+        };
+        policy
+            .select_worker(std::slice::from_ref(&prefill), &info)
+            .await
+            .unwrap();
+        assert_eq!(pa.inflight_chars(&prefill_url), 50);
+        {
+            let _guards = LoadGuards::new(
+                &WorkerSelection::Dual {
+                    prefill: prefill.clone(),
+                    decode: decode.clone(),
+                },
+                None,
+                Some(&policy),
+                (None, None),
+            );
+        }
+        assert_eq!(pa.inflight_chars(&prefill_url), 0);
+        assert_eq!(pa.inflight_chars(&decode_url), 0);
+    }
+
+    /// Without a policy (or with a non-prefill_aware one) the guards must still
+    /// manage the worker's own load counter.
+    #[tokio::test]
+    async fn guards_without_policy_are_plain_load_guards() {
+        let w = worker("http://w:8000");
+        {
+            let _guards = LoadGuards::new(
+                &WorkerSelection::Single { worker: w.clone() },
+                None,
+                None,
+                (None, None),
+            );
+            assert_eq!(w.load(), 1);
+        }
+        assert_eq!(w.load(), 0);
+    }
 }
