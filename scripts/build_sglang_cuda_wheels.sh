@@ -80,7 +80,8 @@ export_wheels() {
 if [[ "${PACKAGES}" == all || "${PACKAGES}" == sglang ]]; then
     echo "==> Building sglang wheel"
     cd "${SGLANG_SOURCE_DIR}"
-    source scripts/ci/utils/install_protoc.sh
+    # install_protoc.sh exits early when protoc exists; do not let it exit the builder.
+    (source scripts/ci/utils/install_protoc.sh)
     source scripts/ci/utils/install_rustup.sh
     export PATH="${HOME}/.cargo/bin:${PATH}"
     cd python
@@ -101,4 +102,12 @@ if [[ "${PACKAGES}" == all || "${PACKAGES}" == sglang-kernel ]]; then
 fi
 
 echo "==> Built wheels:"
+shopt -s nullglob
+built_wheels=("${WHEEL_DIR}"/*.whl)
+expected_wheels=1
+[[ "${PACKAGES}" == all ]] && expected_wheels=2
+if (( ${#built_wheels[@]} != expected_wheels )); then
+    echo "Expected ${expected_wheels} wheel(s), found ${#built_wheels[@]} in ${WHEEL_DIR}" >&2
+    exit 1
+fi
 ls -l "${WHEEL_DIR}"
