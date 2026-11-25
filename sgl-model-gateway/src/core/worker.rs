@@ -1151,6 +1151,7 @@ pub struct WorkerLoadGuard {
     /// Outcome handed to `on_drop`. Optimistic until [`Self::set_success`] runs;
     /// stream bodies settle it after the guard has been attached.
     success: Arc<AtomicBool>,
+    first_byte: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl WorkerLoadGuard {
@@ -1181,6 +1182,33 @@ impl WorkerLoadGuard {
             routing_key,
             on_drop,
             success: Arc::new(AtomicBool::new(true)),
+            first_byte: None,
+        }
+    }
+
+    /// Own the policy reservation immediately after selection.
+    pub fn with_policy(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        policy: &Arc<dyn crate::policies::LoadBalancingPolicy>,
+        dispatch_id: Option<u64>,
+    ) -> Self {
+        let mut guard = Self::with_on_drop(
+            worker.clone(),
+            headers,
+            crate::policies::completion_hook(policy, worker.as_ref(), dispatch_id),
+        );
+        guard.first_byte = crate::policies::first_token_hook(policy, worker.as_ref(), dispatch_id);
+        guard
+    }
+
+    pub fn take_first_byte_hook(&mut self) -> Option<Box<dyn FnOnce() + Send + Sync>> {
+        self.first_byte.take()
+    }
+
+    pub fn on_first_byte(&mut self) {
+        if let Some(hook) = self.first_byte.take() {
+            hook();
         }
     }
 

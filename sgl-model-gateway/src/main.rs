@@ -147,12 +147,32 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "prefill_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
+
+    /// Weight for new prefill characters in weighted selection
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    prefill_weight: f64,
+
+    /// Reservation expiry in seconds
+    #[arg(long, default_value_t = 3600, help_heading = "Routing Policy")]
+    prefill_pending_ttl_secs: u64,
+
+    /// Relative tolerance for weighted selection ties
+    #[arg(long, default_value_t = 0.02, help_heading = "Routing Policy")]
+    prefill_tie_tolerance_ratio: f64,
+
+    /// Prefill selection mode
+    #[arg(long, default_value = "lexicographic", value_parser = ["lexicographic", "weighted"], help_heading = "Routing Policy")]
+    prefill_selection: String,
+
+    /// Backlog deadband in tokens for lexicographic selection
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    prefill_backlog_epsilon_tokens: u64,
 
     /// Absolute threshold for load balancing trigger
     #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
@@ -204,11 +224,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "prefill_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "prefill_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -767,6 +787,19 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
             },
+            "prefill_aware" => PolicyConfig::PrefillAware {
+                prefill_weight: self.prefill_weight,
+                eviction_interval_secs: self.eviction_interval,
+                max_tree_size: self.max_tree_size,
+                pending_ttl_secs: self.prefill_pending_ttl_secs,
+                tie_tolerance_ratio: self.prefill_tie_tolerance_ratio,
+                selection: if self.prefill_selection == "weighted" {
+                    smg::config::types::PrefillSelection::Weighted
+                } else {
+                    smg::config::types::PrefillSelection::Lexicographic
+                },
+                backlog_epsilon_tokens: self.prefill_backlog_epsilon_tokens,
+            },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
@@ -1277,4 +1310,54 @@ Provide --worker-urls or PD flags as usual.",
         shutdown_otel();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn parse_policy_prefill_aware_round_trip() {
+        for flag in ["--policy", "--prefill-policy", "--decode-policy"] {
+            let args = CliArgs::try_parse_from(["smg", flag, "prefill_aware"]).unwrap();
+            let value = serde_json::to_value(args.parse_policy("prefill_aware")).unwrap();
+            assert_eq!(value["type"], "prefill_aware");
+            assert_eq!(value["prefill_weight"], 1.0);
+            assert_eq!(value["pending_ttl_secs"], 3600);
+            assert_eq!(value["tie_tolerance_ratio"], 0.02);
+            assert_eq!(value["selection"], "lexicographic");
+            assert_eq!(value["backlog_epsilon_tokens"], 0);
+            let restored: PolicyConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(restored).unwrap(), value);
+        }
+        let args = CliArgs::try_parse_from([
+            "smg",
+            "--policy",
+            "prefill_aware",
+            "--prefill-weight",
+            "2.5",
+            "--prefill-pending-ttl-secs",
+            "7200",
+            "--prefill-tie-tolerance-ratio",
+            "0.1",
+            "--prefill-selection",
+            "weighted",
+            "--prefill-backlog-epsilon-tokens",
+            "4",
+            "--eviction-interval",
+            "60",
+            "--max-tree-size",
+            "1000",
+        ])
+        .unwrap();
+        let value = serde_json::to_value(args.parse_policy(&args.policy)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "prefill_aware", "prefill_weight": 2.5, "pending_ttl_secs": 7200,
+                "tie_tolerance_ratio": 0.1, "selection": "weighted", "backlog_epsilon_tokens": 4,
+                "eviction_interval_secs": 60, "max_tree_size": 1000,
+            })
+        );
+    }
 }

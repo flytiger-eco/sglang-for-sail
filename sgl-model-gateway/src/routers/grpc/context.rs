@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     core::{Worker, WorkerLoadGuard},
-    policies::{completion_hook, LoadBalancingPolicy},
+    policies::LoadBalancingPolicy,
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionResponse},
         classify::{ClassifyRequest, ClassifyResponse},
@@ -173,6 +173,7 @@ pub(crate) enum LoadGuards {
     },
 }
 
+#[cfg(test)]
 impl LoadGuards {
     pub fn new(
         selection: &WorkerSelection,
@@ -180,28 +181,17 @@ impl LoadGuards {
         policy: Option<&Arc<dyn LoadBalancingPolicy>>,
         tokens: (Option<u64>, Option<u64>),
     ) -> Self {
-        let hook = |worker: &Arc<dyn Worker>, token: Option<u64>| {
-            policy.and_then(|p| completion_hook(p, worker.as_ref(), token))
+        let guard = |worker: &Arc<dyn Worker>, token| match policy {
+            Some(policy) => WorkerLoadGuard::with_policy(worker.clone(), headers, policy, token),
+            None => WorkerLoadGuard::new(worker.clone(), headers),
         };
         match selection {
-            WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::with_on_drop(
-                    worker.clone(),
-                    headers,
-                    hook(worker, tokens.0),
-                ),
+            WorkerSelection::Single { worker } => Self::Single {
+                _guard: guard(worker, tokens.0),
             },
-            WorkerSelection::Dual { prefill, decode } => LoadGuards::Dual {
-                _prefill: WorkerLoadGuard::with_on_drop(
-                    prefill.clone(),
-                    headers,
-                    hook(prefill, tokens.0),
-                ),
-                _decode: WorkerLoadGuard::with_on_drop(
-                    decode.clone(),
-                    headers,
-                    hook(decode, tokens.1),
-                ),
+            WorkerSelection::Dual { prefill, decode } => Self::Dual {
+                _prefill: guard(prefill, tokens.0),
+                _decode: guard(decode, tokens.1),
             },
         }
     }

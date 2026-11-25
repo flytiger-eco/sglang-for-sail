@@ -8,7 +8,7 @@ use super::PipelineStage;
 use crate::routers::{
     error,
     grpc::{
-        context::{ClientSelection, ExecutionResult, RequestContext, WorkerSelection},
+        context::{ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection},
         proto_wrapper::{
             ProtoEmbedRequest, ProtoEmbedResponseVariant, ProtoGenerateRequest, ProtoRequest,
             ProtoStream,
@@ -104,11 +104,37 @@ impl PipelineStage for RequestExecutionStage {
                         self.execute_dual_dispatch(req, clients, workers).await
                     }
                 },
-                ProtoRequest::Embed(req) => self.execute_single_embed(req, clients).await,
+                ProtoRequest::Embed(req) => {
+                    self.execute_single_embed(req, clients, ctx.state.load_guards.as_mut())
+                        .await
+                }
             }
         }
         .instrument(span)
         .await?;
+
+        // Each upstream stream owns its reservation independently. Completing
+        // prefill releases it even while decode continues to stream.
+        let result = match (result, ctx.state.load_guards.take()) {
+            (ExecutionResult::Single { stream }, Some(LoadGuards::Single { _guard })) => {
+                ExecutionResult::Single {
+                    stream: stream.with_guard(_guard),
+                }
+            }
+            (
+                ExecutionResult::Dual { prefill, decode },
+                Some(LoadGuards::Dual { _prefill, _decode }),
+            ) => ExecutionResult::Dual {
+                prefill: prefill.with_guard(_prefill),
+                decode: Box::new(decode.with_guard(_decode)),
+            },
+            (result, guards) => {
+                if let Some(LoadGuards::Single { mut _guard }) = guards {
+                    _guard.on_first_byte();
+                }
+                result
+            }
+        };
 
         // Store result in context for ResponseProcessingStage
         ctx.state.response.execution_result = Some(result);
@@ -162,6 +188,7 @@ impl RequestExecutionStage {
         &self,
         proto_request: ProtoEmbedRequest,
         clients: &mut ClientSelection,
+        guards: Option<&mut LoadGuards>,
     ) -> Result<ExecutionResult, Response> {
         let client = clients.single_mut().ok_or_else(|| {
             error!(
@@ -185,6 +212,10 @@ impl RequestExecutionStage {
                 format!("Failed to start embedding: {}", e),
             )
         })?;
+
+        if let Some(LoadGuards::Single { _guard }) = guards {
+            _guard.on_first_byte();
+        }
 
         match response.into_response() {
             ProtoEmbedResponseVariant::Complete(complete) => {

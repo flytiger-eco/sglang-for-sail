@@ -379,11 +379,15 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
         }
 
         let tree_key = tree_key_for_worker(workers[healthy[0]].as_ref());
-        let tree = self
-            .trees
-            .entry(tree_key.clone())
-            .or_insert_with(|| Arc::new(Tree::new()))
-            .clone();
+        let tree = healthy
+            .iter()
+            .all(|&idx| tree_key_for_worker(workers[idx].as_ref()) == tree_key)
+            .then(|| {
+                self.trees
+                    .entry(tree_key)
+                    .or_insert_with(|| Arc::new(Tree::new()))
+                    .clone()
+            });
 
         let text = info.request_text.unwrap_or("");
         let prompt_chars: u64 = text.chars().count() as u64;
@@ -391,7 +395,9 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
         // One cluster-wide lookup: how much of this prompt nobody has seen yet.
         // With a shared storage tier the prefix is reachable from any instance,
         // so the remaining prefill work does not depend on the placement.
-        let matched = tree.prefix_match_chars_for_tenant(text, CLUSTER_TENANT, false) as u64;
+        let matched = tree.as_ref().map_or(0, |tree| {
+            tree.prefix_match_chars_for_tenant(text, CLUSTER_TENANT, false) as u64
+        });
         let new_chars = prompt_chars.saturating_sub(matched);
 
         // Per-candidate load: the ledger keeps prefill and decode apart.
@@ -467,7 +473,9 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
         // skipped push would let a later completion drain another request's
         // entry.
         let dispatch_id = self.pending_for(&chosen_url).push(pending_chars);
-        tree.insert(text, CLUSTER_TENANT);
+        if let Some(tree) = tree {
+            tree.insert(text, CLUSTER_TENANT);
+        }
         workers[chosen].increment_processed();
 
         Some((chosen, Some(dispatch_id)))
@@ -525,6 +533,63 @@ mod tests {
             request_text: Some(text),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_model_candidates_do_not_read_or_populate_a_tree() {
+        let policy = PrefillAwarePolicy::new();
+        let workers: Vec<Arc<dyn Worker>> = ["model-a", "model-b"]
+            .iter()
+            .enumerate()
+            .map(|(i, model)| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}"))
+                        .model(crate::core::ModelCard::new(*model))
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        let prompt = "shared prompt";
+        let (_, token) = policy
+            .select_worker_with_token(&workers[..1], &info(prompt))
+            .await
+            .unwrap();
+        policy.on_dispatch_complete(workers[0].url(), token, true);
+        for candidates in [
+            workers.clone(),
+            vec![workers[1].clone(), workers[0].clone()],
+        ] {
+            let (idx, token) = policy
+                .select_worker_with_token(&candidates, &info(prompt))
+                .await
+                .unwrap();
+            assert_eq!(
+                policy.inflight_chars(candidates[idx].url()),
+                prompt.len() as u64
+            );
+            policy.on_dispatch_complete(candidates[idx].url(), token, true);
+        }
+        assert_eq!(
+            policy.trees.len(),
+            1,
+            "mixed selection must not create another model's tree"
+        );
+        let (_, token) = policy
+            .select_worker_with_token(&workers[1..], &info(prompt))
+            .await
+            .unwrap();
+        assert_eq!(policy.inflight_chars(workers[1].url()), prompt.len() as u64);
+        policy.on_dispatch_complete(workers[1].url(), token, true);
+        let (_, token) = policy
+            .select_worker_with_token(&workers[..1], &info(prompt))
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.inflight_chars(workers[0].url()),
+            0,
+            "homogeneous fast path still hits"
+        );
+        policy.on_dispatch_complete(workers[0].url(), token, true);
     }
 
     /// A short request must avoid the worker still carrying a long prefill.

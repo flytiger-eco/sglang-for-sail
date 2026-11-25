@@ -8,7 +8,7 @@ use tracing::{error, warn};
 
 use super::PipelineStage;
 use crate::{
-    core::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    core::{ConnectionMode, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
     routers::{
@@ -76,13 +76,16 @@ impl PipelineStage for WorkerSelectionStage {
 
         let headers = ctx.input.headers.as_ref();
 
-        let (workers, dispatch_tokens) = match self.mode {
+        let (workers, guards) = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self
                     .select_single_worker(ctx.input.model_id.as_deref(), text, tokens, headers)
                     .await
                 {
-                    Some((w, token)) => (WorkerSelection::Single { worker: w }, (token, None)),
+                    Some((w, guard)) => (
+                        WorkerSelection::Single { worker: w },
+                        LoadGuards::Single { _guard: guard },
+                    ),
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
                         error!(
@@ -103,9 +106,12 @@ impl PipelineStage for WorkerSelectionStage {
                     .select_pd_pair(ctx.input.model_id.as_deref(), text, tokens, headers)
                     .await
                 {
-                    Some((prefill, decode, p_token, d_token)) => (
+                    Some((prefill, decode, p_guard, d_guard)) => (
                         WorkerSelection::Dual { prefill, decode },
-                        (p_token, d_token),
+                        LoadGuards::Dual {
+                            _prefill: p_guard,
+                            _decode: d_guard,
+                        },
                     ),
                     None => {
                         let model = ctx.input.model_id.as_deref().unwrap_or(UNKNOWN_MODEL_ID);
@@ -134,12 +140,7 @@ impl PipelineStage for WorkerSelectionStage {
         // a later stage failing (client acquisition, request building) would
         // otherwise drop the context without a completion hook and leave a
         // phantom backlog until the policy's TTL expires.
-        ctx.state.load_guards = Some(LoadGuards::new(
-            &workers,
-            ctx.input.headers.as_ref(),
-            Some(&policy),
-            dispatch_tokens,
-        ));
+        ctx.state.load_guards = Some(guards);
         ctx.state.selected_policy = Some(policy);
         ctx.state.workers = Some(workers);
         Ok(None)
@@ -157,7 +158,7 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Option<u64>)> {
+    ) -> Option<(Arc<dyn Worker>, WorkerLoadGuard)> {
         // Get workers for the specified model, filtered by connection mode
         let workers = self.worker_registry.get_workers_filtered(
             model_id,
@@ -199,6 +200,7 @@ impl WorkerSelectionStage {
             )
             .await?;
         let selected = available[idx].clone();
+        let guard = WorkerLoadGuard::with_policy(selected.clone(), headers, &policy, dispatch_id);
 
         // Record worker selection metric
         Metrics::record_worker_selection(
@@ -208,7 +210,7 @@ impl WorkerSelectionStage {
             policy.name(),
         );
 
-        Some((selected, dispatch_id))
+        Some((selected, guard))
     }
 
     async fn select_pd_pair(
@@ -217,7 +219,12 @@ impl WorkerSelectionStage {
         text: Option<&str>,
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
-    ) -> Option<(Arc<dyn Worker>, Arc<dyn Worker>, Option<u64>, Option<u64>)> {
+    ) -> Option<(
+        Arc<dyn Worker>,
+        Arc<dyn Worker>,
+        WorkerLoadGuard,
+        WorkerLoadGuard,
+    )> {
         let all_workers = self.worker_registry.get_workers_filtered(
             model_id,
             None,
@@ -270,9 +277,22 @@ impl WorkerSelectionStage {
         let (prefill_idx, prefill_token) = policy
             .select_worker_with_token(&available_prefill, &info)
             .await?;
+        let prefill_guard = WorkerLoadGuard::with_policy(
+            available_prefill[prefill_idx].clone(),
+            headers,
+            &policy,
+            prefill_token,
+        );
         let (decode_idx, decode_token) = policy
             .select_worker_with_token(&available_decode, &info)
             .await?;
+
+        let decode_guard = WorkerLoadGuard::with_policy(
+            available_decode[decode_idx].clone(),
+            headers,
+            &policy,
+            decode_token,
+        );
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let policy_name = policy.name();
@@ -294,8 +314,8 @@ impl WorkerSelectionStage {
         Some((
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
-            prefill_token,
-            decode_token,
+            prefill_guard,
+            decode_guard,
         ))
     }
 }
