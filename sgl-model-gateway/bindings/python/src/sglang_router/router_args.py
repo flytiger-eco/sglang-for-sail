@@ -348,7 +348,7 @@ class RouterArgs:
             type=float,
             default=RouterArgs.prefill_weight,
             help="Weight of one not-yet-prefilled character vs one queued character "
-            "for prefill_aware routing (default 1.0)",
+            "for prefill_aware weighted selection (default 1.0)",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-pending-ttl-secs",
@@ -360,7 +360,7 @@ class RouterArgs:
             f"--{prefix}prefill-tie-tolerance-ratio",
             type=float,
             default=RouterArgs.prefill_tie_tolerance_ratio,
-            help="Relative tolerance for randomising among near-equal prefill_aware scores",
+            help="Relative tolerance for weighted prefill_aware ties, as a fraction of the best score",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-selection",
@@ -368,7 +368,8 @@ class RouterArgs:
             choices=["lexicographic", "weighted"],
             default=RouterArgs.prefill_selection,
             help="prefill_aware selection rule: 'lexicographic' (least pending prefill, "
-            "then least decoding) or 'weighted' (outstanding + weight*new chars)",
+            "then least decoding) or 'weighted' (outstanding + weight*new chars). "
+            "Both assume shared prefix cache (e.g. HiCache L3) across instances",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-backlog-epsilon-tokens",

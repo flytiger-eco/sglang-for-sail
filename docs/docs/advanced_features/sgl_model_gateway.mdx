@@ -882,6 +882,11 @@ Response:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy cache_aware`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`prefill_aware`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Routes to the least pending prefill backlog, then the fewest decoding requests (see also `--prefill-selection weighted`). Requires a shared prefix cache such as HiCache L3 so prefixes written by one instance are readable by all</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy prefill_aware`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`bucket`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Divides workers into load buckets with dynamic boundaries</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`--policy bucket`</td>

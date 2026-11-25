@@ -505,7 +505,7 @@ impl Router {
                 PolicyType::PrefillAware => ConfigPolicyConfig::PrefillAware {
                     prefill_weight: self.prefill_weight as f64,
                     eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: 10_000_000,
+                    max_tree_size: self.max_tree_size,
                     pending_ttl_secs: self.prefill_pending_ttl_secs,
                     tie_tolerance_ratio: self.prefill_tie_tolerance_ratio as f64,
                     selection: config::PrefillSelection::parse(&self.prefill_selection)

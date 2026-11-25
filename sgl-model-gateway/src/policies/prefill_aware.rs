@@ -1,26 +1,31 @@
 //! Prefill-backlog aware routing policy.
 //!
-//! For every healthy worker `w` the policy minimises
+//! Every dispatch is charged the prompt characters nobody has cached yet,
+//! `new_chars = prompt_chars - matched`, and released in two steps: the first
+//! response byte moves it from the *prefilling* to the *decoding* counter, and
+//! completion (by dispatch id) removes it. Entries older than
+//! `pending_ttl_secs` are pruned lazily so a lost completion cannot leak.
 //!
-//! ```text
-//! score(w) = inflight_chars(w) + weight * (prompt_chars - prefix_match_chars(w))
-//! ```
+//! Candidates are ranked by `selection`:
 //!
-//! * `inflight_chars(w)` is the number of characters the requests already
-//!   dispatched to `w` still have to prefill — the same unit as the second
-//!   term, so a request whose prefix is fully resident costs `w` nothing. It is
-//!   maintained by this policy: added in `select_worker`, removed through
-//!   `on_request_complete` (wired from the router's per-request load guard).
-//!   Entries older than `pending_ttl_secs` are pruned lazily so a lost
-//!   completion cannot leak.
-//! * `matched` comes from one radix tree per pool/model that records what the
-//!   *cluster* has seen, not what one worker owns: with a shared storage tier a
-//!   prefix is reachable from any instance, so the work a request needs is
-//!   `prompt_chars - matched` regardless of where it lands.
+//! * `lexicographic` (default): least `pending_prefill` first, then fewest
+//!   decoding dispatches. A request whose prefix is fully resident skips the
+//!   backlog tier because prefill backlog is irrelevant to it.
+//! * `weighted`: minimise `outstanding_chars + prefill_weight * new_chars` and
+//!   randomise among scores within `tie_tolerance_ratio` of the best.
+//!
+//! `matched` comes from one radix tree per pool/model that records what the
+//! *cluster* has seen, not what one worker owns. This requires a shared prefix
+//! cache (for example a HiCache L3 such as Mooncake) so that a prefix written
+//! by any instance is readable by all. With device/host caches only, a prefix
+//! seen on one worker is cold on the others and `new_chars` understates the
+//! real prefill work.
 //!
 //! Characters (not tokens) are used on purpose: the router has no tokenizer and
 //! the tree already works in characters, so every candidate is compared on the
-//! same, cheap yardstick.
+//! same, cheap yardstick. Requests that arrive as token ids only (gRPC
+//! `input_ids` without text) are charged `tokens * CHARS_PER_TOKEN` and skip
+//! the prefix lookup, since there is no text to match against.
 
 use std::{
     collections::HashMap,
@@ -389,15 +394,25 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
                     .clone()
             });
 
-        let text = info.request_text.unwrap_or("");
-        let prompt_chars: u64 = text.chars().count() as u64;
+        let text = info.request_text;
+        // Token-only gRPC requests carry no text; charge an estimate so they
+        // still raise the worker's backlog.
+        let prompt_chars: u64 = match text {
+            Some(text) => text.chars().count() as u64,
+            None => info
+                .tokens
+                .map_or(0, |ids| (ids.len() as u64).saturating_mul(CHARS_PER_TOKEN)),
+        };
 
         // One cluster-wide lookup: how much of this prompt nobody has seen yet.
         // With a shared storage tier the prefix is reachable from any instance,
         // so the remaining prefill work does not depend on the placement.
-        let matched = tree.as_ref().map_or(0, |tree| {
-            tree.prefix_match_chars_for_tenant(text, CLUSTER_TENANT, false) as u64
-        });
+        let matched = match (text, tree.as_ref()) {
+            (Some(text), Some(tree)) => {
+                tree.prefix_match_chars_for_tenant(text, CLUSTER_TENANT, false) as u64
+            }
+            _ => 0,
+        };
         let new_chars = prompt_chars.saturating_sub(matched);
 
         // Per-candidate load: the ledger keeps prefill and decode apart.
@@ -434,7 +449,10 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
                     })
                     .collect();
                 let best = scored.iter().map(|(_, s)| *s).fold(f64::INFINITY, f64::min);
-                let tol = (self.config.tie_tolerance_ratio * prompt_chars as f64).max(1.0);
+                // Tolerance relative to the best score, not to the prompt
+                // length: a fully cached long prompt scores 0 and must not
+                // admit a worker carrying a real backlog.
+                let tol = self.config.tie_tolerance_ratio * best;
                 let pool: Vec<usize> = scored
                     .iter()
                     .filter(|(_, s)| *s <= best + tol)
@@ -473,7 +491,7 @@ impl LoadBalancingPolicy for PrefillAwarePolicy {
         // skipped push would let a later completion drain another request's
         // entry.
         let dispatch_id = self.pending_for(&chosen_url).push(pending_chars);
-        if let Some(tree) = tree {
+        if let (Some(tree), Some(text)) = (tree, text) {
             tree.insert(text, CLUSTER_TENANT);
         }
         workers[chosen].increment_processed();
@@ -904,5 +922,65 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx, 0, "no deadband: the lighter backlog wins");
+    }
+
+    /// gRPC requests that carry only token ids have no text to match, so they
+    /// are charged `tokens * CHARS_PER_TOKEN` instead of nothing.
+    #[tokio::test]
+    async fn token_only_requests_reserve_an_estimate() {
+        let policy = PrefillAwarePolicy::new();
+        let w = worker("http://w1:8000");
+        let ids: Vec<u32> = (1..=40).collect();
+        let (_, token) = policy
+            .select_worker_with_token(
+                std::slice::from_ref(&w),
+                &SelectWorkerInfo {
+                    tokens: Some(&ids),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let expected = ids.len() as u64 * CHARS_PER_TOKEN;
+        assert_eq!(policy.inflight_chars(w.url()), expected);
+        assert_eq!(policy.pending_prefill_chars(w.url()), expected);
+        assert_eq!(policy.phase_counts(w.url()), (1, 0));
+
+        policy.on_first_token(w.url(), token);
+        assert_eq!(policy.pending_prefill_chars(w.url()), 0);
+        assert_eq!(policy.phase_counts(w.url()), (0, 1));
+
+        policy.on_dispatch_complete(w.url(), token, true);
+        assert_eq!(policy.inflight_chars(w.url()), 0);
+    }
+
+    /// The weighted tie band is relative to the best score, not the prompt
+    /// length: a fully cached long prompt must not admit a loaded worker.
+    #[tokio::test]
+    async fn weighted_tolerance_is_relative_to_the_best_score() {
+        let policy = PrefillAwarePolicy::with_config(PrefillAwareConfig {
+            selection: PrefillSelection::Weighted,
+            prefill_weight: 0.0,
+            ..Default::default()
+        });
+        let busy = worker("http://busy:8000");
+        let idle = worker("http://idle:8000");
+        let long = "a".repeat(100_000);
+
+        // Charge the whole prompt to `busy`; the prompt is then fully cached.
+        policy
+            .select_worker(std::slice::from_ref(&busy), &info(&long))
+            .await
+            .unwrap();
+        assert_eq!(policy.inflight_chars(busy.url()), 100_000);
+
+        for _ in 0..16 {
+            let (idx, token) = policy
+                .select_worker_with_token(&[busy.clone(), idle.clone()], &info(&long))
+                .await
+                .unwrap();
+            assert_eq!(idx, 1, "scores are 100000 vs 0, so the idle worker wins");
+            policy.on_dispatch_complete(idle.url(), token, true);
+        }
     }
 }

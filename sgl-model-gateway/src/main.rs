@@ -154,7 +154,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.3, help_heading = "Routing Policy")]
     cache_threshold: f32,
 
-    /// Weight for new prefill characters in weighted selection
+    /// Weight for new prefill characters (weighted selection only)
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     prefill_weight: f64,
 
@@ -162,11 +162,12 @@ struct CliArgs {
     #[arg(long, default_value_t = 3600, help_heading = "Routing Policy")]
     prefill_pending_ttl_secs: u64,
 
-    /// Relative tolerance for weighted selection ties
+    /// Relative tolerance for weighted ties, as a fraction of the best score
     #[arg(long, default_value_t = 0.02, help_heading = "Routing Policy")]
     prefill_tie_tolerance_ratio: f64,
 
-    /// Prefill selection mode
+    /// Prefill ranking: lexicographic (default) or weighted. Both assume a
+    /// shared prefix cache (e.g. HiCache L3) across instances
     #[arg(long, default_value = "lexicographic", value_parser = ["lexicographic", "weighted"], help_heading = "Routing Policy")]
     prefill_selection: String,
 

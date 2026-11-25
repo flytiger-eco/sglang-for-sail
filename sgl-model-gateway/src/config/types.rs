@@ -328,11 +328,11 @@ pub enum PolicyConfig {
         /// above `request_timeout_secs`.
         #[serde(default = "default_prefill_pending_ttl_secs")]
         pending_ttl_secs: u64,
-        /// Relative tolerance used to randomise among near-identical scores
-        /// (`weighted`) or near-identical backlogs (`lexicographic`).
+        /// Relative tolerance used by `weighted` to randomise among scores
+        /// within this fraction of the best score.
         #[serde(default = "default_prefill_tie_tolerance_ratio")]
         tie_tolerance_ratio: f64,
-        /// Ranking mode.
+        /// Ranking mode (default: `lexicographic`).
         #[serde(default)]
         selection: PrefillSelection,
         /// Backlogs within this many tokens of the smallest count as equal in
@@ -414,11 +414,13 @@ impl PolicyConfig {
 pub enum PrefillSelection {
     /// Strict lexicographic order: least pending prefill first, then fewest
     /// decode dispatches. Requests whose prefix is fully resident skip the
-    /// first level, since prefill backlog is irrelevant to them.
+    /// first level, since prefill backlog is irrelevant to them. This is the
+    /// default.
     #[default]
     Lexicographic,
     /// The original weighted score:
-    /// `outstanding_chars(w) + prefill_weight * new_chars(w)`.
+    /// `outstanding_chars(w) + prefill_weight * new_chars(w)`, randomised
+    /// within `tie_tolerance_ratio` of the best score.
     Weighted,
 }
 
