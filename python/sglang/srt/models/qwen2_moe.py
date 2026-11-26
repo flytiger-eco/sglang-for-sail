@@ -609,6 +609,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and self._use_mega_moe
             and get_disagg().disaggregation_mode != "decode"
         )
+        self._decode_shared_gate_fusion = (
+            _is_ppu
+            and self._use_mega_moe
+            and config.hidden_size == 2560
+            and config.num_experts == 512
+            and get_disagg().disaggregation_mode == "decode"
+        )
+        self.gate._ppu_decode_small_bf16 = self._decode_shared_gate_fusion
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
@@ -875,12 +883,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         num_tokens = hidden_states.shape[0]
         defer_shared_gate = (
-            self._prefill_gate_fusion
-            and self.shared_expert_gate is not None
+            self.shared_expert_gate is not None
             and hidden_states.dtype == torch.bfloat16
             and forward_batch is not None
-            and forward_batch.forward_mode == ForwardMode.EXTEND
-            and forward_batch._original_forward_mode in (None, ForwardMode.EXTEND)
+            and (
+                (
+                    self._prefill_gate_fusion
+                    and forward_batch.forward_mode == ForwardMode.EXTEND
+                    and forward_batch._original_forward_mode
+                    in (None, ForwardMode.EXTEND)
+                )
+                or (
+                    self._decode_shared_gate_fusion
+                    and (
+                        forward_batch.forward_mode.is_decode()
+                        or forward_batch.forward_mode.is_target_verify()
+                    )
+                )
+            )
         )
         shared_gate = None
         shared_output = None

@@ -86,17 +86,18 @@ _PPU_BF16_DENSE_MIN_SM = 80
 _PPU_BF16_DENSE_DEVICE_SM = get_device_sm() if _is_ppu else 0
 
 
-def _ppu_bf16_dense_enabled() -> bool:
+def _ppu_bf16_dense_enabled(*, layer_opt_in: bool = False) -> bool:
     """Whether the unquantized BF16 dense GEMM may take the PPU DeepGEMM path.
 
-    OFF by default (see envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16): on 810E the
+    The global switch is OFF by default. Models may also opt in selected
+    PPU1.5 decode projections after shape-specific validation. On 810E the
     DeepGEMM path is slower than the acblas/vendor GEMM it replaces (see the
     linked issue), so it stays opt-in pending DeepGEMM-side tuning. The env is
     read per call so the value can also come from ServerArgs after import.
     """
     return (
         _is_ppu
-        and envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get()
+        and (layer_opt_in or envs.SGLANG_SAIL_DEEPGEMM_DENSE_BF16.get())
         and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
         and _PPU_BF16_DENSE_DEVICE_SM >= _PPU_BF16_DENSE_MIN_SM
         # Batch-invariant mode replaces aten::mm/aten::addmm with deterministic
@@ -136,14 +137,25 @@ def _is_k_major_bf16_dense(x, weight, bias) -> bool:
     return n % 2 == 0 and k % 16 == 0 and x.shape[-1] % 16 == 0
 
 
-def _ppu_gemm_nt_bf16_fake(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+def _ppu_gemm_nt_bf16_fake(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, decode_only: bool = False
+) -> None:
     # Fake impl for export/tracing: C is mutated in place, nothing to return.
     return None
 
 
 @register_custom_op(mutates_args=["C"], fake_impl=_ppu_gemm_nt_bf16_fake)
-def _ppu_gemm_nt_bf16(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
-    deep_gemm_wrapper.gemm_nt_bf16bf16bf16(A, B, C)
+def _ppu_gemm_nt_bf16(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, decode_only: bool = False
+) -> None:
+    if decode_only:
+        # The Decode path is bounded to 32 rows and warmed by graph capture.
+        # Do not precompile the wrapper's unrelated Prefill sizes up to 16K.
+        import deep_gemm
+
+        deep_gemm.bf16_gemm_nt(A, B, C)
+    else:
+        deep_gemm_wrapper.gemm_nt_bf16bf16bf16(A, B, C)
 
 
 # Counters used as evidence for the DeepGEMM bf16 dense route:
@@ -156,7 +168,9 @@ def _ppu_gemm_nt_bf16(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None
 _PPU_BF16_DENSE_STATS = {"hit": 0, "fallback": 0, "error": 0}
 
 
-def _ppu_bf16_dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _ppu_bf16_dense_linear(
+    x: torch.Tensor, weight: torch.Tensor, *, decode_only: bool = False
+) -> torch.Tensor:
     # `bias` is deliberately not accepted: the gate only routes bias-free
     # layers so the GEMM result is the final result.
     x_shapes = x.shape
@@ -169,7 +183,7 @@ def _ppu_bf16_dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
         )
     out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device=x.device)
     try:
-        _ppu_gemm_nt_bf16(x.view(-1, x_shapes[-1]), weight, out)
+        _ppu_gemm_nt_bf16(x.view(-1, x_shapes[-1]), weight, out, decode_only=decode_only)
     except Exception as exc:  # noqa: BLE001
         # Never take the server down on an opt-in path: count it, log once with
         # the failing shape, and serve this layer from acblas instead.
@@ -634,11 +648,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
-        # PPU: route K-major BF16 dense GEMM to DeepGEMM only when the switch
-        # is explicitly enabled; everything else keeps the acblas path below.
-        if _ppu_bf16_dense_enabled():
+        # The global BF16 route remains opt-in. Qwen may mark validated small
+        # Decode projections on PPU1.5. Larger batches,
+        # Prefill, other devices and unmarked layers retain the vendor GEMM.
+        layer_opt_in = (
+            _PPU_BF16_DENSE_DEVICE_SM == 89
+            and getattr(layer, "_ppu_decode_small_bf16", False)
+            and x.ndim == 2
+            and 1 < x.shape[0] <= 32
+            and layer.weight.shape == (512, 2560)
+        )
+        if _ppu_bf16_dense_enabled(layer_opt_in=layer_opt_in):
             if _is_k_major_bf16_dense(x, layer.weight, bias):
-                return _ppu_bf16_dense_linear(x, layer.weight)
+                return _ppu_bf16_dense_linear(x, layer.weight, decode_only=layer_opt_in)
             _PPU_BF16_DENSE_STATS["fallback"] += 1
 
         return F.linear(x, layer.weight, bias)
