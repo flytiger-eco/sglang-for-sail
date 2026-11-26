@@ -2599,6 +2599,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
+        self.prefetch_after_moe = (
+            envs.SGLANG_OPT_DSA_LAYER_SPLIT_PREFETCH_AFTER_MOE.get()
+        )
         if hasattr(config, "rope_parameters"):
             rope_theta = config.rope_parameters["rope_theta"]
             assert rope_theta is not None, f"rope_theta not found in config: {config}"
@@ -2814,9 +2817,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
 
-        maybe_prefetch_next_full_attention_kv(
-            forward_batch, next_full_attention_layer_id
-        )
+        prefetch_after_moe = self.prefetch_after_moe
+        if not prefetch_after_moe:
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
@@ -2844,6 +2849,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 gemm_output_zero_allocator,
             )
         hidden_states = ffn_exit.finish(hidden_states)
+
+        if prefetch_after_moe:
+            # Start LayerSplit transport after this FFN. The broadcast stream
+            # waits on the current stream and can overlap the next layer's
+            # Q/K projections and Indexer without competing with this MegaMoE.
+            maybe_prefetch_next_full_attention_kv(
+                forward_batch, next_full_attention_layer_id
+            )
 
         return (hidden_states, topk_indices)
 

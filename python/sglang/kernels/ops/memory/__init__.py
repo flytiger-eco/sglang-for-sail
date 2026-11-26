@@ -30,6 +30,15 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+register_kernel(
+    KernelSpec(
+        op="memory.scatter_unique_pages",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.layer_split_page_scatter:scatter_unique_pages",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+
 __all__ = []
 
 

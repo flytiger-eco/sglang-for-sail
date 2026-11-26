@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -212,6 +213,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
         self.layer_shard_enabled = True
+        self.batch_page_vector_scatter = (
+            envs.SGLANG_OPT_DSA_LAYER_SPLIT_VECTOR_SCATTER.get()
+        )
         self.layer_broadcast_comm = None
         # Supported paths use batch pages; retain the original full-pool fallback.
         self.batch_page_broadcast_enabled = (
@@ -293,7 +297,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         # This initial conservative threshold needs calibration on real PPU.
         if pages.numel() * 5 >= (self.remote_kv_buffer.shape[0] // self.page_size) * 3:
             return
-        self.batch_page_broadcast_plan = BatchPageBroadcastPlan(pages)
+        self.batch_page_broadcast_plan = BatchPageBroadcastPlan(
+            pages,
+            vector_scatter=self.batch_page_vector_scatter,
+        )
         if not getattr(self, "_batch_page_plan_logged", False):
             logger.info(
                 "LayerSplit batch-page transport active: rank=%s, pages=%s/%s, verify=%s",

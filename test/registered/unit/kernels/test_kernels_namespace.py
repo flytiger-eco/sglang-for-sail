@@ -234,6 +234,16 @@ def test_inventory_targets_survive_module_moves():
         )
 
 
+def test_layer_split_page_scatter_is_inventoried():
+    spec = K.registry.get_backend("memory.scatter_unique_pages", KernelBackend.TRITON)
+    assert (
+        spec.target
+        == "sglang.kernels.ops.memory.layer_split_page_scatter:scatter_unique_pages"
+    )
+    assert K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 def test_reclassified_public_entry_points_are_inventoried():
     """Public compute functions in these formerly unregistered modules need metadata."""
     root = Path(K.__file__).resolve().parent / "ops"
