@@ -32,7 +32,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.utils.common import is_ppu
+
+_is_ppu = is_ppu()
 
 # Cap on the stored [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -576,17 +579,56 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
-        verify_query_group_size: int = 1,
+        num_queries_per_request: int = 1,
     ) -> torch.Tensor:
-        logits = qsa_mqa_decode(
-            q,
-            compressed_cache,
-            compressed_page_table,
-            compressed_lengths,
-            max_model_len,
-            mask_logits=not (q.is_cuda and is_ppu()),
-            verify_query_group_size=verify_query_group_size,
+        logits = None
+        # Dispatch by indexer dtype: the base PPU verify kernel is bf16-only,
+        # so fp8 scoring and verify widths other than three go through the
+        # grouped shared-K kernel, which supports both dtypes.
+        use_base_verify = (
+            num_queries_per_request == 3
+            and q.dtype == torch.bfloat16
+            and self.index_n_heads == 4
+            and self.index_head_dim == 128
         )
+        if (
+            not use_base_verify
+            and _is_ppu
+            and HAS_TILELANG
+            and num_queries_per_request > 1
+        ):
+            from sglang.kernels.ops.attention.qsa_grouped_mqa import (
+                qsa_grouped_mqa_decode,
+                qsa_grouped_mqa_supported,
+            )
+
+            if qsa_grouped_mqa_supported(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                num_query_heads=self.index_n_heads,
+                num_queries_per_request=num_queries_per_request,
+            ):
+                logits = qsa_grouped_mqa_decode(
+                    q=q,
+                    k_cache=compressed_cache,
+                    page_table=compressed_page_table,
+                    context_lens=compressed_lengths,
+                    max_model_len=max_model_len,
+                    num_query_heads=self.index_n_heads,
+                    num_queries_per_request=num_queries_per_request,
+                )
+        if logits is None:
+            logits = qsa_mqa_decode(
+                q,
+                compressed_cache,
+                compressed_page_table,
+                compressed_lengths,
+                max_model_len,
+                mask_logits=not (q.is_cuda and is_ppu()),
+                verify_query_group_size=3 if use_base_verify else 1,
+            )
         if logits.is_cuda and self.block_topk == 512:
             # Decode rows start at zero, so compressed lengths double as row lengths;
             # skip the generic zero-fill + subtract.
@@ -754,6 +796,21 @@ class QSAIndexer(MultiPlatformOp):
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)
             )
+            spec = forward_batch.spec_info
+            num_queries_per_request = 1
+            # Linear Eagle verification packs consecutive, ordered queries per
+            # request; the last query's page table covers the whole group.
+            if (
+                is_target_verify
+                and isinstance(spec, EagleVerifyInput)
+                and spec.topk == 1
+                # Wider compute tiles are tested; grouped serving currently
+                # enables only these verify widths.
+                and spec.draft_token_num in (3, 4)
+                and spec.num_tokens_per_req == spec.draft_token_num
+                and q.shape[0] == forward_batch.batch_size * spec.draft_token_num
+            ):
+                num_queries_per_request = spec.draft_token_num
             return self.select_decode_tokens(
                 q,
                 compressed_cache,
@@ -762,16 +819,7 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
-                verify_query_group_size=(
-                    3
-                    if is_target_verify
-                    and self.index_n_heads == 4
-                    and self.index_head_dim == 128
-                    and getattr(
-                        getattr(forward_batch, "spec_info", None), "draft_token_num", 0
-                    ) == 3
-                    else 1
-                ),
+                num_queries_per_request=num_queries_per_request,
             )
 
         compressed_keys, row_starts, row_ends, row_sequence_lengths = (
