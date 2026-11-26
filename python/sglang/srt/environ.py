@@ -1328,6 +1328,8 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
 
     # DSA Backend (canonical names; fall back to SGLANG_NSA_* with deprecation warning)
+    SGLANG_OPT_DSA_LAYER_SPLIT_VECTOR_SCATTER = EnvBool(False)
+    SGLANG_OPT_DSA_LAYER_SPLIT_PREFETCH_AFTER_MOE = EnvBool(False)
     SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
         True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
     )

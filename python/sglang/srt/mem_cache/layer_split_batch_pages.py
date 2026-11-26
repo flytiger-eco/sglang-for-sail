@@ -62,8 +62,9 @@ class BatchPageBroadcastPlan:
     supplies the same stream ordering and H2D dependencies as full transport.
     """
 
-    def __init__(self, page_ids):
+    def __init__(self, page_ids, *, vector_scatter=False):
         self.page_ids = page_ids
+        self.vector_scatter = vector_scatter
         self.workspaces = {}
         self.transferred_bytes = 0
         self.full_buffer_bytes = 0
@@ -81,7 +82,14 @@ class BatchPageBroadcastPlan:
         if source_pages is not None:
             torch.index_select(source_pages, 0, self.page_ids, out=packed)
         collective(packed)
-        destination_pages.index_copy_(0, self.page_ids, packed)
+        if self.vector_scatter and destination_pages.is_cuda:
+            from sglang.kernels.ops.memory.layer_split_page_scatter import (
+                scatter_unique_pages,
+            )
+
+            scatter_unique_pages(destination_pages, self.page_ids, packed)
+        else:
+            destination_pages.index_copy_(0, self.page_ids, packed)
         self.transferred_bytes += packed.numel() * packed.element_size()
         self.full_buffer_bytes += destination_pages.numel() * destination_pages.element_size()
         self.collectives += 1
