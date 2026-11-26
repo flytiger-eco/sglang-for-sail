@@ -1,12 +1,11 @@
 # syntax=docker/dockerfile:1
-# Build the image with source-built SGLang and pinned PPU dependency wheels:
+# Build the image with pinned PPU wheels from the repository root:
 # docker build -f docker/ppu.Dockerfile --target runtime -t sglang:ppu .
 # docker build -f docker/ppu.Dockerfile --target framework -t sglang:ppu-dev .
 #
 # Based on docker/ppu.Dockerfile from v0.5.21, retaining wheel preparation and
 # framework/runtime targets.
-# Build sglang/sglang-kernel from the pinned source ref with the cudafy CUDA
-# conversion; use precompiled CUDA-compatible wheels for other PPU dependencies.
+# Use CUDA-compatible PPU wheels; do not compile SGLang, AOT kernels or gateway.
 # NVIDIA-only components and kernels-community CUDA cubins are not installed.
 ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103
 # The pinned SGLang wheel provides runtime_common/tracing extras; install ray
@@ -14,10 +13,9 @@ ARG PPU_BASE_IMAGE=pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-u
 # Avoid CUDA diffusion dependencies from all and torch-for-sail/triton-for-sail
 # wrapper distributions from all_sail.
 ARG BUILD_TYPE=runtime_common,tracing
-# Source repository and ref used by scripts/build_sglang_cuda_wheels.sh.
-# SGLANG_SOURCE_REPO must be supplied with --build-arg.
-ARG SGLANG_SOURCE_REPO
-ARG SGLANG_SOURCE_REF=yuhe/v1.0.0
+# The nightly workflow resolves these URLs from the selected pypi_tmp batch.
+ARG FLYTIGER_SGLANG_WHL_URL=https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-24-1614/sglang-1.0.0-1g88c64c3f7a2e-cp312-cp312-linux_x86_64.whl
+ARG FLYTIGER_SGLANG_KERNEL_WHL_URL=https://pkg.flytiger-eco.com/artifactory/pypi_tmp/2026-11-24-1614/sglang_kernel-0.4.11-1g88c64c3f7a2e-cp310-abi3-linux_x86_64.whl
 # Match the community v1.0.0 Python dependency pins.
 ARG TRANSFORMERS_VERSION=5.19.0
 ARG DEEPSEEK_RECIPE_VERSION=0.2.0
@@ -28,7 +26,7 @@ ARG MAX_JOBS=16
 ARG FFMPEG_VERSION=7.1.3
 ARG FFMPEG_SHA256=e0b04c4b43d7e6d67cb6710334fb513adf13ac860532f30e1d0ac4c231f232fb
 # Pin published PPU package versions to prevent upstream CUDA package selection.
-# Retain sailify for JIT compilation. sglang/sglang-kernel are built from source.
+# Retain sailify for JIT compilation.
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
     cpm-kernels==1.0.11+v0.1.0.ppu2.2.0 \
@@ -166,6 +164,8 @@ ARG PPU_PIP_INDEX
 ARG MAX_JOBS
 ARG PPU_PACKAGES
 ARG PPU_TORCH_PACKAGES
+ARG FLYTIGER_SGLANG_WHL_URL
+ARG FLYTIGER_SGLANG_KERNEL_WHL_URL
 
 WORKDIR /build
 
@@ -174,7 +174,7 @@ WORKDIR /build
 # and output on the same filesystem and avoid EXDEV.
 RUN source "${PPU_SDK}/envsetup.sh" ppu \
     && mkdir -p /wheels \
-    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES}; do \
+    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES} ${FLYTIGER_SGLANG_WHL_URL} ${FLYTIGER_SGLANG_KERNEL_WHL_URL}; do \
         echo "==> Building ${spec}" \
         && MAX_JOBS=${MAX_JOBS} python3 -m pip wheel \
             --no-cache-dir --no-deps --no-build-isolation \
@@ -194,27 +194,7 @@ RUN python3 -c 'import glob, os, zipfile; \
     && ls -l /wheels
 
 ########################################################
-# STAGE 2: Build sglang/sglang-kernel wheels from the pinned source ref
-########################################################
-FROM base AS sglang_wheels_builder
-
-ARG MAX_JOBS
-ARG SGLANG_SOURCE_REPO
-ARG SGLANG_SOURCE_REF
-
-WORKDIR /build
-COPY scripts/cudafy_sail_sglang.py scripts/build_sglang_cuda_wheels.sh /build/scripts/
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/root/.cargo/registry \
-    MAX_JOBS="${MAX_JOBS}" \
-    SGLANG_SOURCE_REPO="${SGLANG_SOURCE_REPO}" \
-    SGLANG_SOURCE_REF="${SGLANG_SOURCE_REF}" \
-    BUILD_ROOT=/build/sglang-cuda \
-    WHEEL_DIR=/wheels/sglang \
-    bash /build/scripts/build_sglang_cuda_wheels.sh
-
-########################################################
-# STAGE 3: Install PPU wheels and SGLang runtime dependencies
+# STAGE 2: Install PPU wheels and SGLang runtime dependencies
 ########################################################
 FROM base AS ppu_deps
 
@@ -229,7 +209,6 @@ COPY --from=ffmpeg_builder /opt/ffmpeg7/lib /opt/ffmpeg7/lib
 ENV LD_LIBRARY_PATH="/opt/ffmpeg7/lib:${LD_LIBRARY_PATH}"
 
 COPY --from=ppu_wheels_builder /wheels /tmp/wheels/ppu
-COPY --from=sglang_wheels_builder /wheels/sglang /tmp/wheels/ppu
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --no-deps /tmp/wheels/ppu/*.whl \
     && for w in /tmp/wheels/ppu/*.whl; do \
@@ -269,12 +248,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip list --format=freeze > /sgl-workspace/constraints.txt
 
 ########################################################
-# STAGE 4: Verify the wheel installation without source or Rust builds
+# STAGE 3: Verify the wheel installation without source or Rust builds
 ########################################################
 FROM ppu_deps AS sglang_install
 
 ARG TRANSFORMERS_VERSION
 ARG DEEPSEEK_RECIPE_VERSION
+ARG FLYTIGER_SGLANG_WHL_URL
+ARG FLYTIGER_SGLANG_KERNEL_WHL_URL
 
 WORKDIR /sgl-workspace
 RUN mkdir -p /sgl-workspace/sglang /root/.cache/huggingface /root/.cache/sglang \
@@ -287,7 +268,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     blake3 evalscope==1.14.0 \
     && python3 -c "import blake3, evalscope; from importlib.metadata import version; print('blake3:', version('blake3'), 'evalscope:', version('evalscope'))"
 
-ENV SGLANG_RUST_BUILD_MODE=never
+ENV SGLANG_RUST_BUILD_MODE=never \
+    FLYTIGER_SGLANG_WHL_URL="${FLYTIGER_SGLANG_WHL_URL}" \
+    FLYTIGER_SGLANG_KERNEL_WHL_URL="${FLYTIGER_SGLANG_KERNEL_WHL_URL}"
 
 ########################################################
 # Framework Image (dev)
