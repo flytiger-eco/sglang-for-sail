@@ -25,7 +25,7 @@ ARG UBUNTU_MIRROR
 ARG MAX_JOBS=16
 ARG FFMPEG_VERSION=7.1.3
 ARG FFMPEG_SHA256=e0b04c4b43d7e6d67cb6710334fb513adf13ac860532f30e1d0ac4c231f232fb
-# Pin published PPU package versions to prevent upstream CUDA package selection.
+# Pin PPU package versions and wheel URLs to prevent upstream CUDA package selection.
 # Retain sailify for JIT compilation.
 ARG PPU_PACKAGES="\
     acext==1.1.0+v0.2.0.ppu2.2.0 \
@@ -40,7 +40,7 @@ ARG PPU_PACKAGES="\
     flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
-    pla==1.1.0+v0.1.0.ppu2.2.0 \
+    https://pkg.flytiger-eco.com/artifactory/github_generic/nightly/flytiger-eco/pla/master+4f83c18.ppu2.2.0/pla-1.1.0+4f83c18.cuda13.0.0.ubuntu2404.sdk2.2.0-cp312-cp312-linux_x86_64.whl \
     nvidia-dali-cuda130==1.53.0+v0.1.0.ppu2.2.0 \
     sailify==1.0.0+ppu2.2.1 \
     sglang_router==0.3.2+v0.1.0.ppu2.2.0 \
