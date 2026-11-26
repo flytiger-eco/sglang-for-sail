@@ -37,7 +37,6 @@ ARG PPU_PACKAGES="\
     fast-hadamard-transform==1.0.4.post1+v0.1.0.ppu2.2.0 \
     flash_mla==2.1.0+v1.1.0.ppu2.2.1 \
     flash_attn==2.8.2+v1.0.0.ppu2.2.1 \
-    flash_attn_3==3.0.0+v1.0.0.ppu2.2.1 \
     flashinfer_python==0.6.18+v0.2.0.ppu2.2.0 \
     mooncake==0.3.12.post1+v0.1.0.ppu2.2.0 \
     msa_for_sail==0.1.1+v0.1.0.ppu2.2.0 \
@@ -52,6 +51,8 @@ ARG PPU_PACKAGES="\
     triton==3.7.1+v0.1.0.ppu2.2.0"
 # The base image provides torch/torchvision; only add torchaudio.
 ARG PPU_TORCH_PACKAGES="torchaudio==2.11.0+v0.1.0.ppu2.2.0"
+# Download the large FA3 wheel directly instead of through its wrapper sdist.
+ARG FLASH_ATTN_3_WHEEL_URL=https://pkg.flytiger-eco.com/artifactory/pypi_generic/flash_attn_3/3.0.0+v1.0.0.ppu2.2.1/flash_attn_3-3.0.0+cu130torch2.13.0ubuntu2404oe-cp312-cp312-linux_x86_64.whl
 
 FROM ${PPU_BASE_IMAGE} AS base
 
@@ -166,6 +167,7 @@ ARG PPU_PACKAGES
 ARG PPU_TORCH_PACKAGES
 ARG FLYTIGER_SGLANG_WHL_URL
 ARG FLYTIGER_SGLANG_KERNEL_WHL_URL
+ARG FLASH_ATTN_3_WHEEL_URL
 
 WORKDIR /build
 
@@ -174,7 +176,7 @@ WORKDIR /build
 # and output on the same filesystem and avoid EXDEV.
 RUN source "${PPU_SDK}/envsetup.sh" ppu \
     && mkdir -p /wheels \
-    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES} ${FLYTIGER_SGLANG_WHL_URL} ${FLYTIGER_SGLANG_KERNEL_WHL_URL}; do \
+    && for spec in ${PPU_PACKAGES} ${PPU_TORCH_PACKAGES} ${FLYTIGER_SGLANG_WHL_URL} ${FLYTIGER_SGLANG_KERNEL_WHL_URL} ${FLASH_ATTN_3_WHEEL_URL}; do \
         echo "==> Building ${spec}" \
         && MAX_JOBS=${MAX_JOBS} python3 -m pip wheel \
             --no-cache-dir --no-deps --no-build-isolation \
