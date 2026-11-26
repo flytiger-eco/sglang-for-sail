@@ -267,8 +267,8 @@ RUN python3 -c "from torchcodec.decoders import AudioDecoder, VideoDecoder; from
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -c /sgl-workspace/constraints.txt \
-    blake3 evalscope==1.14.0 \
-    && python3 -c "import blake3, evalscope; from importlib.metadata import version; print('blake3:', version('blake3'), 'evalscope:', version('evalscope'))"
+    blake3 \
+    && python3 -c "import blake3; from importlib.metadata import version; print('blake3:', version('blake3'))"
 
 ENV SGLANG_RUST_BUILD_MODE=never \
     FLYTIGER_SGLANG_WHL_URL="${FLYTIGER_SGLANG_WHL_URL}" \
