@@ -84,6 +84,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_mm,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -1934,10 +1935,17 @@ class KVCacheConfigurator:
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
+            resolve_qsa_indexer_dtype,
         )
 
         qsa_config = self.model_config.hf_config
         qsa_profile = parse_qsa_profile(qsa_config)
+        qsa_indexer_dtype = get_model().qsa_indexer_dtype
+        if qsa_indexer_dtype != "auto" and qsa_profile is None:
+            raise ValueError(
+                f"--qsa-indexer-dtype {qsa_indexer_dtype} needs a model with a "
+                "compressed QSA indexer (Qwen4-Exp); this model has none"
+            )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
@@ -1949,6 +1957,7 @@ class KVCacheConfigurator:
                 qsa_compress_ratio=qsa_profile.compress_ratio,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
+                qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
         replicated_kv = not self.is_draft_worker and use_qsa_only_cp(qsa_config)
         parallel = get_parallel()

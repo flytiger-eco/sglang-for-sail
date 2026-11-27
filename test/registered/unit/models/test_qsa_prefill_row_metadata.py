@@ -12,9 +12,12 @@ from sglang.srt.layers.attention.qsa.cp import QSAOnlyCPContext
 from sglang.srt.layers.attention.qsa.kernel import QSAPrefillPhysicalSelection
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
+    build_group_ring_slots,
+    build_pending_ring_slots,
     build_qsa_prefill_mqa_plan,
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+from sglang.srt.mem_cache.qsa_kv_pool import qsa_pending_ring_size
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -149,6 +152,66 @@ def test_prefill_metadata_and_selected_tokens_match_request_ownership(
         len(local_indices), token_topk + ratio - 1
     )
     torch.testing.assert_close(result.sort(dim=1).values, expected)
+
+
+@pytest.mark.parametrize(
+    "ratio, length, draft",
+    [(4, 2, 3), (4, 5, 4), (4, 7, 4), (4, 13, 1), (8, 15, 6)],
+)
+def test_pd_verify_keeps_prefill_tail_until_group_compression(ratio, length, draft):
+    ring_size = qsa_pending_ring_size(ratio)
+    prefill_slot, decode_slot = 2, 5
+    prefill_positions = torch.arange(length)
+    prefill_slots = build_pending_ring_slots(
+        token_to_batch_idx=torch.zeros(length, dtype=torch.long),
+        req_pool_indices=torch.tensor([prefill_slot]),
+        sequence_lengths=torch.tensor([length]),
+        logical_positions=prefill_positions,
+        compress_ratio=ratio,
+        ring_size=ring_size,
+        is_extend=True,
+    )
+    prefill_ring = torch.full((3 * ring_size,), -1)
+    # Slot zero is only a write sink. Avoid duplicate-index writes into it.
+    live = prefill_slots >= prefill_slot * ring_size
+    prefill_ring[prefill_slots[live]] = prefill_positions[live]
+
+    # PD copies one request's complete slice to the receiver's request slot.
+    decode_ring = torch.full((6 * ring_size,), -1)
+    decode_ring[decode_slot * ring_size : (decode_slot + 1) * ring_size] = (
+        prefill_ring[prefill_slot * ring_size : (prefill_slot + 1) * ring_size]
+    )
+    decode_positions = torch.arange(length, length + draft)
+    decode_slots = build_pending_ring_slots(
+        token_to_batch_idx=torch.zeros(draft, dtype=torch.long),
+        req_pool_indices=torch.tensor([decode_slot]),
+        sequence_lengths=torch.tensor([length + draft]),
+        logical_positions=decode_positions,
+        compress_ratio=ratio,
+        ring_size=ring_size,
+        is_extend=False,
+    )
+    decode_ring[decode_slots] = decode_positions
+
+    # The indexer writes the whole verify batch before reading a completed group.
+    end = (length // ratio + 1) * ratio - 1
+    group_slots = build_group_ring_slots(
+        req_pool_indices=torch.tensor([decode_slot]),
+        group_end_positions=torch.tensor([end]),
+        sequence_ids=torch.tensor([0]),
+        compress_ratio=ratio,
+        ring_size=ring_size,
+    )
+    if end < length + draft:
+        torch.testing.assert_close(
+            decode_ring[group_slots[0]], torch.arange(end + 1 - ratio, end + 1)
+        )
+    else:
+        tail = torch.arange(length // ratio * ratio, length + draft)
+        torch.testing.assert_close(
+            decode_ring[decode_slot * ring_size + tail % ring_size], tail
+        )
+    assert (decode_ring[: decode_slot * ring_size] == -1).all()
 
 
 if __name__ == "__main__":

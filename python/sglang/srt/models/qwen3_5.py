@@ -130,6 +130,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_ppu,
     is_xpu,
     make_layers,
     set_weight_attrs,
@@ -140,6 +141,7 @@ from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_confi
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
@@ -746,7 +748,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _project_qkvz(self, hidden_states: torch.Tensor, verify_front: bool):
+        if verify_front and envs.SGLANG_PPU_GDN_VERIFY_FP8_PROJ.get():
+            from sglang.kernels.ops.attention.linear.gdn_verify_front import (
+                fused_verify_proj,
+            )
+
+            optimized = fused_verify_proj(self.in_proj_qkvz, hidden_states)
+            if optimized is not None:
+                return optimized, None
+        return self.in_proj_qkvz(hidden_states)
+
+    def _forward_input_proj(
+        self, hidden_states: torch.Tensor, *, verify_front: bool = False
+    ):
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -826,7 +841,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self._project_qkvz(hidden_states, verify_front)
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
@@ -840,7 +855,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
             )
         else:
-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            projected_states_qkvz, _ = self._project_qkvz(hidden_states, verify_front)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
@@ -922,8 +937,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        verify_front = False
+        if (
+            _is_ppu
+            and self.config.model_type == "qwen4_exp_text"
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            verify_front = getattr(backend, "supports_packed_verify", False)
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, verify_front=verify_front
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
@@ -938,8 +964,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
-            _gdn_decode_fused_proj_conv
-            and forward_batch.forward_mode.is_decode()
+            (
+                verify_front
+                or (_gdn_decode_fused_proj_conv and forward_batch.forward_mode.is_decode())
+            )
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
         )
@@ -1001,6 +1029,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     "(core_attn_out, z)"
                 )
             core_attn_out, z = attn_result
+            if verify_front:
+                use_strided_prefill_z = z.ndim == 3 and not z.is_contiguous()
         else:
             core_attn_out = attn_result
         assert z is not None

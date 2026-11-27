@@ -16,12 +16,27 @@ from sglang.srt.layers.hc_small_batch_triton import (
     hc_mix_down,
     hc_mix_down_supported,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_ppu
 
 _is_ppu = is_ppu()
 
 
 _MAX_SPLIT_COMBINE_ROWS = 32
+
+
+class _HCPreparedMix(msgspec.Struct, frozen=True):
+    """Mix output prepared by the immediately preceding HC write-back."""
+
+    owner: object
+    residual: torch.Tensor
+    normed: torch.Tensor
+    mixed: torch.Tensor
+    gates: torch.Tensor
+
+
+_HCMixInput = torch.Tensor | _HCPreparedMix
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -368,7 +383,7 @@ class GatedResidual(HyperConnectionBase):
     def mix(
         self,
         hyper_input: torch.Tensor,
-        pre_normed: Optional[torch.Tensor] = None,
+        pre_normed: Optional[_HCMixInput] = None,
     ):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -376,6 +391,16 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input, None)
+
+        if isinstance(pre_normed, _HCPreparedMix):
+            if pre_normed.owner is self and pre_normed.residual is hyper_input:
+                return pre_normed.mixed, (
+                    hyper_input,
+                    pre_normed.normed,
+                    pre_normed.gates,
+                )
+            # A row movement or replacement has invalidated the prepared mix.
+            pre_normed = None
 
         if pre_normed is not None:
             assert pre_normed.shape == hyper_input.shape
@@ -542,17 +567,55 @@ class GatedResidual(HyperConnectionBase):
         residuals,
         next_norm_weight: torch.Tensor,
         next_norm_eps: float,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        *,
+        next_mixer: Optional["GatedResidual"] = None,
+    ) -> tuple[torch.Tensor, Optional[_HCMixInput]]:
         """Combine and precompute the next HC mix normalization.
 
         The fused CUDA JIT path is used only when combine gates were hoisted
         into ``mix()`` and the next HC uses per-branch grouped RMSNorm.  Other
         paths return ``None`` for the normalized tensor so the next ``mix()``
-        executes its regular normalization path.
+        executes its regular normalization path.  When ``next_mixer`` is given,
+        the PPU gated-HC mega kernel may fold combine, the next norm and the
+        next mix into one launch and return its prepared mix instead.
         """
         hyper_input, hyper_input_normed, gates = residuals
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype), None
+
+        if (
+            _is_ppu
+            and envs.SGLANG_PPU_GATED_HC_MEGA.get()
+            and 1 <= block_output.shape[0] <= 128
+            and next_mixer is not None
+            and getattr(next_mixer, "block_inject_weight", None) is not None
+            and getattr(next_mixer, "input_mix_weight_down", None) is not None
+            and getattr(next_mixer, "input_mix_weight_up", None) is not None
+            and next_mixer.hc_norm.weight is next_norm_weight
+            and next_norm_eps == 1e-6
+            and not is_batch_invariant_mode_enabled()
+        ):
+            old_gates = gates
+            if old_gates is None:
+                old_gates = self._precompute_gates(hyper_input_normed)
+            if old_gates is not None:
+                from sglang.kernels.ops.gemm.hc_gated_mega import run_gated_hc
+
+                fused = run_gated_hc(
+                    block_output,
+                    hyper_input,
+                    old_gates,
+                    next_norm_weight,
+                    next_mixer.input_mix_weight_down.weight,
+                    next_mixer.block_inject_weight.weight,
+                    next_mixer.input_mix_weight_up.weight,
+                    next_mixer,
+                )
+                if fused is not None:
+                    updated, normed, mixed, new_gates = fused
+                    return updated, _HCPreparedMix(
+                        next_mixer, updated, normed, mixed, new_gates
+                    )
 
         if (
             self._ppu_small_hc

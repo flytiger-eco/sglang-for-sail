@@ -620,6 +620,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
+        self._sail_qwen_megamoe = (
+            _is_ppu
+            and self._use_mega_moe
+            and getattr(config, "model_type", None) == "qwen4_exp_text"
+            and config.num_experts == 512
+            and self._mega_top_k == 10
+            and self._mega_hidden_size == 2560
+        )
 
     def get_moe_weights(self):
         return [
@@ -869,6 +877,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         # Same contract as _forward_deepep: combined rows, no TP all-reduce.
         from sglang.srt.layers.moe.mega_moe import (
+            _mega_moe_mma_type,
             is_mega_moe_experts_ready,
             run_mega_routed_experts,
         )
@@ -906,26 +915,68 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         topk_ids = None
         topk_weights = None
+        overlap = (
+            self._sail_qwen_megamoe
+            and envs.SGLANG_PPU_QWEN_MEGAMOE_OVERLAP.get()
+            and not self.enable_shared_expert_fusion
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and 0 < num_tokens <= 192
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and self.alt_stream is not None
+            and self.shared_expert is not None
+            and self.shared_expert_gate is not None
+            and self.shared_expert_gate.weight.dtype == torch.bfloat16
+            and self.shared_expert_gate.weight.is_contiguous()
+            and not is_in_breakable_cuda_graph()
+            and not torch.compiler.is_compiling()
+            and _mega_moe_mma_type(self.experts) in ("fp4xfp4", "mxf4xmxf4")
+        )
         if num_tokens > 0:
-            router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(
-                hidden_states,
-                apply_gate=not defer_shared_gate,
-                prefill=(
-                    self._prefill_gate_fusion
-                    and forward_batch is not None
-                    and forward_batch.forward_mode == ForwardMode.EXTEND
-                    and forward_batch._original_forward_mode
-                    in (None, ForwardMode.EXTEND)
-                ),
-            )
-            if defer_shared_gate and shared_output is not None:
-                # Keep the original GEMV and its BF16 output; defer only the
-                # elementwise gate so its rounded product can join shared-add.
-                shared_gate = self.shared_expert_gate(hidden_states)
+            if overlap:
+                from sglang.kernels.ops.moe.qwen_shared_gate import qwen_shared_gate
+
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, apply_gate=False
+                    )
+                    if (
+                        shared_output.is_contiguous()
+                        and shared_output.dtype == torch.bfloat16
+                    ):
+                        shared_output = qwen_shared_gate(
+                            hidden_states, self.shared_expert_gate.weight, shared_output
+                        )
+                    else:
+                        shared_output = (
+                            torch.sigmoid(self.shared_expert_gate(hidden_states))
+                            * shared_output
+                        )
+                router_logits, _ = self.gate(hidden_states)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states,
+                    apply_gate=not defer_shared_gate,
+                    prefill=(
+                        self._prefill_gate_fusion
+                        and forward_batch is not None
+                        and forward_batch.forward_mode == ForwardMode.EXTEND
+                        and forward_batch._original_forward_mode
+                        in (None, ForwardMode.EXTEND)
+                    ),
+                )
+                if defer_shared_gate and shared_output is not None:
+                    # Keep the original GEMV and its BF16 output; defer only the
+                    # elementwise gate so its rounded product can join shared-add.
+                    shared_gate = self.shared_expert_gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                **({"fuse_padding": True} if overlap else {}),
                 num_token_non_padded=(
                     forward_batch.moe_num_token_non_padded()
                     if forward_batch is not None
@@ -957,7 +1008,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             intermediate_size=self._mega_intermediate_size,
             top_k=self._mega_top_k,
             num_tokens=num_tokens,
+            keep_sail_topk_int32=overlap,
+            # This role is uniform across the EP group, including idle ranks
+            # that still participate in symmetric buffer allocation.
+            use_full_ppu_sms=(
+                self._sail_qwen_megamoe
+                and get_disagg().disaggregation_mode == "decode"
+            ),
         )
+        if overlap:
+            current_stream.wait_stream(self.alt_stream)
+            shared_output.record_stream(current_stream)
         if shared_output is not None:
             if shared_gate is not None:
                 from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (

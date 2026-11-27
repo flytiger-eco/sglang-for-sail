@@ -211,6 +211,18 @@ class Model(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with FP8 GEMMs (CUDA SM90/SM100 or PPU). Use the same dtype on "
+                "both PD peers. The main KV cache is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
+        ),
+    ] = "auto"
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (

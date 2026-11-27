@@ -1253,6 +1253,11 @@ class MoriKVManager(CommonKVManager):
                 else []
             )
 
+            if st in ("qsa_pending", "qsa_compressed") and src_lens != dst_lens:
+                raise RuntimeError(
+                    f"{st.upper()} layout differs between prefill and decode: "
+                    f"prefill={src_lens}, decode={dst_lens}"
+                )
             if st == "mamba":
                 if peer_info.decode_tp_size != self.attn_tp_size and 0 in src_dims:
                     raise RuntimeError(
