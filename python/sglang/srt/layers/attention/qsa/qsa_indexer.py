@@ -296,6 +296,7 @@ class QSAIndexer(MultiPlatformOp):
             sequence_lengths=metadata.sequence_lengths,
             logical_positions=logical_positions,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
             is_extend=is_extend,
         )
 
@@ -307,6 +308,7 @@ class QSAIndexer(MultiPlatformOp):
             group_end_positions=group_end_positions,
             sequence_ids=sequence_ids,
             compress_ratio=self.compress_ratio,
+            ring_size=metadata.token_to_kv_pool.qsa_ring_size,
         )
 
     def update_key_state_and_compress(

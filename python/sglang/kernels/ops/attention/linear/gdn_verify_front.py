@@ -96,7 +96,15 @@ def _per_channel_fp8_projection(linear) -> bool:
     )
 
 
-def verify_qkvz_projection(linear, x):
+def fused_verify_proj(linear, x):
+    """QKVZ input projection with the per-token FP8 quant fused in.
+
+    Optional GDN VERIFY fast path (``SGLANG_PPU_GDN_VERIFY_FP8_PROJ``): it
+    replaces the generic ``apply_fp8_linear`` quant + GEMM with one exact-quant
+    Triton kernel plus the PPU channelwise DeepGEMM. Returns ``None`` when the
+    layer or the input does not match that contract.
+    """
+
     from sglang.srt.layers import deep_gemm_wrapper
     from sglang.srt.layers.quantization.fp8_utils import gemm_nt_f8f8bf16
     from sglang.srt.utils import is_ppu

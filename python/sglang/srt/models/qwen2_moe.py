@@ -620,11 +620,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
-        self.topk.topk_config.sail_megamoe_fuse_padding = (
-            is_ppu()
+        self._sail_qwen_megamoe = (
+            _is_ppu
             and self._use_mega_moe
-            and envs.SGLANG_PPU_QWEN_MEGAMOE_OVERLAP.get()
-            and not self.enable_shared_expert_fusion
+            and getattr(config, "model_type", None) == "qwen4_exp_text"
+            and config.num_experts == 512
             and self._mega_top_k == 10
             and self._mega_hidden_size == 2560
         )
@@ -916,7 +916,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         topk_ids = None
         topk_weights = None
         overlap = (
-            self.topk.topk_config.sail_megamoe_fuse_padding
+            self._sail_qwen_megamoe
+            and envs.SGLANG_PPU_QWEN_MEGAMOE_OVERLAP.get()
+            and not self.enable_shared_expert_fusion
             and forward_batch is not None
             and forward_batch.forward_mode.is_target_verify()
             and 0 < num_tokens <= 192
@@ -974,6 +976,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                **({"fuse_padding": True} if overlap else {}),
                 num_token_non_padded=(
                     forward_batch.moe_num_token_non_padded()
                     if forward_batch is not None
@@ -1006,6 +1009,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=self._mega_top_k,
             num_tokens=num_tokens,
             keep_sail_topk_int32=overlap,
+            # This role is uniform across the EP group, including idle ranks
+            # that still participate in symmetric buffer allocation.
+            use_full_ppu_sms=(
+                self._sail_qwen_megamoe
+                and get_disagg().disaggregation_mode == "decode"
+            ),
         )
         if overlap:
             current_stream.wait_stream(self.alt_stream)

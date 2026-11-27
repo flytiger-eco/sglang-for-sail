@@ -517,14 +517,7 @@ def tilelang_qsa_mqa_prefill(
             torch.ones_like(logits, dtype=torch.bool), -float("inf")
         )
     heads, head_dim = q.shape[1:]
-    use_shared_ppu_kernel = (
-        is_ppu()
-        and heads == 4
-        and head_dim == 128
-        and q.dtype == k.dtype
-        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
-    )
-    block_q = 8 if use_shared_ppu_kernel else max(1, 128 // heads)
+    block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
     # A torch.cat of the padding rows would copy the whole [rows, keys] logits matrix,
@@ -542,38 +535,21 @@ def tilelang_qsa_mqa_prefill(
         starts = torch.cat([starts, starts[-1:].expand(padding)])
         ends = torch.cat([ends, ends[-1:].expand(padding)])
 
-    flat_k = k[:, 0].to(scoring_dtype).contiguous()
-    scale = float(score_scale or math.sqrt(head_dim))
-    if use_shared_ppu_kernel:
-        from sglang.kernels.ops.attention.qsa_grouped_mqa import (
-            qsa_mqa_prefill_scores,
-        )
-
-        qsa_mqa_prefill_scores(
-            q_padded,
-            flat_k,
-            starts,
-            ends,
-            logits,
-            scale,
-            block_keys=_prefill_mqa_block_n(keys, heads, head_dim),
-        )
-    else:
-        _tilelang_qsa_mqa_prefill_kernel(
-            heads=heads,
-            head_dim=head_dim,
-            block_q=block_q,
-            dtype=_TILELANG_DTYPES[scoring_dtype],
-            block_n=_prefill_mqa_block_n(keys, heads, head_dim),
-            output_bf16=output_bf16,
-        )(
-            q_padded.reshape(-1, head_dim),
-            flat_k,
-            logits,
-            starts,
-            ends,
-            scale,
-        )
+    _tilelang_qsa_mqa_prefill_kernel(
+        heads=heads,
+        head_dim=head_dim,
+        block_q=block_q,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
+        block_n=_prefill_mqa_block_n(keys, heads, head_dim),
+        output_bf16=output_bf16,
+    )(
+        q_padded.reshape(-1, head_dim),
+        k[:, 0].to(scoring_dtype).contiguous(),
+        logits,
+        starts,
+        ends,
+        float(score_scale or math.sqrt(head_dim)),
+    )
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]

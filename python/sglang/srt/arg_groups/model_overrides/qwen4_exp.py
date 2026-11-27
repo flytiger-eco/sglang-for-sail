@@ -90,14 +90,6 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
                 "--qsa-indexer-dtype fp8_e4m3 requires the compressed QSA indexer"
             )
     if profile is not None:
-        if (
-            cfg.attention_backend is None
-            and cfg.prefill_attention_backend is None
-            and cfg.decode_attention_backend is None
-        ):
-            # Preserve model-driven QSA selection before the generic hardware
-            # default chooses FA3/Triton. Model and backend must share this choice.
-            overrides["attention_backend"] = "qsa"
         # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
         # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64

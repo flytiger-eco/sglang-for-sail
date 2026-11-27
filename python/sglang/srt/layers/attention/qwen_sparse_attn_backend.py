@@ -483,12 +483,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
             raise NotImplementedError(
                 "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                f"compress ratio ({self.compress_ratio}); got {draft_tokens}"
             )
 
     @staticmethod
@@ -923,6 +920,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=sequence_lengths,
                 logical_positions=ring_logical_positions,
                 compress_ratio=self.compress_ratio,
+                ring_size=self.token_to_kv_pool.qsa_ring_size,
                 is_extend=group_member_rows is not None,
             )
             if not decode_like:
@@ -949,6 +947,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                         group_end_positions=group_positions.long(),
                         sequence_ids=group_sequence_ids.long(),
                         compress_ratio=self.compress_ratio,
+                        ring_size=self.token_to_kv_pool.qsa_ring_size,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -1461,6 +1460,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_size=pool.qsa_ring_size,
                 is_extend=False,
             )
         )
@@ -1470,6 +1470,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_size=pool.qsa_ring_size,
             ).to(torch.int32)
         )
 

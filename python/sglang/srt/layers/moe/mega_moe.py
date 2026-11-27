@@ -80,7 +80,7 @@ def _mega_moe_max_num_sms() -> Optional[int]:
 
 
 @contextmanager
-def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm, *, use_full_ppu_sms=False):
     max_num_sms = _mega_moe_max_num_sms()
     if max_num_sms is None:
         yield
@@ -125,12 +125,16 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
     mma_type: Optional[str] = None,
     activation: str = "swiglu",
+    *,
+    use_full_ppu_sms: bool = False,
 ) -> SymmBuffer:
     import deep_gemm
 
     if mma_type is None:
         mma_type = _mega_moe_mma_type()
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    with _configure_mega_moe_deep_gemm_num_sms(
+        deep_gemm, use_full_ppu_sms=use_full_ppu_sms
+    ):
         key = (
             id(group),
             num_max_tokens_per_rank,
@@ -336,6 +340,7 @@ def run_mega_routed_experts(
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
     keep_sail_topk_int32: bool = False,
+    use_full_ppu_sms: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -355,6 +360,7 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
+    use_full_ppu_sms = use_full_ppu_sms and mma_type in ("fp4xfp4", "mxf4xmxf4")
     buf = _get_mega_moe_symm_buffer(
         ep_group,
         num_experts=num_experts,
@@ -363,6 +369,7 @@ def run_mega_routed_experts(
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
         mma_type=mma_type,
+        use_full_ppu_sms=use_full_ppu_sms,
     )
 
     topk_id_dtype = torch.int64 if _is_ppu else torch.int32
@@ -465,7 +472,9 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    with _configure_mega_moe_deep_gemm_num_sms(
+        deep_gemm, use_full_ppu_sms=use_full_ppu_sms
+    ):
         mega_moe_kernel = (
             deep_gemm.fp4_fp4_mega_moe
             if _is_ppu and mma_type == "mxf4xmxf4"

@@ -7,7 +7,7 @@ import triton.language as tl
 @triton.jit(do_not_specialize=["N", "KS0", "KS2", "RS0", "RS1"])
 def _store_pending_tail(
     keys, rope, lengths, extend_lengths, starts, requests, key_ring, rope_ring,
-    N, D: tl.constexpr, R: tl.constexpr,
+    N, D: tl.constexpr, R: tl.constexpr, RING_SIZE: tl.constexpr,
     KS0, KS2,
     RS0, RS1,
     ROPE_1D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_R: tl.constexpr,
@@ -20,7 +20,8 @@ def _store_pending_tail(
     tail = length % R
     member = tl.arange(0, BLOCK_R)
     row = start + extend_length - tail + member
-    slot = request_slot * R + member
+    position = length - tail + member
+    slot = request_slot.to(tl.int64) * RING_SIZE + position % RING_SIZE
     valid = (member < tail) & (extend_length >= tail) & (row >= 0) & (row < N) & (request_slot > 0)
     dim = tl.arange(0, BLOCK_D)
     value = tl.load(keys + row[:, None] * KS0 + dim[None, :] * KS2,
@@ -55,6 +56,7 @@ def store_qsa_pending_tail(token_k, rope_positions, metadata, layer_id):
         metadata.req_pool_indices, pool.get_qsa_key_state_buffer(layer_id),
         pool.qsa_rope_position_buffer,
         N=token_k.shape[0], D=token_k.shape[2], R=metadata.compress_ratio,
+        RING_SIZE=pool.qsa_ring_size,
         KS0=token_k.stride(0), KS2=token_k.stride(2),
         RS0=rope_positions.stride(0),
         RS1=rope_positions.stride(1) if rope_positions.ndim == 2 else 0,

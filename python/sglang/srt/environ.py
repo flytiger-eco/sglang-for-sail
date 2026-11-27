@@ -331,6 +331,7 @@ class Envs:
     SGLANG_PPU_GATED_HC_MEGA = EnvBool(True)
     SGLANG_PPU_QWEN_MEGAMOE_OVERLAP = EnvBool(True)
     SGLANG_PPU_GDN_VERIFY_FRONT = EnvBool(True)
+    SGLANG_PPU_GDN_VERIFY_FP8_PROJ = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device

@@ -271,7 +271,6 @@ class TopKConfig:
     sqrtsoftplus_log1p: bool = False
     # Let the fused router also emit FlashInfer routed-MoE packed ids.
     fused_gate_packed_ids: bool = False
-    sail_megamoe_fuse_padding: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -675,6 +674,7 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
         dynamic_expert_bias: Optional[torch.Tensor] = None,
+        fuse_padding: bool = False,
     ) -> TopKOutput:
 
         updater = get_global_expert_location_updater()
@@ -749,6 +749,7 @@ class TopK(BaseFusedOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                     dynamic_expert_bias=dynamic_expert_bias,
+                    fuse_padding=fuse_padding,
                 )
         return self._apply_waterfill(topk_output, hidden_states.shape[0])
 
@@ -2508,6 +2509,7 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     dynamic_expert_bias: Optional[torch.Tensor] = None,
+    fuse_padding: bool = False,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2534,7 +2536,7 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
     fuse_sail_padding = (
-        topk_config.sail_megamoe_fuse_padding
+        fuse_padding
         and _is_ppu
         and _is_cuda
         and not _use_aiter

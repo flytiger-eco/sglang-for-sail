@@ -45,19 +45,14 @@ def resolve_qsa_indexer_dtype(name: str) -> torch.dtype:
     )
 
 
-def qsa_pending_ring_size(compress_ratio: int, max_rows_per_request: int = 1) -> int:
-    """Pending-ring slots per request for forwards of up to ``max_rows_per_request``
-    rows each (speculative verify / draft extend; 1 for plain decode).
+def qsa_pending_ring_size(compress_ratio: int) -> int:
+    """Fixed PD layout for QSA forwards with at most one group of new rows.
 
-    Every row stores its raw key before any group is compressed, and a group
-    completed by a row reaches back ``compress_ratio - 1`` positions, past the
-    forward's first row. Those members survive the forward's later stores only if
-    ``position % ring`` does not repeat over ``compress_ratio + rows - 1``
-    consecutive positions. Rounding up to a power of two gives servers with
-    different draft-token counts (2-5 at ratio 4) the same ring, which PD
-    pending-state transfer requires of prefill and decode."""
-    span = int(compress_ratio) + max(int(max_rows_per_request), 1) - 1
-    return 1 << (span - 1).bit_length()
+    A forward can write an entire group before reading any of its members.
+    Reserve a second group so those writes cannot evict the preceding tail.
+    The width is model-derived so prefill and decode use the same slot stride.
+    """
+    return 2 * compress_ratio
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
@@ -113,7 +108,6 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
-        qsa_max_rows_per_request: int = 1,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -185,9 +179,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        self.qsa_ring_size = qsa_pending_ring_size(
-            self.qsa_compress_ratio, qsa_max_rows_per_request
-        )
+        self.qsa_ring_size = qsa_pending_ring_size(self.qsa_compress_ratio)
         ring_slots = self.qsa_num_request_slots * self.qsa_ring_size
         logger.info(
             "QSA compressed indexer cache dtype: %s (pending ring %s, %d slots "

@@ -1,4 +1,4 @@
-"""PPU MQA scoring shared by packed prefill tiles and paged verify groups."""
+"""PPU grouped MQA scoring for paged speculative verification."""
 
 import math
 
@@ -28,8 +28,6 @@ def _qsa_mqa_kernel(
     key_splits: int = 64,
     threads: int = 128,
     dtype: str = "float8_e4m3fn",
-    paged: bool = True,
-    output_bf16: bool = False,
 ):
     qpad = 1 << (queries - 1).bit_length()
     head_multiple = max(1, 16 // qpad)
@@ -39,11 +37,8 @@ def _qsa_mqa_kernel(
     max_pages = T.dynamic("max_pages")
     output_keys = T.dynamic("output_keys")
     rows = groups * queries
-    output_dtype = T.bfloat16 if output_bf16 else T.float32
-    q_shape = (
-        [rows, physical_heads, head_dim] if paged else [rows * physical_heads, head_dim]
-    )
-    k_shape = [keys, page_size, 1, head_dim] if paged else [keys, head_dim]
+    q_shape = [rows, physical_heads, head_dim]
+    k_shape = [keys, page_size, 1, head_dim]
 
     @T.macro
     def score_and_store(
@@ -52,7 +47,7 @@ def _qsa_mqa_kernel(
         scores: T.Buffer([block_keys, qpad * hpad], T.float32),
         reduced: T.Buffer([block_keys, qpad], T.float32),
         ends: T.Buffer([rows], T.int32),
-        out: T.Buffer([rows, output_keys], output_dtype),
+        out: T.Buffer([rows, output_keys], T.float32),
         row_base: T.int32,
         column_base: T.int32,
         scale: T.float32,
@@ -70,27 +65,20 @@ def _qsa_mqa_kernel(
         view = T.reshape(scores, [block_keys, qpad, hpad])
         T.reduce_sum(view, reduced, dim=2, clear=True)
         for qi, ki in T.Parallel(qpad, block_keys):
-            if paged:
-                if qi < queries:
-                    if (
-                        column_base + ki < ends[row_base + qi]
-                        and column_base + ki < output_keys
-                    ):
-                        out[row_base + qi, column_base + ki] = reduced[ki, qi] / scale
-            else:
-                if output_bf16:
+            if qi < queries:
+                if (
+                    column_base + ki < ends[row_base + qi]
+                    and column_base + ki < output_keys
+                ):
                     out[row_base + qi, column_base + ki] = reduced[ki, qi] / scale
-                else:
-                    out[row_base + qi, column_base + ki] = reduced[ki, qi]
 
     @T.prim_func
     def kernel(
         Q: T.Tensor(q_shape, dtype),
         K: T.Tensor(k_shape, dtype),
         Table: T.Tensor([rows, max_pages], T.int32),
-        Starts: T.Tensor([rows], T.int32),
         Ends: T.Tensor([rows], T.int32),
-        Out: T.Tensor([rows, output_keys], output_dtype),
+        Out: T.Tensor([rows, output_keys], T.float32),
         Scale: T.float32,
     ):
         with T.Kernel(groups, key_splits, threads=threads) as (bx, sx):
@@ -99,62 +87,28 @@ def _qsa_mqa_kernel(
             scores = T.alloc_fragment([block_keys, qpad * hpad], T.float32)
             reduced = T.alloc_fragment([block_keys, qpad], T.float32)
             base = bx * queries
-            if (
-                not paged
-                and physical_heads == heads
-                and heads == hpad
-                and queries == qpad
-            ):
-                T.copy(Q[base * physical_heads, 0], qs)
-            else:
-                T.clear(qs)
-                for qi in range(queries):
-                    T.copy(
-                        Q[base + qi, :heads, :], qs[qi * hpad : qi * hpad + heads, :]
-                    )
-            if paged:
-                last = base + queries - 1
-                end = T.min(Ends[last], output_keys)
-                count = T.ceildiv(end, block_keys)
-                for step in T.serial(T.ceildiv(T.max(count - sx, 0), key_splits)):
-                    block = sx + step * key_splits
-                    if block * block_keys < end:
-                        for sp in range(block_keys // page_size):
-                            if block * block_keys + sp * page_size < end:
-                                T.copy(
-                                    K[
-                                        Table[
-                                            last, block * (block_keys // page_size) + sp
-                                        ],
-                                        :,
-                                        0,
-                                        :,
+            T.clear(qs)
+            for qi in range(queries):
+                T.copy(Q[base + qi, :heads, :], qs[qi * hpad : qi * hpad + heads, :])
+            last = base + queries - 1
+            end = T.min(Ends[last], output_keys)
+            count = T.ceildiv(end, block_keys)
+            for step in T.serial(T.ceildiv(T.max(count - sx, 0), key_splits)):
+                block = sx + step * key_splits
+                if block * block_keys < end:
+                    for sp in range(block_keys // page_size):
+                        if block * block_keys + sp * page_size < end:
+                            T.copy(
+                                K[
+                                    Table[
+                                        last, block * (block_keys // page_size) + sp
                                     ],
-                                    ks[sp * page_size : (sp + 1) * page_size, :],
-                                )
-                        score_and_store(
-                            qs,
-                            ks,
-                            scores,
-                            reduced,
-                            Ends,
-                            Out,
-                            base,
-                            block * block_keys,
-                            Scale,
-                        )
-            else:
-                start = T.alloc_var(T.int32)
-                end = T.alloc_var(T.int32)
-                start = 2147483647
-                end = -2147483648
-                for qi in T.serial(queries):
-                    start = T.min(start, T.min(Starts[base + qi], output_keys))
-                    end = T.max(end, T.min(Ends[base + qi], output_keys))
-                for block in T.Pipelined(
-                    T.ceildiv(end - start, block_keys), num_stages=3
-                ):
-                    T.copy(K[start + block * block_keys, 0], ks)
+                                    :,
+                                    0,
+                                    :,
+                                ],
+                                ks[sp * page_size : (sp + 1) * page_size, :],
+                            )
                     score_and_store(
                         qs,
                         ks,
@@ -163,63 +117,11 @@ def _qsa_mqa_kernel(
                         Ends,
                         Out,
                         base,
-                        start + block * block_keys,
+                        block * block_keys,
                         Scale,
                     )
 
     return kernel.with_attr("global_symbol", "qsa_mqa")
-
-
-def qsa_mqa_prefill_scores(q, k, starts, ends, logits, score_scale, *, block_keys=64):
-    """Write packed eight-query score tiles into caller-owned storage.
-
-    The caller supplies query rows already padded to eight and an initialized
-    logits buffer. Only the planned key tiles are written; other elements are
-    untouched. The caller must mask outside each row's [start, end) range for
-    both output dtypes and discard padded query rows. FP32 scores also need
-    caller-side division; BF16 logits are scaled here before rounding.
-    """
-    if not (
-        _is_ppu
-        and q.is_cuda
-        and q.ndim == 3
-        and q.shape[1:] == (4, 128)
-        and q.shape[0] % 8 == 0
-        and k.ndim == 2
-        and k.shape[1] == 128
-        and q.dtype == k.dtype
-        and q.dtype in (torch.bfloat16, torch.float8_e4m3fn)
-        and logits.shape == (q.shape[0], k.shape[0])
-        and logits.dtype in (torch.float32, torch.bfloat16)
-        and starts.shape == ends.shape == (q.shape[0],)
-        and starts.dtype == ends.dtype == torch.int32
-        and q.device == k.device == starts.device == ends.device == logits.device
-        and all(t.is_contiguous() for t in (q, k, starts, ends, logits))
-    ):
-        raise ValueError("unsupported packed QSA scoring inputs")
-    if not q.shape[0] or not k.shape[0]:
-        return
-    dtype = "float8_e4m3fn" if q.dtype == torch.float8_e4m3fn else "bfloat16"
-    _qsa_mqa_kernel(
-        heads=4,
-        physical_heads=4,
-        head_dim=128,
-        queries=8,
-        block_keys=block_keys,
-        key_splits=1,
-        threads=256,
-        dtype=dtype,
-        paged=False,
-        output_bf16=logits.dtype == torch.bfloat16,
-    )(
-        q.reshape(-1, 128),
-        k,
-        starts.reshape(-1, 1),
-        starts,
-        ends,
-        logits,
-        float(score_scale),
-    )
 
 
 def qsa_grouped_mqa_supported(
@@ -287,5 +189,5 @@ def qsa_grouped_mqa_decode(
         queries=num_queries_per_request,
         page_size=k_cache.shape[1],
         dtype=dtype,
-    )(q, k_cache, page_table, context_lens, context_lens, out, math.sqrt(q.shape[-1]))
+    )(q, k_cache, page_table, context_lens, out, math.sqrt(q.shape[-1]))
     return out

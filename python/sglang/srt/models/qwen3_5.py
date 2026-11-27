@@ -130,6 +130,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_ppu,
     is_xpu,
     make_layers,
     set_weight_attrs,
@@ -140,6 +141,7 @@ from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_confi
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_ppu = is_ppu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
@@ -747,12 +749,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _project_qkvz(self, hidden_states: torch.Tensor, verify_front: bool):
-        if verify_front:
+        if verify_front and envs.SGLANG_PPU_GDN_VERIFY_FP8_PROJ.get():
             from sglang.kernels.ops.attention.linear.gdn_verify_front import (
-                verify_qkvz_projection,
+                fused_verify_proj,
             )
 
-            optimized = verify_qkvz_projection(self.in_proj_qkvz, hidden_states)
+            optimized = fused_verify_proj(self.in_proj_qkvz, hidden_states)
             if optimized is not None:
                 return optimized, None
         return self.in_proj_qkvz(hidden_states)
@@ -935,14 +937,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        packed_verify = False
-        if forward_batch.forward_mode.is_target_verify():
+        verify_front = False
+        if (
+            _is_ppu
+            and self.config.model_type == "qwen4_exp_text"
+            and forward_batch.forward_mode.is_target_verify()
+        ):
             from sglang.srt.model_executor.forward_context import get_attn_backend
 
             backend = get_attn_backend()
             backend = getattr(backend, "linear_attn_backend", backend)
-            packed_verify = getattr(backend, "supports_packed_verify", False)
-        verify_front = packed_verify and envs.SGLANG_PPU_GDN_VERIFY_FRONT.get()
+            verify_front = getattr(backend, "supports_packed_verify", False)
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states, verify_front=verify_front
         )
@@ -960,9 +965,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         use_strided_prefill_z = False
         use_fused_decode_proj_conv = (
             (
-                _gdn_decode_fused_proj_conv
-                and (forward_batch.forward_mode.is_decode() or packed_verify)
-                or verify_front
+                verify_front
+                or (_gdn_decode_fused_proj_conv and forward_batch.forward_mode.is_decode())
             )
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)

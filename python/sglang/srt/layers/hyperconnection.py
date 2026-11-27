@@ -586,6 +586,7 @@ class GatedResidual(HyperConnectionBase):
         if (
             _is_ppu
             and envs.SGLANG_PPU_GATED_HC_MEGA.get()
+            and 1 <= block_output.shape[0] <= 128
             and next_mixer is not None
             and getattr(next_mixer, "block_inject_weight", None) is not None
             and getattr(next_mixer, "input_mix_weight_down", None) is not None
