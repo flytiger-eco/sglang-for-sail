@@ -335,6 +335,7 @@ def run_mega_routed_experts(
     num_tokens: int,
     activation_clamp: Optional[float] = None,
     routed_scaling_factor: float = 1.0,
+    keep_sail_topk_int32: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -365,6 +366,16 @@ def run_mega_routed_experts(
     )
 
     topk_id_dtype = torch.int64 if _is_ppu else torch.int32
+    # The Sail MXFP4 pre-dispatch can widen int32 input directly into its
+    # int64 workspace, avoiding a separate cast launch for eligible callers.
+    if (
+        keep_sail_topk_int32
+        and _is_ppu
+        and mma_type in ("fp4xfp4", "mxf4xmxf4")
+        and topk_ids is not None
+        and topk_ids.dtype == torch.int32
+    ):
+        topk_id_dtype = torch.int32
     if num_tokens > 0:
         topk_ids_in = topk_ids.to(topk_id_dtype)
         topk_weights_in = topk_weights.to(torch.float32)

@@ -271,6 +271,7 @@ class TopKConfig:
     sqrtsoftplus_log1p: bool = False
     # Let the fused router also emit FlashInfer routed-MoE packed ids.
     fused_gate_packed_ids: bool = False
+    sail_megamoe_fuse_padding: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -1086,6 +1087,7 @@ def fused_topk(
                 topk,
                 scoring_func="softmax",
                 renormalize=renormalize,
+                num_token_non_padded=num_token_non_padded,
             )
         else:
             topk_softmax(
@@ -2531,6 +2533,20 @@ def select_experts(
     packed_topk = None
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
+    fuse_sail_padding = (
+        topk_config.sail_megamoe_fuse_padding
+        and _is_ppu
+        and _is_cuda
+        and not _use_aiter
+        and scoring_func == "softmax"
+        and correction_bias is None
+        and num_token_non_padded is not None
+        and expert_location_dispatch_info is None
+        and num_fused_shared_experts == 0
+        and 0 < hidden_states.shape[0] <= 192
+        and router_logits.shape[-1] == 512
+        and top_k == 10
+    )
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
@@ -2729,6 +2745,9 @@ def select_experts(
                     num_token_non_padded=num_token_non_padded,
                 )
             # ===== END TO BE REFACTORED ====
+            if fuse_sail_padding and not routing_overridden:
+                _fused_topk_kwargs["num_token_non_padded"] = num_token_non_padded
+                padded_rows_masked = True
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
