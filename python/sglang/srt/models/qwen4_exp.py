@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
+    _HCMixInput,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.linear import (
@@ -419,7 +420,7 @@ def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
 class _HCPreNormed(msgspec.Struct, frozen=True):
     """Carries a fused combine output's precomputed norm across layer boundaries."""
 
-    normed: torch.Tensor
+    normed: _HCMixInput
 
 
 _HCInterLayerState = Optional[Union[torch.Tensor, _HCPreNormed]]
@@ -1583,11 +1584,20 @@ class Qwen4ExpLayerExtensionMixin:
             hidden_states = hc_sp.reduce_scatter(hidden_states)
         elif not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
+        prepare_mix = (
+            _is_ppu
+            and envs.SGLANG_PPU_GATED_HC_MEGA.get()
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        )
         hidden_states, pre_normed = self.attn_hyper_connection.combine_and_norm(
             hidden_states,
             residual,
             self.mlp_hyper_connection.hc_norm.weight,
             self.mlp_hyper_connection.config.rms_norm_eps,
+            next_mixer=self.mlp_hyper_connection if prepare_mix else None,
         )
         hidden_states, residual = self.mlp_hyper_connection.mix(
             hidden_states, pre_normed=pre_normed
@@ -1664,6 +1674,7 @@ class Qwen4ExpLayerExtensionMixin:
         *,
         next_hc_norm_weight: Optional[torch.Tensor] = None,
         next_hc_norm_eps: Optional[float] = None,
+        next_mixer: Optional[GatedResidual] = None,
     ) -> Tuple[torch.Tensor, Optional[_HCPreNormed]]:
         if next_hc_norm_weight is None or next_hc_norm_eps is None:
             hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
@@ -1674,6 +1685,7 @@ class Qwen4ExpLayerExtensionMixin:
             residual,
             next_hc_norm_weight,
             next_hc_norm_eps,
+            next_mixer=next_mixer,
         )
         return (
             hidden_states,
@@ -1726,6 +1738,7 @@ class Qwen4ExpLinearDecoderLayer(
             forward_batch,
             next_hc_norm_weight=kwargs.get("next_hc_norm_weight"),
             next_hc_norm_eps=kwargs.get("next_hc_norm_eps"),
+            next_mixer=kwargs.get("next_mixer"),
         )
 
 
@@ -2005,6 +2018,7 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch,
             next_hc_norm_weight=kwargs.get("next_hc_norm_weight"),
             next_hc_norm_eps=kwargs.get("next_hc_norm_eps"),
+            next_mixer=kwargs.get("next_mixer"),
         )
 
 
@@ -2128,6 +2142,21 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     else None
                 )
             )
+            # The gated-HC mega kernel needs the next mixer's combine and
+            # mix weights; the model-level final mixer is mix-only, so only a
+            # real following layer can host the prepared mix.
+            next_mixer = (
+                next_layer.attn_hyper_connection
+                if next_layer is not None
+                and next_ple is None
+                and _is_ppu
+                and envs.SGLANG_PPU_GATED_HC_MEGA.get()
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+                else None
+            )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 hidden_states, residual = layer(
                     positions=positions,
@@ -2142,6 +2171,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     next_hc_norm_eps=next_hc.config.rms_norm_eps
                     if next_hc is not None
                     else None,
+                    next_mixer=next_mixer,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)
