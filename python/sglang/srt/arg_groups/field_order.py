@@ -521,6 +521,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "qsa_indexer_dtype",
     "vision_quantization",
     "vision_model_path",
     "image_pruning_rate",

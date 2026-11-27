@@ -320,6 +320,7 @@ if HAS_TILELANG:
         page_size: int = 64,
         group_ctas: int = 16,
         threads: int = 128,
+        dtype: str = "bfloat16",
     ):
         # The validated MMA layout wants 64 GEMM rows; pages narrower than
         # that are packed in sub-page quadrants of one 64-row tile.
@@ -333,8 +334,8 @@ if HAS_TILELANG:
 
         @T.prim_func
         def kernel(
-            Q: T.Tensor([batch, 1, heads, head_dim], T.bfloat16),  # type: ignore
-            KCache: T.Tensor([pages, page_size, 1, head_dim], T.bfloat16),  # type: ignore
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
             ContextLens: T.Tensor([batch], T.int32),  # type: ignore
             Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
@@ -343,8 +344,8 @@ if HAS_TILELANG:
             # Keep the grid static for CUDA graph replay and let each CTA
             # grid-stride over the groups in the row's device-side length.
             with T.Kernel(batch, group_ctas, threads=threads) as (bx, gx):
-                q_shared = T.alloc_shared([heads, head_dim], T.bfloat16)
-                k_shared = T.alloc_shared([GROUP, head_dim], T.bfloat16)
+                q_shared = T.alloc_shared([heads, head_dim], dtype)
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
                 reduced = T.alloc_fragment([GROUP], T.float32)
                 T.copy(Q[bx, 0, :, :], q_shared)
@@ -640,7 +641,7 @@ def tilelang_qsa_mqa_decode(
     query_heads, head_dim = q.shape[1:]
     kernel_heads = qsa_mqa_padded_heads(query_heads)
     ppu_kernel = is_ppu()
-    scoring_dtype = torch.bfloat16 if ppu_kernel else _scoring_dtype(q, k_cache)
+    scoring_dtype = _scoring_dtype(q, k_cache)
     q_kernel = q.to(scoring_dtype)
     if kernel_heads != query_heads:
         q_kernel = torch.cat(
@@ -671,9 +672,12 @@ def tilelang_qsa_mqa_decode(
         if ppu_kernel
         else _tilelang_qsa_mqa_decode_kernel
     )
-    kernel_kwargs = dict(heads=kernel_heads, head_dim=head_dim, page_size=page_size)
-    if not ppu_kernel:
-        kernel_kwargs["dtype"] = _TILELANG_DTYPES[scoring_dtype]
+    kernel_kwargs = dict(
+        heads=kernel_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        dtype=_TILELANG_DTYPES[scoring_dtype],
+    )
     factory(**kernel_kwargs)(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
