@@ -643,6 +643,12 @@ def _causal_conv1d_update_kernel(
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    verify_ba_ptr=None,
+    verify_b_ptr=None,
+    verify_a_ptr=None,
+    VERIFY_BA_STRIDE: tl.constexpr = 0,
+    VERIFY_V_HEADS: tl.constexpr = 0,
+    DEDUP_LINEAR: tl.constexpr = False,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -655,6 +661,22 @@ def _causal_conv1d_update_kernel(
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    if VERIFY_V_HEADS > 0 and tl.program_id(1) == 0:
+        # As in the separate unpack, produce B/A even for padded requests.
+        for step in tl.static_range(seqlen):
+            row = idx_seq * seqlen + step
+            mask_ba = idx_feats < VERIFY_V_HEADS
+            b = tl.load(
+                verify_ba_ptr + row * VERIFY_BA_STRIDE + idx_feats, mask_ba, 0
+            )
+            a = tl.load(
+                verify_ba_ptr + row * VERIFY_BA_STRIDE + VERIFY_V_HEADS + idx_feats,
+                mask_ba,
+                0,
+            )
+            tl.store(verify_b_ptr + row * VERIFY_V_HEADS + idx_feats, b, mask_ba)
+            tl.store(verify_a_ptr + row * VERIFY_V_HEADS + idx_feats, a, mask_ba)
 
     if IS_CONTINUOUS_BATCHING:
         # mask = idx_seq < batch
@@ -811,6 +833,16 @@ def _causal_conv1d_update_kernel(
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
 
+    if DEDUP_LINEAR:
+        # The next step's history aliases this step's suffix in the compact pool.
+        window = (
+            intermediate_conv_window_ptr
+            + intermediate_state_batch_coord * stride_inter_seq
+            + idx_feats * stride_inter_dim
+        )
+        tl.store(window, col1, mask=mask_w)
+        tl.store(window + stride_inter_win, col2, mask=mask_w)
+
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
         acc = acc_preload
@@ -956,7 +988,9 @@ def _causal_conv1d_update_kernel(
                 col1 = col2
                 col2 = matrix_x
 
-            if SAVE_INTERMEDIATE:
+            if DEDUP_LINEAR:
+                tl.store(window + (idx_token + 2) * stride_inter_win, col2, mask=mask_w)
+            elif SAVE_INTERMEDIATE:
                 # Save the window state after consuming this token
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
@@ -1014,6 +1048,8 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    *,
+    verify_ba_outputs: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -1076,7 +1112,15 @@ def causal_conv1d_update(
         assert cache_seqlens is None  # not needed for vLLM - circular buffer
 
     # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
-    out = torch.empty_like(x)
+    if verify_ba_outputs is None:
+        out = torch.empty_like(x)
+        verify_ba = verify_b = verify_a = None
+        verify_heads = verify_ba_stride = 0
+    else:
+        verify_ba, verify_b, verify_a = verify_ba_outputs
+        verify_heads = verify_b.shape[-1]
+        verify_ba_stride = verify_ba.stride(0)
+        out = x.new_empty((batch, seqlen, dim)).transpose(1, 2)
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -1200,7 +1244,19 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=1024 if verify_heads else 256,
+        verify_ba_ptr=verify_ba,
+        verify_b_ptr=verify_b,
+        verify_a_ptr=verify_a,
+        VERIFY_BA_STRIDE=verify_ba_stride,
+        VERIFY_V_HEADS=verify_heads,
+        DEDUP_LINEAR=bool(
+            verify_heads
+            and width == 4
+            and retrieve_next_token is None
+            and intermediate_conv_window is not None
+            and stride_inter_step == stride_inter_win
+        ),
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         **pdl_kwargs,

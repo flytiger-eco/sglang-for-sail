@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_ppu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
 _is_hip = is_hip()
@@ -619,6 +619,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 lengths, chunks, self.mamba_chunk_size, self.device
             )
 
+    @property
+    def supports_packed_verify(self) -> bool:
+        return is_ppu() and envs.SGLANG_PPU_GDN_VERIFY_FRONT.get()
+
     def _init_target_verify_qkv_routing(self, forward_batch: ForwardBatch) -> None:
         # CUDA-graph metadata leaves mode and draft count at their defaults.
         if not forward_batch.forward_mode.is_target_verify():
@@ -930,8 +934,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        assert isinstance(mixed_qkv, torch.Tensor)
-        seq_len = mixed_qkv.shape[0]
+        packed_verify = isinstance(mixed_qkv, tuple)
+        seq_len = mixed_qkv[0].shape[0] if packed_verify else mixed_qkv.shape[0]
 
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
@@ -948,6 +952,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+        verify_ba_outputs = None
+        conv_weight = layer.conv_weights
+        if packed_verify:
+            assert is_target_verify and self.supports_packed_verify
+            from sglang.kernels.ops.attention.linear.gdn_verify_front import (
+                prepare_verify_conv,
+            )
+
+            projected_qkvz, projected_ba = mixed_qkv
+            prepared = prepare_verify_conv(
+                layer,
+                projected_qkvz,
+                projected_ba,
+                conv_states,
+                forward_batch.spec_info.draft_token_num,
+                retrieve_next_token,
+            )
+            if prepared is None:
+                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                    projected_qkvz,
+                    projected_ba,
+                    layer.num_q_heads,
+                    layer.num_v_heads,
+                    layer.head_q_dim,
+                    layer.head_v_dim,
+                )
+            else:
+                mixed_qkv, z, b, a, conv_weight = prepared
+                verify_ba_outputs = (projected_ba, b, a)
+
         if self.mis_metadata is not None:
             if is_target_verify:
                 raise ValueError("GDN MIS does not support target verify")
@@ -1017,23 +1051,43 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = mixed_qkv.view(
-                batch_size, draft_token_num, -1
-            ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            # DP-attention padding may leave an incomplete trailing verify
+            # group, or no complete group at all on an idle rank. Only real
+            # requests may update recurrent or convolution state.
+            num_conv_tokens = batch_size * draft_token_num
+            if num_conv_tokens > 0:
+                mixed_qkv_reshaped = (
+                    mixed_qkv[:num_conv_tokens]
+                    .view(batch_size, draft_token_num, -1)
+                    .transpose(1, 2)
+                )
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    conv_weight,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                    **(
+                        {"verify_ba_outputs": verify_ba_outputs}
+                        if verify_ba_outputs is not None
+                        else {}
+                    ),
+                )
+                processed = mixed_qkv_processed.transpose(1, 2).view(
+                    num_conv_tokens, -1
+                )
+                if num_conv_tokens != seq_len:
+                    mixed_qkv = torch.cat(
+                        [processed, mixed_qkv[num_conv_tokens:]], dim=0
+                    )
+                else:
+                    mixed_qkv = processed
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -1218,7 +1272,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, h, ssm_states, forward_metadata
                 )
 
-        return core_attn_out
+        return (core_attn_out, z) if packed_verify else core_attn_out
 
     def _forward_extend_mis(
         self,
